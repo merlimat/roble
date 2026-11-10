@@ -37,7 +37,7 @@ const META_FILTER_PREFIX: &[u8] = b"filter.";
 const META_FULL_FILTER_PREFIX: &[u8] = b"fullfilter.";
 
 /// The blocks the metaindex points at.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Metaindex {
     /// The properties block, which every table has.
     pub properties: Option<BlockHandle>,
@@ -46,7 +46,11 @@ pub struct Metaindex {
     /// The filter block, if the table has one.
     pub filter: Option<BlockHandle>,
     /// The value index, present when the table has value blocks.
-    pub value_index: Option<BlockHandle>,
+    ///
+    /// Carries the column widths as well as the block handle: the metaindex
+    /// value for `pebble.value_index` is a handle *plus* three width bytes,
+    /// and the index is unreadable without them.
+    pub value_index: Option<crate::value_block::ValueIndex>,
 }
 
 /// A readable Pebble sstable over bytes already in memory.
@@ -146,6 +150,34 @@ impl<'a> Table<'a> {
         };
         let decoded = self.decode_block(handle)?;
         crate::rangedel::decode(&Block::new(decoded.as_slice())?)
+    }
+
+    /// The value blocks' handles, read from the value index.
+    ///
+    /// Decoded once so that resolving many values does not re-read the index
+    /// per value.
+    pub fn value_blocks(&self) -> Result<Vec<BlockHandle>> {
+        let Some(index) = &self.metaindex.value_index else {
+            return Ok(Vec::new());
+        };
+        let block = self.decode_block(index.handle)?;
+        index.decode_rows(block.as_slice())
+    }
+
+    /// Resolves a value-block handle into the value's bytes.
+    ///
+    /// `blocks` comes from [`Table::value_blocks`].
+    pub fn resolve_value(&self, blocks: &[BlockHandle], handle_bytes: &[u8]) -> Result<Vec<u8>> {
+        let handle = crate::value_block::Handle::decode(handle_bytes)?;
+        let block_handle = blocks.get(handle.block_num as usize).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "value handle names block {} of {}",
+                handle.block_num,
+                blocks.len()
+            ))
+        })?;
+        let block = self.decode_block(*block_handle)?;
+        Ok(crate::value_block::value_in_block(block.as_slice(), handle)?.to_vec())
     }
 
     /// The filter block's bytes, if the table has one.
@@ -306,7 +338,9 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
         } else if name == META_RANGE_KEY {
             range_key_present = true;
         } else if name == META_VALUE_INDEX {
-            handles.value_index = Some(handle);
+            handles.value_index = Some(crate::value_block::ValueIndex::decode_metaindex_value(
+                entry.value,
+            )?);
         } else if name.starts_with(META_FILTER_PREFIX) || name.starts_with(META_FULL_FILTER_PREFIX)
         {
             handles.filter = Some(handle);

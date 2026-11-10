@@ -33,6 +33,7 @@ pub mod manifest;
 pub mod rangedel;
 pub mod record;
 pub mod sst;
+pub mod value_block;
 
 pub use block::{BlockBuilder, BlockHandle};
 pub use checksum::ChecksumType;

@@ -36,6 +36,7 @@ const FIXTURES: &[&str] = &[
     "xxhash64",
     "rangedel",
     "bloom",
+    "valueblocks",
 ];
 
 fn golden_dir() -> PathBuf {
@@ -173,6 +174,49 @@ fn robles_bloom_filter_is_byte_identical_to_go_pebbles() {
             String::from_utf8_lossy(k)
         );
     }
+}
+
+/// The value-block fixture must really contain value blocks, and roble must
+/// resolve every handle to the same bytes Pebble's reader produces.
+///
+/// The dump comparison already proves the values match, because Go's dump
+/// resolves them through Pebble. What this adds is that the path was taken at
+/// all: a fixture that stopped producing value blocks would still pass the
+/// dump comparison while leaving resolution untested.
+#[test]
+fn the_value_block_fixture_really_exercises_resolution() {
+    use roble_format::block::Value;
+
+    let bytes = std::fs::read(golden_dir().join("valueblocks.sst")).expect("read it");
+    let table = Table::open(&bytes).expect("open");
+
+    let blocks = table.value_blocks().expect("value index");
+    assert!(
+        !blocks.is_empty(),
+        "the fixture has no value blocks, so resolution is untested"
+    );
+
+    let mut handles = 0usize;
+    let mut in_place = 0usize;
+    table
+        .for_each_entry(|_, value| {
+            match value {
+                Value::ValueHandle(h) => {
+                    let resolved = table.resolve_value(&blocks, h).expect("resolve");
+                    assert!(!resolved.is_empty(), "a resolved value should not be empty");
+                    handles += 1;
+                }
+                Value::InPlace(_) => in_place += 1,
+                other => panic!("unexpected {} value", other.kind_name()),
+            }
+            Ok(())
+        })
+        .expect("walk");
+
+    assert!(
+        handles > 0,
+        "no entry used a value handle, so {in_place} in-place values proved nothing"
+    );
 }
 
 #[test]

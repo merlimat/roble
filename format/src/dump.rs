@@ -61,13 +61,22 @@ pub fn dump_table(bytes: &[u8]) -> Result<String> {
 
     let tombstones = table.range_deletions()?;
 
+    // Decoded once rather than per value: a table with value blocks has few
+    // of them, but the index would otherwise be re-read for every entry.
+    let value_blocks = table.value_blocks()?;
+
     let mut entries: Vec<String> = Vec::new();
     table.for_each_entry(|key, value| {
+        let resolved;
         let bytes = match value {
             Value::InPlace(v) => v,
+            Value::ValueHandle(h) => {
+                resolved = table.resolve_value(&value_blocks, h)?;
+                &resolved
+            }
             other => {
                 return Error::unsupported(format!(
-                    "{} values are not resolved yet, so they cannot be dumped",
+                    "{} values arrive above roble's pin and cannot be dumped",
                     other.kind_name()
                 ));
             }
