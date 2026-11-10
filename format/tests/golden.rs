@@ -35,6 +35,7 @@ const FIXTURES: &[&str] = &[
     "zstd",
     "xxhash64",
     "rangedel",
+    "bloom",
 ];
 
 fn golden_dir() -> PathBuf {
@@ -100,6 +101,78 @@ fn the_compression_and_checksum_fixtures_contain_what_they_claim() {
         ChecksumType::XxHash64,
         "the xxhash64 fixture is not actually checksummed with xxhash64"
     );
+}
+
+/// The filter block Go Pebble wrote, rebuilt from the same keys, must come out
+/// byte for byte identical.
+///
+/// This is the only check that pins the hash. A filter that merely "works" —
+/// says yes to its own keys at a believable false-positive rate — can still
+/// disagree with Go on every key, and the disagreement surfaces as a point
+/// lookup that answers "not found" for a key that is really there.
+#[test]
+fn robles_bloom_filter_is_byte_identical_to_go_pebbles() {
+    use roble_format::filter::{DEFAULT_BITS_PER_KEY, Filter, FilterBuilder};
+
+    let bytes = std::fs::read(golden_dir().join("bloom.sst")).expect("read bloom.sst");
+    let table = Table::open(&bytes).expect("open bloom.sst");
+
+    let block = table
+        .filter_block()
+        .expect("read the filter block")
+        .expect("the bloom fixture has a filter block");
+    let go_filter = block.as_slice();
+
+    // Pebble adds each point key's prefix as it writes, in table order, which
+    // under the bytewise comparer is the whole user key.
+    let mut builder = FilterBuilder::new(DEFAULT_BITS_PER_KEY);
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    table
+        .for_each_entry(|key, _| {
+            builder.add_key(key.user_key);
+            keys.push(key.user_key.to_vec());
+            Ok(())
+        })
+        .expect("walk");
+    let roble_filter = builder.finish();
+
+    assert_eq!(
+        roble_filter.len(),
+        go_filter.len(),
+        "filter lengths differ: roble {} bytes, Go {} bytes",
+        roble_filter.len(),
+        go_filter.len()
+    );
+    if roble_filter != go_filter {
+        let differing = roble_filter
+            .iter()
+            .zip(go_filter)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .count();
+        let first = roble_filter
+            .iter()
+            .zip(go_filter)
+            .position(|(a, b)| a != b)
+            .expect("they differ somewhere");
+        panic!(
+            "filter bits differ in {differing} of {} bytes, first at {first}:              roble {:#04x} vs Go {:#04x}",
+            go_filter.len(),
+            roble_filter[first],
+            go_filter[first]
+        );
+    }
+
+    // And the filter Go wrote must answer yes to every key in the table.
+    let f = Filter::new(go_filter).expect("Go's filter validates");
+    assert_eq!(f.probes(), 6, "10 bits per key means 6 probes");
+    for k in &keys {
+        assert!(
+            f.may_contain(k),
+            "Go's own filter excludes {:?}",
+            String::from_utf8_lossy(k)
+        );
+    }
 }
 
 #[test]

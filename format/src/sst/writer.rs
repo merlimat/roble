@@ -31,6 +31,7 @@ use crate::block::{
 };
 use crate::checksum::ChecksumType;
 use crate::error::{Error, Result};
+use crate::filter::{self, FilterBuilder};
 use crate::footer::{FOOTER_LEN, PEBBLE_MAGIC, TableFormat};
 use crate::key::{InternalKey, Kind, TRAILER_LEN};
 use crate::rangedel;
@@ -49,6 +50,12 @@ pub struct WriterOptions {
     pub block_size: usize,
     /// The table format. Only [`TableFormat::Pebblev4`] is written.
     pub format: TableFormat,
+    /// Bits per key for the bloom filter, or `None` to write no filter block.
+    ///
+    /// A table without one is format-legal and Go Pebble reads it, but it
+    /// throws away the point-lookup filtering Oxia configures, so the default
+    /// matches Oxia's `bloom.FilterPolicy(10)` (DESIGN.md §1).
+    pub filter_bits_per_key: Option<usize>,
 }
 
 impl Default for WriterOptions {
@@ -56,6 +63,7 @@ impl Default for WriterOptions {
         WriterOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             format: TableFormat::Pebblev4,
+            filter_bits_per_key: Some(filter::DEFAULT_BITS_PER_KEY),
         }
     }
 }
@@ -81,6 +89,7 @@ pub struct TableWriter {
     raw_value_size: u64,
     data_size: u64,
     range_del: rangedel::Builder,
+    filter: Option<FilterBuilder>,
 }
 
 impl TableWriter {
@@ -107,6 +116,7 @@ impl TableWriter {
             raw_value_size: 0,
             data_size: 0,
             range_del: rangedel::Builder::new(),
+            filter: opts.filter_bits_per_key.map(FilterBuilder::new),
         })
     }
 
@@ -150,6 +160,12 @@ impl TableWriter {
         let max_shared = max_shared_len(self.opts.format, &self.prev_key, &encoded);
         self.data
             .add(&encoded, value, max_shared, value_prefix, same_key_prefix);
+
+        // maybeAddToFilter hashes key[:Split(key)], which under the bytewise
+        // comparer is the whole user key, and only for point keys.
+        if let Some(f) = self.filter.as_mut() {
+            f.add_key(key.user_key);
+        }
 
         self.num_entries += 1;
         self.raw_key_size += encoded.len() as u64;
@@ -254,7 +270,15 @@ impl TableWriter {
             Some(self.write_block(&block)?)
         };
 
-        let props = self.properties(index_handle.length);
+        let filter_handle = match self.filter.as_ref() {
+            Some(f) if !f.is_empty() => {
+                let block = f.finish();
+                Some(self.write_block(&block)?)
+            }
+            _ => None,
+        };
+
+        let props = self.properties(index_handle.length, filter_handle);
         let mut props_builder = BlockBuilder::new(usize::MAX);
         let mut prev: Vec<u8> = Vec::new();
         for (name, value) in &props {
@@ -271,6 +295,9 @@ impl TableWriter {
         let mut entries: Vec<(&[u8], BlockHandle)> = vec![(b"rocksdb.properties", props_handle)];
         if let Some(h) = range_del_handle {
             entries.push((rangedel::META_NAME_V2, h));
+        }
+        if let Some(h) = filter_handle {
+            entries.push((filter::META_NAME.as_bytes(), h));
         }
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (name, handle) in entries {
@@ -302,7 +329,11 @@ impl TableWriter {
     }
 
     /// The properties Go Pebble reads back, sorted, as a row block needs.
-    fn properties(&self, index_size: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    fn properties(
+        &self,
+        index_size: u64,
+        filter_handle: Option<BlockHandle>,
+    ) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let mut p: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         let mut put_str = |k: &str, v: &str| {
             p.insert(k.as_bytes().to_vec(), v.as_bytes().to_vec());
@@ -310,6 +341,9 @@ impl TableWriter {
         put_str("rocksdb.comparator", BYTEWISE_COMPARER);
         put_str("rocksdb.merge.operator", CONCATENATE_MERGER);
         put_str("rocksdb.compression", "NoCompression");
+        if filter_handle.is_some() {
+            put_str("rocksdb.filter.policy", filter::POLICY_NAME);
+        }
 
         let mut put_num = |k: &str, v: u64| {
             let mut buf = Vec::new();
@@ -334,7 +368,7 @@ impl TableWriter {
         put_num("rocksdb.data.size", self.data_size);
         put_num("rocksdb.index.size", index_size);
         put_num("rocksdb.merge.operands", 0);
-        put_num("rocksdb.filter.size", 0);
+        put_num("rocksdb.filter.size", filter_handle.map_or(0, |h| h.length));
 
         // saveUint32, not a uvarint: four bytes little-endian. 0 is
         // single-level.

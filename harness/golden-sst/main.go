@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/v2/sstable"
 	"github.com/cockroachdb/pebble/v2/sstable/block"
@@ -54,6 +55,7 @@ type fixture struct {
 	// the Pebble module. Several sequence numbers over one range are covered
 	// from the other direction, by compat/sst-roundtrip.
 	tombstones [][2]string
+	filter     sstable.FilterPolicy
 }
 
 // checksumOrDefault keeps crc32c as the default, as Pebble does, so only the
@@ -229,6 +231,31 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, xx)
 
+	// A bloom filter at Oxia's 10 bits per key. The point of this fixture is
+	// that roble can rebuild the identical bits from the same keys, which is
+	// what catches the sign-extended tail in the hash.
+	bl := fixture{name: "bloom", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression,
+		filter: bloom.FilterPolicy(10)}
+	for i := 0; i < 500; i++ {
+		// The hash folds its last one to three bytes in separately, sign
+		// extended. oxiaKey is 39 bytes, so appending one to four high bytes
+		// covers every length modulo 4 — including the three that reach the
+		// sign-extended tail at all. A fixture whose keys are all a multiple
+		// of four bytes long never exercises it, and an unsigned fold then
+		// produces identical bits.
+		tail := make([]byte, 1+i%4)
+		for j := range tail {
+			tail[j] = byte(0x80 + (i+j)%0x7f)
+		}
+		k := append(oxiaKey(4, i), tail...)
+		bl.entries = append(bl.entries, entry{
+			userKey: k, seqNum: pebble.SeqNum(8000 + i),
+			kind: pebble.InternalKeyKindSet, value: []byte(fmt.Sprintf("b-%d", i)),
+		})
+	}
+	fs = append(fs, bl)
+
 	// Range deletions, which live in their own block and never in a data
 	// block. Before this fixture existed, a table with tombstones read as
 	// though it had none and no test noticed.
@@ -262,7 +289,7 @@ func write(path string, f fixture) error {
 		Checksum:     f.checksumOrDefault(),
 		Comparer:     sstable.DefaultComparer,
 		MergerName:   "pebble.concatenate",
-		FilterPolicy: nil,
+		FilterPolicy: f.filter,
 	}
 	w := sstable.NewWriter(objstorageprovider.NewFileWritable(file), opts)
 	// An sstable needs strictly increasing internal keys.
