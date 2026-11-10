@@ -10,8 +10,7 @@
 > tables Go Pebble reads back entry for entry (`compat/sst-roundtrip`), with
 > the golden corpus going the other way (`harness/golden-sst`).
 >
-> Still to come in M1: value-block
-> resolution,
+> Still to come in M1: value-block resolution,
 > record framing, version edits, and the `roble sst dump` and
 > `roble manifest dump` commands.
 
@@ -254,6 +253,7 @@ The anchors that matter most:
 | bloom filter | `bloom/bloom.go` — RocksDB's full-file filter: 64-byte lines, then one probe-count byte and a u32 line count. Its hash folds the trailing one to three bytes in **sign-extended**, `uint32(int8(b))`, to match RocksDB; unsigned gives different bits for any key whose tail is ≥ 0x80 |
 | metaindex names | `sstable/table.go` — `rocksdb.properties`, `rocksdb.range_del2` (and `rocksdb.range_del` for the refused v1), `pebble.range_key`, `pebble.value_index`, `fullfilter.<policy>`. None of the range ones is spelled the way its feature is |
 | WAL file names | `wal/wal.go` — `makeLogFilename`: `NNNNNN.log`, and `NNNNNN-NNN.log` only under failover |
+| EOF trailer | `record/log_writer.go` — a closed log ends with an eleven-byte recyclable header whose checksum is **zero** and whose log number is one greater than the file's. A reader must test the log number *before* the checksum, or every closed log looks corrupt at its end |
 | unflushed logs | `internal/manifest/version_edit.go` — `MinUnflushedLogNum`, which says what a reopen must replay |
 
 Key kinds roble handles: `DELETE` 0, `SET` 1, `SINGLEDEL` 7, `RANGEDEL` 15,
@@ -461,7 +461,8 @@ format/src/
   sst/writer.rs     table writer
   batch.rs          Pebble batch repr
   manifest.rs       version edits; recognises virtual-table backings to refuse them
-  record.rs         32 KiB block record framing: legacy (MANIFEST) and recyclable (WAL)
+  record.rs         32 KiB block record framing: legacy (MANIFEST), recyclable
+                    (WAL), and the EOF trailer that ends a closed log
   files.rs          file names, NNNNNN.log, marker.manifest.*, marker.format-version.*
 ```
 

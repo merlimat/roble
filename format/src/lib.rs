@@ -30,6 +30,7 @@ pub mod block;
 pub mod filter;
 pub mod key;
 pub mod rangedel;
+pub mod record;
 pub mod sst;
 
 pub use block::{BlockBuilder, BlockHandle};
