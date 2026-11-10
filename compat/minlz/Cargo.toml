@@ -1,0 +1,11 @@
+[package]
+name = "minlz-compat"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Decompression only: roble reads MinLZ blocks and never writes them, which is
+# why this crate's encoder not being byte-compatible with Go's does not matter.
+# default-features = false drops its S2 codec, leaving minlz + crc + crc-catalog.
+minlz = { version = "1.2.3", default-features = false, features = ["minlz"] }

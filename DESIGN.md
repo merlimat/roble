@@ -1,0 +1,707 @@
+# roble — design
+
+> Status: nothing is implemented. This document fixes the compatibility target
+> (§3), the decisions that differ from encina's (§4), and the order the work goes
+> in (§13). M1, the format crate, is next: encode and decode Pebble's files with
+> no engine behind them, verified against files Go Pebble wrote (§12).
+
+roble is an embedded, ordered key-value store for Rust, built on the
+[compio](https://github.com/compio-rs/compio) completion-based runtime. It is a
+log-structured merge tree whose on-disk files and whose operations are
+compatible with [Pebble](https://github.com/cockroachdb/pebble), so that a
+Pebble database and a roble database are the same database.
+
+Its first user is a Rust implementation of [Oxia](https://github.com/oxia-db/oxia)'s
+data server, where it replaces Pebble behind the `kvstore.KV` interface. roble
+takes encina's approach to threads and I/O — one `!Send` store per thread, its
+own cache, direct I/O, all I/O through a trait the caller can implement — and
+applies it to someone else's file format.
+
+## 1. Workload
+
+Read from `oxia-db/oxia` at `oxiad/dataserver/database/kvstore/`, which is the
+contract roble has to meet.
+
+| Aspect | Shape |
+|---|---|
+| Keys / values | Keys are byte strings: Oxia's `compare.Encoder` encodes a user key so that bytewise order gives its hierarchical, `/`-aware order. Values are protobuf records, mostly a few hundred bytes. |
+| Writes | One batch per replicated write, applied atomically: `Put`, `Delete`, `DeleteRange`. A batch is read back through itself before it commits, so batches are indexed (§6). |
+| Reads | Point lookups, and lookups under a comparison: floor, ceiling, lower, higher. Forward and reverse range scans. Prefix iteration that also reads the keys outside the prefix, by seeking. |
+| Deletes | Point deletes, and `DeleteRange` over key ranges. |
+| Shape of a node | Hundreds of shards per process, one store per (namespace, shard), all sharing one block cache. Memtables are 4 MiB, blocks 16 KiB, bloom filters 10 bits per key. |
+| Durability | **Oxia disables Pebble's WAL** (`DisableWAL: !UseWAL` in `kv_pebble.go`: "WAL is kept outside the KV store"). Oxia's replication log is the source of truth; the store need only be durable at `Flush()`, and Oxia replays everything after that. `SyncData` decides whether a commit syncs. roble works both ways: the WAL is on by default, and `disable_wal` is what Oxia sets (§4). |
+| Snapshots | `db.Checkpoint(dir)`, whose files are streamed to a follower in 1 MiB chunks and written straight into a fresh database directory, which is then opened. |
+| Compression | L0 uncompressed, L1 and below Snappy. No merge operator. |
+| Key-encoding conversion | Oxia converts a database to the configured key encoding inside `pebble.Open`, writing the new one with 64 KiB blocks and `GoodCompression`, and leaves an `oxia-key-encoding-format` marker in the database directory — a file Pebble knows nothing about, which `Checkpoint` output then also carries (§3, §12). |
+
+Three consequences shape everything below. First, **snapshots move raw files
+between implementations**, so file-format compatibility is a correctness
+requirement for a mixed Go/Rust cluster, not a migration convenience. Second,
+**Oxia's data path runs without a WAL**, so running without one has to be a
+first-class configuration rather than a degraded mode — which is not the same as
+roble not having a WAL at all (§4). Third, **the files in a live database were
+not all written by the current configuration**: a converted database holds
+64 KiB blocks and a compression profile that the steady-state options never
+produce, which is why §3 separates what roble reads from what it writes.
+
+## 2. Why compatibility, and what it costs
+
+An LSM is not obviously the right structure for this workload — encina's
+copy-on-write B+tree would serve it well, and §2 of encina's design says why.
+roble is an LSM because *the files must be Pebble's*, and that decides the
+structure. The data structure is a consequence of the compatibility
+requirement, not a conclusion about the workload.
+
+What compatibility buys:
+
+- **An existing cluster upgrades in place.** A Rust data server opens the
+  database a Go one left behind, with no export, no dual write and no downtime.
+- **A mixed cluster works.** Oxia moves a shard by checkpointing it and
+  streaming the files; a Go leader can seed a Rust follower and the reverse.
+- **The way back stays open.** If roble is wrong about something, Go Pebble can
+  open the database and serve it.
+- **Existing tooling works.** The `pebble` command inspects roble's files, which
+  is also how roble's own tests are judged (§12).
+
+What it costs, stated plainly:
+
+- **The format is someone else's, and it moves.** Pebble ratchets format major
+  versions; each one may add a structure roble would have to implement.
+- **Bug-for-bug fidelity is the bar for reads.** Writing files Go Pebble accepts
+  is the easier half. Reading every file Go Pebble might have written — value
+  blocks, two-level indexes, obsolete-key bits, four compression algorithms,
+  recycled logs — is the harder one, and a gap shows up as a corruption error on
+  a follower, far from its cause. Narrowing what roble *writes* (§3) cuts the
+  work; it does not cut this.
+- **Some of roble's preferences are not available.** It cannot choose a node
+  format that suits its data, as encina does, nor skip a bloom filter it doesn't
+  want, without writing files Go Pebble reads differently.
+
+The pin in §3 is what makes this bounded rather than open-ended.
+
+## 3. The compatibility target
+
+roble targets exactly what Oxia asks Pebble for, and refuses the rest.
+
+| Item | Value | From |
+|---|---|---|
+| Pebble | `github.com/cockroachdb/pebble/v2` v2.1.7 | `oxiad/go.mod` |
+| Format major version | `FormatVirtualSSTables` | `kv_pebble.go` |
+| Max table format | **Pebblev4** — row-oriented blocks, value blocks, `DELSIZED` tombstones, range keys, virtual sstables. What the format permits, not what roble implements: the table below says which of these it declines | `FormatMajorVersion.MaxTableFormat` |
+| Comparer | `leveldb.BytewiseComparator` | default; Oxia sets none for new databases |
+| Merger | `pebble.concatenate`, unused | no merge operator is configured |
+| Block size | 16 KiB | `kv_pebble.go` |
+| Filter | `rocksdb.BuiltinBloomFilter`, 10 bits per key | `bloom.FilterPolicy(10)` |
+| Compression, steady state | none (L0) and Snappy (L1+) | `kv_pebble.go` |
+| Compression, converted databases | none (L0) and `GoodCompression` (L1+): Zstd3 for data and value blocks, and for index, filter and metadata blocks `fastestCompression` — **Snappy on arm64, MinLZ everywhere else**, resolved at init from `runtime.GOARCH`, so the file depends on the writer's CPU | `kv_pebble_formats.go` |
+| Block size, converted databases | 64 KiB | `kv_pebble_formats.go` |
+
+**Not in the target**, because the pin excludes them: columnar blocks
+(Pebblev5), the footer checksum and blob value handles (Pebblev6), footer
+attributes (Pebblev7), WAL sync chunks (`FormatWALSyncChunks`, above the pin, so
+a log at the pin uses recyclable chunks), WAL failover to a secondary directory,
+and disaggregated or shared storage. MinLZ is *not* in this list, because a
+compression profile is an option rather than a format version, and Oxia's own
+conversion path writes it — roble reads it, as the compression note below says.
+
+roble refuses a database whose format major version is above its pin, and a
+table whose format is above Pebblev4, with a clear error rather than a partial
+read. **Treat the pin as part of roble's public contract**: if Oxia raises it,
+that is a roble release, not a configuration change.
+
+### What roble reads, writes and refuses
+
+The rule: **roble reads what an Oxia database can contain, and writes the
+narrowest set of structures Go Pebble accepts.** Where a structure cannot appear
+in such a database, roble refuses it rather than carrying a read path for it —
+except where reading costs a couple of match arms and refusing would cost a live
+shard, which is the case for `SINGLEDEL` and `DELSIZED`.
+
+| Structure | Read | Write |
+|---|---|---|
+| sstable, Pebblev4 down to Pebblev1 | yes | Pebblev4 only |
+| In-place value prefix byte on `SET` (Pebblev3+) | yes | yes |
+| Two-level index blocks | yes | yes, when the index outgrows a block |
+| Value blocks and value handles | yes | **no** |
+| Range-deletion blocks (v2 tombstones) | yes | yes |
+| Bloom filter blocks (full key, bytewise `Split`) | yes | yes |
+| The Pebblev4 obsolete bit | yes, honoured | **never set** |
+| Block properties | yes, unknown collectors skipped | the minimum Go accepts (M1) |
+| `SINGLEDEL`, `DELSIZED` | yes | never written |
+| MANIFEST version edits | yes | yes |
+| `marker.manifest.*`, `marker.format-version.*` | yes | yes |
+| `OPTIONS-*`, `LOCK`, file naming, obsolete-file deletion | yes | yes |
+| WAL records and batch repr | yes | yes, recyclable chunks |
+| Checkpoint directories | yes | yes |
+| Files roble does not recognise | left alone, never deleted | never written |
+| Range-key blocks (set, unset, delete) | **error** | never written |
+| Virtual sstables (a file entry over part of a backing file) | **error** | never written |
+| A comparer other than `leveldb.BytewiseComparator` | **error** | never written |
+| MERGE keys | error | never written |
+| Columnar blocks, blob files | error | never written |
+| WAL failover segments (`NNNNNN-NNN.log`) | error | never written |
+
+**Why range keys, virtual sstables and the legacy comparer are refused rather
+than read.** Oxia creates none of them, so a file holding one means an
+assumption has broken, and a loud error is worth more than a best-effort read.
+
+- **Range keys.** Oxia calls no range-key API anywhere in the repository.
+  Refusing them takes the range-key iterator out of the read path entirely
+  (§5, §6), which is the largest single saving on this list.
+- **Virtual sstables.** Only `Excise` and `IngestAndExcise` create one, and Oxia
+  calls neither; the shard split streams a snapshot the child filters by hash
+  range, rather than excising (`SHARD_SPLIT_DESIGN.md`). The MANIFEST reader
+  still parses backing-table entries far enough to recognise one and refuse it.
+- **`oxia-slash-spans`.** Every Oxia from 0.15 on converts the database when it
+  opens it, so a Rust server does not meet an unconverted one. roble asserts the
+  comparer name and refuses anything else. That also removes a trap: a bloom
+  filter is built over `Comparer.Split(key)`, and `oxia-slash-spans` sets `Split`
+  to return 0 where bytewise returns `len(key)` — mixing the two gives a silent
+  "not found" for a key that is really there.
+
+**Why the write side is narrower.** Writing a structure means getting it right
+or corrupting a Go reader; reading one means getting it right or failing loudly.
+
+- **No value blocks.** Pebble sends a value to one when
+  `setHasSamePrefix && valueLen > 0`, where the prefix is `key[:Split(key)]` —
+  under bytewise, the whole user key. So a value block appears only where the
+  same user key repeats within one output table, which takes an open snapshot
+  keeping an older version alive. Rare in Oxia, and never necessary to write.
+- **The obsolete bit is never set.** It is an optimization that lets a reader
+  skip a key; set it wrongly and Go Pebble skips a live one — wrong results, in
+  the other implementation, with no corruption error anywhere. Always-zero is
+  correct and legal.
+- **Two-level indexes are written**, which is not a choice. Oxia leaves
+  `TargetFileSizes` at Pebble's default — 2 MiB at L0, doubling per level — so a
+  deep file runs to ~128 MiB and its index is many blocks long.
+- **The value prefix byte is block decoding, not a value-block detail.** In a
+  Pebblev3+ table every `SET` value is one prefix byte followed by the value,
+  value block or not. A Pebblev2 table has no such byte, so the reader branches
+  on table format — and that is why reading the older formats stays in, since a
+  long-lived database keeps them in its deep levels.
+
+Compression: roble reads none, Snappy, Zstd **and MinLZ**, and writes none and
+Snappy. MinLZ is not optional — a database converted on anything but arm64 holds
+MinLZ-compressed index, filter and metadata blocks (§1), so refusing it would
+refuse the in-place upgrade §2 is built around. Pebble compresses a block with
+`minlz.Encode(dst, src, level)`, the block format, and reads it back with
+`DecodedLen` and `Decode` (`internal/compression/minlz.go`); above
+`minlz.MaxBlockSize`, 8 MiB, it falls back to Snappy *and tags the block Snappy*,
+so roble needs no special case for an oversized block.
+
+Decompression only, through the `minlz` crate with
+`default-features = false, features = ["minlz"]`, which drops its S2 half and
+leaves a tree of three crates (`minlz`, `crc`, `crc-catalog`). Verified against
+Go: 12 payloads — empty, one byte, 16 KiB and 64 KiB blocks shaped like index,
+filter and record blocks, incompressible blocks that encode as literals, 1 MiB,
+and exactly `MaxBlockSize` — compressed by `github.com/minio/minlz` at the
+version Pebble pins, at both `LevelFastest` and `LevelBalanced`, all 24 pairs
+decoding byte-for-byte through `decompressed_len`, `decompress` and
+`decompress_into`; and 588 truncated or bit-flipped inputs erroring without a
+panic. The crate's encoder is explicitly not byte-compatible with Go's, which
+costs roble nothing, since it never writes MinLZ. The check is `compat/minlz`,
+and it runs.
+**Uncompressed is roble's default**, which is a format-legal choice and the one
+that keeps a cached block byte-for-byte its on-disk bytes (§8).
+
+### The normative reference
+
+Pebble's Go source at the pinned tag is the specification; there is no other.
+Each module of the format crate names the Go file and symbol it implements, so a
+reader can check it, and so a Pebble upgrade has a list of things to re-read.
+The anchors that matter most:
+
+| roble | Pebble at v2.1.7 |
+|---|---|
+| internal keys, kinds, trailers | `internal/base/internal.go` — `InternalKeyKind*`, `InternalTrailerLen = 8` |
+| footer | `sstable/table.go` — `rocksDBFooterLen` (53 bytes), `pebbleDBMagic` |
+| table formats | `sstable/format.go` — the (magic, version) tuple per format |
+| block trailer | `sstable/block` — `TrailerLen = 5`: one compression byte, four checksum bytes |
+| format major versions | `format_major_version.go` — `MaxTableFormat` |
+| version edits | `internal/manifest/version_edit.go` |
+| markers | `internal/base` and `vfs/atomicfs` |
+| batch repr | `batchrepr` — 8-byte sequence number, 4-byte count, then entries |
+| log records | `record/record.go` — 32 KiB blocks; three wire formats, `legacyHeaderSize = 7` (the MANIFEST), `recyclableHeaderSize = 11`, the extra four bytes being the log number (the WAL at the pin), and `walSyncHeaderSize = 19` (above the pin, refused) |
+| WAL file names | `wal/wal.go` — `makeLogFilename`: `NNNNNN.log`, and `NNNNNN-NNN.log` only under failover |
+| unflushed logs | `internal/manifest/version_edit.go` — `MinUnflushedLogNum`, which says what a reopen must replay |
+
+Key kinds roble handles: `DELETE` 0, `SET` 1, `SINGLEDEL` 7, `RANGEDEL` 15,
+`SETWITHDEL` 18, `DELSIZED` 23, and the Pebblev4 obsolete bit, 64. Refused:
+`MERGE` 2, and the range-key kinds `RANGEKEYDEL` 19, `RANGEKEYUNSET` 20 and
+`RANGEKEYSET` 21. `SINGLEDEL` and `DELSIZED` are read but never written: Oxia
+creates neither, and reading them costs two match arms where refusing them would
+cost a dead shard if Pebble ever produced one on its own.
+
+## 4. Decisions
+
+| Topic | Decision |
+|---|---|
+| Format | Pebble's, pinned at §3. roble defines no format of its own, and has no format version of its own. |
+| Durability | **A WAL, on by default.** `write(batch, sync)` appends the batch repr to the log as one record, syncs it if asked, and then applies it to the memtable; `flush()` writes a table, installs the version edit, and retires the logs that edit covers. `disable_wal` skips the log entirely, which is what Oxia sets: then `flush()` is the only durability point. A WAL is an integral part of an LSM rather than a feature of this workload, and roble has to read Pebble's logs regardless, so it is in v1 (M3) rather than deferred — but the no-WAL path is tested as a first-class configuration, because it is the one Oxia runs (§1). |
+| Threading | One `!Send` store per thread, as encina: a compio runtime's, or whatever runs an env the caller implements. No locks or atomics outside wakers. Oxia already shards; a shard's store is owned by one thread. |
+| Memory | **Caches belong to the thread, not the store** (§8): the block cache and the table cache are created per thread and shared by every store on it, within one budget. This differs from encina, where each store has its own, and follows Oxia, where hundreds of shards share one cache. No OS page cache and no `mmap`: direct I/O. |
+| Compaction | Cooperative on the owning thread by default, paced in units of work as encina paces a large merge, so a seeded run replays. Offload to a pool is a capability of the env, not a default (§9). |
+| Allocation | No allocation on the read path for an uncompressed block, which is cached as read. A compressed block costs one buffer per miss, which is why uncompressed is the default. Batches, iterator state and compaction buffers reuse their memory. |
+| Keys and values | Byte strings, ordered bytewise. Limits are Pebble's, not roble's. Values are written in place; roble reads the value blocks Go writes but produces none (§3). **No custom comparator at all**: roble asserts the comparer name in the MANIFEST is `leveldb.BytewiseComparator` and refuses the database otherwise, `oxia-slash-spans` included. |
+| Snapshots | A snapshot pins a version and a sequence number, as Pebble's does. `checkpoint()` produces a directory Go Pebble opens. |
+
+## 5. Architecture
+
+```text
+write(batch) ─► WAL append ─► memtable (arena skiplist) ──► flush ──► new sstable ──► version edit
+                 (sync?)             │                                                     │
+                 NNNNNN.log          └──► immutable memtables                              ▼
+                                                                                   MANIFEST + marker
+open ─► replay the logs the MANIFEST leaves unflushed ─► memtables                         │
+                                                                                           │
+get / scan ─► iterator tree ─► memtables, L0 sublevels, L1..L6 ─┐                          │
+                                                                ▼                          ▼
+                                                    table cache ─► block cache ─► direct I/O
+                                                   (open readers)   (per thread, budget)
+compaction ◄── picker (scores) ──► merge inputs ──► new sstables ──► version edit
+```
+
+- **The WAL is one log file at a time**, `NNNNNN.log`, holding batch reprs in
+  record chunks. A write is logged before it is in a memtable, so nothing is
+  readable that is not recoverable; a memtable rotation rotates the log, and a
+  flush retires every log the version edit's minimum unflushed log number leaves
+  behind. With `disable_wal` none of this exists and `flush()` is the only
+  durability point (§4, §6).
+- **Memtables are skiplists over an arena**, keyed by internal key (user key,
+  sequence number, kind). Range deletions get a skiplist of their own, as in
+  Pebble, so a point read never walks tombstones it doesn't need. A
+  full memtable becomes immutable and queues for flush; the arena is released
+  when its table is written.
+- **Versions are immutable and reference counted.** A version is the set of
+  files per level, with L0 as sublevels. A flush or a compaction produces a
+  version edit, which is appended to the MANIFEST and then applied; a reader
+  holding an older version is unaffected, so a snapshot costs one reference
+  count, as an encina iterator does.
+- **Files are immutable, so there is nothing to lock.** A block is found through
+  the table cache (an open reader per file, with its index and filter) and the
+  block cache (decoded blocks, keyed by file number and offset).
+- **Reads assemble an iterator tree**: one iterator per memtable and per level,
+  merged by internal key, with range-deletion iterators layered over them, and
+  the sequence number of the snapshot deciding what is visible.
+  This is the part with no encina counterpart and the most room to be slow;
+  §6 says what it must not do.
+- **One flush and one compaction at a time per store**, both cooperative, so a
+  write never waits on a compaction's merge for more than a slice of work (§9).
+- **Obsolete files are deleted after the version that referenced them is
+  dropped**, by file number, with the directory synced. Getting this wrong
+  either leaks files or makes a reader read a deleted one, so it is checked by
+  the invariant checker after every step (§12).
+
+## 6. Operations
+
+Each maps to a method of Oxia's `kvstore.KV` or `kvstore.WriteBatch`.
+
+### `write(batch, sync)`
+
+A `WriteBatch` encodes operations into **Pebble's batch repr** — an 8-byte
+sequence number, a 4-byte count, then kind/key/value entries — in an arena that
+`clear()` empties without releasing. Using Pebble's encoding rather than one of
+roble's own is deliberate: Oxia checksums the batch bytes and compares that
+checksum across replicas, so a Go batch and a roble batch of the same operations
+must be the same bytes.
+
+That encoding pays twice over, because **the WAL record is the batch repr**: the
+bytes Oxia checksums are the bytes appended to the log, with no re-encoding
+between the batch and the file.
+
+`write()` assigns sequence numbers, appends the repr to the log as one record,
+syncs the log if `sync` is set, and then applies the entries to the memtable — in
+that order, so nothing is ever readable that a replay would not recover. With
+`disable_wal` the log step is skipped and `sync` means nothing: durability is
+`flush()`'s job alone (§4). A batch whose entries would exceed the memtable
+rotates it first, which rotates the log with it.
+
+roble writes recyclable chunks, as Go does at the pin, but **does not recycle log
+files**: a rotation creates a new one. Reading a recycled file is still required,
+since Go recycles, and that is what the log number in the chunk header is for.
+
+**Indexed batches.** Oxia reads a batch back through itself (`Get`, `FindLower`,
+`KeyRangeScan`, `RangeScan` on the batch) before committing it, so a batch keeps
+a skiplist index over its own repr, and its iterators merge the batch with the
+store's view. This is Pebble's indexed batch, and it is not optional.
+
+`put_with(key, len, |buf| …)` reserves space in the arena and lets the caller
+write the value into it, which is what Oxia's `PutMarshalable` needs to marshal
+protobuf once instead of twice.
+
+### `get(key, comparison)`
+
+Five comparisons, as encina: equal, floor, ceiling, lower, higher. Equal is a
+point lookup — bloom filter per table, then one block read. The other four are a
+seek: `SeekGE` for ceiling and higher, `SeekLT` for floor and lower, over the
+full iterator tree, since the answer may be in any level.
+
+A floor lookup is where an LSM is worst and where Oxia leans hardest: unlike
+encina's single descent, it probes every level, and a tombstone may send it
+further back. The iterator tree must therefore skip whole blocks by index key
+rather than walking entries, and must not read a table whose key range excludes
+the seek.
+
+Reads lend their key and value to a closure, as encina's do, so a cached
+uncompressed block is read without copying.
+
+### `delete_range(start..end)`
+
+A range tombstone, written to the memtable's range-deletion skiplist and then to
+a table's range-deletion block. Unlike encina, which drops covered subtrees and
+leaves nothing behind, every later read in that range checks the tombstone until
+compaction drops it. That is the cost the format chooses for us (§2).
+
+### Iterators
+
+Forward and reverse, bounded, over a snapshot. `seek_ge` / `seek_lt` /
+`next` / `prev`. Reverse iteration over an LSM is more expensive than forward,
+which Oxia's `KeyRangeScanReverse` uses; it is worth measuring early.
+
+A prefix iterator additionally serves `Lookup` for keys outside its prefix,
+which Oxia uses to read internal keys while scanning: it keeps a second iterator
+over the same snapshot rather than moving the first.
+
+Iterators read ahead, as encina's do, and share a read with another iterator
+that wants the same block (§8).
+
+### `flush()`, `snapshot()`, `checkpoint(dir)`
+
+`flush()` makes the memtable an immutable one, writes it as a table, appends the
+version edit — carrying the new minimum unflushed log number — and syncs: the
+point at which Oxia's data becomes durable. The logs below that number are then
+obsolete, and are deleted like any other obsolete file.
+
+`snapshot()` pins a version and a sequence number. `checkpoint(dir)` writes a
+directory Go Pebble opens: hard links to the live tables, a fresh MANIFEST
+holding one edit that describes the version, the markers, and an `OPTIONS-*`.
+Oxia streams that directory, so it is the single most important interop test
+(§12).
+
+### Opening and recovery
+
+`open()` reads `marker.format-version.*` and `marker.manifest.*`, replays the
+MANIFEST into a version, and then replays, in order, every log the version edits
+leave unflushed, applying each record to a fresh memtable. The next sequence
+number is the highest the replay saw, or the MANIFEST's last sequence number when
+there was nothing to replay — it never goes backwards, or a write Oxia replays
+could lose to a tombstone that outlives it.
+
+A torn record at the tail of the last log is the ordinary shape of a crash and
+ends the replay; a torn record anywhere else, or a chunk whose log number belongs
+to an older file, is corruption. **roble refuses a log it cannot replay rather
+than opening without it**: ignoring one silently discards writes that were
+already acknowledged. With `disable_wal` there is nothing to replay and the
+database opens as of the last flush.
+
+## 7. The format crate
+
+`roble-format` encodes and decodes Pebble's files. It has no I/O, no async, no
+runtime, and no knowledge of an engine, which is what makes it fuzzable and
+testable against golden files on its own, and what makes the first milestone
+useful before anything else exists.
+
+```text
+format/src/
+  key.rs            internal keys: user key, sequence number, kind, trailer
+  block/mod.rs      row-oriented block builder and in-place reader, including
+                    the Pebblev3+ value prefix byte on every SET
+  block/restart.rs  restart arrays, prefix compression, seek within a block
+  value_block.rs    value blocks, short attributes, value handles — read only
+  filter.rs         rocksdb.BuiltinBloomFilter
+  props.rs          properties block, metaindex, block properties
+  footer.rs         footer, magics and versions per table format
+  rangedel.rs       v2 range-deletion blocks
+  sst/reader.rs     table reader: footer, metaindex, index, blocks
+  sst/writer.rs     table writer
+  batch.rs          Pebble batch repr
+  manifest.rs       version edits; recognises virtual-table backings to refuse them
+  record.rs         32 KiB block record framing: legacy (MANIFEST) and recyclable (WAL)
+  files.rs          file names, NNNNNN.log, marker.manifest.*, marker.format-version.*
+```
+
+Blocks are **searched in place**, as encina's nodes are: a reader binary-searches
+the restart array and then scans within a restart interval, without decoding the
+block into owned values. This is what lets an uncompressed cached block be the
+bytes that came off the disk.
+
+## 8. Memory and caches
+
+**Caches belong to the thread.** A `Caches` value is created per runtime thread
+and passed to every store opened on it through `Options`, holding:
+
+- a **block cache**, keyed by (file number, offset), with a budget and CLOCK
+  eviction, as encina's leaf cache;
+- a **table cache**, open readers with their index and filter blocks, bounded by
+  count, since an open reader costs file descriptors as well as memory.
+
+A node runs hundreds of shards, so a per-store budget — encina's model — would
+either waste memory on cold shards or starve hot ones. Dividing one node budget
+by the number of threads keeps roble's total within a configured bound, which is
+the property encina insists on, while sharing within a thread. The sharing needs
+no atomics: it is all within one thread, behind `Rc`.
+
+**Direct I/O and alignment.** A block is 16 KiB at an offset that is not
+aligned, so a read covers the enclosing aligned span and the block cache keeps
+the block, not the span. Frames are size-classed rather than encina's uniform
+4 KiB, since blocks vary and a value block or a two-level index partition may be
+larger.
+
+**Compression is where "no allocation on the read path" breaks.** A Snappy block
+must be decompressed into a buffer, so a cached block is no longer the bytes
+that were read, and a miss allocates. Compression is recorded per block, so
+writing everything uncompressed is fully format-compatible, and it keeps
+in-place search, zero-copy reads and a cache whose budget is exact. **roble
+defaults to uncompressed and measures the trade**: Oxia already runs L0
+uncompressed, and its values are small records with shared structure, so the
+disk-space cost may be smaller than it looks. Reading Snappy, Zstd and MinLZ is
+required regardless, for files Go wrote (§3).
+
+**Memtables** are arenas of a configured size, 4 MiB to match Oxia. A store's
+memory is its memtables plus its share of the thread's caches plus its
+compaction buffers, and the budget covers all three.
+
+## 9. Compaction
+
+Compaction is the cost encina does not pay, and the only background CPU work in
+roble. Leveled, with L0 as sublevels, and a **picker** — the component that
+decides, each time compaction can run, which level and which of its files to
+compact into the level below, by scoring every level's size against the target
+size for that level and taking the worst, as Pebble's does. Compatibility
+constrains the files a compaction produces, not when it runs or what it picks,
+so the picker is roble's own and can be simpler than Pebble's to start.
+
+**Where it runs.** On the owning thread, cooperatively, paced in **units of
+work** exactly as encina paces a large merge: a compaction merges a slice, yields
+to the executor, and resumes. The reasons are encina's reasons: no locks, no
+`Send` requirement, and a seeded run replays, since nothing reads the clock
+unless the env says it may (§10). Compaction *scheduling* is part of that: a
+picker that consulted a timer or an RNG would break replay, so it consults
+neither.
+
+The risk this accepts is that a compaction competes with foreground work on the
+same core. For Oxia it is a reasonable bet — many small shards per core, 4 MiB
+memtables, so each compaction is small — but it is a bet, and the fallback is
+designed in rather than discovered later:
+
+**Offload is a capability of the env.** A compaction's inputs are immutable
+files and its output is new files plus a version edit, so the boundary is clean:
+an env that offers a compaction executor gets handed a job that owns its own
+buffers (not the thread's frames, which are `Rc`), and gets back an edit to
+apply. The default executor runs the job cooperatively on the calling thread.
+Start there; add the pool when a benchmark asks for it.
+
+**Write stalls.** A write that cannot find room in a memtable waits for a flush,
+and too many L0 files make a write wait for a compaction. Neither depends on the
+WAL: a log append is not what a write waits on. Oxia watches Pebble's
+`WriteStallBegin` events and counts
+them, so roble exports the same two: memtable stalls and L0 stalls.
+
+## 10. Concurrency and I/O
+
+Reuse encina's shape: a store opens in an `Env`, which opens its files and runs
+its tasks, and all I/O goes through a `Disk` whose requests move owned,
+aligned buffers. `Db` is `!Send` and `!Sync`, a cheap `Clone` handle shared by
+one thread's tasks. `DefaultEnv` uses compio, with `O_DIRECT` on Linux and
+`F_NOCACHE` on macOS.
+
+**What has to change, and why.** encina has one file, created once. An LSM
+creates, renames, links and deletes files constantly, and its correctness
+depends on directory syncs. So the env grows a filesystem, which is Pebble's
+`vfs.FS` in Rust terms:
+
+```rust
+pub trait Fs {
+    type Disk: Disk;
+    /// Held for as long as this process owns the directory.
+    type Lock;
+
+    fn create(&self, path: &Path) -> impl Future<Output = Result<Self::Disk>>;
+    fn open(&self, path: &Path, access: Access) -> impl Future<Output = Result<Self::Disk>>;
+    fn remove(&self, path: &Path) -> impl Future<Output = Result<()>>;
+    fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>>;
+    /// A hard link, which `checkpoint` wants; falls back to a copy.
+    fn link(&self, from: &Path, to: &Path) -> impl Future<Output = Result<()>>;
+    fn list(&self, dir: &Path) -> impl Future<Output = Result<Vec<PathBuf>>>;
+    fn mkdir_all(&self, dir: &Path) -> impl Future<Output = Result<()>>;
+    /// Makes the directory's entries durable, which marker rotation needs.
+    fn sync_dir(&self, dir: &Path) -> impl Future<Output = Result<()>>;
+    fn disk_usage(&self, dir: &Path) -> impl Future<Output = Result<DiskUsage>>;
+    /// Keeps out a second owner; `LOCK` in the database directory.
+    fn lock(&self, path: &Path) -> impl Future<Output = Result<Self::Lock>>;
+}
+```
+
+`Disk` keeps encina's design, with two changes: a read is a byte range rather
+than whole pages, since there is no page size, and it keeps the request classes,
+so a compaction's reads can be told apart from a lookup's — an LSM has more use
+for that than encina does.
+
+Everything else carries over: buffers are owned and returned, a disk that keeps
+one cannot make roble touch memory it lends, a read in flight is polled from a
+slot without a boxed future, and `real_time()` decides whether the store may
+read the clock at all. One owner per directory, through `LOCK`.
+
+Oxia injects a `vfs.FS` today, including `vfs.NewCrashableMem` in its tests, so
+this trait is the same seam it already relies on.
+
+## 11. API sketch
+
+```rust
+let caches = Caches::new(CacheOptions::default().block_cache_bytes(512 << 20));
+let db = Db::open(&DefaultEnv, "data/shard-3", Options::new().caches(&caches)).await?;
+
+let mut batch = db.batch();            // indexed: readable through itself
+batch.put(b"/users/alice", b"...")?;
+batch.delete_range(b"/sessions/", b"/sessions0")?;
+let seen = batch.get(b"/users/alice").await?;
+batch.commit(Sync::No).await?;         // appended to the WAL, not synced
+db.flush().await?;                     // a table; the logs it covers can go
+
+let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
+
+let snap = db.snapshot();
+let mut iter = snap.range(&b"/users/"[..]..&b"/users0"[..]);
+while let Some((k, v)) = iter.next().await? { /* ... */ }
+
+db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
+```
+
+The Oxia mapping, so the surface is complete rather than approximately right:
+
+| Oxia `kvstore` | roble |
+|---|---|
+| `NewWriteBatch`, `Put`, `Delete`, `DeleteRange`, `Commit` | `db.batch()`, `put`, `delete`, `delete_range`, `commit` |
+| `PutMarshalable` | `put_with(key, len, \|buf\| …)` |
+| batch `Get`, `FindLower`, `KeyRangeScan`, `RangeScan` | indexed batch iterators (§6) |
+| batch `Count`, `Size`, `Checksum` | over the Pebble batch repr, so checksums match Go |
+| `Get` with `ComparisonType` | `get` with `Comparison` |
+| `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
+| `KeyPrefixIterator` with `Lookup` | `prefix` iterator (§6) |
+| `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
+| `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
+| `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
+| `SyncData`, `UseWAL` | `Sync` on commit, and `disable_wal` in `Options` (§4) |
+| Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina |
+
+## 12. Testing
+
+Compatibility is the thing that can silently be wrong, so it is tested first and
+in both directions.
+
+- **Golden corpus.** A Go harness in `harness/`, pinned to the versions Pebble
+  v2.1.7 requires, builds databases that
+  exercise each structure of §3: two-level indexes, value blocks, range
+  deletions, obsolete keys, every compression Oxia can produce — none, Snappy,
+  Zstd3 and MinLZ, the last two from the conversion profile — a WAL with
+  recycled log files,
+  tables at Pebblev2 and Pebblev3 as well as v4, and a checkpoint. It also
+  builds the databases **roble must refuse rather than misread** — range keys,
+  a virtual sstable, a MERGE key, the `oxia-slash-spans` comparer, a failover
+  log segment — because a refusal that is not tested is a refusal that panics or
+  half-reads instead. The files are committed. roble's tests read them and
+  compare against the harness's dump of the same files.
+- **Round trip, both ways, in CI.** roble writes a database; the Go harness
+  opens it, scans it, verifies it with the `pebble` tool, checkpoints it; roble opens
+  that checkpoint and compares. Then the reverse. **This is the gate: a change
+  that breaks it is a broken change**, including a performance change.
+- **Format fuzzing.** `roble-format` round-trips blocks, tables, version edits
+  and batch reprs under `cargo fuzz`, and decodes arbitrary bytes without
+  panicking — the corpus seeded from the golden files.
+- **Model-based property tests**, as encina's: random sequences of writes,
+  deletes, range deletes, gets under every comparison, scans forward and
+  reverse, flushes, compactions and reopens, checked against a `BTreeMap`, with
+  a tiny cache and tiny memtables so flush, eviction and compaction happen
+  constantly.
+- **Invariant checker** after every step: levels non-overlapping above L0,
+  sublevels consistent, every file referenced by the current version present on
+  disk, every file on disk that roble *recognises* referenced or obsolete (never
+  neither — a database directory also holds files that are none of roble's
+  business, such as Oxia's `oxia-key-encoding-format` marker, and those are
+  never deleted and never counted), sequence numbers monotonic, and the MANIFEST
+  replaying to the version in memory.
+- **Failure paths.** All I/O goes through `Fs` and `Disk`, so the simulated
+  implementations fail or crash at any single operation, as encina's do: each
+  scenario runs once to count its operations, then once per operation with an
+  error injected there, once with a crash, and once with buffers withheld. After
+  a crash, reopening must yield the state as of the last synced write — or as of
+  the last `flush()` with `disable_wal`, which is Oxia's configuration and so
+  gets its own pass of every scenario. A half-written table, a torn log record or
+  a half-rotated marker must leave the database openable.
+- **Benchmarks** against Go Pebble on Oxia's shape: small records, hundreds of
+  shards, batches per write, floor lookups, reverse scans, and a checkpoint under
+  load. Compressed against uncompressed is a first-class comparison (§8), as is
+  cooperative compaction against offloaded (§9), and the WAL on against off (§4).
+  **Also against encina**, which is not apples-to-apples and is not meant to be:
+  a copy-on-write B+tree with no compaction, no tombstones to step over and a
+  format chosen to suit its data. That is the point — the gap between roble and
+  encina on the same workload is the price of the compatibility requirement, and
+  §2 claims that price is worth paying without ever putting a number on it.
+
+## 13. Milestones
+
+Ordered so that the compatibility risk is resolved before the engine exists.
+
+1. **M1, the format crate.** `roble-format` (§7), plus `roble sst dump` and
+   `roble manifest dump`, validated against the golden corpus and the Go
+   harness's dumps. No engine. If Pebble's format is going to be a problem, it
+   is a problem here, cheaply.
+2. **M2, read-only.** Open a Go-written database or checkpoint: markers,
+   MANIFEST, version, table cache, block cache, the full iterator tree with
+   tombstones, `get` with every comparison, forward and reverse scans, and a
+   clean refusal for each structure of §3 that roble declines. Both-way interop
+   in CI, minus the writing half.
+3. **M3, writes, the WAL and flush.** Memtables, indexed batches, the WAL and its
+   replay, flush, version edits, marker rotation, obsolete-file deletion,
+   `LOCK`. Two gates: **Go Pebble opens and reads what roble wrote**, closing
+   the round trip, and **a crash replays** — to the last synced write with the
+   WAL on, to the last flush with it off, both tested (§12).
+4. **M4, compaction.** Leveled with L0 sublevels, the picker, cooperative
+   execution in units of work, write-stall accounting.
+5. **M5, the Oxia surface.** Snapshots, `checkpoint`, the prefix iterator with
+   `Lookup`, batch checksums that match Go, metrics, and the `KV` mapping of §11
+   complete. A Rust data server can serve a shard.
+
+## 14. Open questions
+
+Stated rather than quietly decided:
+
+- **Uncompressed by default (§8)** needs the measurement before it is a default.
+  If Snappy's space saving on Oxia's values is large, the zero-copy read path is
+  worth less than it looks.
+- **Cooperative compaction (§9)** is a bet on small shards. The offload path is
+  designed but unbuilt; the benchmark in M4 decides whether it gets built.
+- **What reverse iteration costs** is unmeasured, and it is not an optional
+  feature: `KeyRangeScanReverse` is on an Oxia serving path, and an LSM pays more
+  for `prev` than for `next`. So it is measured in M2 against Go Pebble over the
+  same database, and the result is a **gate on M2**, not a number reported in
+  M5 — if roble is materially slower there, that is a design problem to fix while
+  the iterator tree is still being built.
+- **A future Oxia that excises.** Virtual sstables are refused (§3) because
+  nothing in Oxia creates one today — not the data path, and not the shard
+  split, which streams a filtered snapshot. If Oxia adopts `Excise` or
+  `IngestAndExcise`, roble needs them on both sides, and that is a release
+  rather than a patch. Worth watching rather than deciding now.
+- **How closely the picker should follow Pebble's.** Compatibility does not
+  require it. Diverging risks a shard whose shape Go Pebble then compacts
+  differently, which is legal but makes performance comparisons noisy.
+- **Whether roble should recycle log files**, as Pebble does. Not recycling is
+  simpler and keeps `ReuseForWrite` out of `Fs` (§10); recycling saves a file
+  creation and its directory sync per rotation, which with 4 MiB memtables is
+  often. Reading a recycled log is required either way, so this is a performance
+  question to settle in M3, not a compatibility one.
+- **Publishing `roble-format` separately** is deferred rather than open. It is
+  useful on its own — tooling, other engines, reading backups — and worth doing;
+  it also pins roble's compatibility surface in public, and nothing is complete
+  enough to publish until M1 lands. Revisit then.
+
+## Non-goals (for now)
+
+- Access to one store from multiple threads.
+- A format of roble's own, or any format option Pebble does not define.
+- Columnar blocks, blob files, or any format major version above the pin (§3).
+- Merge operators, and any comparator but `leveldb.BytewiseComparator` (§3).
+- Range keys and virtual sstables, in either direction (§3).
+- Disaggregated or shared storage, and remote object stores.
+- Transactions beyond atomic batches.
+- Matching Pebble's compaction heuristics, as opposed to its files.
