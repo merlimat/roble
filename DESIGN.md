@@ -4,14 +4,16 @@
 > fixes the compatibility target (§3), the decisions that differ from encina's
 > (§4), and the order the work goes in (§13).
 >
-> In place: `roble-format` reads every point entry out of a table Go Pebble
-> wrote (footer, metaindex, properties, single- and two-level indexes, row
-> blocks, internal keys, the Pebblev3+ value prefix, crc32c, Snappy) and writes
-> tables Go Pebble reads back entry for entry (`compat/sst-roundtrip`), with
-> the golden corpus going the other way (`harness/golden-sst`).
+> In place, each pinned against Go Pebble rather than against a reading of it:
+> sstables both ways (footer, metaindex, properties, single- and two-level
+> indexes, row blocks, internal keys, the Pebblev3+ value prefix), range
+> deletions, the bloom filter bit-for-bit, none/Snappy/Zstd and both checksums,
+> the batch representation byte-for-byte, record framing in both wire formats,
+> and version edits. `compat/sst-roundtrip` has Go Pebble read every table
+> roble writes; `harness/golden-sst` and `harness/record-files` go the other
+> way, the latter with a real WAL and MANIFEST.
 >
-> Still to come in M1: value-block resolution,
-> record framing, version edits, and the `roble sst dump` and
+> Still to come in M1: value-block resolution, and the `roble sst dump` and
 > `roble manifest dump` commands.
 
 roble is an embedded, ordered key-value store for Rust, built on the
@@ -460,7 +462,8 @@ format/src/
   sst/reader.rs     table reader: footer, metaindex, index, blocks
   sst/writer.rs     table writer
   batch.rs          Pebble batch repr
-  manifest.rs       version edits; recognises virtual-table backings to refuse them
+  manifest.rs       version edits; the new-file tag and the backing-table tags are
+                    how a range-key or virtual table announces itself, and both are refused
   record.rs         32 KiB block record framing: legacy (MANIFEST), recyclable
                     (WAL), and the EOF trailer that ends a closed log
   files.rs          file names, NNNNNN.log, marker.manifest.*, marker.format-version.*

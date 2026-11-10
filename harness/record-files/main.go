@@ -24,6 +24,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -107,6 +108,11 @@ func main() {
 		if err := mdb.Flush(); err != nil {
 			panic(err)
 		}
+	}
+	// Flushes only ever add tables. A compaction is what produces an edit that
+	// deletes them, and without one the MANIFEST exercises half the format.
+	if err := mdb.Compact(context.Background(), []byte("/m/0000"), []byte("/m/9999"), true /* parallelize */); err != nil {
+		panic(err)
 	}
 	if err := mdb.Close(); err != nil {
 		panic(err)
