@@ -111,6 +111,67 @@ fn roble_reframes_the_wal_into_the_same_bytes() {
     compare("records-wal.log", &bytes, &reframed);
 }
 
+/// Every version edit in a real MANIFEST must decode, and re-encode to the
+/// same bytes.
+///
+/// Byte identity matters here for the same reason it does for a table: roble
+/// appends edits to a MANIFEST that Go Pebble then reads, and a reordered or
+/// differently conditioned field is a file Go rejects or misreads rather than
+/// a format error roble can see.
+#[test]
+fn roble_decodes_and_reencodes_every_version_edit() {
+    use roble_format::manifest::VersionEdit;
+
+    let bytes = std::fs::read(golden().join("records-manifest")).expect("read the MANIFEST");
+    let records = read_records(&bytes, 0);
+
+    let mut saw_comparer = false;
+    let mut saw_new_table = false;
+    let mut saw_deleted_table = false;
+    let mut saw_creation_time = false;
+    let mut saw_min_unflushed = false;
+
+    for (i, rec) in records.iter().enumerate() {
+        let edit = VersionEdit::decode(rec).unwrap_or_else(|e| panic!("version edit {i}: {e}"));
+
+        saw_comparer |= edit.comparer_name.is_some();
+        saw_min_unflushed |= edit.min_unflushed_log_num.is_some();
+        saw_new_table |= !edit.new_tables.is_empty();
+        saw_deleted_table |= !edit.deleted_tables.is_empty();
+        saw_creation_time |= edit.new_tables.iter().any(|t| t.creation_time != 0);
+
+        if let Some(name) = &edit.comparer_name {
+            assert_eq!(
+                name, "leveldb.BytewiseComparator",
+                "version edit {i} names another comparer"
+            );
+        }
+
+        let reencoded = edit.encode();
+        if reencoded != *rec {
+            let first = reencoded.iter().zip(rec).position(|(a, b)| a != b);
+            panic!(
+                "version edit {i} re-encodes differently\n  first difference at {first:?}\n                   go    ({} bytes): {:02x?}\n  roble ({} bytes): {:02x?}",
+                rec.len(),
+                &rec[..rec.len().min(48)],
+                reencoded.len(),
+                &reencoded[..reencoded.len().min(48)],
+            );
+        }
+    }
+
+    // A fixture that happened to contain only trivial edits would pass
+    // vacuously, so require the interesting ones to be present.
+    assert!(saw_comparer, "no edit named the comparer");
+    assert!(
+        saw_min_unflushed,
+        "no edit carried a minimum unflushed log number"
+    );
+    assert!(saw_new_table, "no edit added a table");
+    assert!(saw_deleted_table, "no edit deleted a table");
+    assert!(saw_creation_time, "no added table carried a creation time");
+}
+
 #[test]
 fn roble_reads_and_reframes_the_manifest_go_pebble_wrote() {
     let bytes = std::fs::read(golden().join("records-manifest")).expect("read the MANIFEST");

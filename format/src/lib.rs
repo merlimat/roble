@@ -29,6 +29,7 @@ pub mod batch;
 pub mod block;
 pub mod filter;
 pub mod key;
+pub mod manifest;
 pub mod rangedel;
 pub mod record;
 pub mod sst;
