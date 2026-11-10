@@ -1,0 +1,4 @@
+# Record-framed files written by Go Pebble v2.1.7.
+# Regenerate with: cd harness && go run ./record-files ../format/tests/golden
+wal records-wal.log lognum=2
+manifest records-manifest

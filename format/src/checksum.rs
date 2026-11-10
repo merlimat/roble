@@ -58,6 +58,15 @@ impl ChecksumType {
         }
     }
 
+    /// Computes the cooked crc32c over exactly `data`.
+    ///
+    /// Record framing checksums a byte range directly, with no trailing block
+    /// type, so it needs the raw form rather than [`ChecksumType::compute`].
+    pub fn compute_raw(self, data: &[u8]) -> u32 {
+        let c = crc32c::crc32c_append(0, data);
+        c.rotate_right(15).wrapping_add(0xa282_ead8)
+    }
+
     /// Computes the checksum over `data` and the block type byte.
     pub fn compute(self, data: &[u8], block_type: u8) -> Result<u32> {
         match self {
