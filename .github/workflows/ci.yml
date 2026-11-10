@@ -1,0 +1,114 @@
+# Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # The workspace forbids unsafe and warns on missing docs; -D warnings is
+      # what keeps both from decaying one allow at a time.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  go:
+    name: Go harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: harness/go.mod
+          cache-dependency-path: harness/go.sum
+      - name: gofmt
+        working-directory: harness
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        working-directory: harness
+        run: go vet ./...
+      - name: go build
+        working-directory: harness
+        run: go build ./...
+
+  # The gate DESIGN.md §12 calls "the gate": compatibility tested in both
+  # directions, against Go Pebble itself rather than against roble's own idea
+  # of the format. These need both toolchains, which is why they are their own
+  # job rather than part of the Rust one.
+  compat:
+    name: Cross-implementation gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: harness/go.mod
+          cache-dependency-path: harness/go.sum
+
+      - name: roble writes, Go Pebble reads
+        run: compat/sst-roundtrip/run.sh
+
+      - name: the minlz crate decodes Go minio/minlz
+        run: compat/minlz/run.sh
+
+      # The committed golden corpus has to be what the pinned harness still
+      # produces, or the tables roble is judged against have drifted from the
+      # code that made them.
+      #
+      # Only the dumps are compared, not the .sst bytes. Pebble's writer is
+      # deterministic for a given architecture, but a compressed block's bytes
+      # are not necessarily portable between them, and this runs on amd64
+      # while the corpus was generated on arm64. The dumps are the semantic
+      # content and are architecture-independent.
+      - name: the golden corpus is still what the harness produces
+        run: |
+          regenerated="$(mktemp -d)"
+          trap 'rm -rf "$regenerated"' EXIT
+          (cd harness && go run ./golden-sst "$regenerated")
+          status=0
+          for committed in format/tests/golden/*.dump; do
+            name="$(basename "$committed")"
+            if ! diff -u "$committed" "$regenerated/$name"; then
+              echo "::error file=format/tests/golden/$name::stale; regenerate with 'cd harness && go run ./golden-sst ../format/tests/golden'"
+              status=1
+            fi
+          done
+          exit $status
