@@ -2,6 +2,7 @@ format pebblev4
 checksum crc32c
 datablocks 1
 entries 6
+tombstones 0
 entry 000000000000000a set 2f61 76616c75652d6f662d2f61
 entry 000000000000000b set 2f62 76616c75652d6f662d2f62
 entry 000000000000000c set 2f63 76616c75652d6f662d2f63

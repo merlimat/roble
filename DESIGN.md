@@ -10,7 +10,7 @@
 > tables Go Pebble reads back entry for entry (`compat/sst-roundtrip`), with
 > the golden corpus going the other way (`harness/golden-sst`).
 >
-> Still to come in M1: the bloom filter, range-deletion blocks, value-block
+> Still to come in M1: the bloom filter, value-block
 > resolution, batch repr,
 > record framing, version edits, and the `roble sst dump` and
 > `roble manifest dump` commands.
@@ -132,7 +132,8 @@ shard, which is the case for `SINGLEDEL` and `DELSIZED`.
 | In-place value prefix byte on `SET` (Pebblev3+) | yes | yes |
 | Two-level index blocks | yes | yes, when the index outgrows a block |
 | Value blocks and value handles | yes | **no** |
-| Range-deletion blocks (v2 tombstones) | yes | yes |
+| Range-deletion blocks, v2 (`rocksdb.range_del2`) | yes | yes |
+| Range-deletion blocks, v1 (`rocksdb.range_del`) | **error** | never written |
 | Bloom filter blocks (full key, bytewise `Split`) | yes | yes |
 | The Pebblev4 obsolete bit | yes, honoured | **never set** |
 | Block properties | yes, unknown collectors skipped | the minimum Go accepts (M1) |
@@ -250,6 +251,7 @@ The anchors that matter most:
 | markers | `internal/base` and `vfs/atomicfs` |
 | batch repr | `batchrepr` — 8-byte sequence number, 4-byte count, then entries |
 | log records | `record/record.go` — 32 KiB blocks; three wire formats, `legacyHeaderSize = 7` (the MANIFEST), `recyclableHeaderSize = 11`, the extra four bytes being the log number (the WAL at the pin), and `walSyncHeaderSize = 19` (above the pin, refused) |
+| metaindex names | `sstable/table.go` — `rocksdb.properties`, `rocksdb.range_del2` (and `rocksdb.range_del` for the refused v1), `pebble.range_key`, `pebble.value_index`, `fullfilter.<policy>`. None of the range ones is spelled the way its feature is |
 | WAL file names | `wal/wal.go` — `makeLogFilename`: `NNNNNN.log`, and `NNNNNN-NNN.log` only under failover |
 | unflushed logs | `internal/manifest/version_edit.go` — `MinUnflushedLogNum`, which says what a reopen must replay |
 
@@ -376,7 +378,12 @@ uncompressed block is read without copying.
 ### `delete_range(start..end)`
 
 A range tombstone, written to the memtable's range-deletion skiplist and then to
-a table's range-deletion block. Unlike encina, which drops covered subtrees and
+a table's range-deletion block — **only** there, never interleaved with point
+keys, so a reader that walks data blocks alone sees a table with tombstones as
+though it had none. Within the block they are fragmented: sorted by start key,
+with equal starts sharing an end and carrying strictly decreasing sequence
+numbers, which Pebble enforces when writing and roble enforces in both
+directions. Unlike encina, which drops covered subtrees and
 leaves nothing behind, every later read in that range checks the tombstone until
 compaction drops it. That is the cost the format chooses for us (§2).
 

@@ -87,6 +87,25 @@ impl Kind {
         })
     }
 
+    /// The byte that encodes this kind in an internal key's trailer.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Kind::Delete => 0,
+            Kind::Set => 1,
+            Kind::Merge => 2,
+            Kind::SingleDelete => 7,
+            Kind::RangeDelete => 15,
+            Kind::Separator => 17,
+            Kind::SetWithDelete => 18,
+            Kind::RangeKeyDelete => 19,
+            Kind::RangeKeyUnset => 20,
+            Kind::RangeKeySet => 21,
+            Kind::IngestSst => 22,
+            Kind::DeleteSized => 23,
+            Kind::Excise => 24,
+        }
+    }
+
     /// The lowercase name used in dumps and errors.
     pub fn name(self) -> &'static str {
         match self {

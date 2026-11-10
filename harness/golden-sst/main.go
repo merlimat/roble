@@ -49,6 +49,11 @@ type fixture struct {
 	compress  *block.CompressionProfile
 	checksum  block.ChecksumType
 	entries   []entry
+	// tombstones are written through Writer.DeleteRange, which fixes their
+	// sequence number at 0 — the only tombstone API reachable from outside
+	// the Pebble module. Several sequence numbers over one range are covered
+	// from the other direction, by compat/sst-roundtrip.
+	tombstones [][2]string
 }
 
 // checksumOrDefault keeps crc32c as the default, as Pebble does, so only the
@@ -224,6 +229,24 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, xx)
 
+	// Range deletions, which live in their own block and never in a data
+	// block. Before this fixture existed, a table with tombstones read as
+	// though it had none and no test noticed.
+	rd := fixture{name: "rangedel", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression}
+	for i := 0; i < 60; i++ {
+		rd.entries = append(rd.entries, entry{
+			userKey: oxiaKey(2, i), seqNum: pebble.SeqNum(7000 + i),
+			kind: pebble.InternalKeyKindSet, value: []byte(fmt.Sprintf("r-%d", i)),
+		})
+	}
+	rd.tombstones = [][2]string{
+		{"/oxia/default/shard-0002/users/00000005", "/oxia/default/shard-0002/users/00000010"},
+		{"/oxia/default/shard-0002/users/00000020", "/oxia/default/shard-0002/users/00000021"},
+		{"/oxia/default/shard-0002/users/00000030", "/oxia/default/shard-0002/users/00000050"},
+	}
+	fs = append(fs, rd)
+
 	return fs
 }
 
@@ -241,7 +264,7 @@ func write(path string, f fixture) error {
 		MergerName:   "pebble.concatenate",
 		FilterPolicy: nil,
 	}
-	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(file), opts)
+	w := sstable.NewWriter(objstorageprovider.NewFileWritable(file), opts)
 	// An sstable needs strictly increasing internal keys.
 	sorted := append([]entry(nil), f.entries...)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -252,8 +275,14 @@ func write(path string, f fixture) error {
 	})
 	for _, e := range sorted {
 		ik := pebble.MakeInternalKey(e.userKey, e.seqNum, e.kind)
-		if err := w.Add(ik, e.value, false /* forceObsolete */); err != nil {
+		if err := w.Raw().Add(ik, e.value, false /* forceObsolete */); err != nil {
 			return fmt.Errorf("add %q: %w", e.userKey, err)
+		}
+	}
+	// DeleteRange needs already-fragmented spans in sorted order.
+	for _, t := range f.tombstones {
+		if err := w.DeleteRange([]byte(t[0]), []byte(t[1])); err != nil {
+			return fmt.Errorf("delete range %q..%q: %w", t[0], t[1], err)
 		}
 	}
 	return w.Close()
@@ -314,8 +343,36 @@ func dump(path string, f fixture) (string, error) {
 	if err := iter.Error(); err != nil {
 		return "", err
 	}
+	var tombs []string
+	rdIter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, sstable.ReadEnv{})
+	if err != nil {
+		return "", fmt.Errorf("rangedel iter: %w", err)
+	}
+	if rdIter != nil {
+		defer rdIter.Close()
+		span, err := rdIter.First()
+		for ; span != nil && err == nil; span, err = rdIter.Next() {
+			// A fragment iterator coalesces one [start,end) with every
+			// sequence number that deletes it, so one span can be several
+			// tombstones — which is exactly how they sit in the block.
+			for _, k := range span.Keys {
+				tombs = append(tombs, fmt.Sprintf("tombstone %016x %s %s",
+					uint64(k.SeqNum()), hex.EncodeToString(span.Start),
+					hex.EncodeToString(span.End)))
+			}
+		}
+		if err != nil {
+			return "", fmt.Errorf("rangedel iterate: %w", err)
+		}
+	}
+
 	fmt.Fprintf(&b, "entries %d\n", len(lines))
+	fmt.Fprintf(&b, "tombstones %d\n", len(tombs))
 	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteString("\n")
+	}
+	for _, l := range tombs {
 		b.WriteString(l)
 		b.WriteString("\n")
 	}

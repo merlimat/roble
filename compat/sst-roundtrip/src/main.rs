@@ -27,6 +27,8 @@ struct Fixture {
     name: &'static str,
     block_size: usize,
     entries: Vec<(Vec<u8>, u64, Kind, Vec<u8>)>,
+    /// `(start, end, seq_num)`, fragmented and in order.
+    tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
 }
 
 fn oxia_key(shard: u32, i: u32) -> Vec<u8> {
@@ -50,6 +52,7 @@ fn fixtures() -> Vec<Fixture> {
                 )
             })
             .collect(),
+        tombstones: Vec::new(),
     });
 
     // Every point kind roble writes, including a value of zero length and one
@@ -66,6 +69,7 @@ fn fixtures() -> Vec<Fixture> {
             (b"/f".to_vec(), 105, Kind::Set, Vec::new()),
             (b"/g".to_vec(), 106, Kind::Set, vec![b'x'; 5000]),
         ],
+        tombstones: Vec::new(),
     });
 
     // Many small blocks, so the index has to be right rather than incidental.
@@ -82,6 +86,7 @@ fn fixtures() -> Vec<Fixture> {
                 )
             })
             .collect(),
+        tombstones: Vec::new(),
     });
 
     // The same user key at several sequence numbers. This is the case that
@@ -117,6 +122,7 @@ fn fixtures() -> Vec<Fixture> {
         name: "dups",
         block_size: 4096,
         entries: dups,
+        tombstones: Vec::new(),
     });
 
     // Long shared prefixes, which is what Oxia's keys look like, so prefix
@@ -134,6 +140,38 @@ fn fixtures() -> Vec<Fixture> {
                 )
             })
             .collect(),
+        tombstones: Vec::new(),
+    });
+
+    // Range deletions written by roble, for Go Pebble to read. This covers
+    // what the Go-written golden fixture cannot: several sequence numbers over
+    // one range, which is what fragmented tombstones look like after a
+    // compaction. Pebble's public DeleteRange fixes the sequence number at 0,
+    // so only this direction can produce them.
+    out.push(Fixture {
+        name: "rangedel",
+        block_size: 1024,
+        entries: (0..80u32)
+            .map(|i| {
+                (
+                    oxia_key(13, i),
+                    9000 + u64::from(i),
+                    Kind::Set,
+                    format!("t-{i}").into_bytes(),
+                )
+            })
+            .collect(),
+        tombstones: vec![
+            // Disjoint.
+            (oxia_key(13, 5), oxia_key(13, 9), 100),
+            // The same range deleted three times, strictly decreasing.
+            (oxia_key(13, 20), oxia_key(13, 30), 90),
+            (oxia_key(13, 20), oxia_key(13, 30), 80),
+            (oxia_key(13, 20), oxia_key(13, 30), 70),
+            // Adjacent, sharing an endpoint, which is legal and not an overlap.
+            (oxia_key(13, 30), oxia_key(13, 40), 60),
+            (oxia_key(13, 40), oxia_key(13, 50), 50),
+        ],
     });
 
     out
@@ -174,6 +212,10 @@ fn main() {
                 )
             });
         }
+        for (start, end, seq_num) in &f.tombstones {
+            w.add_range_deletion(start, end, *seq_num)
+                .unwrap_or_else(|e| panic!("{}: tombstone: {e}", f.name));
+        }
         let bytes = w
             .finish()
             .unwrap_or_else(|e| panic!("{}: finish: {e}", f.name));
@@ -182,16 +224,33 @@ fn main() {
         std::fs::write(dir.join(format!("{}.sst", f.name)), &bytes).expect("write sst");
         std::fs::write(dir.join(format!("{}.dump", f.name)), &dump).expect("write dump");
 
+        // Both dumps agreeing on "tombstones 0" would read as identical while
+        // proving nothing, so the fixture checks its own dump before Go sees
+        // it.
+        let dumped_tombstones: usize = dump
+            .lines()
+            .find_map(|l| l.strip_prefix("tombstones "))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{}: dump has no tombstone count", f.name));
+        assert_eq!(
+            dumped_tombstones,
+            f.tombstones.len(),
+            "{}: wrote {} tombstones but dumped {dumped_tombstones}",
+            f.name,
+            f.tombstones.len()
+        );
+
         let blocks = dump
             .lines()
             .find_map(|l| l.strip_prefix("datablocks "))
             .unwrap_or("?");
         println!(
-            "{:<14} {:>8} {:>10} {:>8}",
+            "{:<14} {:>8} {:>10} {:>8} {:>11}",
             f.name,
             f.entries.len(),
             bytes.len(),
-            blocks
+            blocks,
+            f.tombstones.len()
         );
     }
 }

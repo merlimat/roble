@@ -34,6 +34,7 @@ const FIXTURES: &[&str] = &[
     "pebblev2",
     "zstd",
     "xxhash64",
+    "rangedel",
 ];
 
 fn golden_dir() -> PathBuf {
@@ -177,6 +178,17 @@ fn roble_reads_back_what_roble_wrote() {
         w.add(key, &value).expect("add");
         expected.push((user_key, 1000 + i, kind, value));
     }
+    // Tombstones too: they live in their own block, so a reader that walks
+    // data blocks alone would report none of them.
+    let tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = vec![
+        (b"/t/a".to_vec(), b"/t/b".to_vec(), 50),
+        (b"/t/c".to_vec(), b"/t/d".to_vec(), 40),
+        (b"/t/c".to_vec(), b"/t/d".to_vec(), 30),
+    ];
+    for (start, end, seq) in &tombstones {
+        w.add_range_deletion(start, end, *seq).expect("tombstone");
+    }
+
     let bytes = w.finish().expect("finish");
 
     let table = Table::open(&bytes).expect("roble reopens its own table");
@@ -199,6 +211,14 @@ fn roble_reads_back_what_roble_wrote() {
         })
         .expect("walk");
     assert_eq!(got, expected);
+
+    let read_back: Vec<(Vec<u8>, Vec<u8>, u64)> = table
+        .range_deletions()
+        .expect("range deletions")
+        .into_iter()
+        .map(|t| (t.start, t.end, t.seq_num))
+        .collect();
+    assert_eq!(read_back, tombstones);
 }
 
 #[test]

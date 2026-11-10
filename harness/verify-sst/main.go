@@ -118,8 +118,36 @@ func dump(path string) (string, error) {
 	if err := iter.Error(); err != nil {
 		return "", fmt.Errorf("iterate: %w", err)
 	}
+	var tombs []string
+	rdIter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, sstable.ReadEnv{})
+	if err != nil {
+		return "", fmt.Errorf("rangedel iter: %w", err)
+	}
+	if rdIter != nil {
+		defer rdIter.Close()
+		span, err := rdIter.First()
+		for ; span != nil && err == nil; span, err = rdIter.Next() {
+			// A fragment iterator coalesces one [start,end) with every
+			// sequence number that deletes it, so one span can be several
+			// tombstones — which is exactly how they sit in the block.
+			for _, k := range span.Keys {
+				tombs = append(tombs, fmt.Sprintf("tombstone %016x %s %s",
+					uint64(k.SeqNum()), hex.EncodeToString(span.Start),
+					hex.EncodeToString(span.End)))
+			}
+		}
+		if err != nil {
+			return "", fmt.Errorf("rangedel iterate: %w", err)
+		}
+	}
+
 	fmt.Fprintf(&b, "entries %d\n", len(lines))
+	fmt.Fprintf(&b, "tombstones %d\n", len(tombs))
 	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteString("\n")
+	}
+	for _, l := range tombs {
 		b.WriteString(l)
 		b.WriteString("\n")
 	}

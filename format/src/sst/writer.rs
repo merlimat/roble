@@ -33,6 +33,7 @@ use crate::checksum::ChecksumType;
 use crate::error::{Error, Result};
 use crate::footer::{FOOTER_LEN, PEBBLE_MAGIC, TableFormat};
 use crate::key::{InternalKey, Kind, TRAILER_LEN};
+use crate::rangedel;
 use crate::sst::reader::BYTEWISE_COMPARER;
 
 /// The merger name Pebble records by default, which Oxia leaves alone.
@@ -79,6 +80,7 @@ pub struct TableWriter {
     raw_key_size: u64,
     raw_value_size: u64,
     data_size: u64,
+    range_del: rangedel::Builder,
 }
 
 impl TableWriter {
@@ -104,6 +106,7 @@ impl TableWriter {
             raw_key_size: 0,
             raw_value_size: 0,
             data_size: 0,
+            range_del: rangedel::Builder::new(),
         })
     }
 
@@ -123,7 +126,7 @@ impl TableWriter {
 
         let mut encoded = Vec::with_capacity(key.user_key.len() + TRAILER_LEN);
         encoded.extend_from_slice(key.user_key);
-        let trailer = (key.seq_num << 8) | u64::from(kind_byte(key.kind));
+        let trailer = (key.seq_num << 8) | u64::from(key.kind.to_byte());
         encoded.extend_from_slice(&trailer.to_le_bytes());
 
         self.check_order(&encoded, key)?;
@@ -162,6 +165,16 @@ impl TableWriter {
         self.block_last_key.clear();
         self.block_last_key.extend_from_slice(&encoded);
         Ok(())
+    }
+
+    /// Adds a range tombstone covering `[start, end)` as of `seq_num`.
+    ///
+    /// Tombstones are kept apart from point keys and written to their own
+    /// block, so they may be added in any interleaving with [`TableWriter::add`];
+    /// among themselves they must arrive fragmented and in order, which
+    /// [`rangedel::Builder`] checks.
+    pub fn add_range_deletion(&mut self, start: &[u8], end: &[u8], seq_num: u64) -> Result<()> {
+        self.range_del.add(start, end, seq_num)
     }
 
     fn check_order(&self, encoded: &[u8], key: InternalKey<'_>) -> Result<()> {
@@ -232,6 +245,15 @@ impl TableWriter {
         let index_block = self.index.finish().to_vec();
         let index_handle = self.write_block(&index_block)?;
 
+        // Pebble writes this block uncompressed, always; roble writes every
+        // block uncompressed, so nothing special is needed beyond saying so.
+        let range_del_handle = if self.range_del.is_empty() {
+            None
+        } else {
+            let block = self.range_del.finish();
+            Some(self.write_block(&block)?)
+        };
+
         let props = self.properties(index_handle.length);
         let mut props_builder = BlockBuilder::new(usize::MAX);
         let mut prev: Vec<u8> = Vec::new();
@@ -243,11 +265,20 @@ impl TableWriter {
         let props_block = props_builder.finish().to_vec();
         let props_handle = self.write_block(&props_block)?;
 
+        // The metaindex is a row block, so its names must be added in order:
+        // "rocksdb.properties" sorts before "rocksdb.range_del2".
         let mut metaindex = BlockBuilder::new(INDEX_RESTART_INTERVAL);
-        let mut encoded_handle = Vec::new();
-        put_uvarint(&mut encoded_handle, props_handle.offset);
-        put_uvarint(&mut encoded_handle, props_handle.length);
-        metaindex.add(b"rocksdb.properties", &encoded_handle, 0, None, false);
+        let mut entries: Vec<(&[u8], BlockHandle)> = vec![(b"rocksdb.properties", props_handle)];
+        if let Some(h) = range_del_handle {
+            entries.push((rangedel::META_NAME_V2, h));
+        }
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, handle) in entries {
+            let mut encoded_handle = Vec::new();
+            put_uvarint(&mut encoded_handle, handle.offset);
+            put_uvarint(&mut encoded_handle, handle.length);
+            metaindex.add(name, &encoded_handle, 0, None, false);
+        }
         let metaindex_block = metaindex.finish().to_vec();
         let metaindex_handle = self.write_block(&metaindex_block)?;
 
@@ -285,12 +316,21 @@ impl TableWriter {
             put_uvarint(&mut buf, v);
             p.insert(k.as_bytes().to_vec(), buf);
         };
-        put_num("rocksdb.num.entries", self.num_entries);
+        // addTombstone increments NumEntries and NumDeletions as well as
+        // NumRangeDeletions, so a table's entry count includes its tombstones.
+        let tombstones = self.range_del.len() as u64;
+        put_num("rocksdb.num.entries", self.num_entries + tombstones);
         put_num("rocksdb.num.data.blocks", self.num_data_blocks);
-        put_num("rocksdb.deleted.keys", self.num_deletions);
-        put_num("rocksdb.num.range-deletions", 0);
-        put_num("rocksdb.raw.key.size", self.raw_key_size);
-        put_num("rocksdb.raw.value.size", self.raw_value_size);
+        put_num("rocksdb.deleted.keys", self.num_deletions + tombstones);
+        put_num("rocksdb.num.range-deletions", tombstones);
+        put_num(
+            "rocksdb.raw.key.size",
+            self.raw_key_size + self.range_del.raw_key_size(),
+        );
+        put_num(
+            "rocksdb.raw.value.size",
+            self.raw_value_size + self.range_del.raw_value_size(),
+        );
         put_num("rocksdb.data.size", self.data_size);
         put_num("rocksdb.index.size", index_size);
         put_num("rocksdb.merge.operands", 0);
@@ -303,24 +343,6 @@ impl TableWriter {
             0u32.to_le_bytes().to_vec(),
         );
         p
-    }
-}
-
-fn kind_byte(kind: Kind) -> u8 {
-    match kind {
-        Kind::Delete => 0,
-        Kind::Set => 1,
-        Kind::Merge => 2,
-        Kind::SingleDelete => 7,
-        Kind::RangeDelete => 15,
-        Kind::Separator => 17,
-        Kind::SetWithDelete => 18,
-        Kind::RangeKeyDelete => 19,
-        Kind::RangeKeyUnset => 20,
-        Kind::RangeKeySet => 21,
-        Kind::IngestSst => 22,
-        Kind::DeleteSized => 23,
-        Kind::Excise => 24,
     }
 }
 
