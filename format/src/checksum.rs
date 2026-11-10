@@ -28,7 +28,13 @@ use crate::error::{Error, Result};
 pub enum ChecksumType {
     /// `ChecksumTypeCRC32c`, Pebble's default and the only one roble writes.
     Crc32c,
-    /// `ChecksumTypeXXHash64`, read because a table may have been written with it.
+    /// `ChecksumTypeXXHash64`.
+    ///
+    /// Not reachable in an Oxia table today — Pebble defaults to crc32c
+    /// (`sstable/options.go`: `ensureDefaults`) and Oxia never sets `Checksum`
+    /// — but unlike MinLZ, which the table format forbids outright, this is
+    /// one option away. The cost of reading it is a few lines; the cost of
+    /// being wrong is a shard that will not open.
     XxHash64,
 }
 
@@ -63,7 +69,12 @@ impl ChecksumType {
                 Ok(c.rotate_right(15).wrapping_add(0xa282_ead8))
             }
             ChecksumType::XxHash64 => {
-                Error::unsupported("xxhash64 block checksums are not implemented yet")
+                // block.go: uint32(xxhash.Sum64(block || blockType)) — the low
+                // 32 bits of the 64-bit hash, with no cooking.
+                let mut buf = Vec::with_capacity(data.len() + 1);
+                buf.extend_from_slice(data);
+                buf.push(block_type);
+                Ok(twox_hash::XxHash64::oneshot(0, &buf) as u32)
             }
         }
     }

@@ -11,7 +11,7 @@
 > the golden corpus going the other way (`harness/golden-sst`).
 >
 > Still to come in M1: the bloom filter, range-deletion blocks, value-block
-> resolution, Zstd and MinLZ decompression, xxhash64 checksums, batch repr,
+> resolution, batch repr,
 > record framing, version edits, and the `roble sst dump` and
 > `roble manifest dump` commands.
 
@@ -103,16 +103,15 @@ roble targets exactly what Oxia asks Pebble for, and refuses the rest.
 | Block size | 16 KiB | `kv_pebble.go` |
 | Filter | `rocksdb.BuiltinBloomFilter`, 10 bits per key | `bloom.FilterPolicy(10)` |
 | Compression, steady state | none (L0) and Snappy (L1+) | `kv_pebble.go` |
-| Compression, converted databases | none (L0) and `GoodCompression` (L1+): Zstd3 for data and value blocks, and for index, filter and metadata blocks `fastestCompression` — **Snappy on arm64, MinLZ everywhere else**, resolved at init from `runtime.GOARCH`, so the file depends on the writer's CPU | `kv_pebble_formats.go` |
+| Compression, converted databases | none (L0) and `GoodCompression` (L1+), which at this pin means **Zstd data blocks and Snappy index blocks when the converting node is arm64, and all Snappy otherwise** — because `GoodCompression` embeds `fastestCompression`, that is MinLZ off arm64, and Pebble downgrades a MinLZ-using profile to Snappy whole below Pebblev6 (§3). So the file still depends on the writer's CPU, just not in the way the profile reads | `kv_pebble_formats.go` |
 | Block size, converted databases | 64 KiB | `kv_pebble_formats.go` |
 
 **Not in the target**, because the pin excludes them: columnar blocks
 (Pebblev5), the footer checksum and blob value handles (Pebblev6), footer
 attributes (Pebblev7), WAL sync chunks (`FormatWALSyncChunks`, above the pin, so
 a log at the pin uses recyclable chunks), WAL failover to a secondary directory,
-and disaggregated or shared storage. MinLZ is *not* in this list, because a
-compression profile is an option rather than a format version, and Oxia's own
-conversion path writes it — roble reads it, as the compression note below says.
+disaggregated or shared storage, and **MinLZ**, which Pebblev6 introduces and
+which Pebble will not write below it (see the compression note below).
 
 roble refuses a database whose format major version is above its pin, and a
 table whose format is above Pebblev4, with a clear error rather than a partial
@@ -190,27 +189,46 @@ or corrupting a Go reader; reading one means getting it right or failing loudly.
   on table format — and that is why reading the older formats stays in, since a
   long-lived database keeps them in its deep levels.
 
-Compression: roble reads none, Snappy, Zstd **and MinLZ**, and writes none and
-Snappy. MinLZ is not optional — a database converted on anything but arm64 holds
-MinLZ-compressed index, filter and metadata blocks (§1), so refusing it would
-refuse the in-place upgrade §2 is built around. Pebble compresses a block with
-`minlz.Encode(dst, src, level)`, the block format, and reads it back with
-`DecodedLen` and `Decode` (`internal/compression/minlz.go`); above
-`minlz.MaxBlockSize`, 8 MiB, it falls back to Snappy *and tags the block Snappy*,
-so roble needs no special case for an oversized block.
+Compression: roble reads none, Snappy and **Zstd**, and writes none and Snappy.
+The block indicator is RocksDB's numbering, not Pebble's internal `Algorithm`
+enum: zstd is **7** and MinLZ is 8, while 2 to 6 are zlib, bzip2, lz4, lz4hc and
+xpress, which Pebble never writes. Reading 2 as zstd — the obvious guess, since
+`internal/compression`'s own enum does number Zstd 2 — gets every Zstd block
+wrong.
 
-Decompression only, through the `minlz` crate with
-`default-features = false, features = ["minlz"]`, which drops its S2 half and
-leaves a tree of three crates (`minlz`, `crc`, `crc-catalog`). Verified against
-Go: 12 payloads — empty, one byte, 16 KiB and 64 KiB blocks shaped like index,
-filter and record blocks, incompressible blocks that encode as literals, 1 MiB,
-and exactly `MaxBlockSize` — compressed by `github.com/minio/minlz` at the
-version Pebble pins, at both `LevelFastest` and `LevelBalanced`, all 24 pairs
-decoding byte-for-byte through `decompressed_len`, `decompress` and
-`decompress_into`; and 588 truncated or bit-flipped inputs erroring without a
-panic. The crate's encoder is explicitly not byte-compatible with Go's, which
-costs roble nothing, since it never writes MinLZ. The check is `compat/minlz`,
-and it runs.
+A Zstd block is `uvarint(uncompressed_len)` followed by a standard Zstd frame
+(`internal/compression/zstd_nocgo.go`), RocksDB's convention, which Pebble
+keeps. A bare frame would decode happily with a stock reader, so this is a
+detail that only fails on real files. roble decodes through `ruzstd`, decode
+only, into a buffer sized from the prefix, as Pebble's own `DecompressInto`
+does; swapping it for the libzstd binding is one function if a benchmark asks.
+
+**MinLZ is refused, because it cannot occur at the pin.** Pebble checks whether
+the table format supports the compression profile and, below Pebblev6, replaces
+the *whole profile* with Snappy — not just the MinLZ part
+(`sstable/options.go`: `tableFormatSupportsCompressionProfile`, called from
+`ensureDefaults`). Measured at Pebblev4, writing with each profile:
+
+| Profile asked for | Data blocks | Index blocks |
+|---|---|---|
+| `NoCompression` | none | none |
+| `SnappyCompression` | snappy | snappy |
+| `ZstdCompression` | zstd | zstd |
+| `MinLZCompression` | **snappy** | **snappy** |
+| `GoodCompression`, arm64 | **zstd** (one snappy, adaptive) | **snappy** |
+| `FastCompression`, arm64 | snappy | snappy |
+
+So Oxia's conversion profile (§1) yields Zstd data blocks and Snappy index
+blocks when the converting node is arm64, and all-Snappy when it is anything
+else, because there `GoodCompression` embeds MinLZ and is therefore downgraded
+whole. Either way no MinLZ block reaches a table at this pin, and a table that
+holds one was written by something outside the target (§3).
+
+`compat/minlz` stays. It is cheap, it is a genuine cross-implementation check,
+and MinLZ becomes live the moment the pin moves to Pebblev6 — at which point the
+`minlz` crate is already known good: 12 payloads at both levels, 24 pairs
+decoding byte-for-byte, 588 malformed inputs erroring without a panic. What it
+does *not* do is gate M2, which is what this document previously claimed.
 **Uncompressed is roble's default**, which is a format-legal choice and the one
 that keeps a cached block byte-for-byte its on-disk bytes (§8).
 
@@ -464,7 +482,7 @@ writing everything uncompressed is fully format-compatible, and it keeps
 in-place search, zero-copy reads and a cache whose budget is exact. **roble
 defaults to uncompressed and measures the trade**: Oxia already runs L0
 uncompressed, and its values are small records with shared structure, so the
-disk-space cost may be smaller than it looks. Reading Snappy, Zstd and MinLZ is
+disk-space cost may be smaller than it looks. Reading Snappy and Zstd is
 required regardless, for files Go wrote (§3).
 
 **Memtables** are arenas of a configured size, 4 MiB to match Oxia. A store's
@@ -602,9 +620,9 @@ in both directions.
 - **Golden corpus.** A Go harness in `harness/`, pinned to the versions Pebble
   v2.1.7 requires, builds databases that
   exercise each structure of §3: two-level indexes, value blocks, range
-  deletions, obsolete keys, every compression Oxia can produce — none, Snappy,
-  Zstd3 and MinLZ, the last two from the conversion profile — a WAL with
-  recycled log files,
+  deletions, obsolete keys, every compression Oxia can produce — none, Snappy
+  and Zstd, the last from the conversion profile — both checksum types, a WAL
+  with recycled log files,
   tables at Pebblev2 and Pebblev3 as well as v4, and a checkpoint. It also
   builds the databases **roble must refuse rather than misread** — range keys,
   a virtual sstable, a MERGE key, the `oxia-slash-spans` comparer, a failover

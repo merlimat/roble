@@ -47,7 +47,28 @@ type fixture struct {
 	format    sstable.TableFormat
 	blockSize int
 	compress  *block.CompressionProfile
+	checksum  block.ChecksumType
 	entries   []entry
+}
+
+// checksumOrDefault keeps crc32c as the default, as Pebble does, so only the
+// fixture that means to exercise xxhash64 says so.
+func (f fixture) checksumOrDefault() block.ChecksumType {
+	if f.checksum == block.ChecksumTypeNone {
+		return block.ChecksumTypeCRC32c
+	}
+	return f.checksum
+}
+
+func checksumName(c block.ChecksumType) string {
+	switch c {
+	case block.ChecksumTypeCRC32c:
+		return "crc32c"
+	case block.ChecksumTypeXXHash64:
+		return "xxhash64"
+	default:
+		panic(fmt.Sprintf("checksum type %d has no dump name", c))
+	}
 }
 
 func kindName(k pebble.InternalKeyKind) string {
@@ -174,6 +195,35 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, old)
 
+	// Zstd data blocks. ZstdCompression is used directly rather than
+	// GoodCompression: Good embeds fastestCompression, which is MinLZ on
+	// amd64, and Pebble then silently swaps the whole profile for Snappy
+	// below Pebblev6 — so Good would produce different bytes depending on
+	// the architecture that generated the corpus.
+	zstd := fixture{name: "zstd", format: sstable.TableFormatPebblev4,
+		blockSize: 2048, compress: block.ZstdCompression}
+	for i := 0; i < 300; i++ {
+		zstd.entries = append(zstd.entries, entry{
+			userKey: oxiaKey(5, i), seqNum: pebble.SeqNum(4000 + i),
+			kind:  pebble.InternalKeyKindSet,
+			value: []byte(strings.Repeat("zstd-compressible-", 15)),
+		})
+	}
+	fs = append(fs, zstd)
+
+	// xxhash64 block checksums. Oxia never selects these — Pebble defaults to
+	// crc32c — but it is one option away, so roble reads them.
+	xx := fixture{name: "xxhash64", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression,
+		checksum: block.ChecksumTypeXXHash64}
+	for i := 0; i < 120; i++ {
+		xx.entries = append(xx.entries, entry{
+			userKey: oxiaKey(9, i), seqNum: pebble.SeqNum(6000 + i),
+			kind: pebble.InternalKeyKindSet, value: []byte(fmt.Sprintf("x-%d", i)),
+		})
+	}
+	fs = append(fs, xx)
+
 	return fs
 }
 
@@ -186,7 +236,7 @@ func write(path string, f fixture) error {
 		TableFormat:  f.format,
 		BlockSize:    f.blockSize,
 		Compression:  f.compress,
-		Checksum:     block.ChecksumTypeCRC32c,
+		Checksum:     f.checksumOrDefault(),
 		Comparer:     sstable.DefaultComparer,
 		MergerName:   "pebble.concatenate",
 		FilterPolicy: nil,
@@ -242,7 +292,7 @@ func dump(path string, f fixture) (string, error) {
 		return "", err
 	}
 	fmt.Fprintf(&b, "format %s\n", formatName(tf))
-	fmt.Fprintf(&b, "checksum crc32c\n")
+	fmt.Fprintf(&b, "checksum %s\n", checksumName(f.checksumOrDefault()))
 	fmt.Fprintf(&b, "datablocks %d\n", props.NumDataBlocks)
 
 	iter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
