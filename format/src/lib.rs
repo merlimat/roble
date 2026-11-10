@@ -25,6 +25,7 @@ mod error;
 mod footer;
 mod varint;
 
+pub mod batch;
 pub mod block;
 pub mod filter;
 pub mod key;

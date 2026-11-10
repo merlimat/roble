@@ -11,7 +11,7 @@
 > the golden corpus going the other way (`harness/golden-sst`).
 >
 > Still to come in M1: value-block
-> resolution, batch repr,
+> resolution,
 > record framing, version edits, and the `roble sst dump` and
 > `roble manifest dump` commands.
 
@@ -339,6 +339,15 @@ must be the same bytes.
 That encoding pays twice over, because **the WAL record is the batch repr**: the
 bytes Oxia checksums are the bytes appended to the log, with no re-encoding
 between the batch and the file.
+
+Two details of that contract are measured rather than assumed. Oxia checksums
+the **whole** repr, header included (`db.go`: `batch.Checksum(previousChecksum)`),
+and it does so **before** `Commit`, so the eight header bytes that hold the
+sequence number are still zero at checksum time — Go Pebble's repr for an
+empty batch is twelve zero bytes. roble therefore leaves the sequence number
+zero until commit stamps it, and stamping it touches nothing but the header.
+And which kinds carry a value is not inferable from the kind: `SETWITHDEL`
+does not, while `DELSIZED` does (`batchrepr.Reader.Next`).
 
 `write()` assigns sequence numbers, appends the repr to the log as one record,
 syncs the log if `sync` is set, and then applies the entries to the memtable — in
