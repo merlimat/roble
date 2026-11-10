@@ -78,8 +78,9 @@ fn the_layout_flag_prepends_and_leaves_the_dump_alone() {
 
     for args in [
         vec!["sst", "dump", "--layout", path.to_str().unwrap()],
-        // The flag is accepted on either side of the path.
+        // The flag is accepted on either side of the path, and short.
         vec!["sst", "dump", path.to_str().unwrap(), "--layout"],
+        vec!["sst", "dump", "-l", path.to_str().unwrap()],
     ] {
         let out = roble(&args);
         assert!(out.status.success(), "{}", stderr(&out));
@@ -157,28 +158,78 @@ fn manifest_dump_reports_every_edit_the_decoder_finds() {
     assert!(text.contains("comparer leveldb.BytewiseComparator"));
 }
 
+/// Argument handling follows encina's: clap with derive, help on stdout, and
+/// errors on stderr with exit status 2.
 #[test]
 fn usage_and_bad_arguments_behave() {
-    for args in [vec![], vec!["--help"], vec!["help"], vec!["-h"]] {
+    for args in [vec!["--help"], vec!["-h"], vec!["help"]] {
         let out = roble(&args);
-        assert!(out.status.success(), "{:?} should succeed", args);
-        assert!(stdout(&out).contains("roble sst dump"), "{args:?}");
+        assert!(out.status.success(), "{args:?} should succeed");
+        let text = stdout(&out);
+        assert!(text.contains("Usage: roble"), "{args:?}: {text}");
+        for command in ["sst", "manifest", "completions"] {
+            assert!(text.contains(command), "{args:?} omits {command}");
+        }
+        // The after_help prose, which says what a refusal means.
+        assert!(
+            text.contains("Exit status"),
+            "{args:?} omits the exit status"
+        );
     }
 
+    // clap reports a missing or wrong argument itself, on stderr, with status 2.
     for args in [
+        vec![],
         vec!["nonsense"],
         vec!["sst"],
         vec!["sst", "dump"],
         vec!["sst", "dump", "a", "b"],
         vec!["manifest", "dump"],
+        vec!["sst", "dump", "--nonsense", "x"],
     ] {
         let out = roble(&args);
-        assert!(!out.status.success(), "{args:?} should fail");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} should exit 2, said {:?}",
+            out.status.code()
+        );
         assert!(
             !stderr(&out).is_empty(),
             "{args:?} should explain itself on stderr"
         );
     }
+}
+
+/// A refusal exits 2, as every other error does.
+#[test]
+fn errors_exit_with_status_two() {
+    let out = roble(&[
+        "sst",
+        "dump",
+        golden("refuse-rangekeys.sst").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = roble(&["sst", "dump", "/nonexistent/table.sst"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// Completions are generated for the shells encina supports.
+#[test]
+fn completions_are_generated() {
+    for shell in ["bash", "zsh", "fish"] {
+        let out = roble(&["completions", shell]);
+        assert!(out.status.success(), "{shell}: {}", stderr(&out));
+        let text = stdout(&out);
+        assert!(!text.is_empty(), "{shell}: nothing generated");
+        assert!(
+            text.contains("roble"),
+            "{shell}: does not mention the command"
+        );
+    }
+    // An unknown shell is clap's error, not a panic.
+    let out = roble(&["completions", "tcsh"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]

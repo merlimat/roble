@@ -12,87 +12,170 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `roble`: inspects Pebble's files (DESIGN.md §13).
+//! `roble`: inspects Pebble's files from the command line.
 //!
 //! Deliberately a thin wrapper. Everything structural comes from
 //! `roble-format`, whose output is pinned byte for byte against Go Pebble; the
 //! only thing this crate decides is presentation, and presentation is the one
-//! part of M1 with no Go counterpart to check against. Keeping the split sharp
-//! is what stops an unverified layer from growing logic of its own: if a
-//! question can be answered by the format crate, this file must not answer it
-//! itself.
-//!
-//! The argument handling is hand-rolled rather than taken from a crate. Two
-//! subcommands and one flag do not earn a dependency tree, and the format
-//! crate's own dependencies are deliberately few.
+//! part of M1 with no Go counterpart to check against (DESIGN.md §13). Keeping
+//! the split sharp is what stops an unverified layer from growing logic of its
+//! own: if a question can be answered by the format crate, this file must not
+//! answer it itself.
 
+use std::fmt::Write as _;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use roble_format::block::Compression;
 use roble_format::manifest::VersionEdit;
 use roble_format::record::RecordReader;
 use roble_format::sst::Table;
 
-const USAGE: &str = "\
-roble — inspects Pebble's files
+const AFTER_HELP: &str = r"Both commands read Pebble's own formats, pinned at the version DESIGN.md §3
+names, and refuse — rather than partly read — anything above that pin. A refusal
+names what it refused: a table with range keys or a virtual sstable is valid
+Pebble that Oxia never writes, so roble declines it instead of reading past a
+structure it does not understand.
 
-usage:
-    roble sst dump [--layout] <file.sst>
-    roble manifest dump <MANIFEST-file>
+Keys and values print as hex, because they are bytes and a dump is compared
+rather than read.
 
-    sst dump          every point entry and range tombstone in a table
-      --layout        also the table's structure: blocks, compression, properties
-    manifest dump     every version edit in a MANIFEST
+Exit status: 0 on success, 2 on errors.";
 
-Both read Pebble's own formats, pinned at the version DESIGN.md §3 names, and
-refuse — rather than partly read — anything above that pin.
-";
+/// Inspects the files of a Pebble or roble database.
+#[derive(Parser)]
+#[command(version, after_help = AFTER_HELP)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Reads a table file
+    Sst {
+        #[command(subcommand)]
+        command: SstCommand,
+    },
+    /// Reads a MANIFEST file
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
+    /// Prints a script that completes roble's commands and options in a shell
+    ///
+    /// For bash, save it where bash-completion looks for it:
+    ///
+    ///     roble completions bash > ~/.local/share/bash-completion/completions/roble
+    ///
+    /// For zsh, save it as _roble in a directory of $fpath, and for fish, as
+    /// ~/.config/fish/completions/roble.fish.
+    #[command(override_usage = "roble completions <SHELL>")]
+    Completions { shell: Shell },
+}
+
+#[derive(Subcommand)]
+enum SstCommand {
+    /// Prints every point entry and range tombstone in a table
+    Dump {
+        /// Also print the table's structure: blocks, compression, properties
+        #[arg(short = 'l', long)]
+        layout: bool,
+        /// The table file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManifestCommand {
+    /// Prints every version edit in a MANIFEST
+    Dump {
+        /// The MANIFEST file
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+}
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
-        Ok(output) => {
-            print!("{output}");
-            ExitCode::SUCCESS
-        }
-        Err(message) => {
-            eprintln!("roble: {message}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run(args: &[String]) -> Result<String, String> {
-    let as_str: Vec<&str> = args.iter().map(String::as_str).collect();
-    match as_str.as_slice() {
-        [] | ["-h"] | ["--help"] | ["help"] => Ok(USAGE.to_string()),
-        ["sst", "dump", rest @ ..] => sst_dump(rest),
-        ["manifest", "dump", rest @ ..] => manifest_dump(rest),
-        [other, ..] => Err(format!("unknown command {other:?}\n\n{USAGE}")),
-    }
-}
-
-fn sst_dump(args: &[&str]) -> Result<String, String> {
-    let (layout, path) = match args {
-        ["--layout", path] | [path, "--layout"] => (true, *path),
-        [path] => (false, *path),
-        _ => {
-            return Err(format!(
-                "usage: roble sst dump [--layout] <file.sst>\n\n{USAGE}"
-            ));
-        }
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Sst {
+            command: SstCommand::Dump { layout, path },
+        } => sst_dump(&path, layout).and_then(write_out),
+        Command::Manifest {
+            command: ManifestCommand::Dump { path },
+        } => manifest_dump(&path).and_then(write_out),
+        Command::Completions { shell } => completions(shell),
     };
-    let bytes = read(path)?;
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        // The reader went away, as in `roble sst dump big.sst | head`: a dump
+        // is piped more often than it is read whole, so stop quietly.
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("roble: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
 
+/// What the command can fail with.
+enum Error {
+    /// Reading or writing a file.
+    Io(io::Error),
+    /// Anything the format crate or this command refused.
+    Message(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "{e}"),
+            Error::Message(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+fn write_out(text: String) -> Result<()> {
+    // Buffered, so that a dump of a large table is one write per block rather
+    // than one per line — and so a broken pipe surfaces here rather than
+    // part-way through a line.
+    let mut out = BufWriter::new(io::stdout().lock());
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+
+fn completions(shell: Shell) -> Result<()> {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    clap_complete::generate(shell, &mut command, name, &mut io::stdout());
+    Ok(())
+}
+
+fn sst_dump(path: &Path, layout: bool) -> Result<String> {
+    let bytes = read(path)?;
     let mut out = String::new();
     if layout {
         out.push_str(&describe_layout(&bytes, path)?);
         out.push('\n');
     }
-    // The dump itself is the format crate's, unchanged: it is the part that is
-    // pinned against Go Pebble, and reformatting it here would put an
-    // unverified layer between the file and the output.
-    out.push_str(&roble_format::dump_table(&bytes).map_err(|e| format!("{path}: {e}"))?);
+    // The dump itself is the format crate's, unchanged: it is the part pinned
+    // against Go Pebble, and reformatting it here would put an unverified
+    // layer between the file and the output.
+    out.push_str(&roble_format::dump_table(&bytes).map_err(|e| at(path, &e))?);
     Ok(out)
 }
 
@@ -100,20 +183,14 @@ fn sst_dump(args: &[&str]) -> Result<String, String> {
 ///
 /// Every number here is read through `roble-format`; this function chooses the
 /// words and nothing else.
-fn describe_layout(bytes: &[u8], path: &str) -> Result<String, String> {
-    use std::fmt::Write as _;
-
-    let table = Table::open(bytes).map_err(|e| format!("{path}: {e}"))?;
+fn describe_layout(bytes: &[u8], path: &Path) -> Result<String> {
+    let table = Table::open(bytes).map_err(|e| at(path, &e))?;
     let footer = *table.footer();
-    let handles = table
-        .data_block_handles()
-        .map_err(|e| format!("{path}: index: {e}"))?;
+    let handles = table.data_block_handles().map_err(|e| at(path, &e))?;
 
     let mut counts: Vec<(Compression, usize)> = Vec::new();
     for h in &handles {
-        let c = table
-            .block_compression(*h)
-            .map_err(|e| format!("{path}: block at {}: {e}", h.offset))?;
+        let c = table.block_compression(*h).map_err(|e| at(path, &e))?;
         match counts.iter_mut().find(|(k, _)| *k == c) {
             Some((_, n)) => *n += 1,
             None => counts.push((c, 1)),
@@ -121,11 +198,11 @@ fn describe_layout(bytes: &[u8], path: &str) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    writeln!(out, "file {path}").unwrap();
-    writeln!(out, "size {}", bytes.len()).unwrap();
-    writeln!(out, "table-format {}", footer.format.name()).unwrap();
-    writeln!(out, "checksum {}", footer.checksum.name()).unwrap();
-    writeln!(
+    let _ = writeln!(out, "file {}", path.display());
+    let _ = writeln!(out, "size {}", bytes.len());
+    let _ = writeln!(out, "table-format {}", footer.format.name());
+    let _ = writeln!(out, "checksum {}", footer.checksum.name());
+    let _ = writeln!(
         out,
         "index {}",
         if table.has_two_level_index() {
@@ -133,11 +210,10 @@ fn describe_layout(bytes: &[u8], path: &str) -> Result<String, String> {
         } else {
             "single-level"
         }
-    )
-    .unwrap();
-    write!(out, "data-blocks {}", handles.len()).unwrap();
+    );
+    let _ = write!(out, "data-blocks {}", handles.len());
     for (c, n) in &counts {
-        write!(out, " {}={n}", c.name()).unwrap();
+        let _ = write!(out, " {}={n}", c.name());
     }
     out.push('\n');
 
@@ -155,98 +231,85 @@ fn describe_layout(bytes: &[u8], path: &str) -> Result<String, String> {
     if meta.value_index.is_some() {
         present.push("value-index");
     }
-    writeln!(out, "metaindex {}", present.join(" ")).unwrap();
+    let _ = writeln!(out, "metaindex {}", present.join(" "));
 
-    let value_blocks = table
-        .value_blocks()
-        .map_err(|e| format!("{path}: value index: {e}"))?;
+    let value_blocks = table.value_blocks().map_err(|e| at(path, &e))?;
     if !value_blocks.is_empty() {
-        writeln!(out, "value-blocks {}", value_blocks.len()).unwrap();
+        let _ = writeln!(out, "value-blocks {}", value_blocks.len());
     }
 
     for (name, value) in table.properties().iter() {
         // Properties are name/value pairs whose types vary by name, so they
         // are shown as the format crate holds them rather than guessed at.
-        writeln!(
+        let _ = writeln!(
             out,
             "property {} {}",
             String::from_utf8_lossy(name),
             printable(value)
-        )
-        .unwrap();
+        );
     }
     Ok(out)
 }
 
-/// Shows a property value as text when it is text, and as hex when it is not.
-fn printable(value: &[u8]) -> String {
-    match std::str::from_utf8(value) {
-        Ok(s) if s.chars().all(|c| !c.is_control()) && !s.is_empty() => s.to_string(),
-        _ => value.iter().map(|b| format!("{b:02x}")).collect(),
-    }
-}
-
-fn manifest_dump(args: &[&str]) -> Result<String, String> {
-    use std::fmt::Write as _;
-
-    let [path] = args else {
-        return Err(format!(
-            "usage: roble manifest dump <MANIFEST-file>\n\n{USAGE}"
-        ));
-    };
+fn manifest_dump(path: &Path) -> Result<String> {
     let bytes = read(path)?;
-
     let mut out = String::new();
-    writeln!(out, "file {path}").unwrap();
-    writeln!(out, "size {}", bytes.len()).unwrap();
+    let _ = writeln!(out, "file {}", path.display());
+    let _ = writeln!(out, "size {}", bytes.len());
 
     // A MANIFEST's records are legacy-framed and carry no log number.
     let mut reader = RecordReader::new(&bytes, 0);
     let mut edits = Vec::new();
     while let Some(record) = reader.next() {
-        let record = record.map_err(|e| format!("{path}: record {}: {e}", edits.len()))?;
-        let edit = VersionEdit::decode(&record)
-            .map_err(|e| format!("{path}: version edit {}: {e}", edits.len()))?;
+        let record = record.map_err(|e| {
+            Error::Message(format!("{}: record {}: {e}", path.display(), edits.len()))
+        })?;
+        let edit = VersionEdit::decode(&record).map_err(|e| {
+            Error::Message(format!(
+                "{}: version edit {}: {e}",
+                path.display(),
+                edits.len()
+            ))
+        })?;
         edits.push(edit);
     }
-    writeln!(out, "edits {}", edits.len()).unwrap();
+    let _ = writeln!(out, "edits {}", edits.len());
 
     for (i, edit) in edits.iter().enumerate() {
-        writeln!(out, "edit {i}").unwrap();
+        let _ = writeln!(out, "edit {i}");
         if let Some(name) = &edit.comparer_name {
-            writeln!(out, "  comparer {name}").unwrap();
+            let _ = writeln!(out, "  comparer {name}");
         }
         if let Some(n) = edit.min_unflushed_log_num {
-            writeln!(out, "  min-unflushed-log {n}").unwrap();
+            let _ = writeln!(out, "  min-unflushed-log {n}");
         }
         if let Some(n) = edit.obsolete_prev_log_num {
-            writeln!(out, "  prev-log {n}").unwrap();
+            let _ = writeln!(out, "  prev-log {n}");
         }
         if let Some(n) = edit.next_file_num {
-            writeln!(out, "  next-file-num {n}").unwrap();
+            let _ = writeln!(out, "  next-file-num {n}");
         }
         if let Some(n) = edit.last_seq_num {
-            writeln!(out, "  last-seq-num {n}").unwrap();
+            let _ = writeln!(out, "  last-seq-num {n}");
         }
         for (level, file_num) in &edit.deleted_tables {
-            writeln!(out, "  deleted L{level} {file_num}").unwrap();
+            let _ = writeln!(out, "  deleted L{level} {file_num}");
         }
         for t in &edit.new_tables {
-            write!(
+            let _ = write!(
                 out,
                 "  added L{} {} size={} seq={}..{}",
                 t.level, t.file_num, t.size, t.smallest_seq_num, t.largest_seq_num
-            )
-            .unwrap();
+            );
             if t.creation_time != 0 {
-                write!(out, " created={}", t.creation_time).unwrap();
+                let _ = write!(out, " created={}", t.creation_time);
             }
             if t.marked_for_compaction {
-                write!(out, " marked-for-compaction").unwrap();
+                let _ = write!(out, " marked-for-compaction");
             }
             out.push('\n');
-            writeln!(out, "    smallest {}", internal_key(&t.smallest)).unwrap();
-            writeln!(out, "    largest  {}", internal_key(&t.largest)).unwrap();
+            let _ = writeln!(out, "    smallest {}", internal_key(&t.smallest));
+            let _ = writeln!(out, "    largest  {}", internal_key(&t.largest));
         }
     }
     Ok(out)
@@ -262,6 +325,18 @@ fn internal_key(encoded: &[u8]) -> String {
     }
 }
 
-fn read(path: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+/// Shows a value as text when it is text, and as hex when it is not.
+fn printable(value: &[u8]) -> String {
+    match std::str::from_utf8(value) {
+        Ok(s) if !s.is_empty() && s.chars().all(|c| !c.is_control()) => s.to_string(),
+        _ => value.iter().map(|b| format!("{b:02x}")).collect(),
+    }
+}
+
+fn at(path: &Path, e: &roble_format::Error) -> Error {
+    Error::Message(format!("{}: {e}", path.display()))
+}
+
+fn read(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| Error::Message(format!("{}: {e}", path.display())))
 }
