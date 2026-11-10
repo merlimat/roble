@@ -26,7 +26,15 @@ use std::path::{Path, PathBuf};
 
 use roble_format::sst::Table;
 
-const FIXTURES: &[&str] = &["simple", "kinds", "multiblock", "snappy", "pebblev2"];
+const FIXTURES: &[&str] = &[
+    "simple",
+    "kinds",
+    "multiblock",
+    "snappy",
+    "pebblev2",
+    "zstd",
+    "xxhash64",
+];
 
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
@@ -50,6 +58,47 @@ fn roble_dump_matches_go_pebble() {
             panic!("{name}: roble's dump differs from Go Pebble's\n{diff}");
         }
     }
+}
+
+/// The fixtures that exist to exercise one algorithm must actually contain it.
+/// Every algorithm decodes to the same entries, so a fixture that silently got
+/// Snappy instead of Zstd would pass `roble_dump_matches_go_pebble` while
+/// leaving the Zstd path untested.
+#[test]
+fn the_compression_and_checksum_fixtures_contain_what_they_claim() {
+    use roble_format::ChecksumType;
+    use roble_format::block::Compression;
+
+    let cases: &[(&str, Compression)] = &[
+        ("simple", Compression::None),
+        ("snappy", Compression::Snappy),
+        ("zstd", Compression::Zstd),
+    ];
+    for (name, want) in cases {
+        let bytes = std::fs::read(golden_dir().join(format!("{name}.sst")))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let table = Table::open(&bytes).unwrap_or_else(|e| panic!("{name}: open: {e}"));
+        let handles = table.data_block_handles().expect("index");
+        let found: Vec<Compression> = handles
+            .iter()
+            .map(|h| table.block_compression(*h).expect("trailer"))
+            .collect();
+        assert!(
+            found.contains(want),
+            "{name} was supposed to exercise {}, but its {} data blocks are {:?}",
+            want.name(),
+            handles.len(),
+            found
+        );
+    }
+
+    let bytes = std::fs::read(golden_dir().join("xxhash64.sst")).expect("read xxhash64.sst");
+    let table = Table::open(&bytes).expect("open xxhash64.sst");
+    assert_eq!(
+        table.footer().checksum,
+        ChecksumType::XxHash64,
+        "the xxhash64 fixture is not actually checksummed with xxhash64"
+    );
 }
 
 #[test]

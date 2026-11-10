@@ -126,6 +126,20 @@ impl<'a> Table<'a> {
         &self.properties
     }
 
+    /// The compression a block was stored with, from its trailer byte.
+    ///
+    /// Worth having beyond a dump: a fixture that means to exercise one
+    /// algorithm and quietly got another would otherwise still pass, since
+    /// every algorithm decodes to the same entries.
+    pub fn block_compression(&self, handle: BlockHandle) -> Result<Compression> {
+        let at = usize::try_from(handle.offset + handle.length)
+            .map_err(|_| Error::Corrupt(format!("block offset {} too large", handle.offset)))?;
+        match self.bytes.get(at) {
+            Some(&b) => Compression::from_byte(b),
+            None => Error::truncated("block trailer", at + 1, self.bytes.len()),
+        }
+    }
+
     /// Decodes one block of this table by handle: checksum, then decompression.
     pub fn decode_block(&self, handle: BlockHandle) -> Result<Decoded<'a>> {
         decode_block_at(self.bytes, handle, self.footer.checksum)

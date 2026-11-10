@@ -1,15 +1,25 @@
 # MinLZ decode compatibility
 
-Settles one question from DESIGN.md §3: **can roble read the MinLZ blocks that
-Oxia's databases contain?**
+Checks that the Rust `minlz` crate decodes MinLZ blocks produced by Go's
+`github.com/minio/minlz`, which is what Pebble compresses with when a
+compression profile selects MinLZ.
 
-It can, and it has to. Oxia's key-encoding conversion (`kv_pebble_formats.go`)
-writes L1 and below with Pebble's `GoodCompression` profile, whose `OtherBlocks`
-setting — index, filter and metadata blocks — is `fastestCompression`: Snappy on
-arm64, **MinLZ everywhere else**, resolved at package init from `runtime.GOARCH`.
-So a database converted on an x86 node holds MinLZ blocks for as long as those
-files live, which for a deep file may be forever. Refusing MinLZ would refuse
-the in-place upgrade roble exists to make possible (§2).
+**This is not needed at roble's current pin, and that is a correction.** An
+earlier version of this file — and of DESIGN.md §3 — claimed that Oxia's
+key-encoding conversion writes MinLZ index blocks on any node that is not
+arm64, and so that refusing MinLZ would refuse the in-place upgrade roble
+exists to make possible. That was wrong. Pebble checks whether the table format
+supports the compression profile and, below Pebblev6, swaps the *entire*
+profile for Snappy rather than only the MinLZ part
+(`sstable/options.go`: `tableFormatSupportsCompressionProfile`). Measured at
+Pebblev4, `MinLZCompression` produces Snappy blocks and `GoodCompression`
+produces Zstd data blocks with Snappy index blocks on arm64, or all Snappy
+elsewhere. No MinLZ block reaches a table at this pin, and `roble-format`
+refuses one.
+
+The check stays for two reasons: it is cheap, and MinLZ goes live the moment
+the pin moves to Pebblev6, at which point the crate is already known good
+rather than a question to answer under time pressure.
 
 ## What this checks
 
