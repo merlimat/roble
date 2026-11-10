@@ -10,7 +10,7 @@
 > tables Go Pebble reads back entry for entry (`compat/sst-roundtrip`), with
 > the golden corpus going the other way (`harness/golden-sst`).
 >
-> Still to come in M1: the bloom filter, value-block
+> Still to come in M1: value-block
 > resolution, batch repr,
 > record framing, version edits, and the `roble sst dump` and
 > `roble manifest dump` commands.
@@ -251,6 +251,7 @@ The anchors that matter most:
 | markers | `internal/base` and `vfs/atomicfs` |
 | batch repr | `batchrepr` — 8-byte sequence number, 4-byte count, then entries |
 | log records | `record/record.go` — 32 KiB blocks; three wire formats, `legacyHeaderSize = 7` (the MANIFEST), `recyclableHeaderSize = 11`, the extra four bytes being the log number (the WAL at the pin), and `walSyncHeaderSize = 19` (above the pin, refused) |
+| bloom filter | `bloom/bloom.go` — RocksDB's full-file filter: 64-byte lines, then one probe-count byte and a u32 line count. Its hash folds the trailing one to three bytes in **sign-extended**, `uint32(int8(b))`, to match RocksDB; unsigned gives different bits for any key whose tail is ≥ 0x80 |
 | metaindex names | `sstable/table.go` — `rocksdb.properties`, `rocksdb.range_del2` (and `rocksdb.range_del` for the refused v1), `pebble.range_key`, `pebble.value_index`, `fullfilter.<policy>`. None of the range ones is spelled the way its feature is |
 | WAL file names | `wal/wal.go` — `makeLogFilename`: `NNNNNN.log`, and `NNNNNN-NNN.log` only under failover |
 | unflushed logs | `internal/manifest/version_edit.go` — `MinUnflushedLogNum`, which says what a reopen must replay |

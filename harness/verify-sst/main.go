@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
@@ -72,26 +73,36 @@ func formatName(tf sstable.TableFormat) string {
 	}
 }
 
-func dump(path string) (string, error) {
+func dump(path string) (dumped string, filterNote string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	// Configure the filter policy so that Pebble wires up the filter block it
+	// finds rather than ignoring it: that is what checks the metaindex name
+	// ("fullfilter." + policy name) and the rocksdb.filter.policy property.
+	// Note that a full scan never consults the filter's bits — SeekPrefixGE
+	// would, but its flags type is in an internal package and so is not
+	// callable from here. The bits are pinned instead by the byte-identity
+	// test in format/tests/golden.rs.
 	r, err := sstable.NewMemReader(data, sstable.ReaderOptions{
 		Comparer: sstable.DefaultComparer,
+		Filters: map[string]sstable.FilterPolicy{
+			"rocksdb.BuiltinBloomFilter": bloom.FilterPolicy(10),
+		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("open: %w", err)
+		return "", "", fmt.Errorf("open: %w", err)
 	}
 	defer r.Close()
 
 	props, err := r.ReadPropertiesBlock(context.Background(), nil)
 	if err != nil {
-		return "", fmt.Errorf("properties: %w", err)
+		return "", "", fmt.Errorf("properties: %w", err)
 	}
 	tf, err := r.TableFormat()
 	if err != nil {
-		return "", fmt.Errorf("table format: %w", err)
+		return "", "", fmt.Errorf("table format: %w", err)
 	}
 
 	var b strings.Builder
@@ -101,7 +112,7 @@ func dump(path string) (string, error) {
 
 	iter, err := r.NewIter(sstable.NoTransforms, nil, nil, sstable.AssertNoBlobHandles)
 	if err != nil {
-		return "", fmt.Errorf("iter: %w", err)
+		return "", "", fmt.Errorf("iter: %w", err)
 	}
 	defer iter.Close()
 
@@ -109,19 +120,19 @@ func dump(path string) (string, error) {
 	for kv := iter.First(); kv != nil; kv = iter.Next() {
 		val, _, err := kv.V.Value(nil)
 		if err != nil {
-			return "", fmt.Errorf("value for %q: %w", kv.K.UserKey, err)
+			return "", "", fmt.Errorf("value for %q: %w", kv.K.UserKey, err)
 		}
 		lines = append(lines, fmt.Sprintf("entry %016x %s %s %s",
 			uint64(kv.K.SeqNum()), kindName(kv.K.Kind()),
 			hex.EncodeToString(kv.K.UserKey), hex.EncodeToString(val)))
 	}
 	if err := iter.Error(); err != nil {
-		return "", fmt.Errorf("iterate: %w", err)
+		return "", "", fmt.Errorf("iterate: %w", err)
 	}
 	var tombs []string
 	rdIter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms, sstable.ReadEnv{})
 	if err != nil {
-		return "", fmt.Errorf("rangedel iter: %w", err)
+		return "", "", fmt.Errorf("rangedel iter: %w", err)
 	}
 	if rdIter != nil {
 		defer rdIter.Close()
@@ -137,7 +148,7 @@ func dump(path string) (string, error) {
 			}
 		}
 		if err != nil {
-			return "", fmt.Errorf("rangedel iterate: %w", err)
+			return "", "", fmt.Errorf("rangedel iterate: %w", err)
 		}
 	}
 
@@ -151,7 +162,10 @@ func dump(path string) (string, error) {
 		b.WriteString(l)
 		b.WriteString("\n")
 	}
-	return b.String(), nil
+	if props.FilterPolicyName != "" {
+		filterNote = fmt.Sprintf(", filter %s (%d bytes)", props.FilterPolicyName, props.FilterSize)
+	}
+	return b.String(), filterNote, nil
 }
 
 func main() {
@@ -172,7 +186,7 @@ func main() {
 	failed := 0
 	for _, sst := range matches {
 		name := strings.TrimSuffix(filepath.Base(sst), ".sst")
-		d, err := dump(sst)
+		d, filter, err := dump(sst)
 		if err != nil {
 			fmt.Printf("%-14s FAILED: %v\n", name, err)
 			failed++
@@ -188,7 +202,7 @@ func main() {
 				entries = after
 			}
 		}
-		fmt.Printf("%-14s read by Go Pebble, %s entries\n", name, entries)
+		fmt.Printf("%-14s read by Go Pebble, %s entries%s\n", name, entries, filter)
 	}
 	if failed > 0 {
 		os.Exit(1)

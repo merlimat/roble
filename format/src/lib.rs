@@ -26,6 +26,7 @@ mod footer;
 mod varint;
 
 pub mod block;
+pub mod filter;
 pub mod key;
 pub mod rangedel;
 pub mod sst;

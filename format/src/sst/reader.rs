@@ -148,6 +148,17 @@ impl<'a> Table<'a> {
         crate::rangedel::decode(&Block::new(decoded.as_slice())?)
     }
 
+    /// The filter block's bytes, if the table has one.
+    ///
+    /// Pebble writes this block uncompressed, so this borrows the table rather
+    /// than allocating.
+    pub fn filter_block(&self) -> Result<Option<Decoded<'a>>> {
+        match self.metaindex.filter {
+            None => Ok(None),
+            Some(h) => Ok(Some(self.decode_block(h)?)),
+        }
+    }
+
     /// The compression a block was stored with, from its trailer byte.
     ///
     /// Worth having beyond a dump: a fixture that means to exercise one
