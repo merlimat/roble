@@ -1,9 +1,14 @@
 # roble — design
 
-> Status: nothing is implemented. This document fixes the compatibility target
+> Status: **M1 is under way.** This document fixes the compatibility target
 > (§3), the decisions that differ from encina's (§4), and the order the work goes
-> in (§13). M1, the format crate, is next: encode and decode Pebble's files with
-> no engine behind them, verified against files Go Pebble wrote (§12).
+> in (§13). In place: the golden-corpus harness (`harness/golden-sst`), and
+> enough of `roble-format` to read every point entry out of a table Go Pebble
+> wrote — footer, metaindex, properties, single- and two-level indexes, row
+> blocks, internal keys, the Pebblev3+ value prefix, crc32c, Snappy. Still to
+> come in M1: the bloom filter, range-deletion blocks, value blocks, the table
+> writer, batch repr, record framing, version edits, and the `roble sst dump`
+> and `roble manifest dump` commands.
 
 roble is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. It is a

@@ -1,11 +1,17 @@
 [package]
 name = "minlz-compat"
 version = "0.0.0"
-edition = "2024"
-publish = false
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Checks that the Rust minlz crate decodes Go minio/minlz block output."
 
 [dependencies]
 # Decompression only: roble reads MinLZ blocks and never writes them, which is
 # why this crate's encoder not being byte-compatible with Go's does not matter.
 # default-features = false drops its S2 codec, leaving minlz + crc + crc-catalog.
 minlz = { version = "1.2.3", default-features = false, features = ["minlz"] }
+
+[lints]
+workspace = true
