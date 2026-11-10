@@ -20,6 +20,7 @@
 //! check it and a Pebble upgrade has a list of things to re-read.
 
 mod checksum;
+mod dump;
 mod error;
 mod footer;
 mod varint;
@@ -28,8 +29,9 @@ pub mod block;
 pub mod key;
 pub mod sst;
 
-pub use block::BlockHandle;
+pub use block::{BlockBuilder, BlockHandle};
 pub use checksum::ChecksumType;
+pub use dump::{dump_table, first_difference};
 pub use error::{Error, Result};
 pub use footer::{Footer, TableFormat};
 pub use key::{InternalKey, Kind};

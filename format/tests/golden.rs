@@ -22,7 +22,6 @@
 //!
 //! Regenerate with `cd harness && go run ./golden-sst ../format/tests/golden`.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use roble_format::sst::Table;
@@ -31,66 +30,6 @@ const FIXTURES: &[&str] = &["simple", "kinds", "multiblock", "snappy", "pebblev2
 
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").expect("writing to a String cannot fail");
-    }
-    s
-}
-
-/// Produces the same dump the Go harness does, from roble's reader alone.
-fn dump(name: &str, table_bytes: &[u8]) -> String {
-    let table = Table::open(table_bytes).unwrap_or_else(|e| panic!("{name}: open: {e}"));
-    let footer = *table.footer();
-
-    let data_blocks = table
-        .data_block_handles()
-        .unwrap_or_else(|e| panic!("{name}: read index: {e}"))
-        .len();
-    // The index walk and the properties block have to agree about how many
-    // data blocks there are: a reader that stopped after the first block would
-    // still produce a well-formed, shorter dump, and this catches that before
-    // the entry diff does.
-    if let Some(claimed) = table
-        .properties()
-        .num_data_blocks()
-        .expect("num data blocks")
-    {
-        assert_eq!(
-            claimed as usize, data_blocks,
-            "properties claim {claimed} data blocks, index walk found {data_blocks}"
-        );
-    }
-
-    let mut entries = Vec::new();
-    table
-        .for_each_entry(|key, value| {
-            let bytes = value
-                .in_place()
-                .expect("fixtures hold no value blocks, as the harness asserts");
-            entries.push(format!(
-                "entry {:016x} {} {} {}",
-                key.seq_num,
-                key.kind.name(),
-                hex(key.user_key),
-                hex(bytes)
-            ));
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("{name}: walk entries: {e}"));
-
-    let mut out = String::new();
-    writeln!(out, "format {}", footer.format.name()).unwrap();
-    writeln!(out, "checksum {}", footer.checksum.name()).unwrap();
-    writeln!(out, "datablocks {data_blocks}").unwrap();
-    writeln!(out, "entries {}", entries.len()).unwrap();
-    for e in entries {
-        writeln!(out, "{e}").unwrap();
-    }
-    out
 }
 
 #[test]
@@ -105,37 +44,12 @@ fn roble_dump_matches_go_pebble() {
         let expected = std::fs::read_to_string(&expected_path)
             .unwrap_or_else(|e| panic!("{}: {e}", expected_path.display()));
 
-        let actual = dump(name, &bytes);
-        if actual != expected {
-            let diff = first_difference(&expected, &actual);
+        let actual =
+            roble_format::dump_table(&bytes).unwrap_or_else(|e| panic!("{name}: dump: {e}"));
+        if let Some(diff) = roble_format::first_difference(&expected, &actual) {
             panic!("{name}: roble's dump differs from Go Pebble's\n{diff}");
         }
     }
-}
-
-/// The first differing line, which is far more use than two 400-line dumps.
-fn first_difference(expected: &str, actual: &str) -> String {
-    let mut out = String::new();
-    for (i, (e, a)) in expected.lines().zip(actual.lines()).enumerate() {
-        if e != a {
-            writeln!(out, "  line {}:", i + 1).unwrap();
-            writeln!(out, "    go:    {e}").unwrap();
-            writeln!(out, "    roble: {a}").unwrap();
-            return out;
-        }
-    }
-    let (e, a) = (expected.lines().count(), actual.lines().count());
-    writeln!(out, "  go produced {e} lines, roble {a}").unwrap();
-    if a > e {
-        for line in actual.lines().skip(e).take(3) {
-            writeln!(out, "    roble only: {line}").unwrap();
-        }
-    } else {
-        for line in expected.lines().skip(a).take(3) {
-            writeln!(out, "    go only:    {line}").unwrap();
-        }
-    }
-    out
 }
 
 #[test]
@@ -173,4 +87,103 @@ fn a_corrupt_block_fails_its_checksum() {
         matches!(err, roble_format::Error::ChecksumMismatch { .. }),
         "expected a checksum mismatch, got {err}"
     );
+}
+
+/// What roble wrote has to read back as what it was handed: the cheap half of
+/// the round trip, with no Go toolchain in the loop. The expensive half — Go
+/// Pebble reading it — is `compat/sst-roundtrip`.
+#[test]
+fn roble_reads_back_what_roble_wrote() {
+    use roble_format::block::Value;
+    use roble_format::sst::{TableWriter, WriterOptions};
+    use roble_format::{InternalKey, Kind};
+
+    // Small blocks so the index is exercised rather than a single block.
+    let opts = WriterOptions {
+        block_size: 512,
+        ..Default::default()
+    };
+    let mut w = TableWriter::new(opts).expect("writer");
+
+    let mut expected = Vec::new();
+    for i in 0..300u64 {
+        let user_key = format!("/oxia/default/shard-0003/users/{i:08}").into_bytes();
+        let kind = match i % 4 {
+            0 => Kind::Set,
+            1 => Kind::Delete,
+            2 => Kind::SetWithDelete,
+            _ => Kind::DeleteSized,
+        };
+        let value: Vec<u8> = if matches!(kind, Kind::Set | Kind::SetWithDelete) {
+            format!("{{\"v\":{i}}}").into_bytes()
+        } else {
+            Vec::new()
+        };
+        let key = InternalKey {
+            user_key: &user_key,
+            seq_num: 1000 + i,
+            kind,
+            obsolete: false,
+        };
+        w.add(key, &value).expect("add");
+        expected.push((user_key, 1000 + i, kind, value));
+    }
+    let bytes = w.finish().expect("finish");
+
+    let table = Table::open(&bytes).expect("roble reopens its own table");
+    assert_eq!(table.footer().format.name(), "pebblev4");
+    assert!(!table.has_two_level_index());
+    assert!(
+        table.data_block_handles().expect("index").len() > 1,
+        "the fixture is meant to span several data blocks"
+    );
+
+    let mut got = Vec::new();
+    table
+        .for_each_entry(|key, value| {
+            let v = match value {
+                Value::InPlace(v) => v.to_vec(),
+                other => panic!("roble wrote a {} value", other.kind_name()),
+            };
+            got.push((key.user_key.to_vec(), key.seq_num, key.kind, v));
+            Ok(())
+        })
+        .expect("walk");
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn the_writer_refuses_what_roble_does_not_write() {
+    use roble_format::sst::{TableWriter, WriterOptions};
+    use roble_format::{InternalKey, Kind};
+
+    let key = |kind, obsolete| InternalKey {
+        user_key: b"/k",
+        seq_num: 1,
+        kind,
+        obsolete,
+    };
+    for kind in [Kind::Merge, Kind::RangeKeySet, Kind::Excise] {
+        let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+        assert!(
+            w.add(key(kind, false), b"v").is_err(),
+            "{} should be refused",
+            kind.name()
+        );
+    }
+    // The obsolete bit is never set, because setting it wrongly makes a Go
+    // reader skip a live key.
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    assert!(w.add(key(Kind::Set, true), b"v").is_err());
+
+    // Out-of-order keys are caught at write time, not discovered at read time.
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    w.add(key(Kind::Set, false), b"v").expect("first key");
+    let earlier = InternalKey {
+        user_key: b"/a",
+        seq_num: 1,
+        kind: Kind::Set,
+        obsolete: false,
+    };
+    assert!(w.add(earlier, b"v").is_err(), "descending keys must fail");
 }

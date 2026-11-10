@@ -37,8 +37,10 @@
 //! Pebblev3 on it carries `setHasSameKeyPrefixSinceLastRestart`
 //! (`rowblk_writer.go`: `setHasSameKeyPrefixRestartMask`).
 
+mod builder;
 mod compression;
 
+pub use builder::{BlockBuilder, DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL, max_shared_len};
 pub(crate) use compression::decode as decode_compressed;
 pub use compression::{Compression, Decoded};
 
