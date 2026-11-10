@@ -56,6 +56,9 @@ type fixture struct {
 	// from the other direction, by compat/sst-roundtrip.
 	tombstones [][2]string
 	filter     sstable.FilterPolicy
+	// wantValueBlocks says the fixture exists to exercise value blocks, which
+	// needs the same user key more than once.
+	wantValueBlocks bool
 }
 
 // checksumOrDefault keeps crc32c as the default, as Pebble does, so only the
@@ -256,6 +259,23 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, bl)
 
+	// Value blocks. A value lands in one only when the same user key repeats
+	// within the table, so the fixture writes several versions of each key —
+	// which is what a table looks like after a flush with a snapshot held
+	// open.
+	vb := fixture{name: "valueblocks", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression, wantValueBlocks: true}
+	for i := 0; i < 40; i++ {
+		for v := 5; v >= 1; v-- {
+			vb.entries = append(vb.entries, entry{
+				userKey: oxiaKey(6, i), seqNum: pebble.SeqNum(1000 + i*10 + v),
+				kind:  pebble.InternalKeyKindSet,
+				value: []byte(fmt.Sprintf("version-%d-of-%d-%s", v, i, strings.Repeat("p", v*7))),
+			})
+		}
+	}
+	fs = append(fs, vb)
+
 	// Range deletions, which live in their own block and never in a data
 	// block. Before this fixture existed, a table with tombstones read as
 	// though it had none and no test noticed.
@@ -333,13 +353,16 @@ func dump(path string, f fixture) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// These fixtures are meant to hold no value blocks: with the bytewise
-	// comparer a value only goes to a value block when the same user key
-	// repeats inside one table, which none of them does. Assert it rather than
-	// assume it, so the fixture cannot drift out from under the dump.
-	if props.NumValueBlocks != 0 {
-		return "", fmt.Errorf("%s: %d value blocks, fixtures must have none",
-			f.name, props.NumValueBlocks)
+	// With the bytewise comparer a value only goes to a value block when the
+	// same user key repeats inside one table. Each fixture declares whether it
+	// means to contain any, and the declaration is checked both ways: a
+	// fixture that quietly stopped producing them would otherwise leave the
+	// resolution path untested.
+	if f.wantValueBlocks && props.NumValueBlocks == 0 {
+		return "", fmt.Errorf("%s: meant to hold value blocks but holds none", f.name)
+	}
+	if !f.wantValueBlocks && props.NumValueBlocks != 0 {
+		return "", fmt.Errorf("%s: %d unexpected value blocks", f.name, props.NumValueBlocks)
 	}
 
 	var b strings.Builder

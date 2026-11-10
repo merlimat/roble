@@ -9,12 +9,14 @@
 > indexes, row blocks, internal keys, the Pebblev3+ value prefix), range
 > deletions, the bloom filter bit-for-bit, none/Snappy/Zstd and both checksums,
 > the batch representation byte-for-byte, record framing in both wire formats,
-> and version edits. `compat/sst-roundtrip` has Go Pebble read every table
+> version edits, and value-block resolution. `compat/sst-roundtrip` has Go Pebble read every table
 > roble writes; `harness/golden-sst` and `harness/record-files` go the other
 > way, the latter with a real WAL and MANIFEST.
 >
-> Still to come in M1: value-block resolution, and the `roble sst dump` and
-> `roble manifest dump` commands.
+> Still to come in M1: the `roble sst dump` and `roble manifest dump`
+> commands, whose output format is roble's own and so has no Go counterpart to
+> be checked against — the first piece of this milestone that cannot be pinned
+> byte for byte.
 
 roble is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. It is a
@@ -454,7 +456,9 @@ format/src/
   block/mod.rs      row-oriented block builder and in-place reader, including
                     the Pebblev3+ value prefix byte on every SET
   block/restart.rs  restart arrays, prefix compression, seek within a block
-  value_block.rs    value blocks, short attributes, value handles — read only
+  value_block.rs    value blocks, value handles, and the value index — read only.
+                    The metaindex value is a block handle *plus* three width
+                    bytes, without which the index cannot be read
   filter.rs         rocksdb.BuiltinBloomFilter
   props.rs          properties block, metaindex, block properties
   footer.rs         footer, magics and versions per table format
