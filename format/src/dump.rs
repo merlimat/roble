@@ -23,8 +23,14 @@
 //!   checksum crc32c
 //!   datablocks 3
 //!   entries 42
+//!   tombstones 2
 //!   entry 000000000000000a set 2f61 76616c7565
+//!   tombstone 0000000000000005 2f61 2f62
 //! ```
+//!
+//! `entries` counts point entries only. Pebble's own `rocksdb.num.entries`
+//! includes range deletions, which is a different number and deliberately not
+//! the one dumped here.
 //!
 //! Sequence numbers are 16 hex digits, keys and values hex, kinds the names in
 //! [`crate::Kind::name`]. This is the output `roble sst dump` will print.
@@ -52,6 +58,8 @@ pub fn dump_table(bytes: &[u8]) -> Result<String> {
             "properties claim {claimed} data blocks, the index walk found {data_blocks}"
         ));
     }
+
+    let tombstones = table.range_deletions()?;
 
     let mut entries: Vec<String> = Vec::new();
     table.for_each_entry(|key, value| {
@@ -83,8 +91,19 @@ pub fn dump_table(bytes: &[u8]) -> Result<String> {
     writeln!(out, "checksum {}", footer.checksum.name()).expect("String");
     writeln!(out, "datablocks {data_blocks}").expect("String");
     writeln!(out, "entries {}", entries.len()).expect("String");
+    writeln!(out, "tombstones {}", tombstones.len()).expect("String");
     for e in entries {
         writeln!(out, "{e}").expect("String");
+    }
+    for t in &tombstones {
+        writeln!(
+            out,
+            "tombstone {:016x} {} {}",
+            t.seq_num,
+            hex(&t.start),
+            hex(&t.end)
+        )
+        .expect("String");
     }
     Ok(out)
 }

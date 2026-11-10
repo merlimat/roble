@@ -27,6 +27,7 @@ mod varint;
 
 pub mod block;
 pub mod key;
+pub mod rangedel;
 pub mod sst;
 
 pub use block::{BlockBuilder, BlockHandle};

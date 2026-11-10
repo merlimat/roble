@@ -29,7 +29,8 @@ pub const BYTEWISE_COMPARER: &str = "leveldb.BytewiseComparator";
 
 /// Metaindex entry names (`sstable/table.go`).
 const META_PROPERTIES: &[u8] = b"rocksdb.properties";
-const META_RANGE_DEL_V2: &[u8] = b"pebble.range_del";
+const META_RANGE_DEL_V2: &[u8] = crate::rangedel::META_NAME_V2;
+const META_RANGE_DEL_V1: &[u8] = crate::rangedel::META_NAME_V1;
 const META_RANGE_KEY: &[u8] = b"pebble.range_key";
 const META_VALUE_INDEX: &[u8] = b"pebble.value_index";
 const META_FILTER_PREFIX: &[u8] = b"filter.";
@@ -83,6 +84,14 @@ impl<'a> Table<'a> {
                 "table has a range-key block, which Oxia never writes and roble does not read",
             );
         }
+        // Pebble refuses a v1 range-deletion block too: it is unfragmented,
+        // and every format roble can open is past the point where one could
+        // legitimately exist (`sstable/reader.go`).
+        if metaindex.range_del_v1_present {
+            return Error::unsupported(
+                "table has an unfragmented v1 range-deletion block (rocksdb.range_del)",
+            );
+        }
         let metaindex = metaindex.handles;
 
         let properties = match metaindex.properties {
@@ -124,6 +133,19 @@ impl<'a> Table<'a> {
     /// The table's properties.
     pub fn properties(&self) -> &Properties {
         &self.properties
+    }
+
+    /// Every range tombstone in the table, in stored order.
+    ///
+    /// Tombstones live only in the range-deletion block, never interleaved
+    /// with point keys, so a reader that walks data blocks alone sees a table
+    /// with tombstones as though it had none (DESIGN.md §6).
+    pub fn range_deletions(&self) -> Result<Vec<crate::rangedel::Tombstone>> {
+        let Some(handle) = self.metaindex.range_del else {
+            return Ok(Vec::new());
+        };
+        let decoded = self.decode_block(handle)?;
+        crate::rangedel::decode(&Block::new(decoded.as_slice())?)
     }
 
     /// The compression a block was stored with, from its trailer byte.
@@ -252,11 +274,13 @@ fn collect_handles(block: &Block<'_>) -> Result<Vec<BlockHandle>> {
 struct ParsedMetaindex {
     handles: Metaindex,
     range_key_present: bool,
+    range_del_v1_present: bool,
 }
 
 fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
     let mut handles = Metaindex::default();
     let mut range_key_present = false;
+    let mut range_del_v1_present = false;
     let mut iter = block.iter();
     while let Some(entry) = iter.next() {
         let entry = entry?;
@@ -266,6 +290,8 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
             handles.properties = Some(handle);
         } else if name == META_RANGE_DEL_V2 {
             handles.range_del = Some(handle);
+        } else if name == META_RANGE_DEL_V1 {
+            range_del_v1_present = true;
         } else if name == META_RANGE_KEY {
             range_key_present = true;
         } else if name == META_VALUE_INDEX {
@@ -280,5 +306,6 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
     Ok(ParsedMetaindex {
         handles,
         range_key_present,
+        range_del_v1_present,
     })
 }
