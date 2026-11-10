@@ -219,6 +219,30 @@ fn the_value_block_fixture_really_exercises_resolution() {
     );
 }
 
+/// A table Pebble wrote with range keys must be refused, by name.
+///
+/// §3 declines range keys, and until this fixture existed that refusal was
+/// only tested against synthetic bytes. Pebble writes them through a public
+/// API, so the real thing is cheap to produce — and the point of refusing is
+/// that roble declines the table rather than reading past a structure it does
+/// not understand.
+#[test]
+fn a_real_range_key_table_is_refused() {
+    let bytes = std::fs::read(golden_dir().join("refuse-rangekeys.sst"))
+        .expect("read refuse-rangekeys.sst");
+    let err = Table::open(&bytes).expect_err("a range-key table must be refused");
+    let text = format!("{err}");
+    assert!(
+        text.contains("range-key"),
+        "the refusal should name range keys, got {text:?}"
+    );
+    // And it must be a refusal, not a corruption report: the file is valid.
+    assert!(
+        matches!(err, roble_format::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
 #[test]
 fn a_truncated_table_errors_rather_than_panicking() {
     let bytes = std::fs::read(golden_dir().join("simple.sst")).expect("read simple.sst");

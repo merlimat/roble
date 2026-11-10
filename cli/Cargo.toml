@@ -1,0 +1,21 @@
+[package]
+name = "roble-cli"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Inspects Pebble's files: roble sst dump and roble manifest dump."
+
+[[bin]]
+name = "roble"
+path = "src/main.rs"
+
+[dependencies]
+roble-format = { path = "../format" }
+
+[dev-dependencies]
+roble-format = { path = "../format" }
+
+[lints]
+workspace = true
