@@ -97,7 +97,10 @@ impl<F: Fs> Opened<'_, F> {
             ));
         }
 
+        let _timer = self.metrics.compaction.start();
         let (inputs, below) = self.inputs_for(level, output_level, file_nums)?;
+        self.metrics.compaction_tables[0].add(inputs.len() as u64);
+        self.metrics.compaction_io[0].add(inputs.iter().map(|(_, m)| m.size).sum());
         let mut tables = Vec::new();
         for (_, meta) in &inputs {
             tables.push(self.open_table(meta.file_num).await?);
@@ -110,10 +113,14 @@ impl<F: Fs> Opened<'_, F> {
         // any of them: a crash in the middle leaves files nothing refers to,
         // which the sweep collects, and the database exactly as it was.
         let mut new_tables = Vec::with_capacity(merged.len());
-        for (i, (bytes, bounds)) in merged.into_iter().enumerate() {
+        let mut written: Vec<(u64, u64)> = Vec::new();
+        for (i, (bytes, bounds, entries)) in merged.into_iter().enumerate() {
             let file_num = first_file_num + i as u64;
+            written.push((file_num, entries));
             let mut new_table = bounds.into_new_table(output_level, file_num)?;
             new_table.size = bytes.len() as u64;
+            self.metrics.compaction_tables[1].add(1);
+            self.metrics.compaction_io[1].add(new_table.size);
             self.write_table(file_num, bytes).await?;
             new_tables.push(new_table);
         }
@@ -140,6 +147,14 @@ impl<F: Fs> Opened<'_, F> {
             let _ = self.rotate_manifest().await;
         }
         let _ = self.remove_obsolete_files().await;
+        self.metrics.saw_version(&self.versions().version);
+        self.measure_disk().await;
+        self.metrics.compactions.add(1);
+        self.saw_debt();
+        for (file_num, entries) in written {
+            self.saw_table_entries(file_num, Some(entries));
+        }
+        self.recount_records();
 
         Ok(edit.new_tables.iter().map(|t| t.file_num).collect())
     }
@@ -212,11 +227,16 @@ impl<F: Fs> Opened<'_, F> {
     async fn write_table(&self, file_num: u64, bytes: Vec<u8>) -> Result<()> {
         let path = self.dir.join(roble_format::files::table_filename(file_num));
         let disk = self.fs().create(&path).await?;
+        let written = bytes.len();
         let (result, _) = disk
             .write(WriteBuf::new(bytes), 0, Default::default())
             .await;
         result?;
-        disk.sync(Default::default()).await?;
+        self.metrics.written.add(written);
+        {
+            let _timer = self.metrics.sync_duration.start();
+            disk.sync(Default::default()).await?;
+        }
         disk.close().await?;
         self.fs().sync_dir(&self.dir).await?;
         Ok(())
@@ -231,7 +251,7 @@ async fn merge<D: Disk>(
     tables: &[Rc<OpenTable<D>>],
     below: &[(Vec<u8>, Vec<u8>)],
     target_bytes: u64,
-) -> Result<Vec<(Vec<u8>, Bounds)>> {
+) -> Result<Vec<(Vec<u8>, Bounds, u64)>> {
     let mut iters = Vec::new();
     for t in tables {
         let mut it = t.iter();
@@ -338,7 +358,7 @@ impl Output {
         mut self,
         tombstones: &[Tombstone],
         end: Option<&[u8]>,
-    ) -> Result<Option<(Vec<u8>, Bounds)>> {
+    ) -> Result<Option<(Vec<u8>, Bounds, u64)>> {
         let mut wrote = self.points > 0;
         for t in tombstones {
             let Some(clipped) = clip(t, self.start.as_deref(), end) else {
@@ -362,7 +382,8 @@ impl Output {
         if !wrote {
             return Ok(None);
         }
-        Ok(Some((self.writer.finish()?, self.bounds)))
+        let entries = self.points as u64;
+        Ok(Some((self.writer.finish()?, self.bounds, entries)))
     }
 }
 

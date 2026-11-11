@@ -121,6 +121,16 @@
 > because making the same decision twice is the whole of its job. **Go Pebble
 > reads a database roble spread across levels by itself.**
 >
+> And **metrics**, through OpenTelemetry with [nanometer] handles, as encina
+> does: a store creates them when it opens and records nothing at all without
+> a meter provider. Writes, lookups, scans, flushes, compactions, what each
+> level holds and what the directory takes on disk, with the two counters a
+> write amplification needs. [METRICS.md](METRICS.md) lists them, and what is
+> still owed: the caches' usage, disk I/O, an estimate of the records held,
+> and the two write stalls, which arrive with the waiting they count.
+>
+> [nanometer]: https://docs.rs/nanometer
+>
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
 > other way, the latter with a real WAL and MANIFEST; `harness/batch-repr`
@@ -913,7 +923,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
 | `SyncData`, `UseWAL` | `Sync` on commit, and `disable_wal` in `Options` (§4) |
-| Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina |
+| Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina ([METRICS.md](METRICS.md)) |
 
 ## 12. Testing
 

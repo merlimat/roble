@@ -99,6 +99,23 @@ pub struct Opened<'a, F: Fs> {
     markers: std::cell::RefCell<Vec<String>>,
     /// How large the MANIFEST may grow before a flush replaces it.
     max_manifest_bytes: u64,
+    /// What this store records, if anything (`crate::metrics`).
+    ///
+    /// Shared rather than owned outright because a scan outlives the call
+    /// that made it and counts the keys it steps onto as it goes.
+    pub(crate) metrics: std::rc::Rc<crate::metrics::Metrics>,
+    /// How many entries each table is known to hold, learned when it is
+    /// opened, and their total for the tables the version names.
+    ///
+    /// The records a store holds is not a number any MANIFEST records: it is
+    /// in each table's properties block, which is read when the table is
+    /// opened. So rather than opening every table at once — which would make
+    /// an open pay for a metric — a store learns a table's count the first
+    /// time something has reason to read it, and the estimate climbs to the
+    /// truth as the store is used. A flush and a compaction know their own
+    /// outputs outright, so a store that writes is exact from the start.
+    table_entries: std::cell::RefCell<std::collections::BTreeMap<u64, u64>>,
+    records_in_tables: std::cell::Cell<u64>,
     /// What the picker allows L0 and L1 to hold (`crate::pick`).
     l0_compaction_threshold: u64,
     lbase_max_bytes: u64,
@@ -244,8 +261,20 @@ pub async fn open_with<'a, E: Env>(
         .collect();
     markers.sort();
 
+    let metrics = std::rc::Rc::new(crate::metrics::Metrics::new(&crate::metrics::Meter::new(
+        &options, dir,
+    )));
+    metrics.saw_version(&versions.version);
+    metrics.memtable_size.set(memtable.bytes() as i64);
+    if metrics.recording()
+        && let Ok(usage) = fs.disk_usage(dir).await
+    {
+        metrics.disk_size.set(usage.used_bytes as i64);
+    }
+
     Ok(Opened {
         _lock: lock,
+        metrics,
         fs,
         store_id: options.caches.new_store_id(),
         caches: options.caches,
@@ -259,6 +288,8 @@ pub async fn open_with<'a, E: Env>(
             filename: manifest_filename,
             marker_iter: manifest_marker_iter,
         }),
+        table_entries: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+        records_in_tables: std::cell::Cell::new(0),
         markers: std::cell::RefCell::new(markers),
         max_manifest_bytes: options.max_manifest_bytes,
         l0_compaction_threshold: options.l0_compaction_threshold,
@@ -498,6 +529,13 @@ impl<F: Fs> Opened<'_, F> {
     /// than ignored: nothing but `flush` can make a write durable, and
     /// saying otherwise would be the silent half of a data loss.
     pub async fn write(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
+        let _timer = self.metrics.write.start();
+        let result = self.write_inner(batch, sync).await;
+        self.metrics.write_errors.saw(result)
+    }
+
+    /// The body of [`Opened::write`], so one place counts what it returned.
+    async fn write_inner(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
         // Refused before anything is stamped, so a write that cannot keep
         // its promise changes nothing. Pebble refuses this too, and the
         // reason is the same: with no log there is nowhere for a sync to
@@ -515,6 +553,7 @@ impl<F: Fs> Opened<'_, F> {
         batch.set_seq_num(base);
 
         if !self.disable_wal {
+            let _timer = self.metrics.wal.start();
             // The log, with the borrow released before any waiting: a
             // `RefCell` held across an await is a panic waiting for the
             // first reader that arrives in the middle of a write.
@@ -535,6 +574,7 @@ impl<F: Fs> Opened<'_, F> {
             let framed = writer.as_bytes().to_vec();
             let end = writer.position();
 
+            let written = framed.len();
             let (result, _) = disk
                 .write(
                     crate::buf::WriteBuf::new(framed),
@@ -543,7 +583,9 @@ impl<F: Fs> Opened<'_, F> {
                 )
                 .await;
             result?;
+            self.metrics.written.add(written);
             if sync {
+                let _timer = self.metrics.sync_duration.start();
                 disk.sync(Default::default()).await?;
             }
             if let Some(log) = self.log.borrow_mut().as_mut() {
@@ -553,6 +595,19 @@ impl<F: Fs> Opened<'_, F> {
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
         self.next_seq.set(next);
+
+        for entry in iter_kinds(batch.as_bytes())? {
+            self.metrics.write_operations[entry].add(1);
+        }
+        self.metrics
+            .write_size
+            .record(batch.as_bytes().len() as u64);
+        self.metrics.write_bytes.add(batch.as_bytes().len() as u64);
+        self.metrics.write_entries.record(batch.count() as u64);
+        self.metrics
+            .memtable_size
+            .set(self.unflushed_bytes() as i64);
+        self.saw_records();
         Ok(())
     }
 
@@ -646,6 +701,68 @@ impl<F: Fs> Opened<'_, F> {
         self.markers.borrow_mut().retain(|m| !removed.contains(m));
     }
 
+    /// Takes note of how many entries a table holds.
+    pub(crate) fn saw_table_entries(&self, file_num: u64, entries: Option<u64>) {
+        if !self.metrics.recording() {
+            return;
+        }
+        let Some(entries) = entries else {
+            return;
+        };
+        if self
+            .table_entries
+            .borrow_mut()
+            .insert(file_num, entries)
+            .is_none()
+        {
+            self.recount_records();
+        }
+    }
+
+    /// Re-adds the tables' known counts, dropping those the version has let
+    /// go, and restates the estimate.
+    ///
+    /// Only where the version changes or a table's count is first learned:
+    /// the sum walks every table, and a write must not.
+    pub(crate) fn recount_records(&self) {
+        if !self.metrics.recording() {
+            return;
+        }
+        let live = self.versions().version.table_file_nums();
+        let mut known = self.table_entries.borrow_mut();
+        known.retain(|file_num, _| live.contains(file_num));
+        self.records_in_tables
+            .set(known.values().copied().sum::<u64>());
+        drop(known);
+        self.saw_records();
+    }
+
+    /// Restates the estimate from what the tables and the memtable hold.
+    pub(crate) fn saw_records(&self) {
+        if !self.metrics.recording() {
+            return;
+        }
+        let in_memory = self.memtable().borrow().len() as u64;
+        self.metrics
+            .records
+            .set((self.records_in_tables.get() + in_memory) as i64);
+    }
+
+    /// Restates how much of the disk the directory takes.
+    ///
+    /// Called where files appear or disappear — a flush, a compaction — and
+    /// only when something is recording, since it costs a walk of the
+    /// directory. A failure is dropped rather than reported: a metric that
+    /// could not be measured is not a reason to fail the work it describes.
+    pub(crate) async fn measure_disk(&self) {
+        if !self.metrics.recording() {
+            return;
+        }
+        if let Ok(usage) = self.fs.disk_usage(&self.dir).await {
+            self.metrics.disk_size.set(usage.used_bytes as i64);
+        }
+    }
+
     /// The filesystem this store's files live in.
     pub(crate) fn fs(&self) -> &F {
         self.fs
@@ -698,14 +815,22 @@ impl<F: Fs> Opened<'_, F> {
         file_num: u64,
     ) -> Result<std::rc::Rc<crate::table::OpenTable<F::Disk>>> {
         if let Some(held) = self.caches.table(self.store_id, file_num) {
+            self.metrics.cache_lookups[crate::metrics::TABLE_HIT].add(1);
             return Ok(held);
         }
+        self.metrics.cache_lookups[crate::metrics::TABLE_MISS].add(1);
         let path = self.dir.join(roble_format::files::table_filename(file_num));
         let disk = self.fs.open(&path, Access::ReadOnly).await?;
         let table = std::rc::Rc::new(
-            crate::table::OpenTable::open(file_num, disk, self.caches.blocks(self.store_id))
-                .await?,
+            crate::table::OpenTable::open_metered(
+                file_num,
+                disk,
+                self.caches.blocks(self.store_id),
+                Some(std::rc::Rc::clone(&self.metrics)),
+            )
+            .await?,
         );
+        self.saw_table_entries(file_num, table.entries);
         self.caches
             .hold_table(self.store_id, file_num, std::rc::Rc::clone(&table));
         Ok(table)
@@ -756,4 +881,24 @@ fn internal_key(encoded: &[u8]) -> Result<String> {
     let k = roble_format::InternalKey::decode(encoded)?;
     let hex: String = k.user_key.iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("{hex} #{} {}", k.seq_num, k.kind.name()))
+}
+
+/// Which of `write_operations`' three counters each entry of a batch belongs
+/// to: put, delete, or range delete.
+///
+/// Read off the representation rather than counted as the caller builds it,
+/// because a batch reaches `write` from several places — an indexed batch, a
+/// log replay, a caller's own — and only the bytes are common to all of them.
+fn iter_kinds(repr: &[u8]) -> Result<Vec<usize>> {
+    use roble_format::key::Kind;
+    let mut reader = roble_format::batch::Batch::read(repr)?;
+    let mut out = Vec::new();
+    while let Some(entry) = reader.next() {
+        out.push(match entry?.kind {
+            Kind::RangeDelete => 2,
+            Kind::Delete | Kind::SingleDelete | Kind::DeleteSized => 1,
+            _ => 0,
+        });
+    }
+    Ok(out)
 }

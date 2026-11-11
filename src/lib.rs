@@ -33,6 +33,7 @@ pub mod compact;
 pub mod env;
 pub mod flush;
 pub mod memtable;
+mod metrics;
 pub mod obsolete;
 pub mod open;
 pub mod options;
