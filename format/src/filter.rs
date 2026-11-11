@@ -102,6 +102,27 @@ pub struct Filter<'a> {
 }
 
 impl<'a> Filter<'a> {
+    /// The filter in `block`, or `None` when there is none to consult.
+    ///
+    /// A zero-length block is what Pebble writes when a table has no point
+    /// key to put in a filter — a flush whose only content is a range
+    /// deletion leaves `rocksdb.filter.size 0` and a metaindex entry pointing
+    /// at nothing. Pebble's own reader answers "no" to every key from such a
+    /// block, which is right for that table and wrong for any other, so roble
+    /// declines to consult it rather than trust a filter that excludes
+    /// everything: the caller reads the table and finds the point keys it
+    /// has, which is none. The answers are the same either way; what differs
+    /// is what a wrong guess would cost.
+    ///
+    /// A block that is short but not empty is still refused by
+    /// [`Filter::new`]. That is a malformed filter, not an empty one.
+    pub fn from_block(block: &'a [u8]) -> Result<Option<Self>> {
+        if block.is_empty() {
+            return Ok(None);
+        }
+        Self::new(block).map(Some)
+    }
+
     /// Validates a filter block.
     ///
     /// Everything probing needs is checked once here, so [`Filter::may_contain`]
@@ -247,6 +268,30 @@ impl FilterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_filter_block_is_no_filter_but_a_short_one_is_refused() {
+        // Pebble writes a zero-length filter block for a table with no point
+        // key — a flush whose only content is a range deletion. Refusing it
+        // would make such a table unreadable; trusting it as a filter would
+        // exclude every key in it.
+        assert!(matches!(Filter::from_block(&[]), Ok(None)));
+
+        // Short but not empty is malformed, and stays refused: there is no
+        // length between 1 and 5 that Pebble ever writes.
+        for n in 1..=5 {
+            assert!(
+                Filter::from_block(&vec![0u8; n]).is_err(),
+                "a {n}-byte filter block should be refused"
+            );
+        }
+
+        // One byte past the trailer is a filter again, and from_block hands
+        // it back rather than swallowing it.
+        let mut builder = FilterBuilder::new(DEFAULT_BITS_PER_KEY);
+        builder.add_key(b"k");
+        assert!(matches!(Filter::from_block(&builder.finish()), Ok(Some(_))));
+    }
 
     #[test]
     fn probe_counts_match_pebbles() {

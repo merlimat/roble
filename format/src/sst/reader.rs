@@ -271,7 +271,10 @@ impl<'a> Table<'a> {
         let Some(block) = self.filter_block()? else {
             return Ok(true);
         };
-        Ok(crate::filter::Filter::new(block.as_slice())?.may_contain(user_key))
+        Ok(match crate::filter::Filter::from_block(block.as_slice())? {
+            Some(filter) => filter.may_contain(user_key),
+            None => true,
+        })
     }
 
     /// Calls `f` with the first entry at or after `target`, and returns

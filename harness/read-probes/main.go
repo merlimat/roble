@@ -43,6 +43,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
@@ -145,13 +146,7 @@ func build(dir string) ([][]byte, error) {
 	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
 		return pebble.DBCompressionNone
 	})
-	// Small blocks, so every table holds several of them.
-	//
-	// With one data block per table every block sits at offset 0, and a block
-	// cache that lost the offset from its key would still find the right
-	// block every time — the fixture would look like it exercised the cache
-	// and would not.
-	smallBlocks(opts)
+	levelOptions(opts)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return nil, err
@@ -325,11 +320,23 @@ func build(dir string) ([][]byte, error) {
 	return keys, db.Close()
 }
 
-// smallBlocks makes each level write small data blocks.
-func smallBlocks(o *pebble.Options) {
+// levelOptions sets what every level of this fixture needs.
+//
+// Small data blocks, so each table holds several of them: with one block per
+// table every block sits at offset 0, and a block cache that lost the offset
+// from its key would still find the right block every time.
+//
+// A bloom filter at Oxia's 10 bits per key, so that the tables carry one at
+// all. Without it `get` consults no filter — `may_contain` returns true
+// without looking, and the fast path §6 describes, where a filter rules a
+// table out and no block is read for it, never runs. A filter is an
+// optimisation, so no probe answer may change because of this; that it does
+// not is the thing worth checking.
+func levelOptions(o *pebble.Options) {
 	for i := range o.Levels {
 		o.Levels[i].BlockSize = 128
 		o.Levels[i].IndexBlockSize = 128
+		o.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
 	}
 }
 
@@ -371,7 +378,7 @@ func probe(dir string, keys [][]byte) (string, error) {
 	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
 		return pebble.DBCompressionNone
 	})
-	smallBlocks(opts)
+	levelOptions(opts)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return "", err
@@ -431,7 +438,7 @@ func scanDump(dir string, keys [][]byte) (string, error) {
 	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
 		return pebble.DBCompressionNone
 	})
-	smallBlocks(opts)
+	levelOptions(opts)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return "", err
