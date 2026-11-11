@@ -176,9 +176,9 @@ impl<D: Disk> OpenTable<D> {
             let bytes = self.block(entry.handle).await?;
             let block = Block::new(&bytes)?;
             let mut cursor = block.data_cursor(self.footer.format);
-            cursor.seek_ge(target)?;
+            cursor.seek_ge(&block, target)?;
             if cursor.is_valid() {
-                return Ok(Some(self.entry(&cursor).await?));
+                return Ok(Some(self.entry(&block, &cursor).await?));
             }
             // The target fell past this block's last key; the answer, if any,
             // is the next block's first entry.
@@ -197,9 +197,9 @@ impl<D: Disk> OpenTable<D> {
             let bytes = self.block(self.index[i].handle).await?;
             let block = Block::new(&bytes)?;
             let mut cursor = block.data_cursor(self.footer.format);
-            cursor.seek_lt(target)?;
+            cursor.seek_lt(&block, target)?;
             if cursor.is_valid() {
-                return Ok(Some(self.entry(&cursor).await?));
+                return Ok(Some(self.entry(&block, &cursor).await?));
             }
             if i == 0 {
                 return Ok(None);
@@ -209,8 +209,12 @@ impl<D: Disk> OpenTable<D> {
     }
 
     /// Takes the entry a cursor is on, following a value-block handle.
-    async fn entry(&self, cursor: &roble_format::block::restart::DataCursor<'_>) -> Result<Entry> {
-        let decoded = cursor.entry()?;
+    async fn entry(
+        &self,
+        block: &Block<'_>,
+        cursor: &roble_format::block::restart::DataCursor,
+    ) -> Result<Entry> {
+        let decoded = cursor.entry(block)?;
         check_kind(decoded.key)?;
         let key = cursor.raw_key().to_vec();
         let value = match decoded.value {
@@ -275,4 +279,182 @@ async fn fetch<D: Disk>(
 /// Decodes an entry's key, for a caller that has one of this module's entries.
 pub fn decode_key(encoded: &[u8]) -> Result<InternalKey<'_>> {
     Ok(InternalKey::decode(encoded)?)
+}
+
+/// A position in one table that survives between calls.
+///
+/// This is what the lifetime-free cursor is for. The iterator owns the current
+/// block's bytes — an `Rc` into the block cache — and a cursor beside them,
+/// which a cursor that borrowed its block could not do.
+///
+/// Stepping off either end of a block moves to the next or previous one, so a
+/// caller sees one sequence rather than a sequence of blocks. Reverse is
+/// dearer than forward for the reason §4 gives: within a block, stepping back
+/// rescans from a restart point.
+pub struct TableIter<D: Disk> {
+    table: Rc<OpenTable<D>>,
+    /// Which data block the cursor is in.
+    at: usize,
+    /// That block's bytes, once loaded.
+    bytes: Option<Rc<Vec<u8>>>,
+    cursor: roble_format::block::restart::DataCursor,
+}
+
+impl<D: Disk> OpenTable<D> {
+    /// An iterator over this table, positioned nowhere.
+    pub fn iter(self: &Rc<Self>) -> TableIter<D> {
+        TableIter {
+            cursor: roble_format::block::restart::DataCursor::new(self.footer.format),
+            table: Rc::clone(self),
+            at: 0,
+            bytes: None,
+        }
+    }
+}
+
+impl<D: Disk> TableIter<D> {
+    /// Whether the iterator is on an entry.
+    pub fn is_valid(&self) -> bool {
+        self.cursor.is_valid()
+    }
+
+    /// The encoded internal key it is on.
+    ///
+    /// # Panics
+    /// If it is not on an entry.
+    pub fn key(&self) -> &[u8] {
+        self.cursor.raw_key()
+    }
+
+    /// The entry it is on, with any value-block handle followed.
+    pub async fn entry(&self) -> Result<Entry> {
+        let bytes = self.bytes.as_ref().expect("positioned").clone();
+        let block = Block::new(&bytes)?;
+        self.table.entry(&block, &self.cursor).await
+    }
+
+    /// Loads block `at`, leaving the cursor unpositioned within it.
+    async fn load(&mut self, at: usize) -> Result<()> {
+        let handle = self.table.index[at].handle;
+        self.bytes = Some(self.table.block(handle).await?);
+        self.at = at;
+        Ok(())
+    }
+
+    /// The block currently loaded.
+    fn block(bytes: &Rc<Vec<u8>>) -> Result<Block<'_>> {
+        Ok(Block::new(bytes)?)
+    }
+
+    /// Positions on the table's first entry.
+    pub async fn first(&mut self) -> Result<()> {
+        if self.table.index.is_empty() {
+            return Ok(());
+        }
+        self.load(0).await?;
+        let bytes = self.bytes.clone().expect("loaded");
+        self.cursor.first(&Self::block(&bytes)?)?;
+        // A block with no entries would leave the cursor invalid; step on.
+        if !self.cursor.is_valid() {
+            self.next().await?;
+        }
+        Ok(())
+    }
+
+    /// Positions on the table's last entry.
+    pub async fn last(&mut self) -> Result<()> {
+        if self.table.index.is_empty() {
+            return Ok(());
+        }
+        self.load(self.table.index.len() - 1).await?;
+        let bytes = self.bytes.clone().expect("loaded");
+        self.cursor.last(&Self::block(&bytes)?)?;
+        if !self.cursor.is_valid() {
+            self.prev().await?;
+        }
+        Ok(())
+    }
+
+    /// Steps forward, crossing into the next block at the end of this one.
+    #[allow(clippy::should_implement_trait)]
+    pub async fn next(&mut self) -> Result<()> {
+        if self.cursor.is_valid() {
+            let bytes = self.bytes.clone().expect("positioned");
+            self.cursor.next(&Self::block(&bytes)?)?;
+            if self.cursor.is_valid() {
+                return Ok(());
+            }
+        }
+        // Off the end of this block: the next entry is the next block's
+        // first. A loop rather than one step, because a block with no entries
+        // would otherwise end the iteration early.
+        while self.at + 1 < self.table.index.len() {
+            self.load(self.at + 1).await?;
+            let bytes = self.bytes.clone().expect("loaded");
+            self.cursor.first(&Self::block(&bytes)?)?;
+            if self.cursor.is_valid() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Steps backward, crossing into the previous block at the start of this
+    /// one.
+    pub async fn prev(&mut self) -> Result<()> {
+        if self.cursor.is_valid() {
+            let bytes = self.bytes.clone().expect("positioned");
+            self.cursor.prev(&Self::block(&bytes)?)?;
+            if self.cursor.is_valid() {
+                return Ok(());
+            }
+        }
+        while self.at > 0 {
+            self.load(self.at - 1).await?;
+            let bytes = self.bytes.clone().expect("loaded");
+            self.cursor.last(&Self::block(&bytes)?)?;
+            if self.cursor.is_valid() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Positions on the first entry at or after `target`.
+    pub async fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        let start = first_block_at_or_after(&self.table.index, target)?;
+        if start >= self.table.index.len() {
+            // Past every separator: nothing in this table reaches the target.
+            self.load(self.table.index.len().saturating_sub(1)).await?;
+            self.cursor = roble_format::block::restart::DataCursor::new(self.table.footer.format);
+            return Ok(());
+        }
+        self.load(start).await?;
+        let bytes = self.bytes.clone().expect("loaded");
+        self.cursor.seek_ge(&Self::block(&bytes)?, target)?;
+        if !self.cursor.is_valid() {
+            // The target fell past this block's last key; the answer, if any,
+            // is the next block's first entry.
+            self.next().await?;
+        }
+        Ok(())
+    }
+
+    /// Positions on the last entry before `target`.
+    pub async fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
+        if self.table.index.is_empty() {
+            return Ok(());
+        }
+        let start = first_block_at_or_after(&self.table.index, target)?;
+        let at = start.min(self.table.index.len() - 1);
+        self.load(at).await?;
+        let bytes = self.bytes.clone().expect("loaded");
+        self.cursor.seek_lt(&Self::block(&bytes)?, target)?;
+        if !self.cursor.is_valid() {
+            // Every key in this block is at or past the target; the answer is
+            // the previous block's last entry.
+            self.prev().await?;
+        }
+        Ok(())
+    }
 }

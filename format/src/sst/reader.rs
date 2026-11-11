@@ -297,9 +297,9 @@ impl<'a> Table<'a> {
             let decoded = self.decode_block(entry.handle)?;
             let block = Block::new(decoded.as_slice())?;
             let mut cursor = block.data_cursor(self.footer.format);
-            cursor.seek_ge(target)?;
+            cursor.seek_ge(&block, target)?;
             if cursor.is_valid() {
-                let entry = cursor.entry()?;
+                let entry = cursor.entry(&block)?;
                 check_kind(entry.key)?;
                 f(entry.key, entry.value)?;
                 return Ok(true);
@@ -329,9 +329,9 @@ impl<'a> Table<'a> {
             let decoded = self.decode_block(index[i].handle)?;
             let block = Block::new(decoded.as_slice())?;
             let mut cursor = block.data_cursor(self.footer.format);
-            cursor.seek_lt(target)?;
+            cursor.seek_lt(&block, target)?;
             if cursor.is_valid() {
-                let entry = cursor.entry()?;
+                let entry = cursor.entry(&block)?;
                 check_kind(entry.key)?;
                 f(entry.key, entry.value)?;
                 return Ok(true);
