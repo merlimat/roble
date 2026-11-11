@@ -34,6 +34,12 @@
 > model-based tests against a `BTreeMap` are worth having: the oracle is only
 > interesting because a skiplist reaches the same answer by a different route.
 >
+> It now takes a **batch**: entry `i` of a batch committed at `s` gets `s + i`,
+> which is what makes a later write in the same batch win, and range deletions
+> go to a list of their own rather than among the point keys. Nothing calls it
+> yet — `write` and the read path's view of unflushed writes are the next
+> piece.
+>
 > A log that still holds writes is **refused** until replay lands, since
 > opening without it would discard writes that were already acknowledged.
 >
@@ -330,8 +336,12 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   behind. With `disable_wal` none of this exists and `flush()` is the only
   durability point (§4, §6).
 - **Memtables are skiplists over an arena**, keyed by internal key (user key,
-  sequence number, kind). Range deletions get a skiplist of their own, as in
-  Pebble, so a point read never walks tombstones it doesn't need. A
+  sequence number, kind). Range deletions are kept apart from the point keys,
+  as in Pebble, so a point read never walks tombstones it doesn't need. Pebble
+  gives them a skiplist of their own; roble keeps them in a list sorted by
+  start key, which serves that reason at a memtable's scale — a 4 MiB arena
+  holds few tombstones, and they are searched rather than walked. A second
+  skiplist replaces it the day a workload shows it needs one. A
   full memtable becomes immutable and queues for flush; the arena is released
   when its table is written.
 - **Versions are immutable and reference counted.** A version is the set of

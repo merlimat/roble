@@ -279,3 +279,223 @@ fn a_key_that_is_not_an_internal_key_is_refused() {
     );
     assert!(it.seek_lt(b"short").is_err());
 }
+
+// ------------------------------------------------------------ applying a batch
+
+use roble_format::batch::Batch;
+
+/// The first entry the memtable holds for `user`, which is its newest version.
+fn newest(table: &Memtable, user: &[u8]) -> Option<(u64, Kind, Vec<u8>)> {
+    let mut it = table.iter();
+    it.seek_ge(&key::search_key(user)).expect("seek");
+    if !it.is_valid() {
+        return None;
+    }
+    let k = roble_format::InternalKey::decode(it.key()).expect("decode");
+    if k.user_key != user {
+        return None;
+    }
+    Some((k.seq_num, k.kind, it.value().to_vec()))
+}
+
+#[test]
+fn a_batch_lands_in_the_memtable_with_ascending_sequence_numbers() {
+    let mut b = Batch::new();
+    b.put(b"alpha", b"one").expect("put");
+    b.delete(b"bravo").expect("delete");
+    b.put(b"charlie", b"three").expect("put");
+
+    let mut table = Memtable::new(1);
+    let next = table.apply(b.as_bytes(), 100).expect("apply");
+
+    assert_eq!(next, 103, "three entries from 100 leaves the next at 103");
+    assert_eq!(table.len(), 3);
+    assert_eq!(
+        newest(&table, b"alpha"),
+        Some((100, Kind::Set, b"one".to_vec()))
+    );
+    assert_eq!(
+        newest(&table, b"bravo"),
+        Some((101, Kind::Delete, Vec::new())),
+        "a delete carries no value"
+    );
+    assert_eq!(
+        newest(&table, b"charlie"),
+        Some((102, Kind::Set, b"three".to_vec()))
+    );
+}
+
+#[test]
+fn the_later_write_in_a_batch_wins() {
+    // Entry i gets base + i, and the memtable orders newest first, so the
+    // second put is the one a read meets. This is the whole reason the
+    // numbering is per entry rather than per batch.
+    let mut b = Batch::new();
+    b.put(b"k", b"first").expect("put");
+    b.put(b"k", b"second").expect("put");
+    b.delete(b"gone").expect("delete");
+    b.put(b"gone", b"back").expect("put");
+
+    let mut table = Memtable::new(1);
+    table.apply(b.as_bytes(), 1).expect("apply");
+
+    assert_eq!(
+        newest(&table, b"k"),
+        Some((2, Kind::Set, b"second".to_vec()))
+    );
+    assert_eq!(
+        newest(&table, b"gone"),
+        Some((4, Kind::Set, b"back".to_vec())),
+        "the put after the delete is the newer entry"
+    );
+    assert_eq!(table.len(), 4, "every version is kept, not just the winner");
+}
+
+#[test]
+fn range_deletions_are_kept_apart_from_the_point_keys() {
+    // §6: a reader that walks data blocks alone must see a table with
+    // tombstones as though it had none. The same holds in a memtable.
+    let mut b = Batch::new();
+    b.put(b"a", b"v").expect("put");
+    b.delete_range(b"m", b"p").expect("delete_range");
+    b.put(b"z", b"v").expect("put");
+
+    let mut table = Memtable::new(1);
+    table.apply(b.as_bytes(), 7).expect("apply");
+
+    assert_eq!(table.len(), 2, "the tombstone is not a point key");
+    assert_eq!(table.tombstones().len(), 1);
+    let t = &table.tombstones()[0];
+    assert_eq!(t.start, b"m");
+    assert_eq!(t.end, b"p");
+    assert_eq!(t.seq_num, 8, "it took the sequence number of its position");
+
+    // Walking the point keys meets no tombstone.
+    let mut it = table.iter();
+    it.first();
+    let mut kinds = Vec::new();
+    while it.is_valid() {
+        kinds.push(
+            roble_format::InternalKey::decode(it.key())
+                .expect("decode")
+                .kind,
+        );
+        it.next();
+    }
+    assert_eq!(kinds, vec![Kind::Set, Kind::Set]);
+}
+
+#[test]
+fn tombstones_are_kept_sorted_by_where_they_start() {
+    let mut b = Batch::new();
+    for (start, end) in [
+        (&b"m"[..], &b"p"[..]),
+        (b"a", b"c"),
+        (b"x", b"z"),
+        (b"d", b"f"),
+    ] {
+        b.delete_range(start, end).expect("delete_range");
+    }
+    let mut table = Memtable::new(1);
+    table.apply(b.as_bytes(), 1).expect("apply");
+
+    let starts: Vec<&[u8]> = table
+        .tombstones()
+        .iter()
+        .map(|t| t.start.as_slice())
+        .collect();
+    assert_eq!(starts, [&b"a"[..], b"d", b"m", b"x"]);
+}
+
+#[test]
+fn a_batch_roble_cannot_serve_is_refused() {
+    // MERGE is the one Oxia configures no merger for; roble refuses it on the
+    // way in rather than storing something it cannot later resolve.
+    let mut b = Batch::new();
+    b.put(b"k", b"v").expect("put");
+    // The format crate has no `merge`, so the repr is built by hand: kind 2,
+    // then key and value, with the count raised to match.
+    let mut repr = b.as_bytes().to_vec();
+    repr.push(Kind::Merge.to_byte());
+    repr.push(1);
+    repr.push(b'm');
+    repr.push(1);
+    repr.push(b'v');
+    let count = u32::from_le_bytes(repr[8..12].try_into().unwrap()) + 1;
+    repr[8..12].copy_from_slice(&count.to_le_bytes());
+
+    let mut table = Memtable::new(1);
+    match table.apply(&repr, 1) {
+        Err(roble::Error::Unsupported(m)) => assert!(m.contains("merge"), "got: {m}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_truncated_batch_is_refused() {
+    let mut table = Memtable::new(1);
+    assert!(table.apply(b"short", 1).is_err(), "no header");
+
+    let mut b = Batch::new();
+    b.put(b"k", b"v").expect("put");
+    let repr = b.as_bytes();
+    assert!(
+        table.apply(&repr[..repr.len() - 1], 1).is_err(),
+        "an entry cut short"
+    );
+}
+
+/// Builds a batch repr by hand with one range deletion, so the bounds can be
+/// anything — the format crate's `delete_range` will not build a bad one.
+fn hand_built_range(start: &[u8], end: &[u8]) -> Vec<u8> {
+    let mut repr = vec![0u8; 12];
+    repr[8..12].copy_from_slice(&1u32.to_le_bytes());
+    repr.push(Kind::RangeDelete.to_byte());
+    repr.push(start.len() as u8);
+    repr.extend_from_slice(start);
+    repr.push(end.len() as u8);
+    repr.extend_from_slice(end);
+    repr
+}
+
+#[test]
+fn an_empty_range_deletion_is_dropped_rather_than_refused() {
+    // Pebble's DeleteRange(a, a) is legal and covers nothing, and roble
+    // applies batches that came out of Pebble's own WAL — so refusing one
+    // would mean refusing a database Pebble wrote.
+    let mut table = Memtable::new(1);
+    let next = table
+        .apply(&hand_built_range(b"m", b"m"), 5)
+        .expect("an empty range is not an error");
+
+    assert_eq!(next, 6, "it still consumed its sequence number");
+    assert!(
+        table.tombstones().is_empty(),
+        "a tombstone covering nothing has nothing to say"
+    );
+}
+
+#[test]
+fn a_reversed_range_deletion_is_refused() {
+    let mut table = Memtable::new(1);
+    match table.apply(&hand_built_range(b"m", b"a"), 1) {
+        Err(roble::Error::Corrupt(m)) => {
+            assert!(m.contains("ends before it starts"), "got: {m}")
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_arena_counts_a_tombstone_from_where_it_is_held() {
+    let mut table = Memtable::new(1);
+    let before = table.bytes();
+    table
+        .apply(&hand_built_range(b"aaa", b"zzzz"), 1)
+        .expect("apply");
+    assert_eq!(
+        table.bytes() - before,
+        b"aaa".len() + b"zzzz".len(),
+        "the budget has to see a tombstone's bytes, wherever they live"
+    );
+}

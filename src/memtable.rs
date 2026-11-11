@@ -39,7 +39,8 @@
 
 use std::cmp::Ordering;
 
-use roble_format::key::{self, TRAILER_LEN};
+use roble_format::key::{self, Kind, TRAILER_LEN};
+use roble_format::rangedel::Tombstone;
 
 use crate::error::{Error, Result};
 
@@ -83,6 +84,14 @@ fn order(a: &[u8], b: &[u8]) -> Ordering {
 
 /// A memtable.
 pub struct Memtable {
+    /// Range deletions, kept apart from the point keys and sorted by start.
+    ///
+    /// §4 gives these a skiplist of their own "so a point read never walks
+    /// tombstones it doesn't need". A sorted `Vec` serves that reason at a
+    /// memtable's scale — a 4 MiB arena holds few tombstones, and they are
+    /// searched, not walked — and a second skiplist can replace it the day a
+    /// workload shows it needs one.
+    ranges: Vec<Tombstone>,
     arena: Vec<u8>,
     nodes: Vec<Node>,
     links: Vec<u32>,
@@ -97,6 +106,7 @@ impl Memtable {
     /// An empty memtable whose shape is determined by `seed`.
     pub fn new(seed: u64) -> Self {
         Memtable {
+            ranges: Vec::new(),
             arena: Vec::new(),
             nodes: Vec::new(),
             links: Vec::new(),
@@ -126,8 +136,15 @@ impl Memtable {
     /// Keys and values only: this is what the memtable's size budget counts,
     /// and it is exact rather than estimated. Replacing a value leaves the old
     /// bytes behind and they stay counted, which is the truth about the arena.
+    ///
+    /// Range deletions are counted too, from where they are actually held.
     pub fn bytes(&self) -> usize {
         self.arena.len()
+            + self
+                .ranges
+                .iter()
+                .map(|t| t.start.len() + t.end.len())
+                .sum::<usize>()
     }
 
     /// The key of node `i`.
@@ -259,6 +276,84 @@ impl Memtable {
             self.height = height;
         }
         Ok(())
+    }
+
+    /// Its range deletions, sorted by start key.
+    pub fn tombstones(&self) -> &[Tombstone] {
+        &self.ranges
+    }
+
+    /// Adds a range deletion.
+    fn insert_range(&mut self, start: &[u8], end: &[u8], seq_num: u64) {
+        // The bounds are not copied into the arena: the tombstone owns them,
+        // and appending them as well would store every tombstone twice for
+        // the sake of a counter. `bytes` adds them up instead.
+        let at = self.ranges.partition_point(|t| t.start.as_slice() < start);
+        self.ranges.insert(
+            at,
+            Tombstone {
+                start: start.to_vec(),
+                end: end.to_vec(),
+                seq_num,
+            },
+        );
+    }
+
+    /// Applies a batch representation, giving entry `i` sequence number
+    /// `base + i`.
+    ///
+    /// That numbering is Pebble's: a batch is committed at one sequence
+    /// number and its entries take the ones after it in order, which is what
+    /// makes a later write in the same batch win over an earlier one for the
+    /// same key.
+    ///
+    /// Point keys go to the skiplist and range deletions to the list beside
+    /// it — never interleaved, since a reader that walks point keys must not
+    /// meet a tombstone among them (§6).
+    pub fn apply(&mut self, repr: &[u8], base: u64) -> Result<u64> {
+        let mut reader = roble_format::batch::Batch::read(repr)?;
+        let mut seq = base;
+        while let Some(entry) = reader.next() {
+            let entry = entry?;
+            match entry.kind {
+                Kind::RangeDelete => {
+                    let end = entry.value.ok_or_else(|| {
+                        Error::Corrupt("a range deletion with no end key".to_string())
+                    })?;
+                    // An **empty** range is not an error. Pebble's
+                    // `DeleteRange(a, a)` is legal and covers nothing, and
+                    // roble applies batches that came out of Pebble's own
+                    // WAL — so refusing one would mean refusing a database
+                    // Pebble wrote. It is dropped rather than stored, since a
+                    // tombstone covering nothing has nothing to say.
+                    //
+                    // A **reversed** range is malformed, and that is refused.
+                    match end.cmp(entry.key) {
+                        std::cmp::Ordering::Less => {
+                            return Err(Error::Corrupt(format!(
+                                "a range deletion from {:02x?} to {:02x?}, which ends \
+                                 before it starts",
+                                entry.key, end
+                            )));
+                        }
+                        std::cmp::Ordering::Equal => {}
+                        std::cmp::Ordering::Greater => self.insert_range(entry.key, end, seq),
+                    }
+                }
+                kind => {
+                    if !kind.is_accepted() || kind == Kind::Merge {
+                        return Err(Error::Unsupported(format!(
+                            "a batch entry of kind {}, which roble does not serve",
+                            kind.name()
+                        )));
+                    }
+                    let key = key::encode(entry.key, seq, kind);
+                    self.insert(&key, entry.value.unwrap_or(&[]))?;
+                }
+            }
+            seq += 1;
+        }
+        Ok(seq)
     }
 
     /// An iterator over the memtable, positioned nowhere.
