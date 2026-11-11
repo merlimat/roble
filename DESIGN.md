@@ -50,21 +50,23 @@
 > leave unflushed, taking each batch's own sequence number, and carries on
 > writing where the replay stopped.
 >
-And **flush**: the memtable written out as a table, the table and the log
+> And **flush**: the memtable written out as a table, the table and the log
 > that follows it made durable, and then a version edit appended to the
-> MANIFEST — after which the table is the database's and the old log can be
-> retired.
+> MANIFEST — after which the table is the database's and the old log is
+> retired. **Collecting what the database no longer refers to** closes that
+> last step: a flush deletes the log it replaced, and an open deletes the
+> table an interrupted flush left behind. Nothing else goes, and a name roble
+> cannot parse is never touched.
 >
-> Three gates hold it up. **A crash replays** to the last synced write and no
+> Four gates hold it up. **A crash replays** to the last synced write and no
 > further. **Go Pebble replays the log roble wrote**, when nothing has been
 > flushed, so every key it finds came out of the log. And **Go Pebble reads
 > the table roble wrote, through the MANIFEST roble appended**, when the same
 > writes have been flushed — the MANIFEST's `min_unflushed_log_num` has moved
 > past roble's log by then, so Pebble does not replay it and the keys can
-> only have come from the table. **That closes M3's round trip.**
->
-> A log that still holds writes is **refused** until replay lands, since
-> opening without it would discard writes that were already acknowledged.
+> only have come from the table. **That closes M3's round trip.** The fourth
+> guards the deletions: **Go Pebble reads a database roble has deleted from**,
+> after roble opens one and does nothing but collect.
 >
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
@@ -382,10 +384,16 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   §6 says what it must not do.
 - **One flush and one compaction at a time per store**, both cooperative, so a
   write never waits on a compaction's merge for more than a slice of work (§9).
-- **Obsolete files are deleted after the version that referenced them is
-  dropped**, by file number, with the directory synced. Getting this wrong
-  either leaks files or makes a reader read a deleted one, so it is checked by
-  the invariant checker after every step (§12).
+- **Obsolete files are deleted only after the edit that retired them is
+  durable**: at the end of a flush, and at an open, where the MANIFEST just
+  replayed is as durable as it gets. A table goes when the current version
+  names it at no level; a log goes when its number is below
+  `min_unflushed_log_num`; everything else stays, including every name roble
+  cannot parse. The directory is **not** synced afterwards, as Pebble does not
+  either — an unlink a crash undoes brings back a file that is still obsolete,
+  and the next sweep finds it again. Getting this wrong either leaks files or
+  makes a reader read a deleted one, so it is checked by the invariant checker
+  after every step (§12).
 
 ## 6. Operations
 
@@ -535,7 +543,8 @@ MANIFEST ever committed, which is what §6's version check refuses.
 `flush()` makes the memtable an immutable one, writes it as a table, appends the
 version edit — carrying the new minimum unflushed log number — and syncs: the
 point at which Oxia's data becomes durable. The logs below that number are then
-obsolete, and are deleted like any other obsolete file.
+obsolete, and are deleted like any other obsolete file — including one Pebble
+had kept back to recycle, which roble does not do and so has no use for.
 
 `snapshot()` pins a version and a sequence number. `checkpoint(dir)` writes a
 directory Go Pebble opens: hard links to the live tables, a fresh MANIFEST

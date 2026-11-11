@@ -19,6 +19,10 @@
 // out of the log. Pebble finding them means Pebble replayed roble's record
 // framing, roble's batch representation and roble's sequence numbers — the
 // M3 gate of DESIGN.md §13, in the direction that matters most.
+//
+// In `swept` mode roble wrote nothing and deleted instead, and the keys are
+// every key roble can still read. Pebble finding all of them is the claim
+// that the files roble collected took nothing with them.
 package main
 
 import (
@@ -36,7 +40,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed]")
+		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|swept]")
 		os.Exit(2)
 	}
 	dir := os.Args[1]
@@ -110,9 +114,12 @@ func main() {
 	// Which claim this run made depends on where the keys had to come from.
 	// Flushed, the MANIFEST's min_unflushed has moved past the log roble
 	// wrote, so Pebble does not replay it: every key came out of the table.
-	if mode == "flushed" {
+	switch mode {
+	case "flushed":
 		fmt.Println("\nVERDICT: Go Pebble reads the table roble wrote, through the MANIFEST roble appended")
-	} else {
+	case "swept":
+		fmt.Println("\nVERDICT: Go Pebble reads a database roble has deleted obsolete files from")
+	default:
 		fmt.Println("\nVERDICT: Go Pebble replays the log roble wrote, key for key")
 	}
 }
