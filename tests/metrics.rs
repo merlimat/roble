@@ -721,6 +721,119 @@ async fn the_caches_report_what_they_hold_and_the_store_what_it_looked_for() {
 }
 
 #[compio::test]
+async fn a_compaction_does_not_fill_the_block_cache() {
+    // The thing this is for: a compaction reads every block of its inputs
+    // once and never comes back, so the blocks the foreground is reading have
+    // to still be there afterwards.
+    let cache_tag = KeyValue::new("case", "no-pollution");
+    // Room for a few blocks and nothing like the table written below, so a
+    // compaction that filled the cache would certainly push the foreground's
+    // blocks out.
+    let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, 16 << 10)
+        .meter_provider(&METRICS.0, std::slice::from_ref(&cache_tag));
+
+    let (options, tag) = metered("no-pollution-store");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options.caches(caches))
+        .await
+        .expect("open");
+
+    // Something worth compacting: 200 keys of 200 bytes, well past the cache.
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..200 {
+        batch
+            .put(format!("p{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+
+    // The foreground reads a key of the *fixture's* table, which this
+    // compaction does not touch — a key of the compacted table would be in a
+    // different file afterwards, and missing for that reason rather than for
+    // having been evicted.
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let before = lookups(reader(), &tag, "block");
+    assert!(before["hit"] > 0, "the second read hit: {before:?}");
+    let held = by_attr(reader(), &cache_tag, "roble.cache.usage", "roble.cache")["block"];
+    assert!(held > 0, "and the cache holds it");
+
+    db.compact(0, &[table]).await.expect("compact");
+
+    // Not one of the compaction's block reads was counted as a lookup, and
+    // not one was left behind.
+    let after = lookups(reader(), &tag, "block");
+    assert_eq!(
+        after, before,
+        "a compaction's block reads are not the foreground's lookups: {after:?}"
+    );
+    let still = by_attr(reader(), &cache_tag, "roble.cache.usage", "roble.cache")["block"];
+    assert!(
+        still <= held,
+        "a compaction left {} bytes more in the cache than it found",
+        still - held
+    );
+    let evicted = by_attr(reader(), &cache_tag, "roble.cache.evictions", "roble.cache");
+    assert_eq!(
+        evicted.get("block").copied(),
+        Some(0),
+        "and evicted nothing to make room for them: {evicted:?}"
+    );
+
+    // And the foreground's key is still a hit, which is the whole point:
+    // 40 KiB of compaction went past a 16 KiB cache without disturbing it.
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let last = lookups(reader(), &tag, "block");
+    assert!(
+        last["hit"] > after["hit"],
+        "the foreground's block should have survived the compaction: {last:?} \
+         against {after:?}"
+    );
+}
+
+#[compio::test]
+async fn a_compaction_still_takes_what_the_cache_already_has() {
+    // Discarding is about what a compaction *leaves*, not what it takes: a
+    // block already in the cache is free, and reading it from there costs the
+    // foreground nothing. So a compaction over blocks the foreground just
+    // read should go to the disk less than one over cold blocks.
+    let (options, tag) = metered("warm-compaction");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..40 {
+        batch
+            .put(format!("w{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+
+    // Walk the whole table, so every one of its blocks is in the cache.
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+    while scan.is_valid() {
+        scan.next().await.expect("next");
+    }
+    drop(scan);
+
+    let before = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction")["read"];
+    db.compact(0, &[table]).await.expect("compact");
+    let after = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction")["read"];
+
+    let from_disk = after - before;
+    assert!(
+        from_disk < 40 * 200,
+        "the compaction read {from_disk} bytes from the disk for a table whose \
+         blocks were all in the cache"
+    );
+}
+
+#[compio::test]
 async fn a_small_cache_reports_what_it_evicted() {
     let cache_tag = KeyValue::new("case", "evictions");
     // Room for a handful of the fixture's 128-byte blocks, so a walk over

@@ -158,6 +158,13 @@ that one:
 |---|---|---|---|
 | `roble.cache.lookups` | counter | `{lookup}` | Tables and blocks the store looked for, by `roble.cache` and `roble.cache.result` |
 
+A **compaction's** block reads are not counted here, and do not fill the cache
+either. A compaction reads every block of its inputs exactly once and never
+comes back, so its hit rate is zero by construction and counting its lookups
+would bury the only hit rate anybody asks about — whether the reads that come
+from outside found what they needed. It still *takes* a block that is already
+there, which costs the foreground nothing.
+
 A `Caches` with no provider of its own records nothing, whatever the stores
 drawing on it do.
 
