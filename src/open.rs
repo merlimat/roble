@@ -63,6 +63,13 @@ pub struct Opened<'a, F: Fs> {
     /// This store's identity within those caches: file numbers are per
     /// database, so the caches cannot be keyed by file number alone.
     store_id: u64,
+    /// Writes that no table holds yet.
+    pub(crate) memtable: std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>,
+    /// The next sequence number to hand out.
+    ///
+    /// Starts past the MANIFEST's last, so nothing written here can collide
+    /// with what the tables already hold.
+    next_seq: std::cell::Cell<u64>,
     /// The directory the database lives in.
     pub dir: PathBuf,
     /// The format major version it was written in.
@@ -167,6 +174,12 @@ pub async fn open_with<'a, E: Env>(
         fs,
         store_id: caches.new_store_id(),
         caches,
+        // Seeded from the directory, so the shape of the memtable is a
+        // function of the database rather than of when it was opened (§9).
+        memtable: std::rc::Rc::new(std::cell::RefCell::new(crate::memtable::Memtable::new(
+            versions.last_seq_num.wrapping_add(1),
+        ))),
+        next_seq: std::cell::Cell::new(versions.last_seq_num + 1),
         dir: dir.to_path_buf(),
         format_version,
         manifest_filename,
@@ -330,6 +343,26 @@ impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
 }
 
 impl<F: Fs> Opened<'_, F> {
+    /// Applies a batch: stamps it with the sequence number it commits at, then
+    /// puts its entries in the memtable.
+    ///
+    /// **Not durable yet.** §6's `write(batch, sync)` appends the batch to the
+    /// log first, so that nothing is readable that is not recoverable; the log
+    /// is the next piece, and until it exists a write survives only as far as
+    /// a flush. The signature gains its `sync` then.
+    pub fn write(&self, batch: &mut roble_format::batch::Batch) -> Result<()> {
+        let base = self.next_seq.get();
+        batch.set_seq_num(base);
+        let next = self.memtable.borrow_mut().apply(batch.as_bytes(), base)?;
+        self.next_seq.set(next);
+        Ok(())
+    }
+
+    /// The highest sequence number any read may see.
+    pub(crate) fn snapshot(&self) -> u64 {
+        self.next_seq.get().saturating_sub(1)
+    }
+
     /// The caches this store draws on, for tests that check what they hold.
     pub fn caches_for_test(&self) -> &crate::cache::Caches<F> {
         &self.caches
