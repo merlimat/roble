@@ -86,64 +86,23 @@ fn decode_entry(entries: &[u8], pos: usize) -> Result<Raw> {
     })
 }
 
-/// A position within a block, able to seek and to step either way.
-///
-/// Keys are left as raw bytes; [`DataCursor`] is the wrapper that decodes
-/// internal keys and the Pebblev3+ value prefix. Keeping the two apart is what
-/// stops an index block's separator — which may be a `SET` key — from having a
-/// byte stripped off the handle beside it.
-pub struct Cursor<'a> {
+/// The parts of a block a cursor works over.
+struct Parts<'a> {
     entries: &'a [u8],
     restarts: &'a [u8],
     num_restarts: usize,
-    /// Where the current entry starts, and where it ends.
-    pos: usize,
-    end: usize,
-    /// The assembled key of the current entry.
-    key: Vec<u8>,
-    value: Range<usize>,
-    valid: bool,
 }
 
-impl<'a> Cursor<'a> {
-    /// A cursor over `block`, positioned nowhere.
-    pub fn new(block: &Block<'a>) -> Self {
-        let (entries, restarts, num_restarts) = block.parts();
-        Cursor {
-            entries,
-            restarts,
-            num_restarts,
-            pos: 0,
-            end: 0,
-            key: Vec::new(),
-            value: 0..0,
-            valid: false,
-        }
+fn parts_of<'a>(block: &Block<'a>) -> Parts<'a> {
+    let (entries, restarts, num_restarts) = block.parts();
+    Parts {
+        entries,
+        restarts,
+        num_restarts,
     }
+}
 
-    /// Whether the cursor is on an entry.
-    pub fn is_valid(&self) -> bool {
-        self.valid
-    }
-
-    /// The current entry's key, assembled.
-    ///
-    /// # Panics
-    /// If the cursor is not on an entry; check [`Cursor::is_valid`] first.
-    pub fn key(&self) -> &[u8] {
-        assert!(self.valid, "key() on a cursor that is not on an entry");
-        &self.key
-    }
-
-    /// The current entry's value, as stored.
-    ///
-    /// # Panics
-    /// If the cursor is not on an entry.
-    pub fn value(&self) -> &'a [u8] {
-        assert!(self.valid, "value() on a cursor that is not on an entry");
-        &self.entries[self.value.clone()]
-    }
-
+impl<'a> Parts<'a> {
     /// The offset of restart point `i`, with the stolen high bit masked off.
     fn restart_offset(&self, i: usize) -> Result<usize> {
         if i >= self.num_restarts {
@@ -182,19 +141,81 @@ impl<'a> Cursor<'a> {
         }
         Ok(&self.entries[raw.fresh])
     }
+}
+
+/// A position within a block, able to seek and to step either way.
+///
+/// **The cursor does not borrow the block.** It holds a position and the key
+/// assembled at it, and every operation is given the block to work over. That
+/// is what lets something else own the block's bytes — the block cache owns
+/// them (§8), and an iterator that outlives a single call holds an `Rc` to
+/// them and a cursor beside it. A cursor that borrowed the block could not sit
+/// in the same struct as the bytes it borrows.
+///
+/// The caller is responsible for passing the same block each time. Passing a
+/// different one resumes at an offset that means nothing in it, which the
+/// entry decoder will usually refuse and may not: this is a cursor, not a
+/// handle, and it is private to the iterator that owns it.
+///
+/// Keys are left as raw bytes; [`DataCursor`] is the wrapper that decodes
+/// internal keys and the Pebblev3+ value prefix. Keeping the two apart is what
+/// stops an index block's separator — which may be a `SET` key — from having a
+/// byte stripped off the handle beside it.
+#[derive(Clone, Debug, Default)]
+pub struct Cursor {
+    /// Where the current entry starts, and where it ends.
+    pos: usize,
+    end: usize,
+    /// The assembled key of the current entry.
+    key: Vec<u8>,
+    value: Range<usize>,
+    valid: bool,
+}
+
+impl Cursor {
+    /// A cursor positioned nowhere.
+    pub fn new() -> Self {
+        Cursor::default()
+    }
+
+    /// Whether the cursor is on an entry.
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// The current entry's key, assembled.
+    ///
+    /// # Panics
+    /// If the cursor is not on an entry; check [`Cursor::is_valid`] first.
+    pub fn key(&self) -> &[u8] {
+        assert!(self.valid, "key() on a cursor that is not on an entry");
+        &self.key
+    }
+
+    /// The current entry's value, as stored, borrowed from `block`.
+    ///
+    /// # Panics
+    /// If the cursor is not on an entry.
+    pub fn value<'b>(&self, block: &Block<'b>) -> &'b [u8] {
+        assert!(self.valid, "value() on a cursor that is not on an entry");
+        let (entries, _, _) = block.parts();
+        &entries[self.value.clone()]
+    }
 
     /// Places the cursor on the entry at `pos`, chaining from the key already
     /// held when `keep_key` is set and starting fresh otherwise.
-    fn place(&mut self, pos: usize, keep_key: bool) -> Result<()> {
-        let raw = decode_entry(self.entries, pos)?;
+    fn place(&mut self, parts: &Parts<'_>, pos: usize, keep_key: bool) -> Result<()> {
+        let raw = decode_entry(parts.entries, pos)?;
         if !keep_key {
+            // A fresh placement needs no previous key, and `truncate(0)`
+            // below empties what is held — so there is nothing to clear here,
+            // only something to refuse.
             if raw.shared != 0 {
                 return Error::corrupt(format!(
                     "entry at {pos} shares {} bytes with no previous key",
                     raw.shared
                 ));
             }
-            self.key.clear();
         } else if raw.shared > self.key.len() {
             return Error::corrupt(format!(
                 "block entry shares {} bytes with a {}-byte previous key",
@@ -203,7 +224,7 @@ impl<'a> Cursor<'a> {
             ));
         }
         self.key.truncate(raw.shared);
-        self.key.extend_from_slice(&self.entries[raw.fresh]);
+        self.key.extend_from_slice(&parts.entries[raw.fresh]);
         self.pos = pos;
         self.end = raw.end;
         self.value = raw.value;
@@ -212,49 +233,52 @@ impl<'a> Cursor<'a> {
     }
 
     /// Positions on the first entry.
-    pub fn first(&mut self) -> Result<()> {
-        if self.entries.is_empty() {
+    pub fn first(&mut self, block: &Block<'_>) -> Result<()> {
+        let parts = parts_of(block);
+        if parts.entries.is_empty() {
             self.valid = false;
             return Ok(());
         }
-        self.place(0, false)
+        self.place(&parts, 0, false)
     }
 
     /// Positions on the last entry.
-    pub fn last(&mut self) -> Result<()> {
-        if self.entries.is_empty() {
+    pub fn last(&mut self, block: &Block<'_>) -> Result<()> {
+        let parts = parts_of(block);
+        if parts.entries.is_empty() {
             self.valid = false;
             return Ok(());
         }
         // From the final restart point, which is the cheapest place to start,
         // and forward to the end.
-        self.place(self.restart_offset(self.num_restarts - 1)?, false)?;
-        while self.end < self.entries.len() {
+        self.place(&parts, parts.restart_offset(parts.num_restarts - 1)?, false)?;
+        while self.end < parts.entries.len() {
             let pos = self.end;
-            self.place(pos, true)?;
+            self.place(&parts, pos, true)?;
         }
         Ok(())
     }
 
     /// Steps to the next entry, becoming invalid at the end of the block.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<()> {
+    pub fn next(&mut self, block: &Block<'_>) -> Result<()> {
         if !self.valid {
             return Ok(());
         }
-        if self.end >= self.entries.len() {
+        let parts = parts_of(block);
+        if self.end >= parts.entries.len() {
             self.valid = false;
             return Ok(());
         }
         let pos = self.end;
-        self.place(pos, true)
+        self.place(&parts, pos, true)
     }
 
     /// Steps to the previous entry, becoming invalid before the first.
     ///
     /// This rescans from the restart point before the current entry, because
     /// prefix compression only runs forwards.
-    pub fn prev(&mut self) -> Result<()> {
+    pub fn prev(&mut self, block: &Block<'_>) -> Result<()> {
         if !self.valid {
             return Ok(());
         }
@@ -263,14 +287,15 @@ impl<'a> Cursor<'a> {
             self.valid = false;
             return Ok(());
         }
+        let parts = parts_of(block);
 
         // The last restart point that starts strictly before the current
         // entry. Offsets ascend, so this is a binary search.
         let mut found = None;
-        let (mut lo, mut hi) = (0usize, self.num_restarts);
+        let (mut lo, mut hi) = (0usize, parts.num_restarts);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.restart_offset(mid)? < target {
+            if parts.restart_offset(mid)? < target {
                 found = Some(mid);
                 lo = mid + 1;
             } else {
@@ -283,10 +308,10 @@ impl<'a> Cursor<'a> {
             return Ok(());
         };
 
-        self.place(self.restart_offset(restart)?, false)?;
+        self.place(&parts, parts.restart_offset(restart)?, false)?;
         while self.end < target {
             let pos = self.end;
-            self.place(pos, true)?;
+            self.place(&parts, pos, true)?;
         }
         if self.end != target {
             return Error::corrupt(format!(
@@ -301,8 +326,9 @@ impl<'a> Cursor<'a> {
     /// `target`, which is an encoded internal key.
     ///
     /// Becomes invalid when every key in the block is smaller.
-    pub fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
-        if self.entries.is_empty() {
+    pub fn seek_ge(&mut self, block: &Block<'_>, target: &[u8]) -> Result<()> {
+        let parts = parts_of(block);
+        if parts.entries.is_empty() {
             self.valid = false;
             return Ok(());
         }
@@ -320,19 +346,19 @@ impl<'a> Cursor<'a> {
         // key equals the target starts the scan one interval earlier and the
         // forward scan below still arrives at the same entry. The direction
         // that would be wrong is starting late, and that is pinned.
-        let (mut lo, mut hi) = (0usize, self.num_restarts - 1);
+        let (mut lo, mut hi) = (0usize, parts.num_restarts - 1);
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
-            if key::compare(self.restart_key(mid)?, target)?.is_le() {
+            if key::compare(parts.restart_key(mid)?, target)?.is_le() {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
 
-        self.place(self.restart_offset(lo)?, false)?;
+        self.place(&parts, parts.restart_offset(lo)?, false)?;
         while key::compare(&self.key, target)?.is_lt() {
-            self.next()?;
+            self.next(block)?;
             if !self.valid {
                 return Ok(());
             }
@@ -343,27 +369,32 @@ impl<'a> Cursor<'a> {
     /// Positions on the last entry whose key is strictly less than `target`.
     ///
     /// Becomes invalid when every key in the block is at or past it.
-    pub fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
-        self.seek_ge(target)?;
-        if self.valid { self.prev() } else { self.last() }
+    pub fn seek_lt(&mut self, block: &Block<'_>, target: &[u8]) -> Result<()> {
+        self.seek_ge(block, target)?;
+        if self.valid {
+            self.prev(block)
+        } else {
+            self.last(block)
+        }
     }
 }
 
 /// A [`Cursor`] over a **data** block, decoding internal keys and the
 /// Pebblev3+ value prefix.
-pub struct DataCursor<'a> {
-    inner: Cursor<'a>,
+#[derive(Clone, Debug)]
+pub struct DataCursor {
+    inner: Cursor,
     format: TableFormat,
 }
 
-impl<'a> DataCursor<'a> {
-    /// A data cursor over `block`, positioned nowhere.
+impl DataCursor {
+    /// A data cursor positioned nowhere.
     ///
     /// `format` decides whether a `SET` value carries a prefix byte, so the
     /// wrong one shifts every value by a byte.
-    pub fn new(block: &Block<'a>, format: TableFormat) -> Self {
+    pub fn new(format: TableFormat) -> Self {
         DataCursor {
-            inner: Cursor::new(block),
+            inner: Cursor::new(),
             format,
         }
     }
@@ -379,41 +410,41 @@ impl<'a> DataCursor<'a> {
     }
 
     /// The current entry, with its key and value decoded.
-    pub fn entry(&self) -> Result<Entry<'a, '_>> {
+    pub fn entry<'b>(&self, block: &Block<'b>) -> Result<Entry<'b, '_>> {
         let key = InternalKey::decode(self.inner.key())?;
-        let value = decode_value(self.format, key, self.inner.value())?;
+        let value = decode_value(self.format, key, self.inner.value(block))?;
         Ok(Entry { key, value })
     }
 
     /// Positions on the first entry.
-    pub fn first(&mut self) -> Result<()> {
-        self.inner.first()
+    pub fn first(&mut self, block: &Block<'_>) -> Result<()> {
+        self.inner.first(block)
     }
 
     /// Positions on the last entry.
-    pub fn last(&mut self) -> Result<()> {
-        self.inner.last()
+    pub fn last(&mut self, block: &Block<'_>) -> Result<()> {
+        self.inner.last(block)
     }
 
     /// Steps forward.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<()> {
-        self.inner.next()
+    pub fn next(&mut self, block: &Block<'_>) -> Result<()> {
+        self.inner.next(block)
     }
 
     /// Steps backward.
-    pub fn prev(&mut self) -> Result<()> {
-        self.inner.prev()
+    pub fn prev(&mut self, block: &Block<'_>) -> Result<()> {
+        self.inner.prev(block)
     }
 
     /// Positions on the first entry at or after `target`.
-    pub fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
-        self.inner.seek_ge(target)
+    pub fn seek_ge(&mut self, block: &Block<'_>, target: &[u8]) -> Result<()> {
+        self.inner.seek_ge(block, target)
     }
 
     /// Positions on the last entry before `target`.
-    pub fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
-        self.inner.seek_lt(target)
+    pub fn seek_lt(&mut self, block: &Block<'_>, target: &[u8]) -> Result<()> {
+        self.inner.seek_lt(block, target)
     }
 }
 
@@ -450,11 +481,11 @@ mod tests {
     /// Every entry in the block, read forwards with the cursor.
     fn forwards(block: &Block<'_>) -> Vec<Vec<u8>> {
         let mut c = block.cursor();
-        c.first().expect("first");
+        c.first(block).expect("first");
         let mut out = Vec::new();
         while c.is_valid() {
             out.push(c.key().to_vec());
-            c.next().expect("next");
+            c.next(block).expect("next");
         }
         out
     }
@@ -462,11 +493,11 @@ mod tests {
     /// Every entry in the block, read backwards with the cursor.
     fn backwards(block: &Block<'_>) -> Vec<Vec<u8>> {
         let mut c = block.cursor();
-        c.last().expect("last");
+        c.last(block).expect("last");
         let mut out = Vec::new();
         while c.is_valid() {
             out.push(c.key().to_vec());
-            c.prev().expect("prev");
+            c.prev(block).expect("prev");
         }
         out
     }
@@ -543,7 +574,7 @@ mod tests {
                     .iter()
                     .position(|k| crate::key::compare(k, probe).expect("compare").is_ge());
                 let mut c = block.cursor();
-                c.seek_ge(probe).expect("seek_ge");
+                c.seek_ge(&block, probe).expect("seek_ge");
                 match want_ge {
                     Some(i) => {
                         assert!(c.is_valid(), "seek_ge should land, interval {interval}");
@@ -559,7 +590,7 @@ mod tests {
                     .iter()
                     .rposition(|k| crate::key::compare(k, probe).expect("compare").is_lt());
                 let mut c = block.cursor();
-                c.seek_lt(probe).expect("seek_lt");
+                c.seek_lt(&block, probe).expect("seek_lt");
                 match want_lt {
                     Some(i) => {
                         assert!(c.is_valid(), "seek_lt should land, interval {interval}");
@@ -587,21 +618,21 @@ mod tests {
 
             for (i, key) in keys.iter().enumerate() {
                 let mut c = block.cursor();
-                c.seek_ge(key).expect("seek_ge");
+                c.seek_ge(&block, key).expect("seek_ge");
                 assert_eq!(c.key(), &key[..]);
 
-                c.next().expect("next");
+                c.next(&block).expect("next");
                 if i + 1 < keys.len() {
                     assert_eq!(c.key(), &keys[i + 1][..], "forward from {i}");
-                    c.prev().expect("prev");
+                    c.prev(&block).expect("prev");
                     assert_eq!(c.key(), &key[..], "back again to {i}");
                 } else {
                     assert!(!c.is_valid(), "past the last entry");
                 }
 
                 let mut c = block.cursor();
-                c.seek_ge(key).expect("seek_ge");
-                c.prev().expect("prev");
+                c.seek_ge(&block, key).expect("seek_ge");
+                c.prev(&block).expect("prev");
                 if i > 0 {
                     assert_eq!(c.key(), &keys[i - 1][..], "backward from {i}");
                 } else {
@@ -629,7 +660,8 @@ mod tests {
         assert_eq!(forwards(&block), versions, "newest first");
 
         let mut c = block.cursor();
-        c.seek_ge(&crate::key::search_key(b"k")).expect("seek");
+        c.seek_ge(&block, &crate::key::search_key(b"k"))
+            .expect("seek");
         assert_eq!(
             c.key(),
             &versions[0][..],

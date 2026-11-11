@@ -244,14 +244,17 @@ impl<'a> Block<'a> {
     }
 
     /// A cursor that can seek and step either way over this block.
-    pub fn cursor(&self) -> restart::Cursor<'a> {
-        restart::Cursor::new(self)
+    ///
+    /// The cursor does not borrow the block: every operation takes the block
+    /// again, so that an iterator can own the bytes and the cursor together.
+    pub fn cursor(&self) -> restart::Cursor {
+        restart::Cursor::new()
     }
 
     /// A cursor over this **data** block, decoding internal keys and value
     /// prefixes.
-    pub fn data_cursor(&self, format: crate::TableFormat) -> restart::DataCursor<'a> {
-        restart::DataCursor::new(self, format)
+    pub fn data_cursor(&self, format: crate::TableFormat) -> restart::DataCursor {
+        restart::DataCursor::new(format)
     }
 
     /// Walks the block's entries with keys left as raw bytes.

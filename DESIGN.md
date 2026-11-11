@@ -23,9 +23,13 @@
 > and the **block cache**: decoded blocks keyed by store, table and offset,
 > under a byte budget, evicted by the same CLOCK.
 >
-> Still to come in M2: scans. `get` does its whole merge inside one call and
-> there is no public iterator yet; §6 records what that costs. The caches that
-> a cursor needs now exist, so that is what unblocks it.
+> and the first half of scans: a block cursor that **does not borrow its
+> block**, and a resumable iterator over one table that steps either way
+> across block boundaries.
+>
+> Still to come in M2: the merge of those iterators across levels, with
+> tombstones, behind a public `seek_ge`/`seek_lt`/`next`/`prev`. `get` still
+> does its own merge inside one call; §6 records what that costs.
 >
 > `open` is judged against whole databases Go Pebble wrote, committed under
 > `tests/golden/`, where Pebble's own reader describes the directory and roble
@@ -459,6 +463,12 @@ Forward and reverse, bounded, over a snapshot. `seek_ge` / `seek_lt` /
 `next` / `prev`. Reverse iteration over an LSM is more expensive than forward,
 which Oxia's `KeyRangeScanReverse` uses; it is worth measuring early.
 
+There are two reasons it is dearer, and they compound. Within a block,
+prefix compression only runs forwards, so stepping back means rescanning from
+the restart point before the current entry. Across blocks, a backward step at
+the start of a block has to load the previous one and walk it to its end,
+where a forward step loads the next and stops at its first entry.
+
 A prefix iterator additionally serves `Lookup` for keys outside its prefix,
 which Oxia uses to read internal keys while scanning: it keeps a second iterator
 over the same snapshot rather than moving the first.
@@ -515,7 +525,11 @@ format/src/
   key.rs            internal keys: user key, sequence number, kind, trailer
   block/mod.rs      row-oriented block builder and in-place reader, including
                     the Pebblev3+ value prefix byte on every SET
-  block/restart.rs  restart arrays, prefix compression, seek within a block
+  block/restart.rs  restart arrays, prefix compression, seek within a block, and
+                    stepping either way. The cursor holds a position and is
+                    handed the block per call rather than borrowing it, which
+                    is what lets the block cache own the bytes and an iterator
+                    hold both (§8)
   value_block.rs    value blocks, value handles, and the value index — read only.
                     The metaindex value is a block handle *plus* three width
                     bytes, without which the index cannot be read
