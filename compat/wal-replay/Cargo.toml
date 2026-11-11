@@ -1,0 +1,16 @@
+[package]
+name = "wal-replay"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Writes to a database's log with roble, for Go Pebble to replay."
+
+[dependencies]
+roble = { path = "../.." }
+roble-format = { path = "../../format" }
+compio = { version = "0.19.2", features = ["fs", "macros"] }
+
+[lints]
+workspace = true

@@ -137,6 +137,12 @@ pub struct RecordWriter {
     out: Vec<u8>,
     format: WireFormat,
     log_num: u32,
+    /// Where the first byte of `out` lands in the file.
+    ///
+    /// Blocks are aligned to the **file**, not to this buffer, so a writer
+    /// that carries on part-way through a log has to know how far in it is.
+    /// Zero for a writer that starts a file.
+    base: usize,
 }
 
 impl RecordWriter {
@@ -146,6 +152,7 @@ impl RecordWriter {
             out: Vec::new(),
             format: WireFormat::Legacy,
             log_num: 0,
+            base: 0,
         }
     }
 
@@ -155,7 +162,30 @@ impl RecordWriter {
             out: Vec::new(),
             format: WireFormat::Recyclable,
             log_num,
+            base: 0,
         }
+    }
+
+    /// A recyclable writer that carries on at `at` bytes into the log.
+    ///
+    /// This is how a store reopens a log it is going to keep writing to: the
+    /// records already there are left alone, and the next chunk is framed
+    /// against the block boundaries of the **file**. Starting a fresh writer
+    /// and appending its bytes would align every chunk to the wrong place,
+    /// which no checksum would catch — the chunks would be individually valid
+    /// and in the wrong positions.
+    pub fn resuming(log_num: u32, at: usize) -> Self {
+        RecordWriter {
+            out: Vec::new(),
+            format: WireFormat::Recyclable,
+            log_num,
+            base: at,
+        }
+    }
+
+    /// How far into the file the writer has reached.
+    pub fn position(&self) -> usize {
+        self.base + self.out.len()
     }
 
     /// The bytes written so far.
@@ -179,7 +209,7 @@ impl RecordWriter {
         if self.format != WireFormat::Recyclable {
             return Error::unsupported("only a recyclable log has an EOF trailer");
         }
-        let used = self.out.len() % BLOCK_SIZE;
+        let used = self.position() % BLOCK_SIZE;
         if BLOCK_SIZE - used < RECYCLABLE_HEADER_LEN {
             self.out.resize(self.out.len() + (BLOCK_SIZE - used), 0);
         }
@@ -201,7 +231,7 @@ impl RecordWriter {
             // end of this loop guarantees it, so a branch for it would be
             // unreachable — and an unreachable branch is one no test can
             // cover.
-            let used = self.out.len() % BLOCK_SIZE;
+            let used = self.position() % BLOCK_SIZE;
             debug_assert!(
                 BLOCK_SIZE - used >= header_len,
                 "a block was left with {} bytes, too few for a {header_len}-byte header",
@@ -228,7 +258,7 @@ impl RecordWriter {
 
             // Pebble zero-fills eagerly: once a block cannot hold another
             // header it is padded and closed.
-            let used = self.out.len() % BLOCK_SIZE;
+            let used = self.position() % BLOCK_SIZE;
             if used != 0 && BLOCK_SIZE - used < header_len {
                 self.out.resize(self.out.len() + (BLOCK_SIZE - used), 0);
             }
@@ -627,5 +657,71 @@ mod tests {
                 "the refusal should name the format: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    /// Records chosen to straddle a block boundary, which is the only place
+    /// the base offset can matter.
+    fn payloads() -> Vec<Vec<u8>> {
+        vec![
+            vec![b'a'; 100],
+            vec![b'b'; BLOCK_SIZE - 200],
+            vec![b'c'; BLOCK_SIZE + 500],
+            vec![b'd'; 7],
+        ]
+    }
+
+    #[test]
+    fn resuming_frames_the_same_bytes_as_writing_straight_through() {
+        let payloads = payloads();
+        let mut whole = RecordWriter::recyclable(9);
+        for p in &payloads {
+            whole.write_record(p).expect("write");
+        }
+        let whole = whole.finish();
+
+        // The same records, but the writer is put down and picked up again
+        // after each one.
+        let mut joined: Vec<u8> = Vec::new();
+        for p in &payloads {
+            let mut w = RecordWriter::resuming(9, joined.len());
+            w.write_record(p).expect("write");
+            joined.extend_from_slice(w.as_bytes());
+        }
+
+        assert_eq!(
+            joined, whole,
+            "a resumed writer must frame against the file, not its own buffer"
+        );
+
+        // And the result still reads back as the records that went in.
+        let mut reader = RecordReader::new(&joined, 9);
+        let mut back = Vec::new();
+        while let Some(r) = reader.next() {
+            back.push(r.expect("record"));
+        }
+        assert_eq!(back, payloads);
+    }
+
+    #[test]
+    fn an_eof_trailer_lands_in_the_same_place_either_way() {
+        let payload = vec![b'x'; BLOCK_SIZE - 20];
+        let mut whole = RecordWriter::recyclable(3);
+        whole.write_record(&payload).expect("write");
+        whole.write_eof_trailer().expect("trailer");
+        let whole = whole.finish();
+
+        let mut first = RecordWriter::recyclable(3);
+        first.write_record(&payload).expect("write");
+        let mut joined = first.finish();
+        let mut second = RecordWriter::resuming(3, joined.len());
+        second.write_eof_trailer().expect("trailer");
+        joined.extend_from_slice(second.as_bytes());
+
+        assert_eq!(joined, whole);
     }
 }

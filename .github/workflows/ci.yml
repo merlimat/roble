@@ -89,6 +89,9 @@ jobs:
       - name: the minlz crate decodes Go minio/minlz
         run: compat/minlz/run.sh
 
+      - name: Go Pebble replays the log roble wrote
+        run: compat/wal-replay/run.sh
+
       # The committed golden corpus has to be what the pinned harness still
       # produces, or the tables roble is judged against have drifted from the
       # code that made them.

@@ -236,6 +236,20 @@ pub struct Entry<'a> {
     pub value: Option<&'a [u8]>,
 }
 
+/// The sequence number a representation was committed at.
+///
+/// For a batch read back out of a log: replay has to use the number the batch
+/// was written with, not a fresh one, or a key would come back with a
+/// different age than it had.
+pub fn seq_num_of(repr: &[u8]) -> Result<u64> {
+    if repr.len() < HEADER_LEN {
+        return Error::truncated("batch header", HEADER_LEN, repr.len());
+    }
+    Ok(u64::from_le_bytes(
+        repr[..COUNT_OFFSET].try_into().expect("8 bytes"),
+    ))
+}
+
 /// Walks a batch representation's entries.
 #[derive(Debug)]
 pub struct Reader<'a> {
