@@ -672,6 +672,156 @@ mod tests {
             );
         }
     }
+    /// Frames one chunk by hand, with a checksum that matches it.
+    ///
+    /// The reader validates the checksum before it looks at how chunks follow
+    /// one another, so a test about chunk order has to get the checksum right
+    /// or it tests the checksum instead.
+    fn chunk(type_byte: u8, log_num: Option<u32>, payload: &[u8]) -> Vec<u8> {
+        let header_len = match log_num {
+            Some(_) => RECYCLABLE_HEADER_LEN,
+            None => LEGACY_HEADER_LEN,
+        };
+        let mut out = vec![0u8; header_len];
+        out[4..6].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+        out[6] = type_byte;
+        if let Some(n) = log_num {
+            out[7..11].copy_from_slice(&n.to_le_bytes());
+        }
+        out.extend_from_slice(payload);
+        // Covers the type byte onwards, as the reader computes it.
+        let crc = ChecksumType::Crc32c.compute_raw(&out[6..]);
+        out[0..4].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    fn first_error(bytes: &[u8], log_num: u32) -> Error {
+        RecordReader::new(bytes, log_num)
+            .next()
+            .expect("a chunk to read")
+            .expect_err("bytes that do not read as a record")
+    }
+
+    #[test]
+    fn a_chunk_type_pebble_does_not_define_is_refused() {
+        // 13 is past walSync, which has a refusal of its own. The type is read
+        // before the checksum, so this does not need a good one.
+        let err = first_error(&chunk(13, None, b"x"), 0);
+        assert!(
+            format!("{err}").contains("record chunk type 13"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chunks_that_do_not_follow_one_another_are_refused() {
+        // A record cannot begin in the middle of itself.
+        let err = first_error(&chunk(MIDDLE, None, b"x"), 0);
+        assert!(
+            format!("{err}").contains("starts with a middle or last chunk"),
+            "got {err:?}"
+        );
+
+        // Nor continue with something that begins one.
+        let mut bytes = chunk(FIRST, None, b"a");
+        bytes.extend_from_slice(&chunk(FULL, None, b"b"));
+        let err = first_error(&bytes, 0);
+        assert!(
+            format!("{err}").contains("continues with a full or first chunk"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_that_the_stream_ends_in_the_middle_of_is_refused() {
+        // A FIRST chunk and nothing after it. The difference from a torn tail
+        // is that this is not the tail of a log being replayed — a reader
+        // asked for a record and the bytes stop inside one.
+        let err = first_error(&chunk(FIRST, None, b"abc"), 0);
+        assert!(
+            format!("{err}").contains("ends in the middle of a record"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_zeroed_header_is_padding_only_where_a_header_could_not_have_fitted() {
+        // Pebble zero-fills the tail of a block when the next record will not
+        // start in it. Past the point where a header could have fitted, a
+        // zeroed header is a sign of corruption rather than of padding, and
+        // the two cases are told apart by how much of the block is left.
+        let mut bytes = chunk(FIRST, None, b"a");
+        // A zeroed header with the whole rest of the block behind it.
+        bytes.resize(BLOCK_SIZE, 0);
+        let err = first_error(&bytes, 0);
+        assert!(
+            format!("{err}").contains("zeroed chunk header with"),
+            "got {err:?}"
+        );
+
+        // Padding proper: too little left for even a recyclable header, so the
+        // reader steps to the next block without complaint — and then finds
+        // the stream has ended inside a record, which is the other half of
+        // what makes this padding rather than a tail.
+        // Nine bytes: enough that the zeroed header is read as a header, too
+        // few to be a recyclable one. Fewer than seven would not be read at
+        // all and would take the branch above this one instead.
+        let fill = BLOCK_SIZE - LEGACY_HEADER_LEN - 9;
+        let mut bytes = chunk(FIRST, None, &vec![b'a'; fill]);
+        bytes.resize(BLOCK_SIZE, 0);
+        let err = first_error(&bytes, 0);
+        assert!(
+            format!("{err}").contains("ends in the middle of a record"),
+            "got {err:?}"
+        );
+
+        // And a zeroed header with too little behind it to be a walSync
+        // header but enough to be a recyclable one, which Pebble tolerates as
+        // padding only while the padding is actually zero.
+        let fill = BLOCK_SIZE - LEGACY_HEADER_LEN - 15;
+        let mut bytes = chunk(FIRST, None, &vec![b'a'; fill]);
+        assert_eq!(
+            bytes.len(),
+            BLOCK_SIZE - 15,
+            "the chunk ends 15 bytes short"
+        );
+        bytes.resize(BLOCK_SIZE, 0);
+        *bytes.last_mut().expect("a byte") = 0xff;
+        let err = first_error(&bytes, 0);
+        assert!(
+            format!("{err}").contains("zeroed chunk header followed by data"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_chunk_from_another_log_interrupting_a_record_is_refused() {
+        // A recycled log's tail. Reaching it mid-record is the case that
+        // cannot be waved through: at the start of a record it is the end of
+        // this log's contents, but inside one it means the record was lost.
+        let mut bytes = chunk(RECYCLABLE_FIRST, Some(7), b"a");
+        bytes.extend_from_slice(&chunk(RECYCLABLE_MIDDLE, Some(9), b"b"));
+        let err = first_error(&bytes, 7);
+        assert!(
+            format!("{err}").contains("chunk from log 9 inside log 7"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_recyclable_log_has_an_eof_trailer() {
+        // The trailer is a recyclable header with a zero checksum, so there is
+        // nothing to write it into in a legacy log.
+        let mut w = RecordWriter::legacy();
+        w.write_record(b"x").expect("write");
+        let err = w
+            .write_eof_trailer()
+            .expect_err("a legacy log has no trailer");
+        assert!(
+            format!("{err}").contains("only a recyclable log"),
+            "got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
