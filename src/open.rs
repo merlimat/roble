@@ -99,6 +99,9 @@ pub struct Opened<'a, F: Fs> {
     markers: std::cell::RefCell<Vec<String>>,
     /// How large the MANIFEST may grow before a flush replaces it.
     max_manifest_bytes: u64,
+    /// What the picker allows L0 and L1 to hold (`crate::pick`).
+    l0_compaction_threshold: u64,
+    lbase_max_bytes: u64,
     /// What replaying the MANIFEST established, and what a flush adds to.
     versions: std::cell::RefCell<VersionSet>,
 }
@@ -257,6 +260,8 @@ pub async fn open_with<'a, E: Env>(
         }),
         markers: std::cell::RefCell::new(markers),
         max_manifest_bytes: options.max_manifest_bytes,
+        l0_compaction_threshold: options.l0_compaction_threshold,
+        lbase_max_bytes: options.lbase_max_bytes,
         versions: std::cell::RefCell::new(versions),
     })
 }
@@ -597,6 +602,16 @@ impl<F: Fs> Opened<'_, F> {
     /// (`crate::rotate`), as [`crate::Options`] was asked for.
     pub fn max_manifest_bytes(&self) -> u64 {
         self.max_manifest_bytes
+    }
+
+    /// How many tables L0 may hold before the picker wants it compacted.
+    pub fn l0_compaction_threshold(&self) -> u64 {
+        self.l0_compaction_threshold
+    }
+
+    /// How many bytes L1 may hold, each level below it ten times more.
+    pub fn lbase_max_bytes(&self) -> u64 {
+        self.lbase_max_bytes
     }
 
     /// Points the store at a MANIFEST the marker now names.

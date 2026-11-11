@@ -38,7 +38,9 @@ use std::path::PathBuf;
 async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: wal-replay <database-dir> [--flush|--rotate|--compact|--no-wal|--swept]");
+        eprintln!(
+            "usage: wal-replay <database-dir> [--flush|--rotate|--compact|--settle|--no-wal|--swept]"
+        );
         std::process::exit(2);
     };
     // With `--flush` the same writes go through a table and a MANIFEST edit
@@ -46,25 +48,34 @@ async fn main() {
     // other half of the round trip. With `--swept` roble writes nothing and
     // the only change to the directory is what its open deleted.
     let mode = args.next();
-    let (flush, rotate, compact, no_wal, swept) = match mode.as_deref() {
-        None => (false, false, false, false, false),
-        Some("--flush") => (true, false, false, false, false),
+    let (flush, rotate, compact, settle, no_wal, swept) = match mode.as_deref() {
+        None => (false, false, false, false, false, false),
+        Some("--flush") => (true, false, false, false, false, false),
         // `--rotate` goes further than `--flush`: the MANIFEST Pebble reads
         // from afterwards is not one Pebble ever wrote a byte of.
-        Some("--rotate") => (true, true, false, false, false),
+        Some("--rotate") => (true, true, false, false, false, false),
         // `--compact` goes further still: the table Pebble reads is one
         // roble merged out of others, with fragmented range deletions and a
         // version edit that deletes as well as adds.
-        Some("--compact") => (true, false, true, false, false),
+        Some("--compact") => (true, false, true, false, false, false),
+        // `--settle` hands the picker the wheel until nothing is past its
+        // allowance, so what Pebble opens is a database roble spread across
+        // levels by itself.
+        Some("--settle") => (true, false, false, true, false, false),
         // `--no-wal` is Oxia's own configuration: nothing reaches the log, so
         // the flush is the only thing that happened.
-        Some("--no-wal") => (true, false, false, true, false),
-        Some("--swept") => (false, false, false, false, true),
+        Some("--no-wal") => (true, false, false, false, true, false),
+        Some("--swept") => (false, false, false, false, false, true),
         Some(other) => fail(&format!("unknown mode {other}")),
     };
 
     let before = names_in(&dir);
-    let options = roble::Options::new().disable_wal(no_wal);
+    let mut options = roble::Options::new().disable_wal(no_wal);
+    if settle {
+        // Allowances a test-sized database can actually cross, so the picker
+        // has something to do.
+        options = options.l0_compaction_threshold(2).lbase_max_bytes(4096);
+    }
     let db = roble::open_with(&roble::DefaultEnv, &dir, options)
         .await
         .unwrap_or_else(|e| fail(&format!("open {}: {e}", dir.display())));
@@ -185,6 +196,54 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("compact: {e}")))
             .unwrap_or_else(|| fail("the compaction wrote nothing"));
         println!("roble compacted {l0:?} into table {out:06} at L1");
+    }
+
+    if settle {
+        // More rounds, so there is enough to spread over several levels.
+        for round in 0..6 {
+            let mut batch = db.batch();
+            for i in 0..16 {
+                let k = format!("settle-{:03}", (round * 7 + i) % 40).into_bytes();
+                let v = format!("round-{round}").into_bytes();
+                batch
+                    .put(&k, &v)
+                    .unwrap_or_else(|e| fail(&format!("put: {e}")));
+                wrote.retain(|(key, _)| key != &k);
+                wrote.push((k, v));
+            }
+            batch
+                .commit(true)
+                .await
+                .unwrap_or_else(|e| fail(&format!("commit: {e}")));
+            db.flush()
+                .await
+                .unwrap_or_else(|e| fail(&format!("flush: {e}")));
+
+            let mut ran = 0;
+            while db
+                .compact_once()
+                .await
+                .unwrap_or_else(|e| fail(&format!("compact_once: {e}")))
+                .is_some()
+                || db.pick().is_some()
+            {
+                ran += 1;
+                if ran > 50 {
+                    fail("the picker never settled");
+                }
+            }
+        }
+        let spread: Vec<(u32, usize)> = db
+            .versions()
+            .version
+            .levels()
+            .map(|(l, t)| (l, t.len()))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        if spread.len() < 2 {
+            fail("the picker left everything in one level, so this proves nothing");
+        }
+        println!("roble compacted until it settled; levels are {spread:?}");
     }
 
     if no_wal {

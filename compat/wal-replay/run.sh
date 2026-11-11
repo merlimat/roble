@@ -31,7 +31,10 @@
 # fragmented range deletions in it and a version edit that deletes as well as
 # adds.
 #
-# The fifth is Oxia's own configuration: the WAL off, so the table and the
+# The fifth hands the picker the wheel until nothing is past its allowance,
+# so what Pebble opens is a database roble spread across levels by itself.
+#
+# The sixth is Oxia's own configuration: the WAL off, so the table and the
 # MANIFEST edit are the only things that happened and the log is untouched.
 #
 # The fifth makes the opposite claim. roble opens a database and writes
@@ -51,7 +54,7 @@ trap 'rm -rf "$out"' EXIT
 # into a table through a MANIFEST edit roble appended. The first tests
 # Pebble replaying roble's log; the second tests Pebble reading roble's
 # table and believing roble's MANIFEST.
-for mode in log flushed rotated compacted no-wal swept; do
+for mode in log flushed rotated compacted settled no-wal swept; do
   db="$out/$mode"
   # The swept run needs a database Pebble left something obsolete in, which
   # db-simple is not: Pebble closed db-unflushed-wal holding a log it had
@@ -67,6 +70,7 @@ for mode in log flushed rotated compacted no-wal swept; do
     flushed) cargo run --release --quiet -p wal-replay -- "$db" --flush ;;
     rotated) cargo run --release --quiet -p wal-replay -- "$db" --rotate ;;
     compacted) cargo run --release --quiet -p wal-replay -- "$db" --compact ;;
+    settled) cargo run --release --quiet -p wal-replay -- "$db" --settle ;;
     no-wal)  cargo run --release --quiet -p wal-replay -- "$db" --no-wal ;;
     swept)   cargo run --release --quiet -p wal-replay -- "$db" --swept ;;
     *)       cargo run --release --quiet -p wal-replay -- "$db" ;;

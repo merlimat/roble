@@ -105,9 +105,15 @@
 > is the one that resurrects keys when it is wrong, so it asks the version
 > rather than reading the level number. Overlapping tombstones are fragmented
 > into the shape a range-deletion block holds. **Go Pebble reads a table
-> roble compacted out of others.** The picker that decides which tables and
-> when is next, and is deliberately apart from this: compatibility constrains
-> the files a compaction produces, not when it runs.
+> roble compacted out of others.**
+>
+> And the **picker**: every level scored against what it is allowed to hold —
+> L0 by table count, the rest by bytes — and the worst offender compacted into
+> the level below, ties going to the level nearest L0. It reads no clock and
+> draws no random number, because a seeded run has to replay (§10), and the
+> score is a fraction compared by cross-multiplication rather than a float,
+> because making the same decision twice is the whole of its job. **Go Pebble
+> reads a database roble spread across levels by itself.**
 >
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
@@ -751,13 +757,19 @@ compaction buffers, and the budget covers all three.
 
 ## 9. Compaction
 
-As built, the **merge** is there and the picker is not: `compact(level,
-tables)` does the work and its caller chooses. What it drops, and why each is
-safe, is written out in `src/compact.rs`; what it does not drop yet is a range
-tombstone that has nothing left below it, since carrying a spent tombstone
-costs a reader a comparison and dropping a live one brings a key back from the
-dead. The output is one table, because splitting at a target size is an
-opinion about file sizes and that belongs with the picker.
+As built, `compact(level, tables)` does the merge and `pick()` chooses what to
+feed it, with `compact_once()` joining the two. What a merge drops, and why
+each is safe, is written out in `src/compact.rs`; what it does not drop yet is
+a range tombstone that has nothing left below it, since carrying a spent
+tombstone costs a reader a comparison and dropping a live one brings a key
+back from the dead. The output is one table: splitting at a target size is
+still owed, as are L0 sublevels, cooperative execution and the write-stall
+counters.
+
+The picker is **not scheduled**: nothing runs a compaction behind the caller's
+back yet. Wiring it into a flush waits for the cooperative execution below,
+because a compaction that runs to completion inside a flush is exactly the
+latency spike units of work exist to avoid.
 
 Compaction is the cost encina does not pay, and the only background CPU work in
 roble. Leveled, with L0 as sublevels, and a **picker** — the component that
