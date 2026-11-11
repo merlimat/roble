@@ -39,6 +39,29 @@ use crate::buf::{ReadBuf, WriteBuf};
 use crate::env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 use crate::error::{Error, Result};
 
+/// Whether a hard link that failed this way should be retried as a copy.
+///
+/// Across file systems, and on those without links, a copy is the same thing
+/// more slowly: the point of the link is that a checkpoint costs no bytes, not
+/// that it is a link (§4).
+///
+/// Both kinds have to be named. `Unsupported` is a file system with no links
+/// at all — `ENOSYS` or `EOPNOTSUPP` — and `CrossesDevices` is `EXDEV`, the two
+/// paths being on different file systems, which is what a checkpoint written
+/// to another volume hits. Only the first was matched here until the coverage
+/// report asked why neither arm ever ran: `EXDEV` has had an `io::ErrorKind` of
+/// its own since Rust 1.85 rather than falling into `Unsupported`, so the
+/// cross-file-system case this was written for was the one it did not catch.
+///
+/// Anything else is a real failure — a missing source, a refusal, a name
+/// already taken — and is returned rather than papered over with a copy.
+fn copy_instead(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+    )
+}
+
 /// Databases in the file system, on the current compio runtime.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultEnv;
@@ -88,10 +111,13 @@ impl Fs for FileFs {
     async fn link(&self, from: &Path, to: &Path) -> Result<()> {
         match compio::fs::hard_link(from, to).await {
             Ok(()) => Ok(()),
-            // Across file systems, and on those without links, a copy is the
-            // same thing more slowly: the point of the link is that a
-            // checkpoint costs no bytes, not that it is a link.
-            Err(e) if matches!(e.kind(), io::ErrorKind::Unsupported) => {
+            // The copy itself is untested, with a reason rather than a test
+            // (§12). Reaching it needs a second file system — one mounted
+            // elsewhere, or one without links — which a test cannot conjure on
+            // the machine it happens to run on. What *was* wrong here is which
+            // errors arrive at this arm, and that is decided by `copy_instead`
+            // and tested there, against the errnos themselves.
+            Err(e) if copy_instead(e.kind()) => {
                 let bytes = std::fs::read(from)?;
                 std::fs::write(to, bytes)?;
                 Ok(())
@@ -239,6 +265,15 @@ fn take_lock(file: &File) -> Result<()> {
         let e = io::Error::last_os_error();
         return Err(match e.kind() {
             io::ErrorKind::WouldBlock => Error::Locked,
+            // Untested, with a reason rather than a test (§12). The arm above
+            // is `EWOULDBLOCK`, another owner holding the lock, which a test
+            // takes by opening the database twice. What is left is
+            // `EBADF`, `EINVAL` and `EINTR`: the first two cannot happen on a
+            // descriptor this function was just handed and a constant flag,
+            // and reaching the third would mean delivering a signal mid-call
+            // from inside the test. Covering it would need a seam through
+            // `flock` itself, and a seam exists to be used by the code it
+            // guards — this one would exist only to be exercised.
             _ => e.into(),
         });
     }
@@ -261,4 +296,47 @@ async fn sync_dir(dir: &Path) -> Result<()> {
 #[cfg(not(unix))]
 async fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_link_copies_only_where_no_link_was_possible() {
+        assert!(copy_instead(io::ErrorKind::Unsupported));
+        assert!(copy_instead(io::ErrorKind::CrossesDevices));
+        // A copy would paper over each of these, and each of them is a real
+        // failure a checkpoint should stop on.
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::StorageFull,
+        ] {
+            assert!(!copy_instead(kind), "{kind:?} should not become a copy");
+        }
+    }
+
+    /// The premise the fallback rests on, pinned rather than assumed.
+    ///
+    /// This is the mapping that was wrong: a std that moved `EXDEV` back into
+    /// `Unsupported`, or anywhere else, would put the cross-file-system case
+    /// into the arm that returns an error, and nothing else here would notice
+    /// — a checkpoint onto another volume only fails on a machine that has
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn the_errnos_a_checkpoint_meets_map_to_the_kinds_matched() {
+        let exdev = io::Error::from_raw_os_error(libc::EXDEV);
+        assert_eq!(exdev.kind(), io::ErrorKind::CrossesDevices);
+        assert!(copy_instead(exdev.kind()), "a checkpoint across volumes");
+
+        let unsupported = io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        assert_eq!(unsupported.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            copy_instead(unsupported.kind()),
+            "a file system with no links"
+        );
+    }
 }

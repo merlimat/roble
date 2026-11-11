@@ -28,8 +28,8 @@
 
 use std::path::{Path, PathBuf};
 
-use roble::sim::SimFs;
-use roble::{Access, Disk, Fs, ReadBuf, WriteBuf};
+use roble::sim::{SimEnv, SimFs};
+use roble::{Access, Disk, Env, Fs, ReadBuf, WriteBuf};
 
 /// Runs `case` against both filesystems, with a directory each.
 ///
@@ -227,9 +227,97 @@ both!(disk_usage_counts_the_bytes, |fs, dir| {
     assert_eq!(usage.used_bytes, 300);
 });
 
+both!(disk_usage_counts_what_is_below_a_subdirectory, |fs, dir| {
+    // A database directory is flat, but a checkpoint written inside one is
+    // not, and the usage a store reports is the usage of everything it owns.
+    // Counting only the top level would under-report it by exactly the files
+    // that a checkpoint pins.
+    write_file(fs, &dir.join("a.sst"), &[0u8; 100]).await;
+    let nested = dir.join("checkpoint").join("deeper");
+    fs.mkdir_all(&nested).await.expect("mkdir_all");
+    write_file(fs, &nested.join("b.sst"), &[0u8; 200]).await;
+    let usage = fs.disk_usage(&dir).await.expect("disk usage");
+    assert_eq!(usage.used_bytes, 300);
+});
+
+both!(mkdir_all_makes_the_parents_it_needs, |fs, dir| {
+    // Every parent at once: the caller has a path, not a list of levels.
+    let nested = dir.join("one").join("two").join("three");
+    fs.mkdir_all(&nested).await.expect("mkdir_all");
+    write_file(fs, &nested.join("x.sst"), b"x").await;
+    assert_eq!(read_file(fs, &nested.join("x.sst")).await, b"x");
+
+    // And again on a directory that is already there, which is what an open
+    // of an existing database does.
+    fs.mkdir_all(&nested)
+        .await
+        .expect("mkdir_all on an existing directory should succeed");
+});
+
 both!(removing_a_missing_file_is_an_error, |fs, dir| {
     assert!(fs.remove(&dir.join("never-existed")).await.is_err());
 });
+
+both!(a_read_only_open_cannot_be_written_through, |fs, dir| {
+    // A snapshot reader and a follower seeded from a checkpoint both open
+    // this way, and both share their files with whoever is still writing
+    // them. A write that slipped through would corrupt a database the opener
+    // had promised only to read.
+    let path = dir.join("000004.sst");
+    write_file(fs, &path, b"table bytes").await;
+
+    let disk = fs
+        .open(&path, Access::ReadOnly)
+        .await
+        .expect("open read-only");
+    let (result, _) = disk
+        .write(WriteBuf::new(b"clobber".to_vec()), 0, Default::default())
+        .await;
+    assert!(result.is_err(), "a read-only open should refuse a write");
+    drop(disk);
+
+    // And the bytes are still the ones that were written.
+    assert_eq!(read_file(fs, &path).await, b"table bytes");
+});
+
+#[compio::test]
+async fn the_simulator_does_not_read_the_clock_and_the_file_system_does() {
+    // §9: compaction paces by units of work under the simulator, so that a
+    // seed replays, and by the clock in production, which is faster and not
+    // reproducible. The contrast is the guarantee, so it is what this pins: a
+    // SimEnv that started reading the clock, or a DefaultEnv that stopped,
+    // would cost a replay without failing anything else here.
+    assert!(
+        roble::DefaultEnv.real_time(),
+        "the file system env paces by the clock"
+    );
+    assert!(
+        !SimEnv::new().real_time(),
+        "a simulated run must not read the clock"
+    );
+}
+
+#[compio::test]
+async fn a_spawned_task_runs_on_the_current_runtime() {
+    // Compaction hands work to the env rather than awaiting it inline (§9), so
+    // what the env owes its caller is that a detached task is actually polled.
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = ran.clone();
+    roble::DefaultEnv.spawn(async move { flag.set(true) });
+
+    // A detached task cannot be joined, so the runtime is given real work
+    // until it has had the chance. Bounded, so a task that never runs fails
+    // the test rather than hanging it.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let path = tmp.path().join("tick");
+    for _ in 0..64 {
+        if ran.get() {
+            break;
+        }
+        write_file(&roble::FileFs, &path, b"x").await;
+    }
+    assert!(ran.get(), "the spawned task should have been polled");
+}
 
 both!(the_lock_keeps_out_a_second_owner, |fs, dir| {
     // Two owners of one database corrupt it, so this is a refusal.
