@@ -31,7 +31,9 @@ const FIXTURES: &[&str] = &[
     "kinds",
     "multiblock",
     "snappy",
+    "pebblev1",
     "pebblev2",
+    "pebblev3",
     "zstd",
     "xxhash64",
     "rangedel",
@@ -451,4 +453,26 @@ fn a_merge_key_is_refused_by_every_path_that_reads_one() {
     table
         .seek_ge(&before, |_, _| Ok(()))
         .expect("a seek that does not reach the MERGE key still answers");
+}
+
+/// A table above roble's pin is refused whole, by name.
+///
+/// Pebblev5 is columnar: the blocks are laid out differently, so reading part
+/// of it would not be reading it slowly but reading it wrongly (§3). The
+/// fixture has no dump beside it for that reason — a dump exists to be
+/// compared against roble's reading, and roble has none to offer.
+#[test]
+fn a_table_above_the_pin_is_refused_whole() {
+    let bytes =
+        std::fs::read(golden_dir().join("refuse-pebblev5.sst")).expect("read refuse-pebblev5.sst");
+    let err = Table::open(&bytes).expect_err("pebblev5 is above the pin");
+    let text = format!("{err}");
+    assert!(
+        text.contains("pebblev5") && text.contains("pin"),
+        "the refusal should name the format and the pin, got {text:?}"
+    );
+    assert!(
+        matches!(err, roble_format::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
 }

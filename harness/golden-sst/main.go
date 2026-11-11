@@ -209,6 +209,44 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, old)
 
+	// Pebblev1 and Pebblev3, the two formats inside roble's pin that the corpus
+	// did not hold. Each version is a different reader: v1 has no value prefix
+	// and no obsolete bit, v3 adds the prefix byte on every SET, v4 adds the
+	// bit. Holding only v2 and v4 left the boundaries either side of the change
+	// that matters untested.
+	for _, spec := range []struct {
+		name   string
+		format sstable.TableFormat
+		shard  int
+		seq    int
+	}{
+		{"pebblev1", sstable.TableFormatPebblev1, 10, 700},
+		{"pebblev3", sstable.TableFormatPebblev3, 11, 800},
+	} {
+		f := fixture{name: spec.name, format: spec.format,
+			blockSize: 4096, compress: block.NoCompression}
+		for i := 0; i < 20; i++ {
+			f.entries = append(f.entries, entry{
+				userKey: oxiaKey(spec.shard, i), seqNum: pebble.SeqNum(spec.seq + i),
+				kind: pebble.InternalKeyKindSet, value: []byte(fmt.Sprintf("%s-%d", spec.name, i)),
+			})
+		}
+		fs = append(fs, f)
+	}
+
+	// Pebblev5 is columnar, the first format above roble's pin: a table roble
+	// must refuse whole rather than partly read (§3), and the one version of
+	// that refusal a real Pebble can still write.
+	v5 := fixture{name: "refuse-pebblev5", format: sstable.TableFormatPebblev5,
+		blockSize: 4096, compress: block.NoCompression}
+	for i := 0; i < 6; i++ {
+		v5.entries = append(v5.entries, entry{
+			userKey: oxiaKey(12, i), seqNum: pebble.SeqNum(900 + i),
+			kind: pebble.InternalKeyKindSet, value: []byte("v5"),
+		})
+	}
+	fs = append(fs, v5)
+
 	// Zstd data blocks. ZstdCompression is used directly rather than
 	// GoodCompression: Good embeds fastestCompression, which is MinLZ on
 	// amd64, and Pebble then silently swaps the whole profile for Snappy
@@ -488,6 +526,15 @@ func main() {
 		sst := filepath.Join(dir, f.name+".sst")
 		if err := write(sst, f); err != nil {
 			panic(fmt.Sprintf("%s: write: %v", f.name, err))
+		}
+		// A dump exists to be compared against roble's reading of the same
+		// bytes, so a table roble refuses outright has nothing to compare and
+		// gets none. Pebble can still read it; roble is the one that cannot.
+		if f.format > sstable.TableFormatPebblev4 {
+			st, _ := os.Stat(sst)
+			fmt.Printf("%-14s %10s %10d %8s  %s\n",
+				f.name, "-", st.Size(), "-", "above the pin")
+			continue
 		}
 		d, err := dump(sst, f)
 		if err != nil {

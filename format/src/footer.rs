@@ -173,3 +173,140 @@ impl Footer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A footer naming `magic` and `version`, with both handles at zero.
+    ///
+    /// Built rather than patched out of a fixture, because what is under test
+    /// is the footer alone: the magic, the version and the refusals either
+    /// side of them. Both block handles encode as a zero varint pair, which is
+    /// in range for a table of any size.
+    fn footer_of(magic: &[u8; MAGIC_LEN], version: u32) -> Vec<u8> {
+        let mut f = vec![0u8; FOOTER_LEN];
+        f[0] = 1; // crc32c
+        let version_at = FOOTER_LEN - MAGIC_LEN - VERSION_LEN;
+        f[version_at..version_at + VERSION_LEN].copy_from_slice(&version.to_le_bytes());
+        f[FOOTER_LEN - MAGIC_LEN..].copy_from_slice(magic);
+        f
+    }
+
+    /// Every version roble reads, decoded from the footer that names it.
+    ///
+    /// The corpus carries tables at v1 through v4, so these are pinned there
+    /// too; what it cannot carry is RocksDBv2, which the Pebble the harness is
+    /// built against will no longer write — `TableFormatMinSupported` is
+    /// Pebblev1 — and which roble still has to read, because a database old
+    /// enough to hold one is exactly the database nobody has looked at.
+    #[test]
+    fn each_format_is_decoded_from_its_magic_and_version() {
+        let cases: &[(&[u8; MAGIC_LEN], u32, TableFormat, &str)] = &[
+            (ROCKSDB_MAGIC, 2, TableFormat::RocksDBv2, "rocksdbv2"),
+            (PEBBLE_MAGIC, 1, TableFormat::Pebblev1, "pebblev1"),
+            (PEBBLE_MAGIC, 2, TableFormat::Pebblev2, "pebblev2"),
+            (PEBBLE_MAGIC, 3, TableFormat::Pebblev3, "pebblev3"),
+            (PEBBLE_MAGIC, 4, TableFormat::Pebblev4, "pebblev4"),
+        ];
+        for &(magic, version, want, name) in cases {
+            let footer = Footer::decode(&footer_of(magic, version), 1 << 20)
+                .unwrap_or_else(|e| panic!("{name} should decode: {e}"));
+            assert_eq!(footer.format, want, "{name}");
+            assert_eq!(want.name(), name);
+        }
+    }
+
+    /// The value prefix arrives at v3 and the obsolete bit at v4, which is the
+    /// whole reason the version is read rather than assumed.
+    #[test]
+    fn the_version_decides_what_a_value_and_a_trailer_carry() {
+        use TableFormat::*;
+        for f in [RocksDBv2, Pebblev1, Pebblev2] {
+            assert!(!f.has_value_prefix(), "{f:?}");
+            assert!(!f.has_obsolete_bit(), "{f:?}");
+        }
+        assert!(Pebblev3.has_value_prefix());
+        assert!(!Pebblev3.has_obsolete_bit());
+        assert!(Pebblev4.has_value_prefix());
+        assert!(Pebblev4.has_obsolete_bit());
+    }
+
+    #[test]
+    fn a_version_roble_does_not_read_is_refused_by_name() {
+        // Above the pin: columnar blocks, a footer checksum, footer
+        // attributes. Each is refused whole rather than partly read (§3).
+        for version in 5..=7u32 {
+            let err = Footer::decode(&footer_of(PEBBLE_MAGIC, version), 1 << 20)
+                .expect_err("above the pin");
+            let text = format!("{err}");
+            assert!(
+                text.contains(&format!("pebblev{version}")) && text.contains("pin"),
+                "got {text:?}"
+            );
+            assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        }
+
+        // Past anything Pebble has defined, and the zero it never writes.
+        for version in [0u32, 8, 99] {
+            let err = Footer::decode(&footer_of(PEBBLE_MAGIC, version), 1 << 20)
+                .expect_err("not a version");
+            assert!(
+                format!("{err}").contains(&format!("version {version}")),
+                "got {err:?}"
+            );
+        }
+
+        // RocksDB's magic carries its own version space, and only v2 of it.
+        let err = Footer::decode(&footer_of(ROCKSDB_MAGIC, 3), 1 << 20).expect_err("rocksdb v3");
+        assert!(
+            format!("{err}").contains("rocksdb table format version 3"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_footer_that_is_not_a_pebble_footer_says_which_kind_of_wrong() {
+        // LevelDB is named rather than called corrupt: the bytes are a real
+        // footer, just one whose 48-byte shape predates everything roble
+        // reads.
+        let err = Footer::decode(&footer_of(LEVELDB_MAGIC, 0), 1 << 20).expect_err("leveldb");
+        assert!(format!("{err}").contains("leveldb"), "got {err:?}");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+
+        // Anything else is not a table at all.
+        let err = Footer::decode(&footer_of(b"notatabl", 4), 1 << 20).expect_err("bad magic");
+        assert!(format!("{err}").contains("bad table magic"), "got {err:?}");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+
+        // And a tail too short to hold a footer is truncated, not corrupt:
+        // the difference is whether there is reason to think bytes are
+        // missing.
+        let short = footer_of(PEBBLE_MAGIC, 4)[..FOOTER_LEN - 1].to_vec();
+        let err = Footer::decode(&short, 1 << 20).expect_err("short tail");
+        assert!(matches!(err, Error::Truncated { .. }), "got {err:?}");
+    }
+
+    /// A handle that points outside the table is caught at the footer rather
+    /// than at the read.
+    ///
+    /// The footer is the first thing read and the last thing written, so a
+    /// handle past the end means the table was cut short or the footer was
+    /// not the one that belongs to it. Catching it here is what lets every
+    /// later read assume its handles are in range.
+    #[test]
+    fn a_handle_that_runs_past_the_end_is_refused_at_the_footer() {
+        let mut f = footer_of(PEBBLE_MAGIC, 4);
+        // The metaindex handle, as two single-byte varints: offset 10,
+        // length 10, in a table of 5 bytes.
+        f[1] = 10;
+        f[2] = 10;
+        let err = Footer::decode(&f, 5).expect_err("a handle past the end");
+        let text = format!("{err}");
+        assert!(
+            text.contains("metaindex handle") && text.contains("runs past the end"),
+            "the refusal should name the handle, got {text:?}"
+        );
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+}
