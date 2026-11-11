@@ -96,6 +96,7 @@ struct Candidate {
 impl<F: Fs> Opened<'_, F> {
     /// Reads the key `how` says, or `None` if there is none.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
+        let _timer = self.metrics.get.start();
         match how {
             // Equal keeps its own path: it is the one comparison a bloom
             // filter can answer, and a scan does not consult filters because

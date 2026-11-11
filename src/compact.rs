@@ -97,7 +97,10 @@ impl<F: Fs> Opened<'_, F> {
             ));
         }
 
+        let _timer = self.metrics.compaction.start();
         let (inputs, below) = self.inputs_for(level, output_level, file_nums)?;
+        self.metrics.compaction_tables[0].add(inputs.len() as u64);
+        self.metrics.compaction_io[0].add(inputs.iter().map(|(_, m)| m.size).sum());
         let mut tables = Vec::new();
         for (_, meta) in &inputs {
             tables.push(self.open_table(meta.file_num).await?);
@@ -114,6 +117,8 @@ impl<F: Fs> Opened<'_, F> {
             let file_num = first_file_num + i as u64;
             let mut new_table = bounds.into_new_table(output_level, file_num)?;
             new_table.size = bytes.len() as u64;
+            self.metrics.compaction_tables[1].add(1);
+            self.metrics.compaction_io[1].add(new_table.size);
             self.write_table(file_num, bytes).await?;
             new_tables.push(new_table);
         }
@@ -140,6 +145,8 @@ impl<F: Fs> Opened<'_, F> {
             let _ = self.rotate_manifest().await;
         }
         let _ = self.remove_obsolete_files().await;
+        self.metrics.saw_version(&self.versions().version);
+        self.measure_disk().await;
 
         Ok(edit.new_tables.iter().map(|t| t.file_num).collect())
     }

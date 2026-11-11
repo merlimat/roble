@@ -54,6 +54,7 @@ impl<F: Fs> Opened<'_, F> {
     /// to write. With the WAL off this is the only durability point (§7);
     /// with it on, it is what lets a log be retired.
     pub async fn flush(&self) -> Result<Option<u64>> {
+        let _timer = self.metrics.flush.start();
         let memtable = self.memtable();
         if memtable.borrow().is_empty() && memtable.borrow().tombstones().is_empty() {
             return Ok(None);
@@ -72,6 +73,8 @@ impl<F: Fs> Opened<'_, F> {
         };
 
         let (bytes, new_table) = build_table(&memtable.borrow(), table_num)?;
+        self.metrics.flush_size.record(bytes.len() as u64);
+        self.metrics.flush_bytes.add(bytes.len() as u64);
 
         // 1. The table, then the directory, so its name is durable too.
         let path = self
@@ -140,6 +143,11 @@ impl<F: Fs> Opened<'_, F> {
         //    next flush will find again (§6). Reporting a flush that worked
         //    as one that did not would be the larger lie.
         let _ = self.remove_obsolete_files().await;
+        self.metrics.saw_version(&self.versions().version);
+        self.metrics
+            .memtable_size
+            .set(self.unflushed_bytes() as i64);
+        self.measure_disk().await;
         Ok(Some(table_num))
     }
 

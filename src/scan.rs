@@ -214,17 +214,24 @@ pub struct Scan<D: Disk> {
     upper: Option<Vec<u8>>,
     dir: Dir,
     current: Option<Current>,
+    /// The store's handles, so a scan can count what it steps onto. `None`
+    /// for a scan made without a store, which only the crate's own tests do.
+    metrics: Option<Rc<crate::metrics::Metrics>>,
 }
 
 impl<D: Disk> Scan<D> {
     /// A scan over `tables`, bounded by `lower` (included) and `upper`
     /// (excluded), positioned nowhere.
-    pub fn new(
+    ///
+    /// Crate-private: its arguments are a store's internals, and the way to
+    /// one from outside is [`crate::Opened::scan`].
+    pub(crate) fn new(
         tables: Vec<Rc<OpenTable<D>>>,
         memtables: Vec<Rc<RefCell<Memtable>>>,
         snapshot: u64,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
+        metrics: Option<Rc<crate::metrics::Metrics>>,
     ) -> Self {
         let mut iters: Vec<Source<D>> = tables.iter().map(|t| Source::Table(t.iter())).collect();
         for m in &memtables {
@@ -245,6 +252,14 @@ impl<D: Disk> Scan<D> {
             upper,
             dir: Dir::Forward,
             current: None,
+            metrics,
+        }
+    }
+
+    /// Counts one more key the scan has landed on.
+    fn stepped_onto(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.scan_entries.add(1);
         }
     }
 
@@ -371,6 +386,7 @@ impl<D: Disk> Scan<D> {
                 && self.visible(&user, seq, kind)?
             {
                 self.current = Some(Current { user, value });
+                self.stepped_onto();
                 return Ok(());
             }
         }
@@ -396,6 +412,7 @@ impl<D: Disk> Scan<D> {
                 && self.visible(&user, seq, kind)?
             {
                 self.current = Some(Current { user, value });
+                self.stepped_onto();
                 return Ok(());
             }
         }
@@ -551,6 +568,7 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Scan<F::Disk>> {
+        self.metrics.scans.add(1);
         // Every table of the version. A table whose key range misses the
         // bounds could be left out, but that is the version's business to
         // decide and it costs nothing here: an iterator over a table outside
@@ -577,6 +595,7 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
             self.snapshot(),
             lower.map(|b| b.to_vec()),
             upper.map(|b| b.to_vec()),
+            Some(Rc::clone(&self.metrics)),
         ))
     }
 }

@@ -99,6 +99,11 @@ pub struct Opened<'a, F: Fs> {
     markers: std::cell::RefCell<Vec<String>>,
     /// How large the MANIFEST may grow before a flush replaces it.
     max_manifest_bytes: u64,
+    /// What this store records, if anything (`crate::metrics`).
+    ///
+    /// Shared rather than owned outright because a scan outlives the call
+    /// that made it and counts the keys it steps onto as it goes.
+    pub(crate) metrics: std::rc::Rc<crate::metrics::Metrics>,
     /// What the picker allows L0 and L1 to hold (`crate::pick`).
     l0_compaction_threshold: u64,
     lbase_max_bytes: u64,
@@ -244,8 +249,20 @@ pub async fn open_with<'a, E: Env>(
         .collect();
     markers.sort();
 
+    let metrics = std::rc::Rc::new(crate::metrics::Metrics::new(&crate::metrics::Meter::new(
+        &options, dir,
+    )));
+    metrics.saw_version(&versions.version);
+    metrics.memtable_size.set(memtable.bytes() as i64);
+    if metrics.recording()
+        && let Ok(usage) = fs.disk_usage(dir).await
+    {
+        metrics.disk_size.set(usage.used_bytes as i64);
+    }
+
     Ok(Opened {
         _lock: lock,
+        metrics,
         fs,
         store_id: options.caches.new_store_id(),
         caches: options.caches,
@@ -498,6 +515,7 @@ impl<F: Fs> Opened<'_, F> {
     /// than ignored: nothing but `flush` can make a write durable, and
     /// saying otherwise would be the silent half of a data loss.
     pub async fn write(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
+        let _timer = self.metrics.write.start();
         // Refused before anything is stamped, so a write that cannot keep
         // its promise changes nothing. Pebble refuses this too, and the
         // reason is the same: with no log there is nowhere for a sync to
@@ -515,6 +533,7 @@ impl<F: Fs> Opened<'_, F> {
         batch.set_seq_num(base);
 
         if !self.disable_wal {
+            let _timer = self.metrics.wal.start();
             // The log, with the borrow released before any waiting: a
             // `RefCell` held across an await is a panic waiting for the
             // first reader that arrives in the middle of a write.
@@ -553,6 +572,16 @@ impl<F: Fs> Opened<'_, F> {
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
         self.next_seq.set(next);
+
+        for entry in iter_kinds(batch.as_bytes())? {
+            self.metrics.write_operations[entry].add(1);
+        }
+        self.metrics
+            .write_size
+            .record(batch.as_bytes().len() as u64);
+        self.metrics
+            .memtable_size
+            .set(self.unflushed_bytes() as i64);
         Ok(())
     }
 
@@ -644,6 +673,21 @@ impl<F: Fs> Opened<'_, F> {
     /// Drops names the obsolete sweep removed from the marker list.
     pub(crate) fn forget_markers(&self, removed: &[String]) {
         self.markers.borrow_mut().retain(|m| !removed.contains(m));
+    }
+
+    /// Restates how much of the disk the directory takes.
+    ///
+    /// Called where files appear or disappear — a flush, a compaction — and
+    /// only when something is recording, since it costs a walk of the
+    /// directory. A failure is dropped rather than reported: a metric that
+    /// could not be measured is not a reason to fail the work it describes.
+    pub(crate) async fn measure_disk(&self) {
+        if !self.metrics.recording() {
+            return;
+        }
+        if let Ok(usage) = self.fs.disk_usage(&self.dir).await {
+            self.metrics.disk_size.set(usage.used_bytes as i64);
+        }
     }
 
     /// The filesystem this store's files live in.
@@ -756,4 +800,24 @@ fn internal_key(encoded: &[u8]) -> Result<String> {
     let k = roble_format::InternalKey::decode(encoded)?;
     let hex: String = k.user_key.iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("{hex} #{} {}", k.seq_num, k.kind.name()))
+}
+
+/// Which of `write_operations`' three counters each entry of a batch belongs
+/// to: put, delete, or range delete.
+///
+/// Read off the representation rather than counted as the caller builds it,
+/// because a batch reaches `write` from several places — an indexed batch, a
+/// log replay, a caller's own — and only the bytes are common to all of them.
+fn iter_kinds(repr: &[u8]) -> Result<Vec<usize>> {
+    use roble_format::key::Kind;
+    let mut reader = roble_format::batch::Batch::read(repr)?;
+    let mut out = Vec::new();
+    while let Some(entry) = reader.next() {
+        out.push(match entry?.kind {
+            Kind::RangeDelete => 2,
+            Kind::Delete | Kind::SingleDelete | Kind::DeleteSized => 1,
+            _ => 0,
+        });
+    }
+    Ok(out)
 }
