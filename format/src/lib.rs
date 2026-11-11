@@ -27,6 +27,7 @@ mod varint;
 
 pub mod batch;
 pub mod block;
+pub mod files;
 pub mod filter;
 pub mod key;
 pub mod manifest;

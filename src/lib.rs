@@ -17,15 +17,20 @@
 //! See `DESIGN.md`. This crate is the engine; [`roble_format`] encodes and
 //! decodes the files, with no I/O of its own.
 //!
-//! So far it holds the seam the engine sits on: the [`Env`] a store runs in,
+//! So far it holds the seam the engine sits on — the [`Env`] a store runs in,
 //! the [`Fs`] it opens files in, and the [`Disk`] that holds one of them
-//! (§10). [`DefaultEnv`] is the file system on compio; [`sim`] is an in-memory
+//! (§10) — and, on top of it, [`open`], which reads a database directory:
+//! its markers, and its MANIFEST replayed into a [`Version`] (§6).
+//!
+//! [`DefaultEnv`] is the file system on compio; [`sim`] is an in-memory
 //! filesystem that can be made to fail or crash at any single operation, which
 //! is how §12 tests the failure paths.
 
 pub mod buf;
 pub mod env;
+pub mod open;
 pub mod sim;
+pub mod version;
 
 mod error;
 mod file;
@@ -34,3 +39,5 @@ pub use buf::{ReadBuf, WriteBuf};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
+pub use open::{Opened, open};
+pub use version::{Table, Version, VersionSet};

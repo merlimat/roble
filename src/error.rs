@@ -33,6 +33,20 @@ pub enum Error {
     /// A file was not in the format roble reads, or holds a structure it
     /// refuses to read (DESIGN.md §3).
     Format(roble_format::Error),
+    /// The database is valid Pebble, but uses something roble does not read:
+    /// a format major version above the pin, a comparer other than bytewise,
+    /// WAL failover (DESIGN.md §3).
+    ///
+    /// Separate from [`Error::Format`] because the subject is the database
+    /// rather than one file, and because the answer is different: a refusal
+    /// here means roble is the wrong reader, not that the bytes are bad.
+    Unsupported(String),
+    /// The database's own metadata does not hang together — a MANIFEST edit
+    /// that does not apply, a table the version names and the directory does
+    /// not hold.
+    Corrupt(String),
+    /// There is no database in the directory.
+    NotFound(String),
 }
 
 impl fmt::Display for Error {
@@ -41,6 +55,9 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "{e}"),
             Error::Locked => write!(f, "the database directory is already open elsewhere"),
             Error::Format(e) => write!(f, "{e}"),
+            Error::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Error::Corrupt(m) => write!(f, "corrupt: {m}"),
+            Error::NotFound(m) => write!(f, "{m}"),
         }
     }
 }
@@ -51,6 +68,7 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Locked => None,
             Error::Format(e) => Some(e),
+            Error::Unsupported(_) | Error::Corrupt(_) | Error::NotFound(_) => None,
         }
     }
 }

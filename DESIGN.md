@@ -4,10 +4,17 @@
 > compatibility target (§3), the decisions that differ from encina's (§4), and
 > the order the work goes in (§13).
 >
-> M2's first piece is in: the env, the filesystem and the disk of §10, with a
-> compio implementation and an in-memory one that can be made to fail or crash
-> at any single operation. The engine itself — opening a database, the version,
-> the caches, the iterator tree — is next.
+> M2 so far: the env, the filesystem and the disk of §10, with a compio
+> implementation and an in-memory one that can be made to fail or crash at any
+> single operation; and on top of them `open`, which reads a database directory
+> — its markers, and its MANIFEST replayed into a version — and refuses one it
+> cannot read whole (§6). The caches, the iterator tree and `get` are next.
+>
+> `open` is judged against whole databases Go Pebble wrote, committed under
+> `tests/golden/`, where Pebble's own reader describes the directory and roble
+> has to agree with it exactly. A log that still holds writes is **refused**
+> until replay lands in M3, since opening without it would discard writes that
+> were already acknowledged.
 >
 > `roble-format` encodes and decodes Pebble's files, each structure pinned
 > against Go Pebble rather than against a reading of it: sstables both ways,
@@ -449,6 +456,14 @@ than opening without it**: ignoring one silently discards writes that were
 already acknowledged. With `disable_wal` there is nothing to replay and the
 database opens as of the last flush.
 
+Until replay exists (M3), "cannot replay" covers every log that holds a record,
+so a database with unflushed writes is refused rather than opened short. The
+test for it is a refusal today and a replay later, which is the same test either
+way. Note that `disable_wal` leaves an **empty log file** behind rather than no
+log file, so the question an opener asks is whether a log holds a record, not
+whether one exists — Oxia's own configuration has a log file in the directory,
+holding nothing but the eleven-byte EOF trailer.
+
 ## 7. The format crate
 
 `roble-format` encodes and decodes Pebble's files. It has no I/O, no async, no
@@ -680,6 +695,20 @@ in both directions.
   log segment — because a refusal that is not tested is a refusal that panics or
   half-reads instead. The files are committed. roble's tests read them and
   compare against the harness's dump of the same files.
+- **Whole-database fixtures.** A file can be pinned on its own; a database
+  cannot. Which table sits at which level exists only once a format-version
+  marker, a manifest marker and a MANIFEST are put together and the MANIFEST's
+  edits are replayed in order, so `harness/db-fixture` writes whole directories
+  and dumps what Pebble's own reader finds in them. roble's `open` has to
+  produce the same text. The fixtures are generated with compression off, which
+  is not for realism but so their table sizes are the same on every
+  architecture and the dumps can be compared exactly in CI.
+- **Refusals have no Go counterpart.** Pebble will not write a database above
+  roble's pin, and cannot be asked to write one with a comparer it does not
+  have, so those directories are built by hand in the simulated filesystem.
+  What those tests check is that roble refuses *for the stated reason*, not
+  merely that it fails — a refusal that fires for the wrong reason is how a
+  pin stops being a pin.
 - **Round trip, both ways, in CI.** roble writes a database; the Go harness
   opens it, scans it, verifies it with the `pebble` tool, checkpoints it; roble opens
   that checkpoint and compares. Then the reverse. **This is the gate: a change

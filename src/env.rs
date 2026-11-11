@@ -225,6 +225,15 @@ pub async fn read_exact<D: Disk>(
     Ok(buf.into_vec())
 }
 
+/// Reads the whole file.
+///
+/// For the files a database reads end to end rather than by block: a MANIFEST,
+/// a log, a marker. A table is never read this way.
+pub async fn read_all<D: Disk>(disk: &D, class: D::Class) -> Result<Vec<u8>> {
+    let len = disk.len().await?;
+    read_exact(disk, 0, len as usize, class).await
+}
+
 /// Reads the last `len` bytes of the file, which is how a footer is found.
 pub async fn read_tail<D: Disk>(disk: &D, len: usize, class: D::Class) -> Result<Vec<u8>> {
     let size = disk.len().await?;
