@@ -433,20 +433,21 @@ block cache yet: every read today fetches the bytes afresh, so the closure
 would hand out a borrow of something about to be dropped and save nothing. It
 arrives with the cache, which is also when it starts to pay.
 
-Both ordered searches check that their bound moves outward each time round and
-refuse if it has not. On a well-formed database it always does, which is the
-reason to check: a table whose keys do not match the bounds its MANIFEST entry
-gives it would otherwise spin forever instead of returning an error, and an
-engine that hangs is worse than one that refuses (§2).
+Neither search can now fail to make progress, and not by checking: a scan's
+step always advances at least the iterator whose key it just returned, so the
+loop that skips deleted keys ends when the iterators do. The earlier version
+did need a check — it re-derived its bound each time round, and a table whose
+keys disagreed with the bounds its MANIFEST entry gives it would have spun
+forever. Structure is a better guarantee than a check, and this is the kind of
+thing worth saying out loud when a guard disappears.
 
-One cost is worth naming rather than discovering: the four ordered
-comparisons re-seek every candidate table once per key they reject, so a long
-run of deleted keys costs a seek per table per key. **A scan does not pay
-this** — its iterators keep their place and step — so `get`'s ordered
-comparisons should in time be a scan positioned once and read, rather than
-their own merge. They are kept separate for now because `get` is pinned
-against Pebble as it stands and rewriting it is a change worth making on its
-own.
+**The four ordered comparisons are a scan, positioned once and read.** They
+were their own merge for a while, re-seeking every candidate table once per
+key they rejected, so a long run of deleted keys cost a seek per table per
+key. A scan steps instead, and skipping deleted keys is its job rather than
+`get`'s. Equal keeps its own path, because it is the one comparison a bloom
+filter can answer and a scan does not consult filters — it is asking about a
+range.
 
 (A table is no longer read whole. The table cache holds an open reader with
 its footer, index, filter and tombstones, and data blocks are fetched one at a

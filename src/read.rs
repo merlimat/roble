@@ -97,13 +97,11 @@ impl<F: Fs> Opened<'_, F> {
     /// Reads the key `how` says, or `None` if there is none.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
         match how {
+            // Equal keeps its own path: it is the one comparison a bloom
+            // filter can answer, and a scan does not consult filters because
+            // it is asking about a range (§6).
             Comparison::Equal => self.equal(key).await,
-            Comparison::Ceiling => self.ceiling_from(key.to_vec()).await,
-            Comparison::Higher => self.ceiling_from(successor(key)).await,
-            // The greatest key at or below `key` is the greatest key strictly
-            // below the one after it.
-            Comparison::Floor => self.floor_before(successor(key)).await,
-            Comparison::Lower => self.floor_before(key.to_vec()).await,
+            _ => self.positioned(key, how).await,
         }
     }
 
@@ -121,106 +119,29 @@ impl<F: Fs> Opened<'_, F> {
         }))
     }
 
-    /// The least visible key at or after `from`.
-    async fn ceiling_from(&self, from: Vec<u8>) -> Result<Option<Found>> {
-        let mut from = from;
-        loop {
-            // The bound has to move outward every time round, or this loops
-            // forever. It cannot fail to on a well-formed database, which is
-            // exactly why it is checked: a table whose keys do not match the
-            // bounds the MANIFEST gives it would otherwise hang a server
-            // rather than return an error.
-            let previous = from.clone();
-            let Some(user) = self.least_user_key_at_or_after(&from).await? else {
-                return Ok(None);
-            };
-            let found = self
-                .newest_for(&user)
-                .await?
-                .expect("a key a seek just found must have a newest version");
-            if self.visible(&user, &found).await? {
-                return Ok(Some(Found {
-                    key: user,
-                    value: found.value,
-                }));
-            }
-            // Deleted: step past every version of it and look again.
-            from = successor(&user);
-            if from <= previous {
-                return Err(crate::Error::Corrupt(format!(
-                    "a search for the key at or after {previous:02x?} found {user:02x?}, \
-                     which is not past it"
-                )));
-            }
+    /// The first visible key a scan positioned `how` lands on.
+    ///
+    /// The four ordered comparisons are a scan that is positioned once and
+    /// read, which is what they always were in §6's description: "the other
+    /// four are a seek ... over the full iterator tree". They used to be a
+    /// merge of their own, re-seeking every candidate table once per key they
+    /// rejected; a scan steps instead, and skipping deleted keys is its job
+    /// rather than this one's.
+    async fn positioned(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
+        let mut scan = self.scan().await?;
+        match how {
+            Comparison::Ceiling => scan.seek_ge(key).await?,
+            Comparison::Higher => scan.seek_ge(&successor(key)).await?,
+            // The greatest key at or below `key` is the greatest key strictly
+            // below the one after it.
+            Comparison::Floor => scan.seek_lt(&successor(key)).await?,
+            Comparison::Lower => scan.seek_lt(key).await?,
+            Comparison::Equal => unreachable!("Equal is a point lookup"),
         }
-    }
-
-    /// The greatest visible key strictly before `bound`.
-    async fn floor_before(&self, bound: Vec<u8>) -> Result<Option<Found>> {
-        let mut bound = bound;
-        loop {
-            // As in `ceiling_from`: the bound must move, or this never ends.
-            let previous = bound.clone();
-            let Some(user) = self.greatest_user_key_before(&bound).await? else {
-                return Ok(None);
-            };
-            let found = self
-                .newest_for(&user)
-                .await?
-                .expect("a key a seek just found must have a newest version");
-            if self.visible(&user, &found).await? {
-                return Ok(Some(Found {
-                    key: user,
-                    value: found.value,
-                }));
-            }
-            bound = user;
-            if bound >= previous {
-                return Err(crate::Error::Corrupt(format!(
-                    "a search for the key before {previous:02x?} found {bound:02x?}, \
-                     which is not before it"
-                )));
-            }
-        }
-    }
-
-    /// The least user key present at or after `from`, deleted or not.
-    async fn least_user_key_at_or_after(&self, from: &[u8]) -> Result<Option<Vec<u8>>> {
-        let target = key::search_key(from);
-        let mut best: Option<Vec<u8>> = None;
-        for meta in self.live_tables() {
-            // A table whose keys all end before the target cannot answer.
-            if meta.largest_user_key()? < from {
-                continue;
-            }
-            let table = self.open_table(meta.file_num).await?;
-            if let Some(entry) = table.seek_ge(&target).await? {
-                let k = InternalKey::decode(&entry.key)?.user_key.to_vec();
-                if best.as_ref().is_none_or(|b| k < *b) {
-                    best = Some(k);
-                }
-            }
-        }
-        Ok(best)
-    }
-
-    /// The greatest user key present strictly before `bound`, deleted or not.
-    async fn greatest_user_key_before(&self, bound: &[u8]) -> Result<Option<Vec<u8>>> {
-        let target = key::search_key(bound);
-        let mut best: Option<Vec<u8>> = None;
-        for meta in self.live_tables() {
-            if meta.smallest_user_key()? >= bound {
-                continue;
-            }
-            let table = self.open_table(meta.file_num).await?;
-            if let Some(entry) = table.seek_lt(&target).await? {
-                let k = InternalKey::decode(&entry.key)?.user_key.to_vec();
-                if best.as_ref().is_none_or(|b| k > *b) {
-                    best = Some(k);
-                }
-            }
-        }
-        Ok(best)
+        Ok(scan.is_valid().then(|| Found {
+            key: scan.key().to_vec(),
+            value: scan.value().to_vec(),
+        }))
     }
 
     /// The newest entry any table holds for `user`.
