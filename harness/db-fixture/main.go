@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -74,6 +75,12 @@ func main() {
 	}{
 		{"db-simple", buildSimple},
 		{"db-unflushed-wal", buildUnflushedWAL},
+		// A pair built identically, so their tables get the same file
+		// numbers, holding different keys. Two stores on one thread look
+		// like this, and a cache keyed by file number alone would serve one
+		// the other's table.
+		{"db-twin-a", buildTwin("a")},
+		{"db-twin-b", buildTwin("b")},
 	} {
 		dir := filepath.Join(out, f.name)
 		if err := os.RemoveAll(dir); err != nil {
@@ -91,6 +98,15 @@ func main() {
 		}
 		fmt.Printf("%s: %d files\n", f.name, countFiles(dir))
 	}
+
+	// The twins are only useful if their tables really do collide.
+	a := tableNumbers(filepath.Join(out, "db-twin-a"))
+	b := tableNumbers(filepath.Join(out, "db-twin-b"))
+	if len(a) == 0 || !slices.Equal(a, b) {
+		fail(fmt.Errorf("the twins' tables are %v and %v; they have to be the same file "+
+			"numbers or the shared-cache test proves nothing", a, b))
+	}
+	fmt.Printf("db-twin-a and db-twin-b both hold %v\n", a)
 }
 
 // uncompressed turns compression off for every level.
@@ -204,6 +220,57 @@ func buildUnflushedWAL(dir string) error {
 		return err
 	}
 	return db.Close()
+}
+
+// buildTwin writes a one-table database whose keys are prefixed with `tag`.
+//
+// Both twins are built by exactly the same sequence, so Pebble hands their
+// tables the same file numbers — which is the whole point: the test that two
+// stores sharing a cache cannot read each other's tables needs the file
+// numbers to collide, or it proves nothing. `main` asserts the collision
+// rather than hoping for it.
+func buildTwin(tag string) func(string) error {
+	return func(dir string) error {
+		db, err := pebble.Open(dir, uncompressed(&pebble.Options{
+			FS:                          vfs.Default,
+			FormatMajorVersion:          pebble.FormatVirtualSSTables,
+			DisableAutomaticCompactions: true,
+			DisableWAL:                  true,
+		}))
+		if err != nil {
+			return err
+		}
+		b := db.NewBatch()
+		for i := 0; i < 4; i++ {
+			k := fmt.Sprintf("%s%d", tag, i)
+			if err := b.Set([]byte(k), []byte("twin-"+k), nil); err != nil {
+				return err
+			}
+		}
+		if err := b.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		if err := db.Flush(); err != nil {
+			return err
+		}
+		return db.Close()
+	}
+}
+
+// tableNumbers lists the sstable file numbers in a directory.
+func tableNumbers(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".sst") {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // describe renders what Pebble reads back out of the directory, in the text

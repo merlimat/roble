@@ -57,20 +57,12 @@ pub struct Opened<'a, F: Fs> {
     _lock: F::Lock,
     /// The filesystem the database's files are opened in.
     fs: &'a F,
-    /// Table files, read whole and kept.
-    ///
-    /// **This is the seam the caches replace** (§8). A real read fetches the
-    /// blocks it needs, keyed by file number and offset, inside a budget;
-    /// this reads a whole table the first time anything touches it and never
-    /// lets go. That is wrong for a 64 MiB table and right for getting the
-    /// read path correct first, and it is why there is no public scan
-    /// iterator yet: a cursor that outlives a call has to hold the blocks it
-    /// is reading, and nothing here is fit to hold them.
-    table_cache: std::cell::RefCell<std::collections::BTreeMap<u64, std::rc::Rc<Vec<u8>>>>,
-    /// Each table's range tombstones, decoded once.
-    pub(crate) tombstone_cache: std::cell::RefCell<
-        std::collections::BTreeMap<u64, std::rc::Rc<Vec<roble_format::rangedel::Tombstone>>>,
-    >,
+    /// The caches this store draws on, shared with every other store on the
+    /// thread that was given the same handle (§8).
+    pub(crate) caches: crate::cache::Caches<F>,
+    /// This store's identity within those caches: file numbers are per
+    /// database, so the caches cannot be keyed by file number alone.
+    store_id: u64,
     /// The directory the database lives in.
     pub dir: PathBuf,
     /// The format major version it was written in.
@@ -83,8 +75,20 @@ pub struct Opened<'a, F: Fs> {
     pub versions: VersionSet,
 }
 
-/// Opens the database in `dir`.
+/// Opens the database in `dir` with caches of its own.
+///
+/// A store that shares a thread with others should be opened with
+/// [`open_with`] instead, so that one budget covers them all (§8).
 pub async fn open<'a, E: Env>(env: &'a E, dir: &Path) -> Result<Opened<'a, E::Fs>> {
+    open_with(env, dir, crate::cache::Caches::default()).await
+}
+
+/// Opens the database in `dir`, drawing on `caches`.
+pub async fn open_with<'a, E: Env>(
+    env: &'a E,
+    dir: &Path,
+    caches: crate::cache::Caches<E::Fs>,
+) -> Result<Opened<'a, E::Fs>> {
     let fs = env.fs();
 
     // 1. The lock comes first, so nothing below races a second owner.
@@ -161,8 +165,8 @@ pub async fn open<'a, E: Env>(env: &'a E, dir: &Path) -> Result<Opened<'a, E::Fs
     Ok(Opened {
         _lock: lock,
         fs,
-        table_cache: Default::default(),
-        tombstone_cache: Default::default(),
+        store_id: caches.new_store_id(),
+        caches,
         dir: dir.to_path_buf(),
         format_version,
         manifest_filename,
@@ -326,22 +330,29 @@ impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
 }
 
 impl<F: Fs> Opened<'_, F> {
-    /// The bytes of one table, read whole the first time and kept.
+    /// The caches this store draws on, for tests that check what they hold.
+    pub fn caches_for_test(&self) -> &crate::cache::Caches<F> {
+        &self.caches
+    }
+
+    /// The open reader for one table, from the cache or freshly opened.
     ///
-    /// See [`Opened`]'s `table_cache` for why this is whole files.
-    pub(crate) async fn table_bytes(&self, file_num: u64) -> Result<std::rc::Rc<Vec<u8>>> {
-        // The borrow is dropped before the read, so no borrow is held across
-        // an await.
-        if let Some(held) = self.table_cache.borrow().get(&file_num) {
-            return Ok(std::rc::Rc::clone(held));
+    /// Opening one reads its footer, metaindex, properties, index, filter and
+    /// tombstones — never the whole file — and the reader keeps the file open
+    /// for the data blocks that follow.
+    pub(crate) async fn open_table(
+        &self,
+        file_num: u64,
+    ) -> Result<std::rc::Rc<crate::table::OpenTable<F::Disk>>> {
+        if let Some(held) = self.caches.table(self.store_id, file_num) {
+            return Ok(held);
         }
         let path = self.dir.join(roble_format::files::table_filename(file_num));
         let disk = self.fs.open(&path, Access::ReadOnly).await?;
-        let bytes = std::rc::Rc::new(read_all(&disk, Default::default()).await?);
-        self.table_cache
-            .borrow_mut()
-            .insert(file_num, std::rc::Rc::clone(&bytes));
-        Ok(bytes)
+        let table = std::rc::Rc::new(crate::table::OpenTable::open(file_num, disk).await?);
+        self.caches
+            .hold_table(self.store_id, file_num, std::rc::Rc::clone(&table));
+        Ok(table)
     }
 
     /// Renders what the directory says, in the text the Go harness's

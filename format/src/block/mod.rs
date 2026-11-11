@@ -49,6 +49,39 @@ use crate::error::{Error, Result};
 use crate::key::InternalKey;
 use crate::varint;
 
+/// Verifies and decompresses a block whose bytes have already been fetched.
+///
+/// `fetched` is the block's data **and** its five-byte trailer — exactly the
+/// span [`BlockHandle::span_len`] measures — which is what an engine reads
+/// when it fetches one block instead of a whole table. `offset` only names the
+/// block in a checksum error.
+///
+/// This is the seam a block cache needs: without it, reading a block means
+/// having the whole file in memory, and a cache keyed by (file, offset) has
+/// nothing to cache.
+pub fn decode_fetched(
+    fetched: &[u8],
+    offset: u64,
+    checksum: crate::ChecksumType,
+) -> Result<Decoded<'_>> {
+    if fetched.len() < TRAILER_SIZE {
+        return Error::truncated("block", TRAILER_SIZE, fetched.len());
+    }
+    let (data, trailer) = fetched.split_at(fetched.len() - TRAILER_SIZE);
+    let block_type = trailer[0];
+    let stored = u32::from_le_bytes(trailer[1..5].try_into().expect("4 bytes"));
+
+    let computed = checksum.compute(data, block_type)?;
+    if computed != stored {
+        return Err(Error::ChecksumMismatch {
+            offset,
+            stored,
+            computed,
+        });
+    }
+    decode_compressed(Compression::from_byte(block_type)?, data)
+}
+
 /// `block.TrailerLen`: one byte of block type, four of checksum.
 pub const TRAILER_SIZE: usize = 5;
 
