@@ -476,3 +476,26 @@ fn a_table_above_the_pin_is_refused_whole() {
         "expected Unsupported, got {err:?}"
     );
 }
+
+/// The format crate refuses the same table on its own account.
+///
+/// `Table::open` and the engine's `OpenTable::open` each read the properties
+/// and each check the comparer, because they are reached by different callers
+/// — the dump command goes through one and a database read through the other.
+/// A check in only one of them would leave a reader that served keys in an
+/// order the table was never written in.
+#[test]
+fn the_reader_refuses_a_foreign_comparer_too() {
+    let bytes =
+        std::fs::read(golden_dir().join("refuse-comparer.sst")).expect("read refuse-comparer.sst");
+    let err = Table::open(&bytes).expect_err("a foreign comparer must be refused");
+    let text = format!("{err}");
+    assert!(
+        text.contains("oxia-slash-spans"),
+        "the refusal should name the comparer, got {text:?}"
+    );
+    assert!(
+        matches!(err, roble_format::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}

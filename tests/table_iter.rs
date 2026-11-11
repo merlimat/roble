@@ -31,7 +31,7 @@ use roble::sim::{SimEnv, SimFs};
 use roble::table::OpenTable;
 use roble::{Access, Caches, Disk, Fs, WriteBuf};
 use roble_format::block::Value;
-use roble_format::sst::Table;
+use roble_format::sst::{Table, TableWriter, WriterOptions};
 
 /// The fixtures roble accepts, as `format/tests/golden.rs` lists them.
 const FIXTURES: &[&str] = &[
@@ -89,7 +89,18 @@ fn expected(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// Puts a fixture into a simulated filesystem and opens it as a table.
 async fn open(name: &str) -> (SimEnv, std::rc::Rc<OpenTable<roble::sim::SimDisk>>) {
-    let bytes = std::fs::read(sst_path(name)).expect("read fixture");
+    open_bytes(std::fs::read(sst_path(name)).expect("read fixture")).await
+}
+
+/// The same, for a table built in the test rather than read from the corpus.
+async fn open_bytes(bytes: Vec<u8>) -> (SimEnv, std::rc::Rc<OpenTable<roble::sim::SimDisk>>) {
+    let (env, opened) = try_open_bytes(bytes).await;
+    (env, std::rc::Rc::new(opened.expect("open table")))
+}
+
+/// The same again, handing back whatever opening the table said, for the
+/// fixtures whose point is that it says no.
+async fn try_open_bytes(bytes: Vec<u8>) -> (SimEnv, roble::Result<OpenTable<roble::sim::SimDisk>>) {
     let env = SimEnv::new();
     let fs: &SimFs = env.sim();
     fs.mkdir_all(Path::new("/t")).await.expect("mkdir");
@@ -101,10 +112,7 @@ async fn open(name: &str) -> (SimEnv, std::rc::Rc<OpenTable<roble::sim::SimDisk>
 
     let caches: Caches<SimFs> = Caches::default();
     let disk = fs.open(&path, Access::ReadOnly).await.expect("open");
-    let table = OpenTable::open(1, disk, caches.blocks(0))
-        .await
-        .expect("open table");
-    (env, std::rc::Rc::new(table))
+    (env, OpenTable::open(1, disk, caches.blocks(0)).await)
 }
 
 #[compio::test]
@@ -222,4 +230,69 @@ async fn stepping_back_and_forth_returns_to_the_same_place() {
             }
         }
     }
+}
+
+/// A table with range deletions and no point key has nowhere to go.
+///
+/// A flush whose every write was a `DeleteRange` leaves exactly this, which
+/// `compat/sst-roundtrip` round-trips as `rangedel-only` and Go Pebble reads
+/// back tombstone for tombstone. Its index is empty, so every way of
+/// positioning has to come back invalid rather than reach for a block that is
+/// not there — and the tombstones are still readable, which is the whole
+/// reason the table exists.
+#[compio::test]
+async fn an_empty_table_has_nowhere_to_go_but_still_holds_its_tombstones() {
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    w.add_range_deletion(b"/oxia/a", b"/oxia/z", 5)
+        .expect("tombstone");
+    let bytes = w.finish().expect("finish");
+
+    let (_env, table) = open_bytes(bytes).await;
+    assert_eq!(table.tombstones.len(), 1, "the tombstone survived");
+
+    let mut it = table.iter();
+    assert!(!it.is_valid(), "a fresh iterator is unpositioned");
+
+    it.first().await.expect("first");
+    assert!(!it.is_valid(), "first");
+    it.last().await.expect("last");
+    assert!(!it.is_valid(), "last");
+
+    let target = roble_format::key::search_key(b"/oxia/m");
+    it.seek_ge(&target).await.expect("seek_ge");
+    assert!(!it.is_valid(), "seek_ge");
+    it.seek_lt(&target).await.expect("seek_lt");
+    assert!(!it.is_valid(), "seek_lt");
+
+    // And stepping an unpositioned iterator stays unpositioned rather than
+    // running off either end.
+    it.next().await.expect("next");
+    assert!(!it.is_valid(), "next");
+    it.prev().await.expect("prev");
+    assert!(!it.is_valid(), "prev");
+}
+
+/// A table written with another comparer is refused, by name, at open.
+///
+/// §3 pins the ordering to the bytewise comparer, and Oxia's own
+/// `oxia-slash-spans` is the one a real database could carry: it splits keys
+/// on slashes, so a reader that ignored the name would compare them in an
+/// order the table was not written in and answer every seek slightly wrong.
+/// The fixture's keys are in bytewise order and its ordering is unchanged —
+/// only the name differs — so what is refused is the claim rather than the
+/// bytes, which is the refusal that has to hold.
+#[compio::test]
+async fn a_table_written_with_another_comparer_is_refused() {
+    let bytes = std::fs::read(sst_path("refuse-comparer")).expect("read fixture");
+    let (_env, opened) = try_open_bytes(bytes).await;
+    let err = opened.err().expect("a foreign comparer must be refused");
+    let text = format!("{err}");
+    assert!(
+        text.contains("oxia-slash-spans") && text.contains("leveldb.BytewiseComparator"),
+        "the refusal should name both comparers, got {text:?}"
+    );
+    assert!(
+        matches!(err, roble::Error::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
 }
