@@ -131,27 +131,12 @@ pub enum Value<'a> {
 }
 
 impl<'a> Value<'a> {
-    /// The in-place bytes, or `None` when the value lives elsewhere.
-    pub fn in_place(self) -> Option<&'a [u8]> {
-        match self {
-            Value::InPlace(v) => Some(v),
-            _ => None,
-        }
-    }
-
     /// The name used in dumps.
     pub fn kind_name(self) -> &'static str {
         match self {
             Value::InPlace(_) => "inplace",
             Value::ValueHandle(_) => "valuehandle",
             Value::BlobHandle(_) => "blobhandle",
-        }
-    }
-
-    /// The raw bytes, whatever they mean.
-    pub fn bytes(self) -> &'a [u8] {
-        match self {
-            Value::InPlace(v) | Value::ValueHandle(v) | Value::BlobHandle(v) => v,
         }
     }
 }
@@ -412,4 +397,245 @@ pub(crate) fn decode_value<'a>(
         VALUE_KIND_BLOB_HANDLE => Value::BlobHandle(rest),
         other => return Error::corrupt(format!("value prefix kind {other:#04x}")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::builder::BlockBuilder;
+
+    /// A block of three entries, as a writer leaves it.
+    fn a_block() -> Vec<u8> {
+        let mut b = BlockBuilder::new(2);
+        for (k, v) in [
+            (&b"/oxia/a"[..], &b"one"[..]),
+            (&b"/oxia/b"[..], &b"two"[..]),
+            (&b"/oxia/c"[..], &b"three"[..]),
+        ] {
+            b.add(k, v, 0, None, false);
+        }
+        b.finish().to_vec()
+    }
+
+    #[test]
+    fn a_value_names_the_kind_it_is() {
+        // These names reach a dump and an error message, both of which are
+        // read by someone deciding what a table holds.
+        assert_eq!(Value::InPlace(b"x").kind_name(), "inplace");
+        assert_eq!(Value::ValueHandle(b"x").kind_name(), "valuehandle");
+        assert_eq!(Value::BlobHandle(b"x").kind_name(), "blobhandle");
+    }
+
+    #[test]
+    fn a_fetched_block_shorter_than_its_trailer_is_truncated() {
+        // The trailer carries the compression byte and the checksum, so there
+        // is nothing to verify against without it. An engine that fetched a
+        // short read rather than a block arrives here.
+        for n in 0..TRAILER_SIZE {
+            let err = decode_fetched(&vec![0u8; n], 0, crate::ChecksumType::Crc32c)
+                .expect_err("shorter than a trailer");
+            assert!(
+                matches!(err, Error::Truncated { .. }),
+                "{n} bytes: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_block_is_refused_rather_than_indexed_into() {
+        // Everything `Block::new` checks is what lets the cursor index without
+        // bounds checks afterwards, so each of these has to be caught here.
+        for n in 0..EMPTY_BLOCK_SIZE {
+            assert!(Block::new(&vec![0u8; n]).is_err(), "{n} bytes");
+        }
+        // A restart count of zero: Pebble never writes one, and a block with
+        // no restart point has no place for a cursor to start.
+        assert!(
+            Block::new(&0u32.to_le_bytes()).is_err(),
+            "zero restart points"
+        );
+        // More restart points than the block could hold.
+        let mut claims_many = vec![0u8; 8];
+        claims_many[4..8].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(Block::new(&claims_many).is_err(), "1000 restart points");
+    }
+
+    /// Cutting a real block anywhere errors rather than panicking.
+    ///
+    /// The same shape as `a_truncated_table_errors_rather_than_panicking` one
+    /// level up, and the reason is the same: these decoders are handed bytes
+    /// off a disk, so every prefix of a good block is a thing that can arrive.
+    /// Opening may legitimately succeed — the restart array is at the end, so
+    /// a cut usually destroys it, but not always — and then walking must fail
+    /// rather than read past what is there.
+    #[test]
+    fn a_block_cut_anywhere_is_refused_rather_than_panicking() {
+        // The restart array and its count sit at the end, so in practice
+        // every cut destroys them and `Block::new` is where this stops. That
+        // is worth saying rather than leaving a walk below that never runs:
+        // the entry-level checks are reached by the malformed blocks in the
+        // test after this one, where the restart array is intact and the
+        // entries are not.
+        let whole = a_block();
+        for cut in 0..whole.len() {
+            assert!(Block::new(&whole[..cut]).is_err(), "a block cut at {cut}");
+        }
+        assert!(Block::new(&whole).is_ok(), "the whole block still opens");
+    }
+
+    /// An entry that lies about its own lengths, in a block that is otherwise
+    /// well formed.
+    ///
+    /// These are the two checks between a cursor and reading past the block:
+    /// `Block::new` has already agreed the restart array is sound, so nothing
+    /// before this point looks at the entries at all.
+    #[test]
+    fn an_entry_that_overruns_its_block_is_refused() {
+        // One restart point at offset 0, as every block has.
+        fn with_entries(entries: &[u8]) -> Vec<u8> {
+            let mut out = entries.to_vec();
+            out.extend_from_slice(&0u32.to_le_bytes()); // restart[0] = 0
+            out.extend_from_slice(&1u32.to_le_bytes()); // one restart point
+            out
+        }
+
+        // shared = 0, unshared = 200, value_len = 0, and then nothing.
+        let truncated = with_entries(&[0, 200, 1, 0]);
+        let block = Block::new(&truncated).expect("the restart array is sound");
+        let err = block
+            .iter()
+            .next()
+            .expect("an entry")
+            .expect_err("an entry that runs past the block");
+        assert!(matches!(err, Error::Truncated { .. }), "got {err:?}");
+
+        // shared = 5 on the first entry, where there is no previous key to
+        // share with.
+        let overshared = with_entries(&[5, 1, 0, b'x']);
+        let block = Block::new(&overshared).expect("the restart array is sound");
+        let err = block
+            .iter()
+            .next()
+            .expect("an entry")
+            .expect_err("sharing with a key that is not there");
+        assert!(
+            format!("{err}").contains("shares 5 bytes with a 0-byte previous key"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_prefix_is_decoded_by_its_kind() {
+        use crate::{InternalKey, Kind, TableFormat};
+
+        let key = InternalKey {
+            user_key: b"/oxia/a",
+            seq_num: 7,
+            kind: Kind::Set,
+            obsolete: false,
+        };
+        let v4 = TableFormat::Pebblev4;
+
+        // A blob handle: legal bytes, and a value roble refuses one level up
+        // because blob files arrive above its pin.
+        let blob = [VALUE_KIND_BLOB_HANDLE, 1, 2, 3];
+        assert!(matches!(
+            decode_value(v4, key, &blob).expect("decodes"),
+            Value::BlobHandle(b"\x01\x02\x03")
+        ));
+
+        // A kind the mask leaves that Pebble does not define.
+        let unknown = [VALUE_KIND_MASK, 1, 2, 3];
+        let err = decode_value(v4, key, &unknown).expect_err("no such kind");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+
+        // And a SET with no prefix byte at all, in a format that requires one.
+        let err = decode_value(v4, key, &[]).expect_err("no prefix byte");
+        assert!(
+            format!("{err}").contains("prefix byte"),
+            "got {err:?}, which should name the missing prefix"
+        );
+
+        // Before v3 the value is stored bare, so the same empty slice is an
+        // empty value rather than a missing prefix.
+        let v2 = TableFormat::Pebblev2;
+        assert!(matches!(
+            decode_value(v2, key, &[]).expect("bare"),
+            Value::InPlace(b"")
+        ));
+    }
+
+    /// A restart point that does not exist, or points outside the entries.
+    ///
+    /// `Block::new` counts the restart array and checks it fits; it does not
+    /// read the offsets in it. A cursor asks for them one at a time, so this
+    /// is where a corrupt one has to be caught — before it is used to index.
+    #[test]
+    fn a_restart_point_outside_the_block_is_refused() {
+        let whole = a_block();
+        let block = Block::new(&whole).expect("a good block");
+        let n = block.num_restarts();
+        let err = block
+            .restart_offset(n)
+            .expect_err("one past the last restart point");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+
+        // An offset past the entries, in a block whose restart array is
+        // otherwise well formed.
+        let mut data = vec![0u8, 1, 0, b'x']; // one entry, four bytes
+        data.extend_from_slice(&100u32.to_le_bytes()); // restart[0] = 100
+        data.extend_from_slice(&1u32.to_le_bytes());
+        let block = Block::new(&data).expect("the array fits");
+        let err = block.restart_offset(0).expect_err("past the entries");
+        assert!(
+            format!("{err}").contains("past the 4 bytes of entries"),
+            "got {err:?}"
+        );
+    }
+
+    /// Each of the three ways decoding one data-block entry can fail.
+    ///
+    /// `DataBlockIter` is the cursor the engine reads through, and it layers
+    /// two decodes on the raw entry — the internal key, then the value for
+    /// the table's format. All three failures have to come back as an error
+    /// from `next` rather than as a panic or a half-decoded entry.
+    #[test]
+    fn a_data_block_entry_reports_each_way_it_can_fail() {
+        use crate::TableFormat;
+
+        fn with_entries(entries: &[u8]) -> Vec<u8> {
+            let mut out = entries.to_vec();
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out
+        }
+
+        fn first_error(data: &[u8]) -> Error {
+            let block = Block::new(data).expect("the restart array is sound");
+            block
+                .iter_data(TableFormat::Pebblev4)
+                .next()
+                .expect("an entry")
+                .expect_err("an entry that cannot be decoded")
+        }
+
+        // The raw entry itself overruns the block.
+        let err = first_error(&with_entries(&[0, 200, 1, 0]));
+        assert!(matches!(err, Error::Truncated { .. }), "raw: {err:?}");
+
+        // A key too short to hold the eight-byte trailer every internal key
+        // ends with.
+        let err = first_error(&with_entries(&[0, 3, 0, b'a', b'b', b'c']));
+        assert!(matches!(err, Error::Truncated { .. }), "key: {err:?}");
+
+        // A well-formed SET key, and a value with no prefix byte, which
+        // Pebblev4 requires on every SET.
+        let mut entry = vec![0u8, 9, 0, b'k'];
+        entry.extend_from_slice(&1u64.to_le_bytes()); // seq 0, kind Set
+        let err = first_error(&with_entries(&entry));
+        assert!(
+            format!("{err}").contains("prefix byte"),
+            "value: {err:?}, which should name the missing prefix"
+        );
+    }
 }
