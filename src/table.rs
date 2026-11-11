@@ -40,7 +40,7 @@ use roble_format::sst::{
     BYTEWISE_COMPARER, IndexEntry, Metaindex, Properties, check_kind, first_block_at_or_after,
     index_entries_of,
 };
-use roble_format::{FOOTER_LEN, Footer, InternalKey};
+use roble_format::{FOOTER_LEN, Footer};
 
 use crate::env::{Disk, read_exact, read_tail};
 use crate::error::{Error, Result};
@@ -252,12 +252,6 @@ impl<D: Disk> OpenTable<D> {
         let bytes = self.block(*block_handle).await?;
         Ok(roble_format::value_block::value_in_block(&bytes, handle)?.to_vec())
     }
-
-    /// The smallest internal key of the table's first block, for a caller that
-    /// wants to skip it without consulting the MANIFEST.
-    pub fn index_entries(&self) -> &[IndexEntry] {
-        &self.index
-    }
 }
 
 /// Reads one block and gives back its decoded bytes.
@@ -280,11 +274,6 @@ async fn fetch<D: Disk>(
             Decoded::Owned(v) => v,
         },
     ))
-}
-
-/// Decodes an entry's key, for a caller that has one of this module's entries.
-pub fn decode_key(encoded: &[u8]) -> Result<InternalKey<'_>> {
-    Ok(InternalKey::decode(encoded)?)
 }
 
 /// A position in one table that survives between calls.
