@@ -49,8 +49,13 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
             .expect("create");
         let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
         result.expect("write");
+        // Synced, and the directory with it: a fixture that was never made
+        // durable is discarded by `crash()` along with everything else, and
+        // the test would be about the loader rather than about roble.
+        disk.sync(()).await.expect("sync");
         disk.close().await.expect("close");
     }
+    fs.sync_dir(&dir).await.expect("sync dir");
     (env, dir)
 }
 
@@ -123,7 +128,7 @@ async fn what_is_written_is_what_is_read() {
                 }
             }
         }
-        db.write(&mut batch).expect("write");
+        db.write(&mut batch, false).await.expect("write");
 
         assert_eq!(
             contents(&db).await,
@@ -156,7 +161,7 @@ async fn a_write_shadows_what_a_table_holds() {
 
     let mut batch = Batch::new();
     batch.put(&key, b"written-later").expect("put");
-    db.write(&mut batch).expect("write");
+    db.write(&mut batch, false).await.expect("write");
 
     let found = db.get(&key, Comparison::Equal).await.expect("get");
     assert_eq!(
@@ -168,7 +173,7 @@ async fn a_write_shadows_what_a_table_holds() {
     // And a delete hides it entirely.
     let mut batch = Batch::new();
     batch.delete(&key).expect("delete");
-    db.write(&mut batch).expect("write");
+    db.write(&mut batch, false).await.expect("write");
     assert!(
         db.get(&key, Comparison::Equal)
             .await
@@ -200,7 +205,7 @@ async fn a_range_deletion_in_the_memtable_hides_a_table() {
 
     let mut batch = Batch::new();
     batch.delete_range(&start, &end).expect("delete_range");
-    db.write(&mut batch).expect("write");
+    db.write(&mut batch, false).await.expect("write");
 
     let after = contents(&db).await;
     for k in &covered {
@@ -234,7 +239,7 @@ async fn a_scan_does_not_see_a_write_that_came_after_it() {
     let mut batch = Batch::new();
     batch.put(b"m1", b"first").expect("put");
     batch.put(b"m3", b"first").expect("put");
-    db.write(&mut batch).expect("write");
+    db.write(&mut batch, false).await.expect("write");
 
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
@@ -249,7 +254,7 @@ async fn a_scan_does_not_see_a_write_that_came_after_it() {
     let mut batch = Batch::new();
     batch.put(b"m2", b"later").expect("put");
     batch.put(b"m3", b"changed").expect("put");
-    db.write(&mut batch).expect("write");
+    db.write(&mut batch, false).await.expect("write");
 
     let mut seen = Model::new();
     while scan.is_valid() {
@@ -293,11 +298,319 @@ async fn sequence_numbers_carry_on_from_the_manifest() {
     let mut batch = Batch::new();
     batch.put(b"one", b"1").expect("put");
     batch.put(b"two", b"2").expect("put");
-    db.write(&mut batch).expect("write");
+    db.write(&mut batch, false).await.expect("write");
 
     assert_eq!(
         batch.seq_num(),
         last + 1,
         "a batch commits at the sequence number after the MANIFEST's last"
+    );
+}
+
+// ------------------------------------------------------------------ durability
+
+#[compio::test]
+async fn a_crash_replays_to_the_last_synced_write() {
+    // §12's second gate for M3. The rule is exact: a write that was synced is
+    // there after the crash, and one that was not is not. Anything looser
+    // would be a store that either loses acknowledged writes or pretends to
+    // have lost unacknowledged ones.
+    let (env, dir) = load("db-reads").await;
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut synced = Batch::new();
+        synced.put(b"durable-1", b"kept").expect("put");
+        synced.put(b"durable-2", b"kept").expect("put");
+        db.write(&mut synced, true).await.expect("write");
+
+        let mut unsynced = Batch::new();
+        unsynced.put(b"lost-1", b"gone").expect("put");
+        db.write(&mut unsynced, false).await.expect("write");
+
+        // Both are readable before the crash: the memtable has them.
+        for k in [b"durable-1".as_slice(), b"lost-1"] {
+            assert!(
+                db.get(k, Comparison::Equal).await.expect("get").is_some(),
+                "{k:02x?} should be readable before the crash"
+            );
+        }
+    }
+
+    env.sim().crash();
+
+    let db = roble::open(&env, &dir)
+        .await
+        .expect("reopen after the crash");
+    for k in [b"durable-1".as_slice(), b"durable-2"] {
+        assert_eq!(
+            db.get(k, Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"kept".to_vec()),
+            "{k:02x?} was synced, so the crash must not have taken it"
+        );
+    }
+    assert!(
+        db.get(b"lost-1", Comparison::Equal)
+            .await
+            .expect("get")
+            .is_none(),
+        "an unsynced write should not survive a crash"
+    );
+}
+
+#[compio::test]
+async fn a_replayed_write_keeps_its_sequence_number() {
+    // Replay must use the sequence number the batch was committed at, not a
+    // fresh one: a key that came back younger than it was written could
+    // outlive a delete that should have buried it.
+    let (env, dir) = load("db-reads").await;
+    let key: Vec<u8>;
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        key = contents(&db).await.keys().next().expect("a key").clone();
+
+        // Overwrite a key the tables hold, then delete it — both logged.
+        let mut batch = Batch::new();
+        batch.put(&key, b"newer").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+
+        let mut batch = Batch::new();
+        batch.delete(&key).expect("delete");
+        db.write(&mut batch, true).await.expect("write");
+    }
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert!(
+        db.get(&key, Comparison::Equal)
+            .await
+            .expect("get")
+            .is_none(),
+        "the delete was written after the put, and must still be the newer of the two"
+    );
+}
+
+#[compio::test]
+async fn writes_carry_on_in_the_same_log_after_a_reopen() {
+    // The second open has to pick up where the first left off. Writing from
+    // the start again would overwrite what was replayed; writing past the end
+    // of the valid records would leave a hole.
+    let (env, dir) = load("db-reads").await;
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut batch = Batch::new();
+        batch.put(b"round-1", b"a").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+    }
+    {
+        let db = roble::open(&env, &dir).await.expect("reopen");
+        let mut batch = Batch::new();
+        batch.put(b"round-2", b"b").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+    }
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        db.get(b"round-1", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"a".to_vec()),
+        "the first round's write should still be there"
+    );
+    assert_eq!(
+        db.get(b"round-2", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"b".to_vec()),
+        "and the second round's"
+    );
+}
+
+#[compio::test]
+async fn a_write_after_a_reopen_outranks_what_replay_brought_back() {
+    // §6: the next sequence number never goes backwards. If a reopen started
+    // numbering from the MANIFEST's last again, a fresh write would be
+    // numbered at or below one replay had just restored, and the older entry
+    // would win.
+    let (env, dir) = load("db-reads").await;
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut batch = Batch::new();
+        batch.put(b"contested", b"written-before").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+    }
+    env.sim().crash();
+
+    {
+        let db = roble::open(&env, &dir).await.expect("reopen");
+        assert_eq!(
+            db.get(b"contested", Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"written-before".to_vec()),
+            "replay should have brought it back"
+        );
+        let mut batch = Batch::new();
+        batch.put(b"contested", b"written-after").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+        assert_eq!(
+            db.get(b"contested", Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"written-after".to_vec()),
+            "the new write must outrank the replayed one"
+        );
+    }
+
+    // And still, after another crash and replay of both.
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        db.get(b"contested", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"written-after".to_vec()),
+        "and the ordering must survive being replayed again"
+    );
+}
+
+#[compio::test]
+async fn a_record_that_spans_a_block_survives_a_crash() {
+    // A log is framed into 32 KiB blocks and a chunk never crosses one, so a
+    // large value is split. Where the second chunk goes depends on how far
+    // into the **file** the first one started — a writer that framed against
+    // its own buffer instead would put it in the wrong place, and every chunk
+    // would still have a valid checksum.
+    let (env, dir) = load("db-reads").await;
+    let big = vec![b'q'; 40 * 1024];
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        // A small record first, so the big one does not start at offset zero.
+        let mut batch = Batch::new();
+        batch.put(b"small", b"s").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+
+        let mut batch = Batch::new();
+        batch.put(b"big", &big).expect("put");
+        db.write(&mut batch, true).await.expect("write");
+    }
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        db.get(b"small", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"s".to_vec())
+    );
+    assert_eq!(
+        db.get(b"big", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(big),
+        "a record split across blocks must come back whole"
+    );
+}
+
+#[compio::test]
+async fn a_torn_record_in_an_earlier_log_is_refused() {
+    // A later log exists only if the earlier one was finished, so damage
+    // there is corruption rather than the tail of a crash — and opening
+    // without it would discard writes that were acknowledged.
+    let (env, dir) = load("db-unflushed-wal").await;
+    let fs = env.sim();
+
+    // A second, later log with a record in it, so log 000004 is no longer
+    // the last one replayed.
+    let mut batch = Batch::new();
+    batch.put(b"later", b"v").expect("put");
+    batch.set_seq_num(100);
+    let mut writer = roble_format::record::RecordWriter::recyclable(5);
+    writer.write_record(batch.as_bytes()).expect("frame");
+    let framed = writer.finish();
+    let disk = fs.create(&dir.join("000005.log")).await.expect("create");
+    let (result, _) = disk.write(WriteBuf::new(framed), 0, ()).await;
+    result.expect("write");
+    disk.sync(()).await.expect("sync");
+    disk.close().await.expect("close");
+
+    // And cut log 000004 off part-way through its record.
+    let disk = fs
+        .open(&dir.join("000004.log"), roble::Access::ReadOnly)
+        .await
+        .expect("open");
+    let whole = roble::env::read_all(&disk, ()).await.expect("read");
+    drop(disk);
+    let disk = fs.create(&dir.join("000004.log")).await.expect("recreate");
+    let (result, _) = disk
+        .write(WriteBuf::new(whole[..whole.len() - 4].to_vec()), 0, ())
+        .await;
+    result.expect("write");
+    disk.sync(()).await.expect("sync");
+    disk.close().await.expect("close");
+    fs.sync_dir(&dir).await.expect("sync dir");
+
+    match roble::open(&env, &dir).await {
+        Err(roble::Error::Corrupt(m)) => assert!(
+            m.contains("000004.log") && m.contains("A later log exists"),
+            "the refusal should name the log and say why it is not a torn tail: {m}"
+        ),
+        other => panic!("expected the earlier log's damage to be refused, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_delete_after_a_reopen_buries_what_replay_brought_back() {
+    // The sharp edge of "the next sequence number never goes backwards".
+    //
+    // If a reopen numbered from the MANIFEST's last again, this delete would
+    // land on the same sequence number as the put replay had just restored.
+    // They are different internal keys — the kind differs — so nothing
+    // replaces anything, and within one sequence number `SET`'s kind byte
+    // sorts ahead of `DEL`'s. The put would win and the key would stay
+    // visible. A reader cannot tell that from a delete that never happened.
+    let (env, dir) = load("db-reads").await;
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut batch = Batch::new();
+        batch.put(b"buried", b"value").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+    }
+    env.sim().crash();
+
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert!(
+        db.get(b"buried", Comparison::Equal)
+            .await
+            .expect("get")
+            .is_some(),
+        "replay should have brought the put back"
+    );
+
+    let mut batch = Batch::new();
+    batch.delete(b"buried").expect("delete");
+    db.write(&mut batch, true).await.expect("write");
+    assert!(
+        db.get(b"buried", Comparison::Equal)
+            .await
+            .expect("get")
+            .is_none(),
+        "the delete was written later and must bury the replayed put"
     );
 }

@@ -117,27 +117,33 @@ async fn the_replay_recovers_the_counters_a_store_resumes_from() {
 }
 
 #[compio::test]
-async fn a_log_holding_unflushed_writes_is_refused_rather_than_ignored() {
-    // The database has a write that was synced to the log and never flushed.
-    // Opening without it would silently drop a write Oxia had acknowledged, so
-    // until replay exists the only safe answer is to refuse (DESIGN.md §6).
+async fn a_log_holding_unflushed_writes_is_replayed() {
+    // This fixture has a write that was synced to the log and never flushed.
+    // Until replay existed roble refused the database rather than open it
+    // short, and the test asserted the refusal; §6 said then that it would be
+    // "a refusal today and a replay later, which is the same test either
+    // way". This is the later.
     let (_tmp, dir) = fixture("db-unflushed-wal");
-    let err = roble::open(&roble::DefaultEnv, &dir)
+    let db = roble::open(&roble::DefaultEnv, &dir)
         .await
-        .expect_err("a database with unreplayed writes must be refused");
-    match err {
-        Error::Unsupported(m) => {
-            assert!(
-                m.contains("replaying a log is not implemented"),
-                "the refusal should say replay is missing, got: {m}"
-            );
-            assert!(
-                m.contains("000004.log"),
-                "the refusal should name the log, got: {m}"
-            );
-        }
-        other => panic!("expected an Unsupported refusal, got {other:?}"),
-    }
+        .expect("a database with unreplayed writes should now open");
+
+    assert_eq!(
+        db.get(b"flushed", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"in a table".to_vec()),
+        "the flushed key comes from the table"
+    );
+    assert_eq!(
+        db.get(b"logged", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"only in the log".to_vec()),
+        "and the logged one from the log, or it was lost"
+    );
 }
 
 #[compio::test]

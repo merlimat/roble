@@ -44,9 +44,18 @@
 > at and ignores anything above. A write during a scan takes a higher number
 > and is invisible to it, with nothing copied and nothing reference-counted.
 >
-> **What is written is not yet durable.** §6's `write(batch, sync)` logs the
-> batch before applying it, so that nothing is readable that is not
-> recoverable; the log is next, and the signature gains its `sync` then.
+> And the **WAL**: `write(batch, sync)` frames the batch into the log, syncs
+> it when asked and only then applies it to the memtable, so nothing is
+> readable that is not recoverable. `open` replays the logs the version edits
+> leave unflushed, taking each batch's own sequence number, and carries on
+> writing where the replay stopped.
+>
+> Two gates hold it up. **A crash replays** to the last synced write and no
+> further, tested by crashing the simulated filesystem between the two. And
+> **Go Pebble replays the log roble wrote** (`compat/wal-replay`): nothing
+> roble writes there is flushed, so every key Pebble finds came out of the
+> log — its framing, its batch representation and its sequence numbers. That
+> is half of M3's round trip.
 >
 > A log that still holds writes is **refused** until replay lands, since
 > opening without it would discard writes that were already acknowledged.
@@ -528,13 +537,24 @@ than opening without it**: ignoring one silently discards writes that were
 already acknowledged. With `disable_wal` there is nothing to replay and the
 database opens as of the last flush.
 
-Until replay exists (M3), "cannot replay" covers every log that holds a record,
-so a database with unflushed writes is refused rather than opened short. The
-test for it is a refusal today and a replay later, which is the same test either
-way. Note that `disable_wal` leaves an **empty log file** behind rather than no
-log file, so the question an opener asks is whether a log holds a record, not
+As built, the replay stops at the first record of the **last** log that does
+not read, and the store carries on writing from there — overwriting what was
+half-written, which was never acknowledged. A record that does not read in an
+*earlier* log is corruption and refused, because a later log exists only if
+that one was finished.
+
+That rule is looser than §6 states in one way, and the looseness is
+deliberate: it tolerates a torn record anywhere in the last log, not only at
+its tail. Telling a torn tail from damage in the middle of the same file would
+mean deciding what the bytes after it were supposed to be, and stopping at the
+last record that reads is the answer that loses nothing either way.
+
+Note that `disable_wal` leaves an **empty log file** behind rather than no log
+file, so the question an opener asks is whether a log holds a record, not
 whether one exists — Oxia's own configuration has a log file in the directory,
-holding nothing but the eleven-byte EOF trailer.
+holding nothing but the eleven-byte EOF trailer. A store writes into that log
+rather than starting a new one, which is why no new file number is needed and
+no MANIFEST has to be written before a write can be logged.
 
 ## 7. The format crate
 

@@ -43,7 +43,7 @@ use roble_format::files::{
 use roble_format::manifest::VersionEdit;
 use roble_format::record::RecordReader;
 
-use crate::env::{Access, Env, Fs, read_all};
+use crate::env::{Access, Disk, Env, Fs, read_all};
 use crate::error::{Error, Result};
 use crate::version::VersionSet;
 
@@ -65,6 +65,8 @@ pub struct Opened<'a, F: Fs> {
     store_id: u64,
     /// Writes that no table holds yet.
     pub(crate) memtable: std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>,
+    /// The log this store appends to, if it has one.
+    log: std::cell::RefCell<Option<Log<F::Disk>>>,
     /// The next sequence number to hand out.
     ///
     /// Starts past the MANIFEST's last, so nothing written here can collide
@@ -159,8 +161,39 @@ pub async fn open_with<'a, E: Env>(
         }
     }
 
-    // 6. A log with records in it cannot be honoured yet.
-    refuse_unreplayed_logs(fs, dir, &names, versions.min_unflushed_log_num).await?;
+    // 6. Replay the logs the version edits leave unflushed.
+    let mut memtable = crate::memtable::Memtable::new(versions.last_seq_num.wrapping_add(1));
+    let replayed = replay_logs(
+        fs,
+        dir,
+        &names,
+        versions.min_unflushed_log_num,
+        &mut memtable,
+    )
+    .await?;
+
+    // The next sequence number never goes backwards: a write replay brought
+    // back must not be overwritten by one numbered the same (§6).
+    let next_seq = versions
+        .last_seq_num
+        .max(replayed.highest_seq)
+        .saturating_add(1);
+
+    // The log the store carries on writing to, opened where the replay
+    // stopped. Overwriting a torn tail is the point: those bytes were never
+    // acknowledged.
+    let log = match replayed.tail {
+        Some((log_num, at)) => {
+            let path = dir.join(roble_format::files::log_filename(log_num));
+            let disk = fs.open(&path, Access::ReadWrite).await?;
+            Some(Log {
+                disk: std::rc::Rc::new(disk),
+                log_num,
+                at,
+            })
+        }
+        None => None,
+    };
 
     let mut markers: Vec<String> = names
         .iter()
@@ -174,12 +207,9 @@ pub async fn open_with<'a, E: Env>(
         fs,
         store_id: caches.new_store_id(),
         caches,
-        // Seeded from the directory, so the shape of the memtable is a
-        // function of the database rather than of when it was opened (§9).
-        memtable: std::rc::Rc::new(std::cell::RefCell::new(crate::memtable::Memtable::new(
-            versions.last_seq_num.wrapping_add(1),
-        ))),
-        next_seq: std::cell::Cell::new(versions.last_seq_num + 1),
+        memtable: std::rc::Rc::new(std::cell::RefCell::new(memtable)),
+        next_seq: std::cell::Cell::new(next_seq),
+        log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
         format_version,
         manifest_filename,
@@ -291,12 +321,42 @@ async fn read_version_edits<F: Fs>(fs: &F, path: &Path, file_num: u64) -> Result
 /// acknowledged and no table has it yet, and opening without it would discard
 /// that write silently. Replaying it is M3's work; until then this refuses,
 /// because that is the one answer that cannot lose data (§6).
-async fn refuse_unreplayed_logs<F: Fs>(
+/// The log a store is writing to.
+struct Log<D: Disk> {
+    disk: std::rc::Rc<D>,
+    log_num: u64,
+    /// Where the next record goes.
+    at: usize,
+}
+
+/// What replaying the logs established.
+struct Replayed {
+    /// The log that is still open for writing, and how far into it the valid
+    /// records reach.
+    tail: Option<(u64, usize)>,
+    /// The highest sequence number any replayed batch used.
+    highest_seq: u64,
+}
+
+/// Replays every log the version edits leave unflushed, in order.
+///
+/// A torn record at the tail of the **last** log is the ordinary shape of a
+/// crash: the replay stops there and the store carries on writing from that
+/// point, overwriting what was half-written. A torn record in an earlier log
+/// is corruption, because a later log exists only if that one was complete.
+///
+/// The rule as written tolerates a torn record anywhere in the last log, not
+/// only at its tail. Telling a torn tail from damage in the middle of the
+/// same file would mean deciding what the bytes after it were meant to be,
+/// and the answer that loses no data either way is to stop at the last record
+/// that reads (§6).
+async fn replay_logs<F: Fs>(
     fs: &F,
     dir: &Path,
     names: &[String],
     min_unflushed_log_num: u64,
-) -> Result<()> {
+    memtable: &mut crate::memtable::Memtable,
+) -> Result<Replayed> {
     let mut logs: Vec<(u64, &String)> = names
         .iter()
         .filter_map(|n| files::parse_filename(n).map(|p| (p, n)))
@@ -305,27 +365,50 @@ async fn refuse_unreplayed_logs<F: Fs>(
         .collect();
     logs.sort();
 
-    for (log_num, name) in logs {
+    let mut out = Replayed {
+        tail: None,
+        highest_seq: 0,
+    };
+    let last = logs.len().saturating_sub(1);
+    for (i, (log_num, name)) in logs.iter().enumerate() {
         let disk = fs.open(&dir.join(name), Access::ReadOnly).await?;
         let bytes = read_all(&disk, Default::default()).await?;
-        let mut reader = RecordReader::new(&bytes, log_num as u32);
-        match reader.next() {
-            None => {}
-            Some(Ok(_)) => {
-                return Err(Error::Unsupported(format!(
-                    "{name} holds writes that no table holds yet, and replaying a log is not \
-                     implemented; opening without it would discard writes that were already \
-                     acknowledged"
-                )));
-            }
-            Some(Err(e)) => {
-                return Err(Error::Corrupt(format!(
-                    "{name}: {e}, so what it holds cannot be told from what it lost"
-                )));
+        let mut reader = RecordReader::new(&bytes, *log_num as u32);
+
+        let mut good = 0usize;
+        loop {
+            match reader.next() {
+                None => {
+                    good = reader.offset();
+                    break;
+                }
+                Some(Ok(record)) => {
+                    // A batch's own header says what sequence number it was
+                    // committed at; replay must use it rather than inventing
+                    // one, or a key would come back with a different age than
+                    // it was written with.
+                    let base = roble_format::batch::seq_num_of(&record)?;
+                    let next = memtable.apply(&record, base)?;
+                    out.highest_seq = out.highest_seq.max(next.saturating_sub(1));
+                    good = reader.offset();
+                }
+                Some(Err(e)) => {
+                    if i == last {
+                        // The tail of the last log: a crash, not corruption.
+                        break;
+                    }
+                    return Err(Error::Corrupt(format!(
+                        "{name}: {e}. A later log exists, so this one was complete when it \
+                         was written, and what it holds cannot be told from what it lost"
+                    )));
+                }
             }
         }
+        if i == last {
+            out.tail = Some((*log_num, good));
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 // Written out rather than derived: the lock has no business in a debug line,
@@ -343,16 +426,52 @@ impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
 }
 
 impl<F: Fs> Opened<'_, F> {
-    /// Applies a batch: stamps it with the sequence number it commits at, then
-    /// puts its entries in the memtable.
+    /// Appends a batch to the log, syncs it if asked, and then applies it to
+    /// the memtable.
     ///
-    /// **Not durable yet.** §6's `write(batch, sync)` appends the batch to the
-    /// log first, so that nothing is readable that is not recoverable; the log
-    /// is the next piece, and until it exists a write survives only as far as
-    /// a flush. The signature gains its `sync` then.
-    pub fn write(&self, batch: &mut roble_format::batch::Batch) -> Result<()> {
+    /// That order is the whole point: **nothing is readable that is not
+    /// recoverable** (§6). `sync` decides whether the write is durable when
+    /// this returns or merely written — without it the batch survives the
+    /// store going away but not the machine.
+    pub async fn write(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
         let base = self.next_seq.get();
         batch.set_seq_num(base);
+
+        // The log, with the borrow released before any waiting: a `RefCell`
+        // held across an await is a panic waiting for the first reader that
+        // arrives in the middle of a write.
+        let Some((disk, log_num, at)) = self
+            .log
+            .borrow()
+            .as_ref()
+            .map(|l| (std::rc::Rc::clone(&l.disk), l.log_num, l.at))
+        else {
+            return Err(Error::Unsupported(format!(
+                "{} holds no log file, so a write could not be recovered",
+                self.dir.display()
+            )));
+        };
+
+        let mut writer = roble_format::record::RecordWriter::resuming(log_num as u32, at);
+        writer.write_record(batch.as_bytes())?;
+        let framed = writer.as_bytes().to_vec();
+        let end = writer.position();
+
+        let (result, _) = disk
+            .write(
+                crate::buf::WriteBuf::new(framed),
+                at as u64,
+                Default::default(),
+            )
+            .await;
+        result?;
+        if sync {
+            disk.sync(Default::default()).await?;
+        }
+        if let Some(log) = self.log.borrow_mut().as_mut() {
+            log.at = end;
+        }
+
         let next = self.memtable.borrow_mut().apply(batch.as_bytes(), base)?;
         self.next_seq.set(next);
         Ok(())
