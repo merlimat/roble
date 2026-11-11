@@ -42,6 +42,10 @@ the caller's choosing.
 | `roble.operation.type` | `roble.write.operations` | `put`, `delete`, `delete_range` |
 | `roble.level` | `roble.level.*` | `0`–`6` |
 | `disk.io.direction` | `roble.compaction.*` | `read`, `write` |
+| `error.type` | `roble.*.errors` | `io`, `locked`, `format`, `unsupported`, `corrupt`, `not_found` |
+
+A handle exists for every value of `error.type` from the moment a store opens,
+so the series are there at zero before anything has gone wrong.
 
 ## Writing
 
@@ -50,6 +54,9 @@ the caller's choosing.
 | `roble.write.duration` | latency | s | Time a successful write takes, from the call until its batch is in the memtable |
 | `roble.write.operations` | counter | `{operation}` | Operations in the batches written successfully, by kind |
 | `roble.write.size` | histogram | By | Bytes of the batch representation of each write |
+| `roble.write.bytes` | counter | By | Bytes of the batch representations written successfully |
+| `roble.write.entries` | histogram | `{entry}` | Operations in each batch written successfully |
+| `roble.write.errors` | counter | `{error}` | Writes that failed, by what went wrong |
 | `roble.wal.append.duration` | latency | s | Time appending a batch to the log takes, including its sync when one was asked for |
 | `roble.memtable.size` | up-down counter | By | Bytes of writes that no table holds yet |
 
@@ -63,6 +70,9 @@ because nothing is appended: its durability is `flush`'s (§4).
 | `roble.get.duration` | latency | s | Time a lookup takes, found or not |
 | `roble.scans` | counter | `{scan}` | Scans created |
 | `roble.scan.entries` | counter | `{entry}` | Keys that scans stepped onto |
+| `roble.scans.open` | up-down counter | `{scan}` | Scans created and not yet dropped |
+| `roble.read.bytes` | counter | By | Bytes of the keys and values that lookups and scans returned |
+| `roble.read.errors` | counter | `{error}` | Lookups that failed, by what went wrong |
 
 A `get` under any comparison but `Equal` is a scan, positioned once: it counts one
 scan and one entry. `Equal` is a point lookup and counts neither.
@@ -71,6 +81,8 @@ scan and one entry. `Equal` is a point lookup and counts neither.
 
 | Metric | Instrument | Unit | What it says |
 |---|---|---|---|
+| `roble.flushes` | counter | `{flush}` | Flushes that wrote a table |
+| `roble.compactions` | counter | `{compaction}` | Compactions run |
 | `roble.flush.duration` | latency | s | Time a flush takes, from the call until its version edit is durable |
 | `roble.flush.size` | histogram | By | Bytes of the table each flush wrote |
 | `roble.flush.bytes` | counter | By | Bytes that flushes wrote |
@@ -93,6 +105,7 @@ Both halves are counters rather than histograms so that the ratio can be taken.
 | `roble.level.tables` | up-down counter | `{table}` | Tables in each level of the store's current version |
 | `roble.level.size` | up-down counter | By | Bytes of the tables in each level |
 | `roble.disk.size` | up-down counter | By | Bytes of every file in the store's directory |
+| `roble.compaction.debt` | up-down counter | By | Bytes the levels hold above what their allowances let them |
 
 `roble.disk.size` is measured from the directory, so it counts the MANIFEST, the
 logs, the markers and anything obsolete that the sweep has not collected yet — not
@@ -102,6 +115,42 @@ disappear, which is a flush, a compaction and an open.
 These are up-down counters rather than gauges so that the stores of a process add
 up to one series per set of attributes. Each store adds what changes and takes its
 share back out when it closes, so a store that goes away stops being counted.
+
+## What Oxia graphs
+
+Oxia's data server exports a fixed set of Pebble's metrics per shard, in
+`kv_pebble.go`, plus some of its own around the `kvstore.KV` calls. This is
+what each becomes here.
+
+| Oxia | roble |
+|---|---|
+| `kv_batch_commit_latency` | `roble.write.duration` |
+| `kv_read_latency` | `roble.get.duration` |
+| `kv_write` | `roble.write.bytes` |
+| `kv_write_ops` | `roble.write.operations` |
+| `kv_read` | `roble.read.bytes` |
+| `kv_read_ops` | the count of `roble.get.duration`, or `roble.scan.entries` |
+| `kv_write_errors` | `roble.write.errors`, by `error.type` |
+| `kv_read_errors` | `roble.read.errors`, by `error.type` |
+| `kv_batch_size` | `roble.write.size` |
+| `kv_batch_count` | `roble.write.entries` |
+| `pebble_flush_total` | `roble.flushes` |
+| `pebble_flush` | `roble.flush.bytes` |
+| `pebble_compactions_total` | `roble.compactions` |
+| `pebble_compaction_debt` | `roble.compaction.debt` |
+| `pebble_memtable_size` | `roble.memtable.size` |
+| `pebble_disk_space` | `roble.disk.size` |
+| `pebble_num_files_total` | `roble.level.tables`, summed over levels |
+| `pebble_write_amplification_percent` | the ratio above |
+| `pebble_read_iterators` | `roble.scans.open` |
+| `pebble_block_cache_used` / `_hits` / `_misses`, `pebble_max_cache_size` | *not yet* — see below |
+| `pebble_read` | *not yet* — the disk's bytes, below |
+| `pebble_l0_sublevels` | *not yet* — roble has no L0 sublevels |
+| `kv_pebble_write_stalls`, `kv_pebble_write_stall_time` | *not yet* — below |
+
+Pebble's gauges are read from one `db.Metrics()` call that Oxia memoizes for
+five seconds; roble's are recorded where the thing happens, so there is nothing
+to poll and nothing to memoize.
 
 ## Not here yet
 
@@ -114,6 +163,8 @@ share back out when it closes, so a store that goes away stops being counted.
 - **An estimate of the records a store holds.** The count is in each table's
   properties block, which is read when a table is opened; summing it means opening
   every table of the version, which a store does not do today.
-- **The two write stalls** of §9 — a write waiting for a memtable, and a write
-  waiting for L0 to drain. Nothing stalls yet, and a counter for an event that
-  cannot happen says nothing; they arrive with the waiting they count.
+- **The two write stalls** of §9, and the time spent in them — a write waiting
+  for a memtable, and a write waiting for L0 to drain. Nothing stalls yet, and a
+  counter for an event that cannot happen says nothing; they arrive with the
+  waiting they count.
+- **L0 sublevels**, which roble does not build yet.

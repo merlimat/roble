@@ -177,6 +177,16 @@ impl<D: Disk> Source<D> {
     }
 }
 
+impl<D: Disk> Drop for Scan<D> {
+    /// A scan that has gone away is one fewer open, and a store that keeps
+    /// reporting scans nobody holds is how an iterator leak hides.
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.scans_open.add(-1);
+        }
+    }
+}
+
 /// Which way the iterators are currently positioned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dir {
@@ -256,10 +266,15 @@ impl<D: Disk> Scan<D> {
         }
     }
 
-    /// Counts one more key the scan has landed on.
+    /// Counts one more key the scan has landed on, and the bytes it holds.
     fn stepped_onto(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.scan_entries.add(1);
+            if let Some(current) = &self.current {
+                metrics
+                    .read_bytes
+                    .add((current.user.len() + current.value.len()) as u64);
+            }
         }
     }
 
@@ -569,6 +584,7 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
         upper: Option<&[u8]>,
     ) -> Result<Scan<F::Disk>> {
         self.metrics.scans.add(1);
+        self.metrics.scans_open.add(1);
         // Every table of the version. A table whose key range misses the
         // bounds could be left out, but that is the version's business to
         // decide and it costs nothing here: an iterator over a table outside

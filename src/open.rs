@@ -516,6 +516,12 @@ impl<F: Fs> Opened<'_, F> {
     /// saying otherwise would be the silent half of a data loss.
     pub async fn write(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
         let _timer = self.metrics.write.start();
+        let result = self.write_inner(batch, sync).await;
+        self.metrics.write_errors.saw(result)
+    }
+
+    /// The body of [`Opened::write`], so one place counts what it returned.
+    async fn write_inner(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
         // Refused before anything is stamped, so a write that cannot keep
         // its promise changes nothing. Pebble refuses this too, and the
         // reason is the same: with no log there is nowhere for a sync to
@@ -579,6 +585,8 @@ impl<F: Fs> Opened<'_, F> {
         self.metrics
             .write_size
             .record(batch.as_bytes().len() as u64);
+        self.metrics.write_bytes.add(batch.as_bytes().len() as u64);
+        self.metrics.write_entries.record(batch.count() as u64);
         self.metrics
             .memtable_size
             .set(self.unflushed_bytes() as i64);

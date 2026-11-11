@@ -148,6 +148,8 @@ impl<F: Fs> Opened<'_, F> {
             .memtable_size
             .set(self.unflushed_bytes() as i64);
         self.measure_disk().await;
+        self.metrics.flushes.add(1);
+        self.saw_debt();
         Ok(Some(table_num))
     }
 

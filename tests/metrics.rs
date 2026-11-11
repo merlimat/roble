@@ -18,6 +18,14 @@
 //! that the numbers come back out of a provider the way an application's
 //! would, with the attributes they were given.
 //!
+//! **Histograms are not checked here.** nanometer exports those through its
+//! `Producer`, which an application registers with its metric reader and
+//! which needs an OTel SDK with `MetricProducer` support — a patched one, at
+//! this version. So `roble.write.size`, `roble.write.entries` and
+//! `roble.flush.size` have no assertion below, and a mutation of what they
+//! record survives: that is a gap in what can be collected, not one in what
+//! is recorded, and it closes when the SDK does.
+//!
 //! nanometer's registry is process-wide and keyed by (scope, metric name),
 //! and a metric is registered with the provider of the *first* store to
 //! create it. So these tests share one provider — a second would be handed
@@ -256,6 +264,10 @@ async fn a_scan_counts_the_keys_it_steps_onto() {
         Some(walked),
         "every key the scan landed on should have been counted: {seen:?}"
     );
+    assert!(
+        seen["roble.read.bytes"] > 0,
+        "and the bytes it handed back with them: {seen:?}"
+    );
 
     // A `get` under one of the ordered comparisons is a scan too, positioned
     // once, so it counts one entry and not a walk.
@@ -382,6 +394,172 @@ async fn the_bytes_a_write_amplification_needs_are_both_there() {
     assert!(
         seen["roble.disk.size"] > seen["roble.level.size"],
         "the directory holds more than its tables: {seen:?}"
+    );
+}
+
+#[compio::test]
+async fn what_oxia_graphs_from_pebble_is_there() {
+    // Oxia's data server exports a fixed set of Pebble's metrics per shard
+    // (`kv_pebble.go`). These are the ones roble can answer today, under its
+    // own names; the correspondence is written out in METRICS.md.
+    let (options, tag) = metered("oxia");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    let value = vec![b'v'; 200];
+    let mut tables = Vec::new();
+    for round in 0..3 {
+        let mut batch = Batch::new();
+        for i in 0..20 {
+            batch
+                .put(format!("o{:03}", round * 10 + i).as_bytes(), &value)
+                .expect("put");
+        }
+        db.write(&mut batch, true).await.expect("write");
+        tables.push(db.flush().await.expect("flush").expect("a table"));
+    }
+    db.get(b"o000", Comparison::Equal).await.expect("get");
+    db.compact(0, &tables).await.expect("compact");
+
+    let seen = collected(reader(), &tag);
+    for name in [
+        "roble.flushes",          // pebble_flush_total
+        "roble.flush.bytes",      // pebble_flush
+        "roble.compactions",      // pebble_compactions_total
+        "roble.memtable.size",    // pebble_memtable_size
+        "roble.disk.size",        // pebble_disk_space
+        "roble.level.tables",     // pebble_num_files_total
+        "roble.read.bytes",       // kv_read
+        "roble.write.bytes",      // kv_write
+        "roble.write.operations", // kv_write_ops
+    ] {
+        assert!(seen.contains_key(name), "{name} is missing: {seen:?}");
+    }
+    assert_eq!(seen["roble.flushes"], 3);
+    assert_eq!(seen["roble.compactions"], 1);
+    assert!(seen["roble.read.bytes"] >= 200, "{seen:?}");
+    // 60 keys of 200-byte values, so the batches are well past 12 KiB, and
+    // the counter has to carry the bytes rather than merely exist.
+    assert!(
+        seen["roble.write.bytes"] > 12_000,
+        "the bytes a write carried should be counted: {seen:?}"
+    );
+
+    // The debt: how far the levels are past what they may hold. Zero here,
+    // because nothing is.
+    assert_eq!(
+        seen.get("roble.compaction.debt").copied(),
+        Some(0),
+        "nothing is past its allowance: {seen:?}"
+    );
+    assert_eq!(db.compaction_debt(), 0);
+}
+
+#[compio::test]
+async fn the_debt_is_what_the_levels_hold_above_their_allowances() {
+    let (options, tag) = metered("debt");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        options.l0_compaction_threshold(1).lbase_max_bytes(1),
+    )
+    .await
+    .expect("open");
+
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..20 {
+        batch
+            .put(format!("d{i:03}").as_bytes(), &value)
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+
+    // Two L0 tables against an allowance of one: one table's worth of debt.
+    let debt = collected(reader(), &tag)["roble.compaction.debt"];
+    assert!(debt > 0, "L0 is past its allowance, so there is debt");
+
+    db.compact(0, &[table]).await.expect("compact");
+    let after = collected(reader(), &tag)["roble.compaction.debt"];
+    assert_ne!(after, debt, "compacting should have moved the debt");
+    assert_eq!(after as u64, db.compaction_debt());
+}
+
+#[compio::test]
+async fn a_failed_write_is_counted_by_what_went_wrong() {
+    let (options, tag) = metered("errors");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options.disable_wal(true))
+        .await
+        .expect("open");
+
+    let mut batch = Batch::new();
+    batch.put(b"durable", b"please").expect("put");
+    db.write(&mut batch, true)
+        .await
+        .expect_err("a synced write with the WAL off is refused");
+
+    let kinds = by_attr(reader(), &tag, "roble.write.errors", "error.type");
+    assert_eq!(
+        kinds.get("unsupported").copied(),
+        Some(1),
+        "the refusal should be classified, not merely counted: {kinds:?}"
+    );
+    // The other kinds exist at zero — a handle is created for each when the
+    // store opens — which is what makes a dashboard's series appear before
+    // anything has gone wrong.
+    assert_eq!(kinds.get("io").copied(), Some(0), "{kinds:?}");
+    assert_eq!(kinds.get("corrupt").copied(), Some(0), "{kinds:?}");
+}
+
+#[compio::test]
+async fn a_failed_lookup_is_counted_by_what_went_wrong() {
+    let (options, tag) = metered("read-errors");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    // The next filesystem operation fails, and a lookup that has to open a
+    // table makes one.
+    env.sim().fail_at(1);
+    db.get(b"a0", Comparison::Equal)
+        .await
+        .expect_err("the read should have failed");
+    env.sim().stop_failing();
+
+    let kinds = by_attr(reader(), &tag, "roble.read.errors", "error.type");
+    assert_eq!(
+        kinds.get("io").copied(),
+        Some(1),
+        "a read that failed on the disk is an io error: {kinds:?}"
+    );
+}
+
+#[compio::test]
+async fn open_scans_are_counted_until_they_are_dropped() {
+    let (options, tag) = metered("open-scans");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    let a = db.scan().await.expect("scan");
+    let b = db.scan().await.expect("scan");
+    assert_eq!(
+        collected(reader(), &tag).get("roble.scans.open").copied(),
+        Some(2),
+        "two scans are open"
+    );
+    drop(a);
+    assert_eq!(
+        collected(reader(), &tag).get("roble.scans.open").copied(),
+        Some(1),
+        "one went away"
+    );
+    drop(b);
+    assert_eq!(
+        collected(reader(), &tag).get("roble.scans.open").copied(),
+        Some(0),
+        "and a store that goes on reporting scans nobody holds is how a leak hides"
     );
 }
 

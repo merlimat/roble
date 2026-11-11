@@ -147,6 +147,8 @@ impl<F: Fs> Opened<'_, F> {
         let _ = self.remove_obsolete_files().await;
         self.metrics.saw_version(&self.versions().version);
         self.measure_disk().await;
+        self.metrics.compactions.add(1);
+        self.saw_debt();
 
         Ok(edit.new_tables.iter().map(|t| t.file_num).collect())
     }

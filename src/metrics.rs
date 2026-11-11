@@ -56,6 +56,24 @@ const WRITE_OPERATIONS: CounterDef = CounterDef::new("roble.write.operations")
     .description("Operations in the batches written successfully");
 const WRITE_SIZE: HistogramDef = HistogramDef::bytes("roble.write.size")
     .description("Bytes of the batch representation of each write");
+const WRITE_BYTES: CounterDef = CounterDef::new("roble.write.bytes")
+    .unit("By")
+    .description("Bytes of the batch representations written successfully");
+const WRITE_ENTRIES: HistogramDef = HistogramDef::counts("roble.write.entries")
+    .unit("{entry}")
+    .description("Operations in each batch written successfully");
+const WRITE_ERRORS: CounterDef = CounterDef::new("roble.write.errors")
+    .unit("{error}")
+    .description("Writes that failed, by what went wrong");
+const READ_BYTES: CounterDef = CounterDef::new("roble.read.bytes")
+    .unit("By")
+    .description("Bytes of the keys and values that lookups and scans returned");
+const READ_ERRORS: CounterDef = CounterDef::new("roble.read.errors")
+    .unit("{error}")
+    .description("Lookups that failed, by what went wrong");
+const SCANS_OPEN: UpDownCounterDef = UpDownCounterDef::new("roble.scans.open")
+    .unit("{scan}")
+    .description("Scans that have been created and not dropped");
 const GET_DURATION: LatencyDef =
     LatencyDef::new("roble.get.duration").description("Time a lookup takes, found or not");
 const SCANS: CounterDef = CounterDef::new("roble.scans")
@@ -67,6 +85,15 @@ const SCAN_ENTRIES: CounterDef = CounterDef::new("roble.scan.entries")
 const MEMTABLE_SIZE: UpDownCounterDef = UpDownCounterDef::new("roble.memtable.size")
     .unit("By")
     .description("Bytes of writes that no table holds yet");
+const FLUSHES: CounterDef = CounterDef::new("roble.flushes")
+    .unit("{flush}")
+    .description("Flushes that wrote a table");
+const COMPACTIONS: CounterDef = CounterDef::new("roble.compactions")
+    .unit("{compaction}")
+    .description("Compactions run");
+const COMPACTION_DEBT: UpDownCounterDef = UpDownCounterDef::new("roble.compaction.debt")
+    .unit("By")
+    .description("Bytes the levels hold above what their allowances let them");
 const FLUSH_DURATION: LatencyDef = LatencyDef::new("roble.flush.duration")
     .description("Time a flush takes, from the call until its version edit is durable");
 const FLUSH_SIZE: HistogramDef =
@@ -100,6 +127,33 @@ const STORE: &str = "roble.store";
 const OPERATION_TYPE: &str = "roble.operation.type";
 const LEVEL: &str = "roble.level";
 const DIRECTION: &str = "disk.io.direction";
+const ERROR_TYPE: &str = "error.type";
+
+/// The value of `error.type` for each way an operation can fail.
+///
+/// OpenTelemetry asks for a low-cardinality classification rather than a
+/// message, and roble's error kinds already are one.
+const ERROR_TYPES: [&str; 6] = [
+    "io",
+    "locked",
+    "format",
+    "unsupported",
+    "corrupt",
+    "not_found",
+];
+
+/// Which of [`ERROR_TYPES`] an error is.
+fn error_type(error: &crate::error::Error) -> usize {
+    use crate::error::Error::*;
+    match error {
+        Io(_) => 0,
+        Locked => 1,
+        Format(_) => 2,
+        Unsupported(_) => 3,
+        Corrupt(_) => 4,
+        NotFound(_) => 5,
+    }
+}
 
 /// How many levels a version has, and so how many series the level metrics
 /// carry. Named here rather than imported so the array sizes below are one
@@ -184,10 +238,19 @@ pub(crate) struct Metrics {
     /// Puts, deletes and range deletes.
     pub(crate) write_operations: [Counter; 3],
     pub(crate) write_size: Histogram,
+    pub(crate) write_bytes: Counter,
+    pub(crate) write_entries: Histogram,
+    pub(crate) write_errors: Errors,
+    pub(crate) read_bytes: Counter,
+    pub(crate) read_errors: Errors,
+    pub(crate) scans_open: Amount,
     pub(crate) get: Latency,
     pub(crate) scans: Counter,
     pub(crate) scan_entries: Counter,
     pub(crate) memtable_size: Amount,
+    pub(crate) flushes: Counter,
+    pub(crate) compactions: Counter,
+    pub(crate) compaction_debt: Amount,
     pub(crate) flush: Latency,
     pub(crate) flush_size: Histogram,
     pub(crate) flush_bytes: Counter,
@@ -212,10 +275,19 @@ impl Metrics {
                 meter.counter(WRITE_OPERATIONS, &[KeyValue::new(OPERATION_TYPE, kind)])
             }),
             write_size: meter.histogram(WRITE_SIZE),
+            write_bytes: meter.counter(WRITE_BYTES, &[]),
+            write_entries: meter.histogram(WRITE_ENTRIES),
+            write_errors: Errors::new(meter, WRITE_ERRORS),
+            read_bytes: meter.counter(READ_BYTES, &[]),
+            read_errors: Errors::new(meter, READ_ERRORS),
+            scans_open: meter.amount(SCANS_OPEN, &[]),
             get: meter.latency(GET_DURATION),
             scans: meter.counter(SCANS, &[]),
             scan_entries: meter.counter(SCAN_ENTRIES, &[]),
             memtable_size: meter.amount(MEMTABLE_SIZE, &[]),
+            flushes: meter.counter(FLUSHES, &[]),
+            compactions: meter.counter(COMPACTIONS, &[]),
+            compaction_debt: meter.amount(COMPACTION_DEBT, &[]),
             flush: meter.latency(FLUSH_DURATION),
             flush_size: meter.histogram(FLUSH_SIZE),
             flush_bytes: meter.counter(FLUSH_BYTES, &[]),
@@ -238,6 +310,14 @@ impl Metrics {
         self.disk_size.counter.is_some()
     }
 
+    /// Restates how far the levels are past what they may hold.
+    ///
+    /// Pebble calls this the compaction debt and Oxia graphs it: the number
+    /// that says the store is falling behind before anything stalls.
+    pub(crate) fn saw_debt(&self, debt: u64) {
+        self.compaction_debt.set(debt as i64);
+    }
+
     /// Restates what each level holds.
     ///
     /// Called wherever the version changes rather than computed on export,
@@ -248,6 +328,28 @@ impl Metrics {
             self.level_tables[level as usize].set(tables.len() as i64);
             self.level_size[level as usize].set(tables.iter().map(|t| t.size as i64).sum());
         }
+    }
+}
+
+/// One counter per kind of error, so a failure is classified rather than
+/// merely counted.
+#[derive(Default)]
+pub(crate) struct Errors([Counter; ERROR_TYPES.len()]);
+
+impl Errors {
+    fn new(meter: &Meter, def: CounterDef) -> Errors {
+        Errors(ERROR_TYPES.map(|kind| meter.counter(def, &[KeyValue::new(ERROR_TYPE, kind)])))
+    }
+
+    /// Counts `result`'s error, and hands it back unchanged.
+    pub(crate) fn saw<T>(
+        &self,
+        result: Result<T, crate::error::Error>,
+    ) -> Result<T, crate::error::Error> {
+        if let Err(e) = &result {
+            self.0[error_type(e)].add(1);
+        }
+        result
     }
 }
 
@@ -272,6 +374,13 @@ pub(crate) struct Amount {
 }
 
 impl Amount {
+    pub(crate) fn add(&self, n: i64) {
+        if let Some(counter) = &self.counter {
+            self.value.set(self.value.get() + n);
+            counter.add(n);
+        }
+    }
+
     pub(crate) fn set(&self, value: i64) {
         if let Some(counter) = &self.counter {
             counter.add(value - self.value.get());
