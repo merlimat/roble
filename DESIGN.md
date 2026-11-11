@@ -1,6 +1,6 @@
 # roble — design
 
-> Status: **M1, M2 and M3 are complete.** This document fixes
+> Status: **M1, M2 and M3 are complete, and M4 has started.** This document fixes
 > the compatibility target (§3), the decisions that differ from encina's (§4),
 > and the order the work goes in (§13).
 >
@@ -96,6 +96,18 @@
 > things that happened. And the last guards the deletions: **Go Pebble reads
 > a database roble has deleted from**, after roble opens one and does nothing
 > but collect.
+>
+> **M4, compaction**, has started with the **merge**: tables of one level
+> compacted into the level below, pulling in every table there whose range
+> they meet, keeping the newest version of each key and dropping the rest.
+> Three things may go — a superseded version, a key a newer range tombstone
+> covers, and a deletion with nothing left below it to hide — and the third
+> is the one that resurrects keys when it is wrong, so it asks the version
+> rather than reading the level number. Overlapping tombstones are fragmented
+> into the shape a range-deletion block holds. **Go Pebble reads a table
+> roble compacted out of others.** The picker that decides which tables and
+> when is next, and is deliberately apart from this: compatibility constrains
+> the files a compaction produces, not when it runs.
 >
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
@@ -738,6 +750,14 @@ memory is its memtables plus its share of the thread's caches plus its
 compaction buffers, and the budget covers all three.
 
 ## 9. Compaction
+
+As built, the **merge** is there and the picker is not: `compact(level,
+tables)` does the work and its caller chooses. What it drops, and why each is
+safe, is written out in `src/compact.rs`; what it does not drop yet is a range
+tombstone that has nothing left below it, since carrying a spent tombstone
+costs a reader a comparison and dropping a live one brings a key back from the
+dead. The output is one table, because splitting at a target size is an
+opinion about file sizes and that belongs with the picker.
 
 Compaction is the cost encina does not pay, and the only background CPU work in
 roble. Leveled, with L0 as sublevels, and a **picker** — the component that
