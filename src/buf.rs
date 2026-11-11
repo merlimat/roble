@@ -106,3 +106,33 @@ impl From<Vec<u8>> for WriteBuf {
         WriteBuf::new(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_empty` on both buffers, and the conversion into a write buffer.
+    ///
+    /// None of the three has a caller. They stay rather than go, which is the
+    /// opposite of what #26 and #37 did with uncalled code, and for a reason
+    /// that does not apply to those: clippy's `len_without_is_empty` requires
+    /// an `is_empty` beside every `len`, so removing them would trade a lint
+    /// for a line. Testing one costs less than arguing with either.
+    #[test]
+    fn an_empty_buffer_says_so() {
+        assert!(ReadBuf::from_vec(Vec::new()).is_empty());
+        assert!(!ReadBuf::from_vec(vec![1, 2, 3]).is_empty());
+        assert_eq!(ReadBuf::from_vec(vec![1, 2, 3]).len(), 3);
+
+        assert!(WriteBuf::new(Vec::new()).is_empty());
+        assert!(!WriteBuf::new(vec![1, 2, 3]).is_empty());
+        assert_eq!(WriteBuf::new(vec![1, 2, 3]).len(), 3);
+    }
+
+    #[test]
+    fn a_vec_converts_into_a_write_buffer() {
+        let buf: WriteBuf = vec![1u8, 2, 3].into();
+        assert_eq!(buf.len(), 3);
+        assert!(!buf.is_empty());
+    }
+}
