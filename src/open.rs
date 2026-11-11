@@ -64,7 +64,12 @@ pub struct Opened<'a, F: Fs> {
     /// database, so the caches cannot be keyed by file number alone.
     store_id: u64,
     /// Writes that no table holds yet.
-    pub(crate) memtable: std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>,
+    ///
+    /// Two cells deep on purpose. A flush replaces the **handle**, so a scan
+    /// that cloned the old one keeps reading the memtable it started with —
+    /// swapping the contents instead would empty a snapshot out from under
+    /// it. The inner cell is what a write needs.
+    memtable: std::cell::RefCell<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>>,
     /// The log this store appends to, if it has one.
     log: std::cell::RefCell<Option<Log<F::Disk>>>,
     /// The next sequence number to hand out.
@@ -80,8 +85,8 @@ pub struct Opened<'a, F: Fs> {
     pub manifest_filename: String,
     /// Every `marker.` file found, sorted, current and obsolete alike.
     pub markers: Vec<String>,
-    /// What replaying the MANIFEST established.
-    pub versions: VersionSet,
+    /// What replaying the MANIFEST established, and what a flush adds to.
+    versions: std::cell::RefCell<VersionSet>,
 }
 
 /// Opens the database in `dir` with caches of its own.
@@ -207,14 +212,14 @@ pub async fn open_with<'a, E: Env>(
         fs,
         store_id: caches.new_store_id(),
         caches,
-        memtable: std::rc::Rc::new(std::cell::RefCell::new(memtable)),
+        memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
         format_version,
         manifest_filename,
         markers,
-        versions,
+        versions: std::cell::RefCell::new(versions),
     })
 }
 
@@ -472,7 +477,7 @@ impl<F: Fs> Opened<'_, F> {
             log.at = end;
         }
 
-        let next = self.memtable.borrow_mut().apply(batch.as_bytes(), base)?;
+        let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
         self.next_seq.set(next);
         Ok(())
     }
@@ -480,6 +485,61 @@ impl<F: Fs> Opened<'_, F> {
     /// The highest sequence number any read may see.
     pub(crate) fn snapshot(&self) -> u64 {
         self.next_seq.get().saturating_sub(1)
+    }
+
+    /// The memtable a read should use, which a flush may replace afterwards.
+    pub(crate) fn memtable(&self) -> std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>> {
+        std::rc::Rc::clone(&self.memtable.borrow())
+    }
+
+    /// The log this store is appending to, if it has one.
+    ///
+    /// Not the same as the MANIFEST's `min_unflushed_log_num`, which can name
+    /// a log that was never created — a database Pebble wrote with the WAL
+    /// disabled has it at zero. The store writes to the newest log it
+    /// replayed.
+    pub fn current_log(&self) -> Option<u64> {
+        self.log.borrow().as_ref().map(|l| l.log_num)
+    }
+
+    /// How many bytes of writes no table holds yet.
+    ///
+    /// What a caller watches to decide when to flush: §8 sizes a memtable at
+    /// 4 MiB, to match Oxia.
+    pub fn unflushed_bytes(&self) -> usize {
+        self.memtable().borrow().bytes()
+    }
+
+    /// The filesystem this store's files live in.
+    pub(crate) fn fs(&self) -> &F {
+        self.fs
+    }
+
+    /// The version set, for a flush to add to.
+    pub(crate) fn versions_mut(&self) -> std::cell::RefMut<'_, VersionSet> {
+        self.versions.borrow_mut()
+    }
+
+    /// Puts a fresh memtable in front, leaving any open scan on the old one.
+    pub(crate) fn install_fresh_memtable(&self, fresh: crate::memtable::Memtable) {
+        *self.memtable.borrow_mut() = std::rc::Rc::new(std::cell::RefCell::new(fresh));
+    }
+
+    /// Points the store at a different log, which must already exist.
+    pub(crate) async fn install_log(&self, log_num: u64) -> Result<()> {
+        let path = self.dir.join(roble_format::files::log_filename(log_num));
+        let disk = self.fs.open(&path, Access::ReadWrite).await?;
+        *self.log.borrow_mut() = Some(Log {
+            disk: std::rc::Rc::new(disk),
+            log_num,
+            at: 0,
+        });
+        Ok(())
+    }
+
+    /// What the MANIFEST says, as it stands.
+    pub fn versions(&self) -> std::cell::Ref<'_, VersionSet> {
+        self.versions.borrow()
     }
 
     /// The caches this store draws on, for tests that check what they hold.
@@ -527,7 +587,7 @@ impl<F: Fs> Opened<'_, F> {
             let _ = writeln!(out, "marker {m}");
         }
         let _ = writeln!(out, "format-version {}", self.format_version);
-        for (level, tables) in self.versions.version.levels() {
+        for (level, tables) in self.versions.borrow().version.levels() {
             if tables.is_empty() {
                 continue;
             }

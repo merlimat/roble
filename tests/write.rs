@@ -293,7 +293,7 @@ async fn a_scan_does_not_see_a_write_that_came_after_it() {
 async fn sequence_numbers_carry_on_from_the_manifest() {
     let (env, dir) = load("db-reads").await;
     let db = roble::open(&env, &dir).await.expect("open");
-    let last = db.versions.last_seq_num;
+    let last = db.versions().last_seq_num;
 
     let mut batch = Batch::new();
     batch.put(b"one", b"1").expect("put");

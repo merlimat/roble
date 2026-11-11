@@ -156,68 +156,15 @@ impl VersionSet {
         let mut last_seq_num = 0u64;
 
         for (i, edit) in edits.iter().enumerate() {
-            let at = |m: String| Error::Corrupt(format!("version edit {i}: {m}"));
-
-            if let Some(name) = &edit.comparer_name {
-                // Pebble writes the comparer once, in the first edit of a
-                // MANIFEST. A second, different one would mean the database
-                // changed key encoding underneath itself.
-                if let Some(held) = &comparer_name
-                    && held != name
-                {
-                    return Err(at(format!(
-                        "comparer changes from {held:?} to {name:?} mid-MANIFEST"
-                    )));
-                }
-                comparer_name = Some(name.clone());
-            }
-            if let Some(n) = edit.min_unflushed_log_num {
-                min_unflushed_log_num = n;
-            }
-            if let Some(n) = edit.next_file_num {
-                next_file_num = n;
-            }
-            if let Some(n) = edit.last_seq_num {
-                last_seq_num = n;
-            }
-
-            // Deletions first, which is the order Pebble's own
-            // `BulkVersionEdit` accumulates them in.
-            //
-            // It makes no difference to any edit Pebble writes today: a
-            // compaction moves a table by deleting it from one level and
-            // adding it to another, and the duplicate check below is
-            // per-level, so either order gives the same version. Swapping the
-            // two loops breaks no test here, and saying otherwise would be a
-            // claim nothing checks. The order is kept because it is the one
-            // that stays correct if an edit ever does replace a table within a
-            // level.
-            for &(level, file_num) in &edit.deleted_tables {
-                let tables = &mut version.levels[level as usize];
-                let Some(pos) = tables.iter().position(|t| t.file_num == file_num) else {
-                    return Err(at(format!(
-                        "deletes table {file_num} from L{level}, which does not hold it"
-                    )));
-                };
-                tables.remove(pos);
-            }
-            for new in &edit.new_tables {
-                let tables = &mut version.levels[new.level as usize];
-                if tables.iter().any(|t| t.file_num == new.file_num) {
-                    return Err(at(format!(
-                        "adds table {} to L{}, which already holds it",
-                        new.file_num, new.level
-                    )));
-                }
-                // By file number, so a version has one order however the
-                // edits arrived.
-                let table = Table::from_new(new);
-                let pos = tables
-                    .iter()
-                    .position(|t| t.file_num > table.file_num)
-                    .unwrap_or(tables.len());
-                tables.insert(pos, table);
-            }
+            apply_one(
+                edit,
+                i,
+                &mut version,
+                &mut comparer_name,
+                &mut min_unflushed_log_num,
+                &mut next_file_num,
+                &mut last_seq_num,
+            )?;
         }
 
         let Some(comparer_name) = comparer_name else {
@@ -238,6 +185,103 @@ impl VersionSet {
         Ok(set)
     }
 
+    /// Applies one more edit, as a flush or a compaction produces.
+    ///
+    /// The same code the replay uses, so an edit cannot mean one thing when
+    /// it is read back and another when it is written.
+    pub fn apply(&mut self, edit: &VersionEdit) -> Result<()> {
+        let mut comparer = Some(self.comparer_name.clone());
+        apply_one(
+            edit,
+            0,
+            &mut self.version,
+            &mut comparer,
+            &mut self.min_unflushed_log_num,
+            &mut self.next_file_num,
+            &mut self.last_seq_num,
+        )?;
+        self.comparer_name = comparer.expect("the set already had one");
+        self.check()
+    }
+}
+
+/// Applies one edit to the pieces a version set is made of.
+#[allow(clippy::too_many_arguments)]
+fn apply_one(
+    edit: &VersionEdit,
+    i: usize,
+    version: &mut Version,
+    comparer_name: &mut Option<String>,
+    min_unflushed_log_num: &mut u64,
+    next_file_num: &mut u64,
+    last_seq_num: &mut u64,
+) -> Result<()> {
+    let at = |m: String| Error::Corrupt(format!("version edit {i}: {m}"));
+
+    if let Some(name) = &edit.comparer_name {
+        // Pebble writes the comparer once, in the first edit of a
+        // MANIFEST. A second, different one would mean the database
+        // changed key encoding underneath itself.
+        if let Some(held) = &comparer_name
+            && held != name
+        {
+            return Err(at(format!(
+                "comparer changes from {held:?} to {name:?} mid-MANIFEST"
+            )));
+        }
+        *comparer_name = Some(name.clone());
+    }
+    if let Some(n) = edit.min_unflushed_log_num {
+        *min_unflushed_log_num = n;
+    }
+    if let Some(n) = edit.next_file_num {
+        *next_file_num = n;
+    }
+    if let Some(n) = edit.last_seq_num {
+        *last_seq_num = n;
+    }
+
+    // Deletions first, which is the order Pebble's own
+    // `BulkVersionEdit` accumulates them in.
+    //
+    // It makes no difference to any edit Pebble writes today: a
+    // compaction moves a table by deleting it from one level and
+    // adding it to another, and the duplicate check below is
+    // per-level, so either order gives the same version. Swapping the
+    // two loops breaks no test here, and saying otherwise would be a
+    // claim nothing checks. The order is kept because it is the one
+    // that stays correct if an edit ever does replace a table within a
+    // level.
+    for &(level, file_num) in &edit.deleted_tables {
+        let tables = &mut version.levels[level as usize];
+        let Some(pos) = tables.iter().position(|t| t.file_num == file_num) else {
+            return Err(at(format!(
+                "deletes table {file_num} from L{level}, which does not hold it"
+            )));
+        };
+        tables.remove(pos);
+    }
+    for new in &edit.new_tables {
+        let tables = &mut version.levels[new.level as usize];
+        if tables.iter().any(|t| t.file_num == new.file_num) {
+            return Err(at(format!(
+                "adds table {} to L{}, which already holds it",
+                new.file_num, new.level
+            )));
+        }
+        // By file number, so a version has one order however the
+        // edits arrived.
+        let table = Table::from_new(new);
+        let pos = tables
+            .iter()
+            .position(|t| t.file_num > table.file_num)
+            .unwrap_or(tables.len());
+        tables.insert(pos, table);
+    }
+    Ok(())
+}
+
+impl VersionSet {
     /// Checks the invariants a replayed version has to satisfy.
     ///
     /// These are Pebble's guarantees, not roble's preferences, which makes

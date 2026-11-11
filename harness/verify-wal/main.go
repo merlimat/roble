@@ -35,11 +35,15 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir>")
+	if len(os.Args) < 2 || len(os.Args) > 3 {
+		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed]")
 		os.Exit(2)
 	}
 	dir := os.Args[1]
+	mode := "log"
+	if len(os.Args) == 3 {
+		mode = os.Args[2]
+	}
 
 	expected, deleted, err := readExpectation(filepath.Join(dir, "roble-wrote.txt"))
 	if err != nil {
@@ -103,7 +107,14 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("%d keys and %d deletes checked\n", len(expected), len(deleted))
-	fmt.Println("\nVERDICT: Go Pebble replays the log roble wrote, key for key")
+	// Which claim this run made depends on where the keys had to come from.
+	// Flushed, the MANIFEST's min_unflushed has moved past the log roble
+	// wrote, so Pebble does not replay it: every key came out of the table.
+	if mode == "flushed" {
+		fmt.Println("\nVERDICT: Go Pebble reads the table roble wrote, through the MANIFEST roble appended")
+	} else {
+		fmt.Println("\nVERDICT: Go Pebble replays the log roble wrote, key for key")
+	}
 }
 
 type pair struct {

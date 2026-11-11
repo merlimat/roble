@@ -86,12 +86,12 @@ async fn roble_reads_what_go_pebble_reads() {
     // flattens it, the comparison below would still pass while testing much
     // less, so it is checked here too.
     assert!(
-        db.versions.version.level(0).len() >= 2,
+        db.versions().version.level(0).len() >= 2,
         "L0 should hold overlapping tables, holds {}",
-        db.versions.version.level(0).len()
+        db.versions().version.level(0).len()
     );
     assert!(
-        db.versions
+        db.versions()
             .version
             .levels()
             .filter(|(_, t)| !t.is_empty())
