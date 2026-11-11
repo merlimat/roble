@@ -27,9 +27,13 @@ use roble_format::batch::Batch;
 async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: wal-replay <database-dir>");
+        eprintln!("usage: wal-replay <database-dir> [--flush]");
         std::process::exit(2);
     };
+    // With `--flush` the same writes go through a table and a MANIFEST edit
+    // instead of staying in the log, so what Pebble reads back tests the
+    // other half of the round trip.
+    let flush = args.next().as_deref() == Some("--flush");
 
     let db = roble::open(&roble::DefaultEnv, &dir)
         .await
@@ -74,6 +78,15 @@ async fn main() {
         .await
         .unwrap_or_else(|e| fail(&format!("write: {e}")));
 
+    if flush {
+        let table = db
+            .flush()
+            .await
+            .unwrap_or_else(|e| fail(&format!("flush: {e}")))
+            .unwrap_or_else(|| fail("flush wrote nothing"));
+        println!("roble flushed the memtable to table {table:06}");
+    }
+
     // What Pebble should find, in the format its reader prints.
     let mut out = String::new();
     for (k, v) in &wrote {
@@ -84,9 +97,10 @@ async fn main() {
         .unwrap_or_else(|e| fail(&format!("write the expectation: {e}")));
 
     println!(
-        "roble wrote {} keys and one delete to the log of {}",
+        "roble wrote {} keys and one delete to {} ({})",
         wrote.len(),
-        dir.display()
+        dir.display(),
+        if flush { "flushed" } else { "log only" }
     );
 }
 

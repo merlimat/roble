@@ -50,12 +50,18 @@
 > leave unflushed, taking each batch's own sequence number, and carries on
 > writing where the replay stopped.
 >
-> Two gates hold it up. **A crash replays** to the last synced write and no
-> further, tested by crashing the simulated filesystem between the two. And
-> **Go Pebble replays the log roble wrote** (`compat/wal-replay`): nothing
-> roble writes there is flushed, so every key Pebble finds came out of the
-> log — its framing, its batch representation and its sequence numbers. That
-> is half of M3's round trip.
+And **flush**: the memtable written out as a table, the table and the log
+> that follows it made durable, and then a version edit appended to the
+> MANIFEST — after which the table is the database's and the old log can be
+> retired.
+>
+> Three gates hold it up. **A crash replays** to the last synced write and no
+> further. **Go Pebble replays the log roble wrote**, when nothing has been
+> flushed, so every key it finds came out of the log. And **Go Pebble reads
+> the table roble wrote, through the MANIFEST roble appended**, when the same
+> writes have been flushed — the MANIFEST's `min_unflushed_log_num` has moved
+> past roble's log by then, so Pebble does not replay it and the keys can
+> only have come from the table. **That closes M3's round trip.**
 >
 > A log that still holds writes is **refused** until replay lands, since
 > opening without it would discard writes that were already acknowledged.
@@ -509,6 +515,22 @@ Iterators read ahead, as encina's do, and share a read with another iterator
 that wants the same block (§8).
 
 ### `flush()`, `snapshot()`, `checkpoint(dir)`
+
+A flush writes in an order chosen so that a crash in the middle of one changes
+nothing: the table and its name are made durable, then the log that will follow
+it, and only then is the version edit appended to the MANIFEST and synced.
+Until that last step the new table is a file nothing refers to and the old log
+still holds every write, so a crash leaves the database exactly as it was.
+After it, the table is the database's and the rest is bookkeeping a replay
+would redo. The one-way door is the MANIFEST write, and it is one record.
+
+A table's **key bounds and sequence-number bounds are not the same thing**. A
+range deletion's upper bound is the sentinel — its end key at the largest
+sequence number there is — which bounds the keys and is not a sequence number
+the table holds. Pebble's own tables show the split: `seq=15..17` beside a
+largest key of `#72057594037927935 rangedel`. Folding the sentinel into the
+sequence range produces a table claiming a sequence number above anything the
+MANIFEST ever committed, which is what §6's version check refuses.
 
 `flush()` makes the memtable an immutable one, writes it as a table, appends the
 version edit — carrying the new minimum unflushed log number — and syncs: the

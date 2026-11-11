@@ -85,7 +85,7 @@ async fn the_replay_recovers_the_counters_a_store_resumes_from() {
 
     // Pebble exposes no public accessor for these, so they are asserted
     // against what the database must be rather than against a Go dump.
-    let v = &db.versions;
+    let v = db.versions();
     assert_eq!(v.comparer_name, BYTEWISE);
     assert_eq!(db.format_version, 16, "the fixture is written at the pin");
     assert_eq!(db.manifest_filename, "MANIFEST-000001");
@@ -473,11 +473,11 @@ async fn a_compaction_replays_as_a_move_between_levels() {
 
     let db = roble::open(&env, &dir).await.expect("open");
     assert!(
-        db.versions.version.level(0).is_empty(),
+        db.versions().version.level(0).is_empty(),
         "L0 should be empty"
     );
-    assert_eq!(db.versions.version.level(6).len(), 1, "L6 should hold it");
-    assert_eq!(db.versions.version.table_count(), 1, "and only once");
+    assert_eq!(db.versions().version.level(6).len(), 1, "L6 should hold it");
+    assert_eq!(db.versions().version.table_count(), 1, "and only once");
 }
 
 #[compio::test]
@@ -722,7 +722,7 @@ async fn overlapping_tables_in_l0_are_normal() {
     .build()
     .await;
     let db = roble::open(&env, &dir).await.expect("L0 may overlap");
-    assert_eq!(db.versions.version.level(0).len(), 2);
+    assert_eq!(db.versions().version.level(0).len(), 2);
 }
 
 #[compio::test]

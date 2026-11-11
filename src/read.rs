@@ -158,7 +158,8 @@ impl<F: Fs> Opened<'_, F> {
         // trailer either way, so this is an ordering of convenience, not of
         // correctness.
         {
-            let memtable = self.memtable.borrow();
+            let held = self.memtable();
+            let memtable = held.borrow();
             let mut cursor = memtable.cursor();
             cursor.seek_ge(&memtable, &target)?;
             if cursor.is_valid() {
@@ -241,7 +242,7 @@ impl<F: Fs> Opened<'_, F> {
         }
         // And the memtable's, which are kept apart from its point keys and so
         // are in no cursor's way (§4).
-        for t in self.memtable.borrow().tombstones() {
+        for t in self.memtable().borrow().tombstones() {
             if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
                 return Ok(false);
             }
@@ -254,7 +255,7 @@ impl<F: Fs> Opened<'_, F> {
     /// Order does not matter: every comparison below is by key or by trailer,
     /// never by position in the tree.
     fn live_tables(&self) -> Vec<TableMeta> {
-        self.versions
+        self.versions()
             .version
             .levels()
             .flat_map(|(_, tables)| tables.iter().cloned())

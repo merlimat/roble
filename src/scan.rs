@@ -522,15 +522,22 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
         // bounds could be left out, but that is the version's business to
         // decide and it costs nothing here: an iterator over a table outside
         // the bounds goes invalid on its first seek.
+        // The file numbers first, so the borrow is released before any
+        // waiting: opening a table is I/O, and a `RefCell` held across it
+        // would collide with the flush that is allowed to run meanwhile.
+        let file_nums: Vec<u64> = self
+            .versions()
+            .version
+            .levels()
+            .flat_map(|(_, metas)| metas.iter().map(|m| m.file_num))
+            .collect();
         let mut tables = Vec::new();
-        for (_, metas) in self.versions.version.levels() {
-            for meta in metas {
-                tables.push(self.open_table(meta.file_num).await?);
-            }
+        for file_num in file_nums {
+            tables.push(self.open_table(file_num).await?);
         }
         Ok(Scan::new(
             tables,
-            Some(Rc::clone(&self.memtable)),
+            Some(self.memtable()),
             self.snapshot(),
             lower.map(|b| b.to_vec()),
             upper.map(|b| b.to_vec()),

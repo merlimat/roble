@@ -411,6 +411,13 @@ impl<D: Disk> TableIter<D> {
 
     /// Positions on the first entry at or after `target`.
     pub async fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        // A table can have no data blocks at all: one holding nothing but a
+        // range deletion has an empty index, and Pebble writes those. The
+        // other three positioning methods guard for it; this one did not,
+        // and `load` indexed an empty slice.
+        if self.table.index.is_empty() {
+            return Ok(());
+        }
         let start = first_block_at_or_after(&self.table.index, target)?;
         if start >= self.table.index.len() {
             // Past every separator: nothing in this table reaches the target.

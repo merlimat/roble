@@ -32,9 +32,21 @@ out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 
 # A database Pebble built, copied so the fixture is left alone.
-cp -R ../../tests/golden/db-simple "$out/db"
-chmod -R u+w "$out/db"
+# Twice over: once with the writes left in the log, once with them flushed
+# into a table through a MANIFEST edit roble appended. The first tests
+# Pebble replaying roble's log; the second tests Pebble reading roble's
+# table and believing roble's MANIFEST.
+for mode in log flushed; do
+  db="$out/$mode"
+  cp -R ../../tests/golden/db-simple "$db"
+  chmod -R u+w "$db"
 
-cargo run --release --quiet -p wal-replay -- "$out/db"
-echo
-(cd ../../harness && go run ./verify-wal "$out/db")
+  if [ "$mode" = flushed ]; then
+    cargo run --release --quiet -p wal-replay -- "$db" --flush
+  else
+    cargo run --release --quiet -p wal-replay -- "$db"
+  fi
+  echo
+  (cd ../../harness && go run ./verify-wal "$db" "$mode")
+  echo
+done

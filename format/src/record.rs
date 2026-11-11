@@ -166,6 +166,20 @@ impl RecordWriter {
         }
     }
 
+    /// A legacy writer that carries on at `at` bytes into the file.
+    ///
+    /// For appending to a MANIFEST, whose records are legacy-framed but
+    /// blocked the same way: a chunk never crosses a 32 KiB boundary, so a
+    /// writer that picks up part-way through has to know where it is.
+    pub fn legacy_resuming(at: usize) -> Self {
+        RecordWriter {
+            out: Vec::new(),
+            format: WireFormat::Legacy,
+            log_num: 0,
+            base: at,
+        }
+    }
+
     /// A recyclable writer that carries on at `at` bytes into the log.
     ///
     /// This is how a store reopens a log it is going to keep writing to: the
@@ -700,6 +714,33 @@ mod resume_tests {
 
         // And the result still reads back as the records that went in.
         let mut reader = RecordReader::new(&joined, 9);
+        let mut back = Vec::new();
+        while let Some(r) = reader.next() {
+            back.push(r.expect("record"));
+        }
+        assert_eq!(back, payloads);
+    }
+
+    #[test]
+    fn a_legacy_writer_resumes_the_same_way() {
+        // The MANIFEST is framed in the same 32 KiB blocks, so appending to
+        // one has the same requirement as appending to a log.
+        let payloads = payloads();
+        let mut whole = RecordWriter::legacy();
+        for p in &payloads {
+            whole.write_record(p).expect("write");
+        }
+        let whole = whole.finish();
+
+        let mut joined: Vec<u8> = Vec::new();
+        for p in &payloads {
+            let mut w = RecordWriter::legacy_resuming(joined.len());
+            w.write_record(p).expect("write");
+            joined.extend_from_slice(w.as_bytes());
+        }
+        assert_eq!(joined, whole);
+
+        let mut reader = RecordReader::new(&joined, 0);
         let mut back = Vec::new();
         while let Some(r) = reader.next() {
             back.push(r.expect("record"));
