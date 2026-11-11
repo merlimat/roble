@@ -33,6 +33,7 @@ pub mod compact;
 pub mod env;
 pub mod flush;
 pub mod memtable;
+mod metrics;
 pub mod obsolete;
 pub mod open;
 pub mod options;
@@ -43,6 +44,7 @@ pub mod scan;
 pub mod sim;
 pub mod table;
 pub mod version;
+pub mod work;
 
 mod error;
 mod file;

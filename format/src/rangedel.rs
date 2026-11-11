@@ -99,6 +99,52 @@ pub fn decode(block: &Block<'_>) -> Result<Vec<Tombstone>> {
     Ok(out)
 }
 
+/// Cuts overlapping tombstones into the fragments a v2 block demands.
+///
+/// A range-deletion block holds fragments: tombstones sorted by start, never
+/// overlapping unless they share both bounds, and then in strictly decreasing
+/// sequence order. `check_fragmented` below refuses anything else, so anything
+/// that collects tombstones from more than one source has to come through
+/// here first — two `delete_range` calls that overlap are ordinary use, not
+/// corruption.
+///
+/// The bounds of every tombstone, sorted and deduplicated, cut the key space
+/// into spans that no tombstone straddles. Each span is then emitted once per
+/// tombstone covering it, newest first — which is exactly the shape the block
+/// demands.
+///
+/// Input that is already fragmented comes back unchanged: its bounds cut the
+/// space at exactly the edges it already has, and a span no tombstone covers
+/// emits nothing.
+pub fn fragment(all: &[&Tombstone]) -> Vec<Tombstone> {
+    let mut cuts: Vec<&[u8]> = Vec::with_capacity(all.len() * 2);
+    for t in all {
+        cuts.push(&t.start);
+        cuts.push(&t.end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut out = Vec::new();
+    for pair in cuts.windows(2) {
+        let (lo, hi) = (pair[0], pair[1]);
+        let mut covering: Vec<u64> = all
+            .iter()
+            .filter(|t| t.start.as_slice() <= lo && hi <= t.end.as_slice())
+            .map(|t| t.seq_num)
+            .collect();
+        covering.sort_unstable_by(|a, b| b.cmp(a));
+        for seq_num in covering {
+            out.push(Tombstone {
+                start: lo.to_vec(),
+                end: hi.to_vec(),
+                seq_num,
+            });
+        }
+    }
+    out
+}
+
 /// The fragmentation invariant, as `addTombstone` enforces it when writing.
 fn check_fragmented(prev: &Tombstone, next: &Tombstone) -> Result<()> {
     match prev.start.cmp(&next.start) {
@@ -274,6 +320,75 @@ mod tests {
         let mut b = Builder::new();
         assert!(b.add(b"/a", b"/a", 1).is_err(), "empty range refused");
         assert!(b.add(b"/z", b"/a", 1).is_err(), "inverted range refused");
+    }
+
+    fn stones(raw: &[(&[u8], &[u8], u64)]) -> Vec<Tombstone> {
+        raw.iter()
+            .map(|(s, e, n)| Tombstone {
+                start: s.to_vec(),
+                end: e.to_vec(),
+                seq_num: *n,
+            })
+            .collect()
+    }
+
+    /// The property that makes fragmenting safe to apply everywhere: input a
+    /// block would already accept comes back as it went in. Were that not so,
+    /// fragmenting on the flush path would rewrite tables that are fine today.
+    #[test]
+    fn already_fragmented_tombstones_come_back_unchanged() {
+        for raw in [
+            // Disjoint, with a gap no tombstone covers.
+            &[(&b"/a"[..], &b"/b"[..], 10u64), (b"/d", b"/e", 3)][..],
+            // Adjacent, sharing a bound.
+            &[(&b"/a"[..], &b"/b"[..], 10u64), (b"/b", b"/c", 9)][..],
+            // Stacked on the same range, strictly decreasing.
+            &[(&b"/a"[..], &b"/b"[..], 10u64), (b"/a", b"/b", 4)][..],
+            // Nothing at all.
+            &[][..],
+        ] {
+            let input = stones(raw);
+            let got = fragment(&input.iter().collect::<Vec<_>>());
+            assert_eq!(got, input, "fragmenting changed an accepted block");
+        }
+    }
+
+    /// Two `delete_range` calls that overlap are ordinary use. Unfragmented
+    /// they are refused; fragmented they describe the same deleted keys.
+    #[test]
+    fn overlapping_tombstones_are_cut_into_fragments() {
+        // `/a`..`/d` at 10, then `/b`..`/f` at 20 — overlapping at neither
+        // bound, which is what a block refuses outright.
+        let input = stones(&[(b"/a", b"/d", 10), (b"/b", b"/f", 20)]);
+        let mut refused = Builder::new();
+        refused.add(b"/a", b"/d", 10).expect("first");
+        assert!(
+            refused.add(b"/b", b"/f", 20).is_err(),
+            "the unfragmented form must be the one that is refused"
+        );
+
+        let got = fragment(&input.iter().collect::<Vec<_>>());
+
+        // The cuts are /a /b /d /f, so three spans; the middle one is covered
+        // by both, newest first.
+        assert_eq!(
+            got,
+            stones(&[
+                (b"/a", b"/b", 10),
+                (b"/b", b"/d", 20),
+                (b"/b", b"/d", 10),
+                (b"/d", b"/f", 20),
+            ])
+        );
+
+        // And the result is something a block will actually take.
+        let mut b = Builder::new();
+        for t in &got {
+            b.add(&t.start, &t.end, t.seq_num).expect("fragmented add");
+        }
+        let bytes = b.finish();
+        let block = Block::new(&bytes).expect("parse");
+        assert_eq!(decode(&block).expect("decode"), got);
     }
 
     #[test]

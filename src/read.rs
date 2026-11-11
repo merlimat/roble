@@ -96,13 +96,21 @@ struct Candidate {
 impl<F: Fs> Opened<'_, F> {
     /// Reads the key `how` says, or `None` if there is none.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
-        match how {
+        let _timer = self.metrics.get.start();
+        let result = match how {
             // Equal keeps its own path: it is the one comparison a bloom
             // filter can answer, and a scan does not consult filters because
             // it is asking about a range (§6).
             Comparison::Equal => self.equal(key).await,
             _ => self.positioned(key, how).await,
+        };
+        let found = self.metrics.read_errors.saw(result)?;
+        if let Some(found) = &found {
+            self.metrics
+                .read_bytes
+                .add((found.key.len() + found.value.len()) as u64);
         }
+        Ok(found)
     }
 
     /// A point lookup.

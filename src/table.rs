@@ -65,6 +65,14 @@ pub struct OpenTable<D: Disk> {
     /// Its range tombstones, decoded once.
     pub tombstones: Vec<Tombstone>,
     blocks: crate::cache::BlockCache,
+    /// What the store that opened it records, if anything.
+    metrics: Option<Rc<crate::metrics::Metrics>>,
+    /// How many entries its properties block says it holds, when it says.
+    ///
+    /// Read while the table is being opened, so learning it costs nothing: a
+    /// store that wants an estimate of the records it holds gets this one
+    /// free, for every table something has had reason to open.
+    pub entries: Option<u64>,
 }
 
 impl<D: Disk> OpenTable<D> {
@@ -75,11 +83,29 @@ impl<D: Disk> OpenTable<D> {
     /// is read whole and accepted when it is read block by block would be
     /// worse than either.
     pub async fn open(file_num: u64, disk: D, blocks: crate::cache::BlockCache) -> Result<Self> {
+        OpenTable::open_metered(file_num, disk, blocks, None).await
+    }
+
+    /// The same, counting every read it makes against a store's handles.
+    ///
+    /// Opening a table is several reads — the footer, the metaindex, the
+    /// properties, the index, the filter and the tombstones — and they are
+    /// the reads a store makes most of, so they are the ones worth counting.
+    pub(crate) async fn open_metered(
+        file_num: u64,
+        disk: D,
+        blocks: crate::cache::BlockCache,
+        metrics: Option<Rc<crate::metrics::Metrics>>,
+    ) -> Result<Self> {
         let size = disk.len().await?;
         let tail = read_tail(&disk, FOOTER_LEN.min(size as usize), Default::default()).await?;
+        if let Some(m) = &metrics {
+            m.read.add(tail.len());
+        }
         let footer = Footer::decode(&tail, size)?;
 
-        let meta_bytes = fetch(&disk, footer.metaindex, footer.checksum).await?;
+        let meta_bytes =
+            fetch(&disk, metrics.as_deref(), footer.metaindex, footer.checksum).await?;
         let metaindex = Metaindex::parse(&Block::new(&meta_bytes)?)?;
 
         // Untested, with a reason (§12): every writer that exists emits a
@@ -92,7 +118,7 @@ impl<D: Disk> OpenTable<D> {
                 "table has no properties block".to_string(),
             )));
         };
-        let props_bytes = fetch(&disk, props_handle, footer.checksum).await?;
+        let props_bytes = fetch(&disk, metrics.as_deref(), props_handle, footer.checksum).await?;
         let properties = Properties::decode(&Block::new(&props_bytes)?)?;
         if let Some(name) = properties.comparer_name()
             && name != BYTEWISE_COMPARER
@@ -104,12 +130,13 @@ impl<D: Disk> OpenTable<D> {
         }
 
         // The index, with a two-level one flattened as it is read.
-        let top_bytes = fetch(&disk, footer.index, footer.checksum).await?;
+        let top_bytes = fetch(&disk, metrics.as_deref(), footer.index, footer.checksum).await?;
         let top = index_entries_of(&Block::new(&top_bytes)?)?;
         let index = if properties.is_two_level_index()? {
             let mut flat = Vec::new();
             for partition in top {
-                let part = fetch(&disk, partition.handle, footer.checksum).await?;
+                let part =
+                    fetch(&disk, metrics.as_deref(), partition.handle, footer.checksum).await?;
                 flat.extend(index_entries_of(&Block::new(&part)?)?);
             }
             flat
@@ -118,26 +145,28 @@ impl<D: Disk> OpenTable<D> {
         };
 
         let filter = match metaindex.filter {
-            Some(h) => Some(fetch(&disk, h, footer.checksum).await?),
+            Some(h) => Some(fetch(&disk, metrics.as_deref(), h, footer.checksum).await?),
             None => None,
         };
         let tombstones = match metaindex.range_del {
             Some(h) => {
-                let bytes = fetch(&disk, h, footer.checksum).await?;
+                let bytes = fetch(&disk, metrics.as_deref(), h, footer.checksum).await?;
                 roble_format::rangedel::decode(&Block::new(&bytes)?)?
             }
             None => Vec::new(),
         };
         let value_blocks = match &metaindex.value_index {
             Some(vi) => {
-                let bytes = fetch(&disk, vi.handle, footer.checksum).await?;
+                let bytes = fetch(&disk, metrics.as_deref(), vi.handle, footer.checksum).await?;
                 vi.decode_rows(&bytes)?
             }
             None => Vec::new(),
         };
 
+        let entries = properties.num_entries()?;
         Ok(OpenTable {
             file_num,
+            entries,
             disk,
             footer,
             index,
@@ -145,6 +174,7 @@ impl<D: Disk> OpenTable<D> {
             value_blocks,
             tombstones,
             blocks,
+            metrics,
         })
     }
 
@@ -169,9 +199,21 @@ impl<D: Disk> OpenTable<D> {
     /// the block budget on bytes that are already held.
     async fn block(&self, handle: BlockHandle) -> Result<Rc<Vec<u8>>> {
         if let Some(held) = self.blocks.get(self.file_num, handle.offset) {
+            if let Some(m) = &self.metrics {
+                m.cache_lookups[crate::metrics::BLOCK_HIT].add(1);
+            }
             return Ok(held);
         }
-        let bytes = fetch(&self.disk, handle, self.footer.checksum).await?;
+        if let Some(m) = &self.metrics {
+            m.cache_lookups[crate::metrics::BLOCK_MISS].add(1);
+        }
+        let bytes = fetch(
+            &self.disk,
+            self.metrics.as_deref(),
+            handle,
+            self.footer.checksum,
+        )
+        .await?;
         self.blocks
             .hold(self.file_num, handle.offset, Rc::clone(&bytes));
         Ok(bytes)
@@ -261,13 +303,19 @@ impl<D: Disk> OpenTable<D> {
 /// cover both or there is nothing to verify against.
 async fn fetch<D: Disk>(
     disk: &D,
+    metrics: Option<&crate::metrics::Metrics>,
     handle: BlockHandle,
     checksum: roble_format::ChecksumType,
 ) -> Result<Rc<Vec<u8>>> {
     let len = usize::try_from(handle.span_len())
         .map_err(|_| Error::Corrupt(format!("block length {} too large", handle.length)))?;
     debug_assert_eq!(len, handle.length as usize + TRAILER_SIZE);
+    let timer = metrics.and_then(|m| m.read_duration.start());
     let raw = read_exact(disk, handle.offset, len, Default::default()).await?;
+    drop(timer);
+    if let Some(m) = metrics {
+        m.read.add(raw.len());
+    }
     Ok(Rc::new(
         match decode_fetched(&raw, handle.offset, checksum)? {
             Decoded::Borrowed(b) => b.to_vec(),

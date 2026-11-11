@@ -121,6 +121,22 @@
 > because making the same decision twice is the whole of its job. **Go Pebble
 > reads a database roble spread across levels by itself.**
 >
+> And a compaction is **cooperative in fact**: it merges a slice, hands the
+> executor back and resumes, so a merge of a million keys is a million keys'
+> worth of work rather than a million keys' worth of waiting for everything
+> else on the core. The slice is counted in entries rather than milliseconds,
+> because a job that yielded on a timer would stop a seeded run replaying.
+>
+> And **metrics**, through OpenTelemetry with [nanometer] handles, as encina
+> does: a store creates them when it opens and records nothing at all without
+> a meter provider. Writes, lookups, scans, flushes, compactions, what each
+> level holds and what the directory takes on disk, with the two counters a
+> write amplification needs. [METRICS.md](METRICS.md) lists them, and what is
+> still owed: the caches' usage, disk I/O, an estimate of the records held,
+> and the two write stalls, which arrive with the waiting they count.
+>
+> [nanometer]: https://docs.rs/nanometer
+>
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
 > other way, the latter with a real WAL and MANIFEST; `harness/batch-repr`
@@ -781,10 +797,16 @@ and a tombstone straddling a split is clipped at it, so the tables either side
 meet at one user key rather than overlapping across it. L0 sublevels,
 cooperative execution and the write-stall counters are still owed.
 
-The picker is **not scheduled**: nothing runs a compaction behind the caller's
-back yet. Wiring it into a flush waits for the cooperative execution below,
-because a compaction that runs to completion inside a flush is exactly the
-latency spike units of work exist to avoid.
+A compaction is paced in units of work (`crate::work`): every
+`Options::compaction_unit` entries it hands the executor back and resumes, so
+a reader or a writer on the same core waits a slice rather than a merge. The
+unit is entries and not time, because §10 lets a store read the clock only
+where the env allows it, and a job that yielded on a timer would stop a seeded
+run replaying.
+
+The picker is still **not scheduled**: nothing runs a compaction behind the
+caller's back. What is left for that is a store that can be handed to a task
+of its own, which is an ownership question rather than a pacing one.
 
 Compaction is the cost encina does not pay, and the only background CPU work in
 roble. Leveled, with L0 as sublevels, and a **picker** — the component that
@@ -913,7 +935,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
 | `SyncData`, `UseWAL` | `Sync` on commit, and `disable_wal` in `Options` (§4) |
-| Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina |
+| Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina ([METRICS.md](METRICS.md)) |
 
 ## 12. Testing
 

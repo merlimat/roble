@@ -145,6 +145,41 @@ impl<F: Fs> Opened<'_, F> {
         best
     }
 
+    /// How many bytes the levels hold above what their allowances let them.
+    ///
+    /// Pebble's compaction debt, which Oxia graphs: the number that says a
+    /// store is falling behind before anything stalls. L0 is counted in
+    /// tables rather than bytes, so its excess is charged at what its tables
+    /// weigh.
+    pub fn compaction_debt(&self) -> u64 {
+        let versions = self.versions();
+        let mut debt = 0;
+        for level in 0..NUM_LEVELS - 1 {
+            let tables = versions.version.level(level);
+            if level == 0 {
+                let over = (tables.len() as u64).saturating_sub(self.l0_compaction_threshold());
+                let each = if tables.is_empty() {
+                    0
+                } else {
+                    tables.iter().map(|t| t.size).sum::<u64>() / tables.len() as u64
+                };
+                debt += over * each;
+            } else {
+                let held: u64 = tables.iter().map(|t| t.size).sum();
+                let allowance = self
+                    .lbase_max_bytes()
+                    .saturating_mul(LEVEL_MULTIPLIER.saturating_pow(level - 1));
+                debt += held.saturating_sub(allowance);
+            }
+        }
+        debt
+    }
+
+    /// Restates the debt, for whatever is recording.
+    pub(crate) fn saw_debt(&self) {
+        self.metrics.saw_debt(self.compaction_debt());
+    }
+
     /// Runs the compaction [`Opened::pick`] chose, if there is one.
     ///
     /// Returns the output tables' file numbers, empty if nothing was worth

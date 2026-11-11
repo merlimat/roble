@@ -304,3 +304,59 @@ async fn fs_open(env: &SimEnv, path: &Path) -> roble::sim::SimDisk {
         .await
         .expect("open the manifest")
 }
+
+#[compio::test]
+async fn overlapping_range_deletions_can_be_flushed() {
+    // Two `delete_range` calls that overlap at neither bound are ordinary
+    // use, and the memtable keeps them as they were asked for. A
+    // range-deletion block holds fragments, though, so emitting them straight
+    // out of the memtable built a block the writer refuses:
+    //
+    //     overlapping tombstones are not fragmented: "/a".."/d" vs "/b".."/f"
+    //
+    // which is worse than a failed flush. The memtable is never emptied, so
+    // every later flush fails the same way and the store can never shed it.
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    for key in [&b"/a1"[..], b"/b1", b"/d1", b"/f1"] {
+        let mut batch = Batch::new();
+        batch.put(key, b"v").expect("put");
+        db.write(&mut batch, true).await.expect("write");
+    }
+
+    // Separate batches, so both tombstones are live in the one memtable.
+    let mut batch = Batch::new();
+    batch.delete_range(b"/a", b"/d").expect("first range");
+    db.write(&mut batch, true).await.expect("write");
+
+    let mut batch = Batch::new();
+    batch.delete_range(b"/b", b"/f").expect("overlapping range");
+    db.write(&mut batch, true).await.expect("write");
+
+    let before = contents(&db).await;
+    assert!(
+        !before.contains_key(b"/a1".as_slice())
+            && !before.contains_key(b"/b1".as_slice())
+            && !before.contains_key(b"/d1".as_slice()),
+        "the ranges should have deleted what they cover: {before:?}"
+    );
+    assert!(
+        before.contains_key(b"/f1".as_slice()),
+        "and nothing past them: {before:?}"
+    );
+
+    db.flush().await.expect("flush").expect("a table");
+
+    assert_eq!(contents(&db).await, before, "the flush changed an answer");
+    assert_eq!(
+        db.unflushed_bytes(),
+        0,
+        "the memtable should have been emptied into the table"
+    );
+
+    // And the table reads back the same on its own, from disk.
+    drop(db);
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(contents(&db).await, before, "a reopen changed an answer");
+}

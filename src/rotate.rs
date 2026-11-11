@@ -93,11 +93,16 @@ impl<F: Fs> Opened<'_, F> {
         let bytes = writer.as_bytes().to_vec();
 
         let disk = self.fs().create(&self.dir.join(&filename)).await?;
+        let written = bytes.len();
         let (result, _) = disk
             .write(WriteBuf::new(bytes), 0, Default::default())
             .await;
         result?;
-        disk.sync(Default::default()).await?;
+        self.metrics.written.add(written);
+        {
+            let _timer = self.metrics.sync_duration.start();
+            disk.sync(Default::default()).await?;
+        }
         disk.close().await?;
         self.fs().sync_dir(&self.dir).await?;
 

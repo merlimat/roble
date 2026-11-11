@@ -9,10 +9,15 @@ description = "Embedded ordered key-value store whose on-disk files are Pebble's
 
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }
+nanometer = "0.1"
+# The version nanometer pins.
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
 roble-format = { path = "format" }
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["fs", "macros"] }
+# Collects the metrics the tests check, with a reader they keep a handle to.
+opentelemetry_sdk = { version = "=0.33.1", features = ["metrics", "experimental_metrics_custom_reader"] }
 tempfile = "3"
 
 [target."cfg(unix)".dependencies]

@@ -56,7 +56,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use roble_format::manifest::{NUM_LEVELS, VersionEdit};
-use roble_format::rangedel::Tombstone;
+use roble_format::rangedel::{self, Tombstone};
 use roble_format::sst::{TableWriter, WriterOptions};
 use roble_format::{InternalKey, key};
 
@@ -97,23 +97,36 @@ impl<F: Fs> Opened<'_, F> {
             ));
         }
 
+        let _timer = self.metrics.compaction.start();
         let (inputs, below) = self.inputs_for(level, output_level, file_nums)?;
+        self.metrics.compaction_tables[0].add(inputs.len() as u64);
+        self.metrics.compaction_io[0].add(inputs.iter().map(|(_, m)| m.size).sum());
         let mut tables = Vec::new();
         for (_, meta) in &inputs {
             tables.push(self.open_table(meta.file_num).await?);
         }
 
         let first_file_num = self.versions().next_file_num;
-        let merged = merge(&tables, &below, self.target_file_size(output_level)).await?;
+        let merged = merge(
+            &tables,
+            &below,
+            self.target_file_size(output_level),
+            self.compaction_unit(),
+        )
+        .await?;
 
         // Every output written and made durable before the edit that claims
         // any of them: a crash in the middle leaves files nothing refers to,
         // which the sweep collects, and the database exactly as it was.
         let mut new_tables = Vec::with_capacity(merged.len());
-        for (i, (bytes, bounds)) in merged.into_iter().enumerate() {
+        let mut written: Vec<(u64, u64)> = Vec::new();
+        for (i, (bytes, bounds, entries)) in merged.into_iter().enumerate() {
             let file_num = first_file_num + i as u64;
+            written.push((file_num, entries));
             let mut new_table = bounds.into_new_table(output_level, file_num)?;
             new_table.size = bytes.len() as u64;
+            self.metrics.compaction_tables[1].add(1);
+            self.metrics.compaction_io[1].add(new_table.size);
             self.write_table(file_num, bytes).await?;
             new_tables.push(new_table);
         }
@@ -140,6 +153,14 @@ impl<F: Fs> Opened<'_, F> {
             let _ = self.rotate_manifest().await;
         }
         let _ = self.remove_obsolete_files().await;
+        self.metrics.saw_version(&self.versions().version);
+        self.measure_disk().await;
+        self.metrics.compactions.add(1);
+        self.saw_debt();
+        for (file_num, entries) in written {
+            self.saw_table_entries(file_num, Some(entries));
+        }
+        self.recount_records();
 
         Ok(edit.new_tables.iter().map(|t| t.file_num).collect())
     }
@@ -212,11 +233,16 @@ impl<F: Fs> Opened<'_, F> {
     async fn write_table(&self, file_num: u64, bytes: Vec<u8>) -> Result<()> {
         let path = self.dir.join(roble_format::files::table_filename(file_num));
         let disk = self.fs().create(&path).await?;
+        let written = bytes.len();
         let (result, _) = disk
             .write(WriteBuf::new(bytes), 0, Default::default())
             .await;
         result?;
-        disk.sync(Default::default()).await?;
+        self.metrics.written.add(written);
+        {
+            let _timer = self.metrics.sync_duration.start();
+            disk.sync(Default::default()).await?;
+        }
         disk.close().await?;
         self.fs().sync_dir(&self.dir).await?;
         Ok(())
@@ -231,7 +257,12 @@ async fn merge<D: Disk>(
     tables: &[Rc<OpenTable<D>>],
     below: &[(Vec<u8>, Vec<u8>)],
     target_bytes: u64,
-) -> Result<Vec<(Vec<u8>, Bounds)>> {
+    unit: u64,
+) -> Result<Vec<(Vec<u8>, Bounds, u64)>> {
+    // The thread goes back to whatever else is ready every `unit` entries,
+    // so a merge of a million keys is a million keys' worth of work rather
+    // than a million keys' worth of waiting for everyone else (§9).
+    let mut pacer = crate::work::Pacer::new(unit);
     let mut iters = Vec::new();
     for t in tables {
         let mut it = t.iter();
@@ -280,6 +311,7 @@ async fn merge<D: Disk>(
             open.add(k, &encoded, &entry.value)?;
         }
         iters[w].next().await?;
+        pacer.did(1).await;
     }
 
     outputs.push(open.finish(&tombstones, None)?);
@@ -338,7 +370,7 @@ impl Output {
         mut self,
         tombstones: &[Tombstone],
         end: Option<&[u8]>,
-    ) -> Result<Option<(Vec<u8>, Bounds)>> {
+    ) -> Result<Option<(Vec<u8>, Bounds, u64)>> {
         let mut wrote = self.points > 0;
         for t in tombstones {
             let Some(clipped) = clip(t, self.start.as_deref(), end) else {
@@ -362,7 +394,8 @@ impl Output {
         if !wrote {
             return Ok(None);
         }
-        Ok(Some((self.writer.finish()?, self.bounds)))
+        let entries = self.points as u64;
+        Ok(Some((self.writer.finish()?, self.bounds, entries)))
     }
 }
 
@@ -416,41 +449,16 @@ fn keep(
     true
 }
 
-/// Splits every input's tombstones into fragments a range-deletion block can
-/// hold.
+/// Every input table's tombstones, fragmented into the shape a
+/// range-deletion block demands.
 ///
-/// The bounds of every tombstone, sorted and deduplicated, cut the key space
-/// into spans that no tombstone straddles. Each span is then emitted once per
-/// tombstone covering it, newest first — which is exactly the shape the block
-/// demands: equal bounds, strictly decreasing sequence numbers.
+/// Two inputs' tombstones routinely overlap, so concatenating them would
+/// build a block the format refuses — and rightly, since a reader walking it
+/// would have to decide what an overlap meant. The fragmenting itself is the
+/// format crate's, which is also what refuses the unfragmented form.
 fn fragment<D: Disk>(tables: &[Rc<OpenTable<D>>]) -> Vec<Tombstone> {
     let all: Vec<&Tombstone> = tables.iter().flat_map(|t| t.tombstones.iter()).collect();
-    let mut cuts: Vec<&[u8]> = Vec::with_capacity(all.len() * 2);
-    for t in &all {
-        cuts.push(&t.start);
-        cuts.push(&t.end);
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut out = Vec::new();
-    for pair in cuts.windows(2) {
-        let (lo, hi) = (pair[0], pair[1]);
-        let mut covering: Vec<u64> = all
-            .iter()
-            .filter(|t| t.start.as_slice() <= lo && hi <= t.end.as_slice())
-            .map(|t| t.seq_num)
-            .collect();
-        covering.sort_unstable_by(|a, b| b.cmp(a));
-        for seq_num in covering {
-            out.push(Tombstone {
-                start: lo.to_vec(),
-                end: hi.to_vec(),
-                seq_num,
-            });
-        }
-    }
-    out
+    rangedel::fragment(&all)
 }
 
 /// The iterator on the least internal key, if any is still positioned.

@@ -18,6 +18,9 @@
 //! where durability comes from, and so changes what `write` promises. The
 //! other two are budgets.
 
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::MeterProvider;
+
 use crate::cache::Caches;
 use crate::env::Fs;
 
@@ -34,9 +37,16 @@ pub struct Options<F: Fs> {
     pub(crate) l0_compaction_threshold: u64,
     /// How many bytes L1 may hold; each level below it ten times more.
     pub(crate) lbase_max_bytes: u64,
+    /// How many entries a compaction merges before it offers the thread
+    /// back; zero to merge straight through.
+    pub(crate) compaction_unit: u64,
     /// How large a table a compaction aims to write into L0; each level
     /// below it twice as large.
     pub(crate) target_file_size: u64,
+    /// Where the store's metrics go, if anywhere (`crate::metrics`).
+    pub(crate) meter: Option<nanometer::Meter>,
+    /// Attributes added to every series, after `roble.store`.
+    pub(crate) metric_attributes: Vec<KeyValue>,
 }
 
 impl<F: Fs> Default for Options<F> {
@@ -47,7 +57,10 @@ impl<F: Fs> Default for Options<F> {
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
+            compaction_unit: crate::work::COMPACTION_UNIT,
             target_file_size: crate::compact::TARGET_FILE_SIZE,
+            meter: None,
+            metric_attributes: Vec::new(),
         }
     }
 }
@@ -113,10 +126,45 @@ impl<F: Fs> Options<F> {
         self
     }
 
+    /// How many entries a compaction merges before it hands the thread back
+    /// to whatever else is ready (§9, `crate::work`).
+    ///
+    /// Zero merges straight through, which is what a caller wants when
+    /// nothing else shares the thread — a bulk load, a repair tool — and what
+    /// nothing else should want: a compaction that does not yield stops every
+    /// read and write on its core until it finishes.
+    pub fn compaction_unit(mut self, entries: u64) -> Self {
+        self.compaction_unit = entries;
+        self
+    }
+
     /// How large a table a compaction into L0 aims to write, each level
     /// below it twice as large (`crate::compact`).
     pub fn target_file_size(mut self, bytes: u64) -> Self {
         self.target_file_size = bytes;
+        self
+    }
+
+    /// Exports the store's metrics through `provider`, under the
+    /// instrumentation scope `roble`. Without a provider, the store records
+    /// none and reads no clock.
+    ///
+    /// [METRICS.md](https://github.com/merlimat/roble/blob/main/METRICS.md)
+    /// lists them. Each series carries `roble.store`, the directory the store
+    /// was opened at, and those of
+    /// [`metric_attributes`](Self::metric_attributes). Histograms export only
+    /// through nanometer's `Producer`, which the app registers with its
+    /// metric reader: see [nanometer](https://docs.rs/nanometer).
+    pub fn meter_provider<P: MeterProvider + ?Sized>(mut self, provider: &P) -> Self {
+        self.meter = Some(nanometer::Meter::new(provider, crate::metrics::SCOPE));
+        self
+    }
+
+    /// Adds `attributes` to every series of the store's metrics, after
+    /// `roble.store`: one of them with that key replaces the store's
+    /// directory.
+    pub fn metric_attributes(mut self, attributes: &[KeyValue]) -> Self {
+        self.metric_attributes.extend_from_slice(attributes);
         self
     }
 }
