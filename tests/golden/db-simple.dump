@@ -1,0 +1,11 @@
+marker marker.format-version.000003.016
+marker marker.manifest.000001.MANIFEST-000001
+format-version 16
+level 0
+  table 000007 size=685 seq=15..17
+    smallest 64656c7461 #16 set
+    largest  70 #72057594037927935 rangedel
+level 6
+  table 000006 size=634 seq=0..0
+    smallest 616c706861 #0 set
+    largest  627261766f #0 set
