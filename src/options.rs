@@ -30,6 +30,10 @@ pub struct Options<F: Fs> {
     pub(crate) disable_wal: bool,
     /// How large the MANIFEST may grow before a flush replaces it.
     pub(crate) max_manifest_bytes: u64,
+    /// How many tables L0 may hold before the picker wants it compacted.
+    pub(crate) l0_compaction_threshold: u64,
+    /// How many bytes L1 may hold; each level below it ten times more.
+    pub(crate) lbase_max_bytes: u64,
 }
 
 impl<F: Fs> Default for Options<F> {
@@ -38,6 +42,8 @@ impl<F: Fs> Default for Options<F> {
             caches: Caches::default(),
             disable_wal: false,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
+            l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
+            lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
         }
     }
 }
@@ -86,6 +92,20 @@ impl<F: Fs> Options<F> {
     /// (`crate::rotate`).
     pub fn max_manifest_bytes(mut self, bytes: u64) -> Self {
         self.max_manifest_bytes = bytes;
+        self
+    }
+
+    /// How many tables L0 may hold before the picker wants it compacted
+    /// (`crate::pick`).
+    pub fn l0_compaction_threshold(mut self, tables: u64) -> Self {
+        self.l0_compaction_threshold = tables;
+        self
+    }
+
+    /// How many bytes L1 may hold, each level below it ten times more
+    /// (`crate::pick`).
+    pub fn lbase_max_bytes(mut self, bytes: u64) -> Self {
+        self.lbase_max_bytes = bytes;
         self
     }
 }

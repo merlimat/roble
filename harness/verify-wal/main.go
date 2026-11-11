@@ -40,7 +40,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|compacted|no-wal|swept]")
+		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|compacted|settled|no-wal|swept]")
 		os.Exit(2)
 	}
 	dir := os.Args[1]
@@ -121,6 +121,8 @@ func main() {
 		fmt.Println("\nVERDICT: Go Pebble reads a database through a MANIFEST roble wrote from nothing")
 	case "compacted":
 		fmt.Println("\nVERDICT: Go Pebble reads a table roble compacted out of others")
+	case "settled":
+		fmt.Println("\nVERDICT: Go Pebble reads a database roble spread across levels by itself")
 	case "no-wal":
 		fmt.Println("\nVERDICT: Go Pebble reads what roble wrote with the WAL off, as Oxia runs it")
 	case "swept":
