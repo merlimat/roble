@@ -56,7 +56,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use roble_format::manifest::{NUM_LEVELS, VersionEdit};
-use roble_format::rangedel::Tombstone;
+use roble_format::rangedel::{self, Tombstone};
 use roble_format::sst::{TableWriter, WriterOptions};
 use roble_format::{InternalKey, key};
 
@@ -449,41 +449,16 @@ fn keep(
     true
 }
 
-/// Splits every input's tombstones into fragments a range-deletion block can
-/// hold.
+/// Every input table's tombstones, fragmented into the shape a
+/// range-deletion block demands.
 ///
-/// The bounds of every tombstone, sorted and deduplicated, cut the key space
-/// into spans that no tombstone straddles. Each span is then emitted once per
-/// tombstone covering it, newest first — which is exactly the shape the block
-/// demands: equal bounds, strictly decreasing sequence numbers.
+/// Two inputs' tombstones routinely overlap, so concatenating them would
+/// build a block the format refuses — and rightly, since a reader walking it
+/// would have to decide what an overlap meant. The fragmenting itself is the
+/// format crate's, which is also what refuses the unfragmented form.
 fn fragment<D: Disk>(tables: &[Rc<OpenTable<D>>]) -> Vec<Tombstone> {
     let all: Vec<&Tombstone> = tables.iter().flat_map(|t| t.tombstones.iter()).collect();
-    let mut cuts: Vec<&[u8]> = Vec::with_capacity(all.len() * 2);
-    for t in &all {
-        cuts.push(&t.start);
-        cuts.push(&t.end);
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut out = Vec::new();
-    for pair in cuts.windows(2) {
-        let (lo, hi) = (pair[0], pair[1]);
-        let mut covering: Vec<u64> = all
-            .iter()
-            .filter(|t| t.start.as_slice() <= lo && hi <= t.end.as_slice())
-            .map(|t| t.seq_num)
-            .collect();
-        covering.sort_unstable_by(|a, b| b.cmp(a));
-        for seq_num in covering {
-            out.push(Tombstone {
-                start: lo.to_vec(),
-                end: hi.to_vec(),
-                seq_num,
-            });
-        }
-    }
-    out
+    rangedel::fragment(&all)
 }
 
 /// The iterator on the least internal key, if any is still positioned.

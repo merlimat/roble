@@ -38,6 +38,7 @@
 
 use roble_format::key::{Kind, SEQ_NUM_MAX};
 use roble_format::manifest::{NewTable, VersionEdit};
+use roble_format::rangedel;
 use roble_format::sst::{TableWriter, WriterOptions};
 use roble_format::{InternalKey, key};
 
@@ -207,7 +208,14 @@ fn build_table(memtable: &Memtable, file_num: u64) -> Result<(Vec<u8>, NewTable)
         cursor.next(memtable);
     }
 
-    for t in memtable.tombstones() {
+    // Fragmented, because a range-deletion block holds fragments and the
+    // memtable holds whatever was asked for. Two `delete_range` calls that
+    // overlap are ordinary use — `/a`..`/d` then `/b`..`/d` — and without
+    // this every flush of that memtable would be refused by the writer, so
+    // the store could never shed it.
+    let tombstones = rangedel::fragment(&memtable.tombstones().iter().collect::<Vec<_>>());
+
+    for t in &tombstones {
         writer.add_range_deletion(&t.start, &t.end, t.seq_num)?;
         // A tombstone's bounds count toward the table's, and its upper one
         // is the sentinel Pebble uses: the end key at the largest sequence
