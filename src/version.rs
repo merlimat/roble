@@ -54,6 +54,13 @@ pub struct Table {
     pub largest_seq_num: u64,
     /// Whether a compaction was asked to pick this table up.
     pub marked_for_compaction: bool,
+    /// Unix seconds when the table was created, or zero if unrecorded.
+    ///
+    /// Nothing in roble reads it. It is carried so that rotating the
+    /// MANIFEST writes back what Pebble wrote: the snapshot edit a rotation
+    /// starts the new file with is built from this, and a field dropped here
+    /// is a field Pebble loses the next time roble rotates.
+    pub creation_time: u64,
 }
 
 impl Table {
@@ -66,6 +73,7 @@ impl Table {
             smallest_seq_num: new.smallest_seq_num,
             largest_seq_num: new.largest_seq_num,
             marked_for_compaction: new.marked_for_compaction,
+            creation_time: new.creation_time,
         }
     }
 

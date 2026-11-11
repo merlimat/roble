@@ -83,10 +83,19 @@ pub struct Opened<'a, F: Fs> {
     pub dir: PathBuf,
     /// The format major version it was written in.
     pub format_version: u64,
-    /// The MANIFEST the manifest marker named.
-    pub manifest_filename: String,
-    /// Every `marker.` file found, sorted, current and obsolete alike.
-    pub markers: Vec<String>,
+    /// The MANIFEST being appended to, and the iteration of the marker that
+    /// names it.
+    ///
+    /// One cell for both, because moving one without the other is exactly
+    /// the failure rotation is shaped to avoid (`crate::rotate`).
+    manifest: std::cell::RefCell<Manifest>,
+    /// Every `marker.` file the directory holds, sorted, current and obsolete
+    /// alike. Kept in step with the directory by the two things that change
+    /// it: a rotation adds one, and the obsolete sweep removes what it
+    /// deleted.
+    markers: std::cell::RefCell<Vec<String>>,
+    /// How large the MANIFEST may grow before a flush replaces it.
+    max_manifest_bytes: std::cell::Cell<u64>,
     /// What replaying the MANIFEST established, and what a flush adds to.
     versions: std::cell::RefCell<VersionSet>,
 }
@@ -130,6 +139,7 @@ pub async fn open_with<'a, E: Env>(
                 dir.display()
             ))
         })?;
+    let manifest_marker_iter = manifest_marker.iter;
     let manifest_filename = manifest_marker.value;
     let Some(parsed) = files::parse_filename(&manifest_filename) else {
         return Err(Error::Corrupt(format!(
@@ -187,16 +197,10 @@ pub async fn open_with<'a, E: Env>(
     //    so no log it deletes is one the replay still needed, and its
     //    failure is swallowed: a leftover file is no reason to refuse a
     //    database that reads.
-    let _ = crate::obsolete::remove_obsolete(
-        fs,
-        dir,
-        &names,
-        &crate::obsolete::Live {
-            tables: versions.version.table_file_nums(),
-            min_unflushed_log_num: versions.min_unflushed_log_num,
-        },
-    )
-    .await;
+    let live = crate::obsolete::Live::of(&versions, parsed.file_num, &names)?;
+    let swept = crate::obsolete::remove_obsolete(fs, dir, &names, &live)
+        .await
+        .unwrap_or_default();
 
     // The next sequence number never goes backwards: a write replay brought
     // back must not be overwritten by one numbered the same (§6).
@@ -223,7 +227,7 @@ pub async fn open_with<'a, E: Env>(
 
     let mut markers: Vec<String> = names
         .iter()
-        .filter(|n| n.starts_with("marker."))
+        .filter(|n| n.starts_with("marker.") && !swept.contains(n))
         .cloned()
         .collect();
     markers.sort();
@@ -238,8 +242,12 @@ pub async fn open_with<'a, E: Env>(
         log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
         format_version,
-        manifest_filename,
-        markers,
+        manifest: std::cell::RefCell::new(Manifest {
+            filename: manifest_filename,
+            marker_iter: manifest_marker_iter,
+        }),
+        markers: std::cell::RefCell::new(markers),
+        max_manifest_bytes: std::cell::Cell::new(crate::rotate::MAX_MANIFEST_BYTES),
         versions: std::cell::RefCell::new(versions),
     })
 }
@@ -339,6 +347,14 @@ async fn read_version_edits<F: Fs>(fs: &F, path: &Path, file_num: u64) -> Result
     Ok(edits)
 }
 
+/// The MANIFEST a store appends to, and the marker that names it.
+struct Manifest {
+    /// Its file name.
+    filename: String,
+    /// The iteration of `marker.manifest.*` that points at it.
+    marker_iter: u64,
+}
+
 /// The log a store is writing to.
 struct Log<D: Disk> {
     disk: std::rc::Rc<D>,
@@ -436,8 +452,8 @@ impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
         f.debug_struct("Opened")
             .field("dir", &self.dir)
             .field("format_version", &self.format_version)
-            .field("manifest_filename", &self.manifest_filename)
-            .field("markers", &self.markers)
+            .field("manifest_filename", &self.manifest.borrow().filename)
+            .field("markers", &self.markers.borrow())
             .field("versions", &self.versions)
             .finish()
     }
@@ -523,6 +539,57 @@ impl<F: Fs> Opened<'_, F> {
         self.memtable().borrow().bytes()
     }
 
+    /// The MANIFEST this store is appending to.
+    pub fn manifest_filename(&self) -> String {
+        self.manifest.borrow().filename.clone()
+    }
+
+    /// Every `marker.` file the directory holds, sorted, current and obsolete
+    /// alike.
+    pub fn markers(&self) -> Vec<String> {
+        self.markers.borrow().clone()
+    }
+
+    /// Which iteration of `marker.manifest.*` names the current MANIFEST.
+    pub(crate) fn manifest_marker_iter(&self) -> u64 {
+        self.manifest.borrow().marker_iter
+    }
+
+    /// How large the MANIFEST may grow before a flush replaces it
+    /// (`crate::rotate`).
+    pub fn max_manifest_bytes(&self) -> u64 {
+        self.max_manifest_bytes.get()
+    }
+
+    /// Sets that limit.
+    ///
+    /// The one knob on a store so far, and it is here because a rotation that
+    /// only happens after 128 MiB of MANIFEST is a rotation no test can
+    /// reach. When options arrive this moves into them.
+    pub fn set_max_manifest_bytes(&self, bytes: u64) {
+        self.max_manifest_bytes.set(bytes);
+    }
+
+    /// Points the store at a MANIFEST the marker now names.
+    ///
+    /// Called only after the marker has moved, and deliberately infallible:
+    /// past that point an append that still went to the old file would be an
+    /// append a reopen never sees.
+    pub(crate) fn install_manifest(&self, filename: String, marker_iter: u64, marker: String) {
+        *self.manifest.borrow_mut() = Manifest {
+            filename,
+            marker_iter,
+        };
+        let mut markers = self.markers.borrow_mut();
+        markers.push(marker);
+        markers.sort();
+    }
+
+    /// Drops names the obsolete sweep removed from the marker list.
+    pub(crate) fn forget_markers(&self, removed: &[String]) {
+        self.markers.borrow_mut().retain(|m| !removed.contains(m));
+    }
+
     /// The filesystem this store's files live in.
     pub(crate) fn fs(&self) -> &F {
         self.fs
@@ -596,7 +663,7 @@ impl<F: Fs> Opened<'_, F> {
         use std::fmt::Write as _;
 
         let mut out = String::new();
-        for m in &self.markers {
+        for m in self.markers.borrow().iter() {
             let _ = writeln!(out, "marker {m}");
         }
         let _ = writeln!(out, "format-version {}", self.format_version);

@@ -40,7 +40,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|swept]")
+		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|swept]")
 		os.Exit(2)
 	}
 	dir := os.Args[1]
@@ -117,6 +117,8 @@ func main() {
 	switch mode {
 	case "flushed":
 		fmt.Println("\nVERDICT: Go Pebble reads the table roble wrote, through the MANIFEST roble appended")
+	case "rotated":
+		fmt.Println("\nVERDICT: Go Pebble reads a database through a MANIFEST roble wrote from nothing")
 	case "swept":
 		fmt.Println("\nVERDICT: Go Pebble reads a database roble has deleted obsolete files from")
 	default:

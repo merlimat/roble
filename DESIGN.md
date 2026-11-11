@@ -58,15 +58,25 @@
 > table an interrupted flush left behind. Nothing else goes, and a name roble
 > cannot parse is never touched.
 >
-> Four gates hold it up. **A crash replays** to the last synced write and no
+> And **rotation**, which keeps the MANIFEST from being the thing a reopen
+> waits on: past 128 MiB a flush starts a fresh one holding a single snapshot
+> edit of the whole version, then moves `marker.manifest.*` to it. The marker
+> is the one-way door, and it moves last — the new MANIFEST is a file nothing
+> refers to until it does, and the old MANIFEST and the old marker are
+> obsolete the moment it has.
+>
+> Five gates hold it up. **A crash replays** to the last synced write and no
 > further. **Go Pebble replays the log roble wrote**, when nothing has been
 > flushed, so every key it finds came out of the log. And **Go Pebble reads
 > the table roble wrote, through the MANIFEST roble appended**, when the same
 > writes have been flushed — the MANIFEST's `min_unflushed_log_num` has moved
 > past roble's log by then, so Pebble does not replay it and the keys can
 > only have come from the table. **That closes M3's round trip.** The fourth
-> guards the deletions: **Go Pebble reads a database roble has deleted from**,
-> after roble opens one and does nothing but collect.
+> **Go Pebble reads a database through a MANIFEST roble wrote from nothing**,
+> after a rotation — every table at every level described by roble's snapshot
+> edit and named by roble's marker. And the fifth guards the deletions: **Go
+> Pebble reads a database roble has deleted from**, after roble opens one and
+> does nothing but collect.
 >
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
@@ -388,8 +398,9 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   durable**: at the end of a flush, and at an open, where the MANIFEST just
   replayed is as durable as it gets. A table goes when the current version
   names it at no level; a log goes when its number is below
-  `min_unflushed_log_num`; everything else stays, including every name roble
-  cannot parse. The directory is **not** synced afterwards, as Pebble does not
+  `min_unflushed_log_num`; a MANIFEST goes when the manifest marker names a
+  different one; a marker goes when a higher iteration of a name roble moves
+  is there; everything else stays, including every name roble cannot parse. The directory is **not** synced afterwards, as Pebble does not
   either — an unlink a crash undoes brings back a file that is still obsolete,
   and the next sweep finds it again. Getting this wrong either leaks files or
   makes a reader read a deleted one, so it is checked by the invariant checker
@@ -545,6 +556,14 @@ version edit — carrying the new minimum unflushed log number — and syncs: th
 point at which Oxia's data becomes durable. The logs below that number are then
 obsolete, and are deleted like any other obsolete file — including one Pebble
 had kept back to recycle, which roble does not do and so has no use for.
+
+Past `max_manifest_bytes` — 128 MiB, Pebble's `MaxManifestFileSize` — that same
+flush **rotates** the MANIFEST: a fresh file holding one snapshot edit of the
+whole version, and then `marker.manifest.*` moved to name it. The marker moves
+last and is the one-way door; roble syncs the directory between creating the new
+marker and letting the old one go, so no crash can land with no marker at all.
+roble does not rotate at open as Pebble does, which keeps opening a database
+something that does not write to it.
 
 `snapshot()` pins a version and a sequence number. `checkpoint(dir)` writes a
 directory Go Pebble opens: hard links to the live tables, a fresh MANIFEST
