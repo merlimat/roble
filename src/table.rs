@@ -173,6 +173,14 @@ impl<D: Disk> OpenTable<D> {
     }
 
     /// The first entry at or after `target`.
+    ///
+    /// There is deliberately no backward mirror of this. It exists for `get`'s
+    /// equal comparison, which is the one comparison a bloom filter can answer
+    /// and so keeps a path of its own (§7) — and a point lookup only ever
+    /// looks forward, for the newest version at or after its search key. The
+    /// ordered comparisons are a scan, and everything that moves backwards
+    /// goes through [`TableIter`], which holds its place instead of forgetting
+    /// it between calls.
     pub async fn seek_ge(&self, target: &[u8]) -> Result<Option<Entry>> {
         let start = first_block_at_or_after(&self.index, target)?;
         for entry in &self.index[start..] {
@@ -187,28 +195,6 @@ impl<D: Disk> OpenTable<D> {
             // is the next block's first entry.
         }
         Ok(None)
-    }
-
-    /// The last entry before `target`.
-    pub async fn seek_lt(&self, target: &[u8]) -> Result<Option<Entry>> {
-        if self.index.is_empty() {
-            return Ok(None);
-        }
-        let start = first_block_at_or_after(&self.index, target)?;
-        let mut i = start.min(self.index.len() - 1);
-        loop {
-            let bytes = self.block(self.index[i].handle).await?;
-            let block = Block::new(&bytes)?;
-            let mut cursor = block.data_cursor(self.footer.format);
-            cursor.seek_lt(&block, target)?;
-            if cursor.is_valid() {
-                return Ok(Some(self.entry(&block, &cursor).await?));
-            }
-            if i == 0 {
-                return Ok(None);
-            }
-            i -= 1;
-        }
     }
 
     /// Takes the entry a cursor is on, following a value-block handle.
