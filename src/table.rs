@@ -150,7 +150,10 @@ impl<D: Disk> OpenTable<D> {
         let Some(bits) = &self.filter else {
             return Ok(true);
         };
-        Ok(roble_format::filter::Filter::new(bits)?.may_contain(user_key))
+        Ok(match roble_format::filter::Filter::from_block(bits)? {
+            Some(filter) => filter.may_contain(user_key),
+            None => true,
+        })
     }
 
     /// One block, from the cache if it is there and from the file if not.

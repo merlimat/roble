@@ -52,7 +52,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=2097152
@@ -62,7 +62,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=4194304
@@ -72,7 +72,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=8388608
@@ -82,7 +82,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=16777216
@@ -92,7 +92,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=33554432
@@ -102,7 +102,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=67108864
@@ -112,7 +112,7 @@
   block_size=128
   block_size_threshold=90
   compression=NoCompression
-  filter_policy=none
+  filter_policy=rocksdb.BuiltinBloomFilter
   filter_type=table
   index_block_size=128
   target_file_size=134217728
