@@ -27,7 +27,9 @@
 //!    the database exactly as it was, with the old log still holding every
 //!    write. After it, the table is the database's and the old log is no
 //!    longer needed.
-//! 4. Only then swap the memtable and the log in memory.
+//! 4. Only then swap the memtable and the log in memory, and collect what
+//!    the edit retired — the log it replaced is now a file the MANIFEST has
+//!    moved past (`crate::obsolete`).
 //!
 //! The one-way door is step 3. Everything before it is reversible by doing
 //! nothing; everything after it is bookkeeping that a replay would redo.
@@ -104,6 +106,14 @@ impl<F: Fs> Opened<'_, F> {
         self.versions_mut().apply(&edit)?;
         self.install_fresh_memtable(Memtable::new(self.snapshot().wrapping_add(1)));
         self.install_log(log_num).await?;
+
+        // 5. What the edit retired: the log this flush replaced, and any
+        //    table an earlier flush wrote whose edit never landed. The
+        //    failure is swallowed on purpose — the flush is durable and a
+        //    file that would not delete is one nothing refers to, which the
+        //    next flush will find again (§6). Reporting a flush that worked
+        //    as one that did not would be the larger lie.
+        let _ = self.remove_obsolete_files().await;
         Ok(Some(table_num))
     }
 

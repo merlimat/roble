@@ -23,6 +23,10 @@
 # which means Pebble replayed roble's record framing, roble's batch
 # representation and roble's sequence numbers.
 #
+# The third run makes the opposite claim. roble opens a database and writes
+# nothing, so the only thing that changed is what roble deleted on the way
+# in. Pebble then has to read a directory roble has removed files from.
+#
 # The other half, roble reading a whole database Pebble wrote, is already
 # covered by tests/golden and the probe corpora.
 set -euo pipefail
@@ -36,16 +40,23 @@ trap 'rm -rf "$out"' EXIT
 # into a table through a MANIFEST edit roble appended. The first tests
 # Pebble replaying roble's log; the second tests Pebble reading roble's
 # table and believing roble's MANIFEST.
-for mode in log flushed; do
+for mode in log flushed swept; do
   db="$out/$mode"
-  cp -R ../../tests/golden/db-simple "$db"
+  # The swept run needs a database Pebble left something obsolete in, which
+  # db-simple is not: Pebble closed db-unflushed-wal holding a log it had
+  # already flushed past, kept back to recycle.
+  if [ "$mode" = swept ]; then
+    cp -R ../../tests/golden/db-unflushed-wal "$db"
+  else
+    cp -R ../../tests/golden/db-simple "$db"
+  fi
   chmod -R u+w "$db"
 
-  if [ "$mode" = flushed ]; then
-    cargo run --release --quiet -p wal-replay -- "$db" --flush
-  else
-    cargo run --release --quiet -p wal-replay -- "$db"
-  fi
+  case "$mode" in
+    flushed) cargo run --release --quiet -p wal-replay -- "$db" --flush ;;
+    swept)   cargo run --release --quiet -p wal-replay -- "$db" --swept ;;
+    *)       cargo run --release --quiet -p wal-replay -- "$db" ;;
+  esac
   echo
   (cd ../../harness && go run ./verify-wal "$db" "$mode")
   echo

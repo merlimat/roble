@@ -28,8 +28,10 @@
 //! 4. Read `marker.manifest.*`, which names the MANIFEST to replay. No marker
 //!    means no database.
 //! 5. Replay that MANIFEST into a version, then check the comparer.
-//! 6. Refuse a log that holds records, because replaying them is not
-//!    implemented yet and opening without them would drop acknowledged writes.
+//! 6. Replay the logs the version leaves unflushed, so every acknowledged
+//!    write is back in the memtable before anyone can read.
+//! 7. Collect what the MANIFEST no longer refers to, which is where a flush
+//!    interrupted between its table and its edit is cleaned up.
 //!
 //! Step 3 before step 5 is the part worth keeping: a database written above
 //! the pin must be refused for being above the pin, not for whatever its
@@ -176,6 +178,25 @@ pub async fn open_with<'a, E: Env>(
         &mut memtable,
     )
     .await?;
+
+    // 7. What the replayed MANIFEST no longer refers to: the logs it has
+    //    moved past, and any table a flush wrote whose edit never landed.
+    //    This is where an interrupted flush is collected — the table was
+    //    written and synced before the edit, so a crash in between leaves a
+    //    file in no version (`crate::obsolete`). It runs after the replay,
+    //    so no log it deletes is one the replay still needed, and its
+    //    failure is swallowed: a leftover file is no reason to refuse a
+    //    database that reads.
+    let _ = crate::obsolete::remove_obsolete(
+        fs,
+        dir,
+        &names,
+        &crate::obsolete::Live {
+            tables: versions.version.table_file_nums(),
+            min_unflushed_log_num: versions.min_unflushed_log_num,
+        },
+    )
+    .await;
 
     // The next sequence number never goes backwards: a write replay brought
     // back must not be overwritten by one numbered the same (§6).

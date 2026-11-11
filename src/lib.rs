@@ -31,6 +31,7 @@ pub mod cache;
 pub mod env;
 pub mod flush;
 pub mod memtable;
+pub mod obsolete;
 pub mod open;
 pub mod read;
 pub mod scan;
