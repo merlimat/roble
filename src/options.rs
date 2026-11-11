@@ -37,6 +37,9 @@ pub struct Options<F: Fs> {
     pub(crate) l0_compaction_threshold: u64,
     /// How many bytes L1 may hold; each level below it ten times more.
     pub(crate) lbase_max_bytes: u64,
+    /// How many entries a compaction merges before it offers the thread
+    /// back; zero to merge straight through.
+    pub(crate) compaction_unit: u64,
     /// How large a table a compaction aims to write into L0; each level
     /// below it twice as large.
     pub(crate) target_file_size: u64,
@@ -54,6 +57,7 @@ impl<F: Fs> Default for Options<F> {
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
+            compaction_unit: crate::work::COMPACTION_UNIT,
             target_file_size: crate::compact::TARGET_FILE_SIZE,
             meter: None,
             metric_attributes: Vec::new(),
@@ -119,6 +123,18 @@ impl<F: Fs> Options<F> {
     /// (`crate::pick`).
     pub fn lbase_max_bytes(mut self, bytes: u64) -> Self {
         self.lbase_max_bytes = bytes;
+        self
+    }
+
+    /// How many entries a compaction merges before it hands the thread back
+    /// to whatever else is ready (§9, `crate::work`).
+    ///
+    /// Zero merges straight through, which is what a caller wants when
+    /// nothing else shares the thread — a bulk load, a repair tool — and what
+    /// nothing else should want: a compaction that does not yield stops every
+    /// read and write on its core until it finishes.
+    pub fn compaction_unit(mut self, entries: u64) -> Self {
+        self.compaction_unit = entries;
         self
     }
 

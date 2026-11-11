@@ -44,6 +44,7 @@ pub mod scan;
 pub mod sim;
 pub mod table;
 pub mod version;
+pub mod work;
 
 mod error;
 mod file;
