@@ -6,9 +6,19 @@
 >
 > M2 so far: the env, the filesystem and the disk of §10, with a compio
 > implementation and an in-memory one that can be made to fail or crash at any
-> single operation; and on top of them `open`, which reads a database directory
-> — its markers, and its MANIFEST replayed into a version — and refuses one it
-> cannot read whole (§6). The caches, the iterator tree and `get` are next.
+> single operation; `open`, which reads a database directory — its markers, and
+> its MANIFEST replayed into a version — and refuses one it cannot read whole
+> (§6); and **seeking inside a table**: internal-key ordering, a block cursor
+> that searches the restart array and steps either way, index descent through
+> one or two levels, and the floor and ceiling seeks of §6 in callback form.
+>
+> The read path above a single table — the merge across L0 sublevels and
+> L1..L6, range tombstones, `get`'s five comparisons — is next, with the block
+> and table caches under it. Seeking came first because its failure modes are
+> its own: a full scan cannot tell a correct seek from one that lands on the
+> wrong side of a block boundary. The format crate deliberately does not own
+> block buffers, so it seeks within blocks a caller hands it; the resumable
+> iterator belongs with the cache that owns the frames (§8).
 >
 > `open` is judged against whole databases Go Pebble wrote, committed under
 > `tests/golden/`, where Pebble's own reader describes the directory and roble
@@ -695,6 +705,16 @@ in both directions.
   log segment — because a refusal that is not tested is a refusal that panics or
   half-reads instead. The files are committed. roble's tests read them and
   compare against the harness's dump of the same files.
+- **Seeks are pinned separately from scans.** `harness/seek-probes` runs
+  Pebble's own iterator over every table in the corpus and writes down what
+  `SeekGE` and `SeekLT` answer for probes derived from that table's keys —
+  each key, and the keys immediately either side of it. roble regenerates the
+  file from its own seeks and compares the whole text. This exists because the
+  full-scan dump cannot catch a seek that lands one block late, or one that is
+  right but cannot be stepped away from afterwards. Values are recorded as a
+  length and their leading bytes rather than whole: what a seek can get wrong
+  about a value is the range it reads it from, and the values themselves are
+  already pinned byte for byte by the scan.
 - **Whole-database fixtures.** A file can be pinned on its own; a database
   cannot. Which table sits at which level exists only once a format-version
   marker, a manifest marker and a MANIFEST are put together and the MANIFEST's

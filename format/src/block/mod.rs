@@ -39,6 +39,7 @@
 
 mod builder;
 mod compression;
+pub mod restart;
 
 pub use builder::{BlockBuilder, DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL, max_shared_len};
 pub(crate) use compression::decode as decode_compressed;
@@ -197,6 +198,29 @@ impl<'a> Block<'a> {
         Ok(offset)
     }
 
+    /// The entry region, the restart array and its length.
+    ///
+    /// For [`restart::Cursor`], which reads restart offsets and jumps within
+    /// the entries rather than walking them.
+    pub(crate) fn parts(&self) -> (&'a [u8], &'a [u8], usize) {
+        (
+            &self.data[..self.restarts_at],
+            &self.data[self.restarts_at..self.restarts_at + self.num_restarts * 4],
+            self.num_restarts,
+        )
+    }
+
+    /// A cursor that can seek and step either way over this block.
+    pub fn cursor(&self) -> restart::Cursor<'a> {
+        restart::Cursor::new(self)
+    }
+
+    /// A cursor over this **data** block, decoding internal keys and value
+    /// prefixes.
+    pub fn data_cursor(&self, format: crate::TableFormat) -> restart::DataCursor<'a> {
+        restart::DataCursor::new(self, format)
+    }
+
     /// Walks the block's entries with keys left as raw bytes.
     ///
     /// This is the right iterator for the metaindex and properties blocks,
@@ -330,7 +354,7 @@ impl<'a> DataBlockIter<'a> {
     }
 }
 
-fn decode_value<'a>(
+pub(crate) fn decode_value<'a>(
     format: crate::TableFormat,
     key: InternalKey<'_>,
     bytes: &'a [u8],

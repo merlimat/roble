@@ -141,6 +141,63 @@ impl Kind {
     }
 }
 
+/// The trailer a seek targets, from Pebble's `MakeSearchKey`: the largest
+/// sequence number with the largest kind byte.
+///
+/// Trailers sort **descending**, so this is the trailer that sorts before every
+/// real key sharing its user key — which is what makes a seek to a user key
+/// land on that user key's newest entry rather than past it. The kind is
+/// Pebble's `InternalKeyKindMax`, asserted against [`Kind::Excise`] in this
+/// module's tests because `to_byte` cannot be called in a constant.
+pub const SEARCH_TRAILER: u64 = (SEQ_NUM_MAX << 8) | 24;
+
+/// Splits an encoded internal key into its user key and its **raw** trailer.
+///
+/// Raw, rather than the decoded sequence number and kind, because that is what
+/// ordering compares: the Pebblev4 obsolete bit lives in the kind byte, and
+/// reassembling a trailer from [`InternalKey`]'s fields would drop it and with
+/// it the ordering between two keys that differ only there.
+pub fn split_encoded(encoded: &[u8]) -> Result<(&[u8], u64)> {
+    if encoded.len() < TRAILER_LEN {
+        return Error::truncated("internal key", TRAILER_LEN, encoded.len());
+    }
+    let (user_key, trailer) = encoded.split_at(encoded.len() - TRAILER_LEN);
+    Ok((
+        user_key,
+        u64::from_le_bytes(trailer.try_into().expect("8 bytes")),
+    ))
+}
+
+/// Compares two encoded internal keys as Pebble's `InternalCompare` does: user
+/// key ascending bytewise, then the raw trailer **descending**.
+///
+/// The descending trailer is why the newest version of a key is the first one a
+/// forward scan meets, and getting it backwards does not produce an error — it
+/// produces a reader that returns stale values.
+pub fn compare(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
+    let (a_user, a_trailer) = split_encoded(a)?;
+    let (b_user, b_trailer) = split_encoded(b)?;
+    Ok(a_user.cmp(b_user).then_with(|| b_trailer.cmp(&a_trailer)))
+}
+
+/// Encodes an internal key: the user key, then the little-endian trailer.
+pub fn encode(user_key: &[u8], seq_num: u64, kind: Kind) -> Vec<u8> {
+    encode_with_trailer(user_key, (seq_num << 8) | kind.to_byte() as u64)
+}
+
+/// Encodes an internal key with a trailer given whole.
+pub fn encode_with_trailer(user_key: &[u8], trailer: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(user_key.len() + TRAILER_LEN);
+    out.extend_from_slice(user_key);
+    out.extend_from_slice(&trailer.to_le_bytes());
+    out
+}
+
+/// The internal key a seek to `user_key` targets.
+pub fn search_key(user_key: &[u8]) -> Vec<u8> {
+    encode_with_trailer(user_key, SEARCH_TRAILER)
+}
+
 /// A borrowed internal key: the user key, its sequence number and its kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InternalKey<'a> {

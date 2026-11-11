@@ -21,7 +21,7 @@
 use crate::block::{Block, BlockHandle, Compression, Decoded, TRAILER_SIZE};
 use crate::error::{Error, Result};
 use crate::footer::{FOOTER_LEN, Footer};
-use crate::key::Kind;
+use crate::key::{self, Kind};
 use crate::sst::Properties;
 
 /// The comparer roble serves, and the only one (DESIGN.md §3).
@@ -70,8 +70,8 @@ impl<'a> Table<'a> {
     /// Reads a table's footer, metaindex and properties, and applies §3.
     ///
     /// Refuses, rather than half-reads: a format above the pin, a range-key
-    /// block, a comparer that is not bytewise, or a two-level index (which
-    /// roble will read, but does not yet).
+    /// block, or a comparer that is not bytewise. A two-level index is read,
+    /// not refused — [`Table::index_entries`] flattens it.
     pub fn open(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() < FOOTER_LEN {
             return Error::truncated("table", FOOTER_LEN, bytes.len());
@@ -220,21 +220,116 @@ impl<'a> Table<'a> {
     }
 
     /// The handles of every data block, in key order, from the index.
+    pub fn data_block_handles(&self) -> Result<Vec<BlockHandle>> {
+        Ok(self
+            .index_entries()?
+            .into_iter()
+            .map(|e| e.handle)
+            .collect())
+    }
+
+    /// Every data block's separator and handle, in key order.
     ///
     /// With a two-level index the top-level block's values are handles to
-    /// index blocks rather than to data blocks, so this descends one level.
-    pub fn data_block_handles(&self) -> Result<Vec<BlockHandle>> {
+    /// index blocks rather than to data blocks, so this descends one level and
+    /// hands back the flattened sequence. A separator is an encoded internal
+    /// key at or above every key in the block it bounds, which is what lets a
+    /// seek skip whole blocks instead of walking entries (DESIGN.md §6).
+    pub fn index_entries(&self) -> Result<Vec<IndexEntry>> {
         let top = self.decode_block(self.footer.index)?;
         let top_block = Block::new(top.as_slice())?;
         if !self.two_level_index {
-            return collect_handles(&top_block);
+            return collect_index(&top_block);
         }
-        let mut handles = Vec::new();
-        for partition in collect_handles(&top_block)? {
-            let part = self.decode_block(partition)?;
-            handles.extend(collect_handles(&Block::new(part.as_slice())?)?);
+        let mut out = Vec::new();
+        for partition in collect_index(&top_block)? {
+            let part = self.decode_block(partition.handle)?;
+            out.extend(collect_index(&Block::new(part.as_slice())?)?);
         }
-        Ok(handles)
+        Ok(out)
+    }
+
+    /// Whether the table's filter rules `user_key` out.
+    ///
+    /// `true` when there is no filter, because a table without one rules
+    /// nothing out. A `false` is final: the key is not in this table, and no
+    /// block need be read for it (§6).
+    pub fn may_contain(&self, user_key: &[u8]) -> Result<bool> {
+        let Some(block) = self.filter_block()? else {
+            return Ok(true);
+        };
+        Ok(crate::filter::Filter::new(block.as_slice())?.may_contain(user_key))
+    }
+
+    /// Calls `f` with the first entry at or after `target`, and returns
+    /// whether there was one.
+    ///
+    /// `target` is an encoded internal key; [`key::search_key`] builds the one
+    /// that finds a user key's newest version.
+    ///
+    /// A callback, as [`Table::for_each_entry`] is, because the key is
+    /// assembled into a cursor's buffer and the value is borrowed from a block
+    /// that lives only for the call. The engine's resumable iterator is built
+    /// on blocks its cache owns rather than on this (§8).
+    pub fn seek_ge<F>(&self, target: &[u8], mut f: F) -> Result<bool>
+    where
+        F: FnMut(crate::InternalKey<'_>, crate::block::Value<'_>) -> Result<()>,
+    {
+        let index = self.index_entries()?;
+        let start = first_block_at_or_after(&index, target)?;
+        // From that block forward: a target that falls past one block's last
+        // key but before the next block's separator is answered by the next
+        // block's first entry.
+        for entry in &index[start..] {
+            let decoded = self.decode_block(entry.handle)?;
+            let block = Block::new(decoded.as_slice())?;
+            let mut cursor = block.data_cursor(self.footer.format);
+            cursor.seek_ge(target)?;
+            if cursor.is_valid() {
+                let entry = cursor.entry()?;
+                check_kind(entry.key)?;
+                f(entry.key, entry.value)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Calls `f` with the last entry before `target`, and returns whether
+    /// there was one.
+    ///
+    /// This is the floor lookup of §6, the one Oxia leans hardest on.
+    pub fn seek_lt<F>(&self, target: &[u8], mut f: F) -> Result<bool>
+    where
+        F: FnMut(crate::InternalKey<'_>, crate::block::Value<'_>) -> Result<()>,
+    {
+        let index = self.index_entries()?;
+        if index.is_empty() {
+            return Ok(false);
+        }
+        // The block whose separator first reaches the target may hold keys on
+        // both sides of it. A target past every separator is answered by the
+        // last block.
+        let start = first_block_at_or_after(&index, target)?;
+        let mut i = start.min(index.len() - 1);
+        loop {
+            let decoded = self.decode_block(index[i].handle)?;
+            let block = Block::new(decoded.as_slice())?;
+            let mut cursor = block.data_cursor(self.footer.format);
+            cursor.seek_lt(target)?;
+            if cursor.is_valid() {
+                let entry = cursor.entry()?;
+                check_kind(entry.key)?;
+                f(entry.key, entry.value)?;
+                return Ok(true);
+            }
+            // Every key in this block is at or past the target, so the answer
+            // is the last entry of the block before it.
+            if i == 0 {
+                return Ok(false);
+            }
+            i -= 1;
+        }
     }
 
     /// Calls `f` with every point entry of the table, in key order.
@@ -253,15 +348,7 @@ impl<'a> Table<'a> {
             let mut iter = block.iter_data(self.footer.format);
             while let Some(entry) = iter.next() {
                 let entry = entry?;
-                if !entry.key.kind.is_accepted() {
-                    return Error::unsupported(format!(
-                        "key kind {} is not served by roble",
-                        entry.key.kind.name()
-                    ));
-                }
-                if entry.key.kind == Kind::Merge {
-                    return Error::unsupported("MERGE keys: Oxia configures no merger");
-                }
+                check_kind(entry.key)?;
                 f(entry.key, entry.value)?;
             }
         }
@@ -303,15 +390,64 @@ fn decode_block_at(
 }
 
 /// Reads an index block's values as block handles.
-fn collect_handles(block: &Block<'_>) -> Result<Vec<BlockHandle>> {
-    let mut handles = Vec::new();
+fn collect_index(block: &Block<'_>) -> Result<Vec<IndexEntry>> {
+    let mut out = Vec::new();
+    // The raw iterator: an index separator is an internal key, but its value
+    // is a block handle and never carries a value prefix byte.
     let mut iter = block.iter();
     while let Some(entry) = iter.next() {
         let entry = entry?;
         let (handle, _) = BlockHandle::decode(entry.value)?;
-        handles.push(handle);
+        out.push(IndexEntry {
+            separator: entry.key.to_vec(),
+            handle,
+        });
     }
-    Ok(handles)
+    Ok(out)
+}
+
+/// The first index entry whose separator reaches `target`, or one past the end.
+///
+/// "Reaches" means at or past, equality included, and the equality matters: a
+/// separator is an internal key at or above every key in the block it bounds,
+/// and it may *be* one of them, so a target equal to a separator is answered
+/// by that block and not the next. The golden corpus cannot tell the two
+/// apart, because it probes with search keys whose trailer no real separator
+/// carries, so this is pinned by the unit test below instead.
+fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<usize> {
+    let (mut lo, mut hi) = (0usize, index.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if key::compare(&index[mid].separator, target)?.is_lt() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Refuses a key roble does not serve, wherever it is met.
+fn check_kind(key: crate::InternalKey<'_>) -> Result<()> {
+    if !key.kind.is_accepted() {
+        return Error::unsupported(format!(
+            "key kind {} is not served by roble",
+            key.kind.name()
+        ));
+    }
+    if key.kind == Kind::Merge {
+        return Error::unsupported("MERGE keys: Oxia configures no merger");
+    }
+    Ok(())
+}
+
+/// One entry of a table's index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    /// An encoded internal key at or above every key in the block.
+    pub separator: Vec<u8>,
+    /// Where the block is.
+    pub handle: BlockHandle,
 }
 
 struct ParsedMetaindex {
@@ -353,4 +489,78 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
         range_key_present,
         range_del_v1_present,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::BlockHandle;
+
+    fn separator(user: &[u8], seq: u64) -> IndexEntry {
+        IndexEntry {
+            separator: key::encode(user, seq, Kind::Set),
+            handle: BlockHandle {
+                offset: 0,
+                length: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn the_index_search_finds_the_first_block_that_reaches_the_target() {
+        let index = vec![
+            separator(b"c", 9),
+            separator(b"f", 7),
+            separator(b"m", 5),
+            separator(b"m", 2),
+            separator(b"x", 1),
+        ];
+
+        // Probes before, between and past the separators, and — the case the
+        // corpus cannot reach — exactly equal to each of them.
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        for e in &index {
+            probes.push(e.separator.clone());
+        }
+        for user in [
+            b"".as_slice(),
+            b"a",
+            b"c",
+            b"d",
+            b"f",
+            b"g",
+            b"m",
+            b"n",
+            b"x",
+            b"z",
+        ] {
+            probes.push(key::search_key(user));
+            probes.push(key::encode(user, 9, Kind::Set));
+            probes.push(key::encode(user, 0, Kind::Set));
+        }
+
+        for probe in &probes {
+            let want = index
+                .iter()
+                .position(|e| key::compare(&e.separator, probe).expect("compare").is_ge())
+                .unwrap_or(index.len());
+            let got = first_block_at_or_after(&index, probe).expect("search");
+            assert_eq!(got, want, "searching for {probe:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_target_equal_to_a_separator_lands_on_that_block() {
+        // Stated on its own because it is the one the corpus misses: skipping
+        // to the next block would lose a key equal to the separator.
+        let index = vec![separator(b"c", 9), separator(b"f", 7)];
+        assert_eq!(
+            first_block_at_or_after(&index, &index[0].separator.clone()).expect("search"),
+            0
+        );
+        assert_eq!(
+            first_block_at_or_after(&index, &index[1].separator.clone()).expect("search"),
+            1
+        );
+    }
 }

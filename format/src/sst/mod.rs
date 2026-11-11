@@ -19,5 +19,5 @@ pub(crate) mod reader;
 mod writer;
 
 pub use properties::Properties;
-pub use reader::{BYTEWISE_COMPARER, Metaindex, Table};
+pub use reader::{BYTEWISE_COMPARER, IndexEntry, Metaindex, Table};
 pub use writer::{CONCATENATE_MERGER, DEFAULT_BLOCK_SIZE, TableWriter, WriterOptions};
