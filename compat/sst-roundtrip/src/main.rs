@@ -174,6 +174,32 @@ fn fixtures() -> Vec<Fixture> {
         ],
     });
 
+    // A table with range deletions and no point key at all, which a flush
+    // produces whenever every write in a memtable was a DeleteRange.
+    //
+    // This is the shape that breaks filters. Pebble, with a filter policy
+    // configured, puts nothing in the bloom and still writes a zero-length
+    // filter block with a `fullfilter.` metaindex entry pointing at it;
+    // roble's own reader refused exactly that until it learned to tell an
+    // empty filter from a malformed one. The same table written the other way
+    // is the half that matters for going back to Pebble: roble writes no
+    // filter entry here rather than an empty one, and what has to hold is
+    // that Pebble still reads every tombstone in it.
+    //
+    // It also pins the degenerate case around it — no entries means an empty
+    // data block and an index with nothing to point at, which both writers
+    // have to agree on before any of the above can be compared.
+    out.push(Fixture {
+        name: "rangedel-only",
+        block_size: 1024,
+        entries: Vec::new(),
+        tombstones: vec![
+            (oxia_key(14, 0), oxia_key(14, 10), 40),
+            (oxia_key(14, 10), oxia_key(14, 20), 30),
+            (oxia_key(14, 30), oxia_key(14, 40), 20),
+        ],
+    });
+
     out
 }
 
