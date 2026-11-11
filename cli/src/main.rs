@@ -134,6 +134,14 @@ enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Untested, with a reason rather than a test (§12). An `Error::Io`
+            // only arises writing the output — everything read is reported
+            // with its path as a `Message` — and the one output failure a
+            // test can arrange is a closed reader, which `main` answers
+            // above without printing. Failing a write some other way means
+            // an output whose behaviour differs between platforms, and a
+            // test that passes on one and not the other is worse than this
+            // line being unrun.
             Error::Io(e) => write!(f, "{e}"),
             Error::Message(m) => write!(f, "{m}"),
         }
