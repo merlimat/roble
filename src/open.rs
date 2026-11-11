@@ -438,6 +438,16 @@ async fn replay_logs<F: Fs>(
                 Some(Err(e)) => {
                     if i == last {
                         // The tail of the last log: a crash, not corruption.
+                        //
+                        // Untested here, with a reason rather than a test
+                        // (§12). Reaching it needs a log whose final record
+                        // was cut mid-write, which is a crash scenario rather
+                        // than a malformed directory — the simulated
+                        // filesystem can stop a write anywhere, and that is
+                        // where this belongs, beside "reopening yields the
+                        // state as of the last synced write". Pinning it from
+                        // a hand-built log here would check the branch
+                        // without checking the claim.
                         break;
                     }
                     return Err(Error::Corrupt(format!(

@@ -178,6 +178,9 @@ async fn a_log_holding_no_records_does_not_stop_an_open() {
 /// Everything is explicit, because what these tests vary is exactly the thing
 /// Pebble would never write.
 struct Synth {
+    /// Whether to write a format-version marker at all. A database with a
+    /// MANIFEST and no marker predates markers entirely.
+    format_marker: bool,
     format_version: String,
     format_marker_iter: u64,
     manifest_marker: Option<(u64, String)>,
@@ -192,6 +195,7 @@ struct Synth {
 impl Default for Synth {
     fn default() -> Self {
         Synth {
+            format_marker: true,
             format_version: "016".to_string(),
             format_marker_iter: 1,
             manifest_marker: Some((1, "MANIFEST-000001".to_string())),
@@ -215,16 +219,18 @@ impl Synth {
         let fs: &SimFs = env.sim();
         fs.mkdir_all(&dir).await.expect("mkdir");
 
-        write(
-            fs,
-            &dir.join(marker_filename(
-                MARKER_FORMAT_VERSION,
-                self.format_marker_iter,
-                &self.format_version,
-            )),
-            b"",
-        )
-        .await;
+        if self.format_marker {
+            write(
+                fs,
+                &dir.join(marker_filename(
+                    MARKER_FORMAT_VERSION,
+                    self.format_marker_iter,
+                    &self.format_version,
+                )),
+                b"",
+            )
+            .await;
+        }
 
         if let Some((iter, value)) = &self.manifest_marker {
             write(
@@ -774,4 +780,182 @@ async fn the_lock_is_held_for_as_long_as_the_database_is_open() {
     roble::open(&env, &dir)
         .await
         .expect("the lock should be free once the database is dropped");
+}
+
+// What the markers and the MANIFEST are refused for, which until now only the
+// cases that reach the version replay had tests. These fire earlier: before
+// an edit has been looked at, and in two of them before the MANIFEST has been
+// opened at all.
+
+#[compio::test]
+async fn a_database_with_no_format_marker_predates_markers_and_is_refused() {
+    // Pebble reads a missing marker as FormatDefault, which only happens for a
+    // directory it is about to create. One with a MANIFEST and no marker was
+    // written before Pebble recorded the version at all, and roble cannot tell
+    // which version that was.
+    let (env, dir) = Synth {
+        format_marker: false,
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Unsupported(m)) => {
+            assert!(m.contains("no marker.format-version.* file"), "got: {m}")
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_format_marker_that_is_not_a_number_is_refused() {
+    // The marker's value is a filename suffix, so anything can be in it. A
+    // version that is not a number is a corrupt marker rather than a version
+    // roble does not serve — which is the difference between the two refusals
+    // this sits beside.
+    let (env, dir) = Synth {
+        format_version: "sixteen".to_string(),
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("\"sixteen\"") && m.contains("not a version number"),
+            "got: {m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_manifest_marker_naming_something_that_is_not_a_file_name_is_refused() {
+    let (env, dir) = Synth {
+        manifest_marker: Some((1, "not a file name".to_string())),
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(m.contains("is not a file name"), "got: {m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_manifest_marker_naming_a_table_is_refused() {
+    // A marker that parses but names the wrong kind of file. Opening it as a
+    // MANIFEST would read an sstable's bytes as version edits, which is the
+    // misreading §3 asks roble to refuse instead.
+    let (env, dir) = Synth {
+        manifest_marker: Some((1, "000007.sst".to_string())),
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("000007.sst") && m.contains("rather than a MANIFEST"),
+            "got: {m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_manifest_holding_no_edits_is_refused() {
+    // An empty MANIFEST is not an empty database: a database has at least the
+    // edit that named its comparer. A replay that accepted this would open a
+    // version with no comparer and no tables, which is indistinguishable from
+    // a database whose files have all been lost.
+    let (env, dir) = Synth {
+        edits: Vec::new(),
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(m.contains("holds no version edits"), "got: {m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_manifest_record_that_does_not_frame_is_refused_with_its_number() {
+    // A record whose checksum does not match its bytes. The number says which
+    // one, and that the records before it were read — a MANIFEST is a
+    // sequence, and where it stops being readable is the useful fact.
+    let edit = VersionEdit {
+        comparer_name: Some(BYTEWISE.to_string()),
+        next_file_num: Some(10),
+        last_seq_num: Some(20),
+        ..Default::default()
+    };
+    let mut writer = RecordWriter::legacy();
+    writer.write_record(&edit.encode()).expect("frame");
+    writer.write_record(&edit.encode()).expect("frame");
+    let mut bytes = writer.finish();
+    // Corrupt the payload of the second record, leaving its checksum stale.
+    let at = bytes.len() - 1;
+    bytes[at] ^= 0xff;
+
+    let (env, dir) = Synth {
+        extra: vec![("MANIFEST-000001".to_string(), bytes)],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(m.contains("record 1"), "got: {m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn an_opened_database_describes_itself() {
+    // `Opened`'s Debug is written out rather than derived, because the lock
+    // has no business in a debug line and a `Fs::Lock` need not be Debug at
+    // all. Written-out means it can drift from the struct, so it is checked
+    // for naming the things someone debugging an open would look for.
+    let (env, dir) = Synth::default().build().await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let text = format!("{db:?}");
+    for expected in [
+        "Opened",
+        "dir",
+        "format_version",
+        "manifest_filename",
+        "markers",
+        "versions",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the debug line should name {expected:?}, got {text}"
+        );
+    }
+    assert!(
+        !text.contains("lock"),
+        "the lock has no business in a debug line, got {text}"
+    );
+}
+
+#[compio::test]
+async fn a_write_to_a_database_with_no_log_is_refused() {
+    // A directory built by hand has markers, a MANIFEST and nothing else. A
+    // database opened from one can be read — everything a read needs is in the
+    // MANIFEST and the tables — but a write has nowhere to record itself, and
+    // a write that is not recoverable is one a crash loses silently (§4).
+    // Refusing is the only answer that does not lie about durability.
+    let (env, dir) = Synth::default().build().await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut batch = roble_format::batch::Batch::new();
+    batch.put(b"k", b"v").expect("put");
+    match db.write(&mut batch, true).await {
+        Err(Error::Unsupported(m)) => assert!(
+            m.contains("holds no log file") && m.contains("could not be recovered"),
+            "got: {m}"
+        ),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
 }
