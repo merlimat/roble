@@ -50,16 +50,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # The compat crates are harnesses that compat/*/run.sh drives against Go,
-      # not crates with tests of their own: counted here they would only report
-      # their own binaries as unrun. cargo-llvm-cov leaves out tests.rs; sim.rs
-      # is test code too, the simulated filesystem the failure-path tests drive.
+      # Everything under compat/ is a harness that compat/*/run.sh drives
+      # against Go, not a crate with tests of its own: counted here it would
+      # only report its own binary as unrun. The two `--exclude`s keep them
+      # from being built at all; the path in the regex is what catches the
+      # next one, because a harness added later would otherwise arrive at 0%
+      # and, now that a drop fails this job, fail it for the one change that
+      # could not have caused it.
+      #
+      # cargo-llvm-cov leaves out tests.rs; sim.rs is test code too, the
+      # simulated filesystem the failure-path tests drive.
       - name: Run the tests under cargo-llvm-cov
         run: >
           cargo llvm-cov --workspace --locked
           --exclude minlz-compat --exclude sst-roundtrip
           --json --output-path target/coverage.json
-          --ignore-filename-regex 'src/sim\.rs$'
+          --ignore-filename-regex '(^|/)compat/|(^|/)src/sim\.rs$'
       - name: Summarize
         id: summary
         run: python3 .github/scripts/coverage-summary.py target/coverage.json
@@ -73,6 +79,34 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA"
           -f state=success -f context=coverage -f description="$TOTALS"
           -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      # What this branch is measured against: the totals this workflow posted
+      # as a status on the commit the pull request branched from. Nothing is
+      # stored in the repository for it, so there is no baseline file to go
+      # stale and nothing to bump by hand when coverage improves.
+      #
+      # A base with no status — the first run after this lands, or a branch
+      # cut from a commit whose run was cancelled — leaves `lines` empty and
+      # the gate below is skipped rather than guessing.
+      - name: Find the coverage its base recorded
+        id: base
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          posted=$(gh api "repos/$GITHUB_REPOSITORY/commits/$BASE/statuses" \
+            --jq '[.[] | select(.context == "coverage")] | first | .description // empty' \
+            2>/dev/null || true)
+          echo "posted: ${posted:-<none>}"
+          lines=$(printf '%s' "$posted" | sed -n 's/^lines \([0-9.]*\)%.*/\1/p')
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+      # After the status above, so the number is recorded whichever way this
+      # goes: a run that fails here has still said what the coverage was.
+      - name: Fail if the coverage dropped
+        if: github.event_name == 'pull_request' && steps.base.outputs.lines != ''
+        run: >
+          python3 .github/scripts/coverage-summary.py target/coverage.json
+          --fail-under '${{ steps.base.outputs.lines }}'
       # A pull request from a fork gets a read-only token, which can't post a status.
       - name: Note that a fork gets no status
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository

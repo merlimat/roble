@@ -17,11 +17,17 @@
 each line no test runs and, on lines that do run, each region that doesn't, such
 as the error branch of a `?`.
 
-Usage: coverage-summary.py REPORT
+Usage: coverage-summary.py REPORT [--fail-under PERCENT]
 
 In GitHub Actions, it also writes the summary to the job summary, and sets the
 step output `totals` to the totals on one line, as in
 `lines 97.8% (65 missed), regions 97.9% (117 missed), functions 97.8% (8 missed)`.
+
+`--fail-under PERCENT` prints nothing but a verdict and exits non-zero if line
+coverage is below PERCENT. The percentage compared is the one this script
+prints, floored to a tenth, so the rule is exactly "the number CI posted last
+time must not go down" — no epsilon to reason about, and a run that rounds to
+the same tenth passes.
 """
 
 import json
@@ -33,8 +39,16 @@ KINDS = ("lines", "regions", "functions")
 
 
 def main():
-    with open(sys.argv[1]) as f:
+    args = sys.argv[1:]
+    floor = None
+    if "--fail-under" in args:
+        at = args.index("--fail-under")
+        floor = float(args[at + 1])
+        del args[at : at + 2]
+    with open(args[0]) as f:
         report = json.load(f)["data"][0]
+    if floor is not None:
+        sys.exit(verdict(report, floor))
     text = "\n".join(summary(report)) + "\n"
     print(text, end="")
     if "GITHUB_STEP_SUMMARY" in os.environ:
@@ -45,6 +59,33 @@ def main():
         with open(os.environ["GITHUB_OUTPUT"], "a") as out:
             line = ", ".join(f"{kind} {coverage(totals[kind])}" for kind in KINDS)
             print(f"totals={line}", file=out)
+
+
+def verdict(report, floor):
+    """Prints whether line coverage held at `floor`, and returns an exit status.
+
+    Only lines are gated. Regions and functions move for reasons lines do not
+    — a refactor that splits one expression into two changes the region count
+    without changing what any test reaches — and three gates would fail three
+    times as often for reasons nobody acted on.
+    """
+    now = tenth(report["totals"]["lines"])
+    if now < floor:
+        print(
+            f"Coverage dropped: lines {now:.1f}%, below the {floor:.1f}% on this "
+            f"branch's base.\n"
+            f"Cover what the change added, or say in the pull request why the "
+            f"line that is now unreached should stay that way (DESIGN.md §12)."
+        )
+        return 1
+    print(f"Coverage held: lines {now:.1f}%, against {floor:.1f}% on the base.")
+    return 0
+
+
+def tenth(summary):
+    """The percentage as this script prints it: floored to a tenth, so that
+    only full coverage shows as 100%."""
+    return math.floor(summary["percent"] * 10) / 10
 
 
 def summary(report):
@@ -94,7 +135,7 @@ def path(file):
 def coverage(summary):
     """As in `97.8% (65 missed)`, rounded down so that only full coverage shows as
     100%."""
-    percent = math.floor(summary["percent"] * 10) / 10
+    percent = tenth(summary)
     missed = summary["count"] - summary["covered"]
     return f"{percent:.1f}%" + (f" ({missed} missed)" if missed else "")
 
