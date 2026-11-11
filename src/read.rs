@@ -152,6 +152,27 @@ impl<F: Fs> Opened<'_, F> {
     async fn newest_for(&self, user: &[u8]) -> Result<Option<Candidate>> {
         let target = key::search_key(user);
         let mut best: Option<Candidate> = None;
+
+        // The memtable first. Anything it holds was written after every table
+        // was, so it usually wins outright — but the comparison below is by
+        // trailer either way, so this is an ordering of convenience, not of
+        // correctness.
+        {
+            let memtable = self.memtable.borrow();
+            let mut cursor = memtable.cursor();
+            cursor.seek_ge(&memtable, &target)?;
+            if cursor.is_valid() {
+                let k = InternalKey::decode(cursor.key(&memtable))?;
+                if k.user_key == user {
+                    best = Some(Candidate {
+                        trailer: (k.seq_num << 8) | k.kind.to_byte() as u64,
+                        kind: k.kind,
+                        value: cursor.value(&memtable).to_vec(),
+                    });
+                }
+            }
+        }
+
         for meta in self.live_tables() {
             if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
                 continue;
@@ -217,6 +238,13 @@ impl<F: Fs> Opened<'_, F> {
         }
         if crate::table::covered_by_tombstone(&tables, user, seq)? {
             return Ok(false);
+        }
+        // And the memtable's, which are kept apart from its point keys and so
+        // are in no cursor's way (§4).
+        for t in self.memtable.borrow().tombstones() {
+            if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
+                return Ok(false);
+            }
         }
         Ok(true)
     }

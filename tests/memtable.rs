@@ -107,24 +107,24 @@ fn build(seed: u64, ops: usize) -> (Memtable, BTreeMap<Key, Vec<u8>>) {
 
 /// Every entry of the memtable, forwards.
 fn forward(table: &Memtable) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut it = table.iter();
-    it.first();
+    let mut it = table.cursor();
+    it.first(table);
     let mut out = Vec::new();
     while it.is_valid() {
-        out.push((it.key().to_vec(), it.value().to_vec()));
-        it.next();
+        out.push((it.key(table).to_vec(), it.value(table).to_vec()));
+        it.next(table);
     }
     out
 }
 
 /// Every entry of the memtable, backwards.
 fn backward(table: &Memtable) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut it = table.iter();
-    it.last();
+    let mut it = table.cursor();
+    it.last(table);
     let mut out = Vec::new();
     while it.is_valid() {
-        out.push((it.key().to_vec(), it.value().to_vec()));
-        it.prev();
+        out.push((it.key(table).to_vec(), it.value(table).to_vec()));
+        it.prev(table);
     }
     out
 }
@@ -174,13 +174,17 @@ fn seeks_land_where_the_model_says() {
             let want_ge = entries
                 .iter()
                 .position(|(k, _)| Key(k.clone()) >= Key(probe.clone()));
-            let mut it = table.iter();
-            it.seek_ge(probe).expect("seek_ge");
+            let mut it = table.cursor();
+            it.seek_ge(&table, probe).expect("seek_ge");
             match want_ge {
                 Some(i) => {
                     assert!(it.is_valid(), "seed {seed}: seek_ge should land");
-                    assert_eq!(it.key(), &entries[i].0[..], "seed {seed}: seek_ge");
-                    assert_eq!(it.value(), &entries[i].1[..], "seed {seed}: seek_ge value");
+                    assert_eq!(it.key(&table), &entries[i].0[..], "seed {seed}: seek_ge");
+                    assert_eq!(
+                        it.value(&table),
+                        &entries[i].1[..],
+                        "seed {seed}: seek_ge value"
+                    );
                 }
                 None => assert!(!it.is_valid(), "seed {seed}: seek_ge past the end"),
             }
@@ -188,12 +192,12 @@ fn seeks_land_where_the_model_says() {
             let want_lt = entries
                 .iter()
                 .rposition(|(k, _)| Key(k.clone()) < Key(probe.clone()));
-            let mut it = table.iter();
-            it.seek_lt(probe).expect("seek_lt");
+            let mut it = table.cursor();
+            it.seek_lt(&table, probe).expect("seek_lt");
             match want_lt {
                 Some(i) => {
                     assert!(it.is_valid(), "seed {seed}: seek_lt should land");
-                    assert_eq!(it.key(), &entries[i].0[..], "seed {seed}: seek_lt");
+                    assert_eq!(it.key(&table), &entries[i].0[..], "seed {seed}: seek_lt");
                 }
                 None => assert!(!it.is_valid(), "seed {seed}: seek_lt before the start"),
             }
@@ -207,21 +211,21 @@ fn a_seek_can_be_stepped_away_from_in_either_direction() {
     let entries = model_entries(&model);
 
     for (i, (k, _)) in entries.iter().enumerate() {
-        let mut it = table.iter();
-        it.seek_ge(k).expect("seek_ge");
-        assert_eq!(it.key(), &k[..]);
+        let mut it = table.cursor();
+        it.seek_ge(&table, k).expect("seek_ge");
+        assert_eq!(it.key(&table), &k[..]);
 
-        it.next();
+        it.next(&table);
         match entries.get(i + 1) {
-            Some((n, _)) => assert_eq!(it.key(), &n[..], "forward from {i}"),
+            Some((n, _)) => assert_eq!(it.key(&table), &n[..], "forward from {i}"),
             None => assert!(!it.is_valid(), "past the last entry"),
         }
 
-        let mut it = table.iter();
-        it.seek_ge(k).expect("seek_ge");
-        it.prev();
+        let mut it = table.cursor();
+        it.seek_ge(&table, k).expect("seek_ge");
+        it.prev(&table);
         match i.checked_sub(1).and_then(|j| entries.get(j)) {
-            Some((p, _)) => assert_eq!(it.key(), &p[..], "backward from {i}"),
+            Some((p, _)) => assert_eq!(it.key(&table), &p[..], "backward from {i}"),
             None => assert!(!it.is_valid(), "before the first entry"),
         }
     }
@@ -253,18 +257,20 @@ fn an_empty_memtable_has_nowhere_to_go() {
     assert!(table.is_empty());
     assert_eq!(table.bytes(), 0);
 
-    let mut it = table.iter();
-    it.first();
+    let mut it = table.cursor();
+    it.first(&table);
     assert!(!it.is_valid());
-    it.last();
+    it.last(&table);
     assert!(!it.is_valid());
-    it.seek_ge(&key::search_key(b"anything")).expect("seek_ge");
+    it.seek_ge(&table, &key::search_key(b"anything"))
+        .expect("seek_ge");
     assert!(!it.is_valid());
-    it.seek_lt(&key::search_key(b"anything")).expect("seek_lt");
+    it.seek_lt(&table, &key::search_key(b"anything"))
+        .expect("seek_lt");
     assert!(!it.is_valid());
     // Stepping an invalid iterator stays invalid rather than panicking.
-    it.next();
-    it.prev();
+    it.next(&table);
+    it.prev(&table);
     assert!(!it.is_valid());
 }
 
@@ -272,12 +278,12 @@ fn an_empty_memtable_has_nowhere_to_go() {
 fn a_key_that_is_not_an_internal_key_is_refused() {
     let mut table = Memtable::new(1);
     assert!(table.insert(b"short", b"v").is_err(), "no trailer");
-    let mut it = table.iter();
+    let mut it = table.cursor();
     assert!(
-        it.seek_ge(b"short").is_err(),
+        it.seek_ge(&table, b"short").is_err(),
         "no trailer to compare against"
     );
-    assert!(it.seek_lt(b"short").is_err());
+    assert!(it.seek_lt(&table, b"short").is_err());
 }
 
 // ------------------------------------------------------------ applying a batch
@@ -286,16 +292,16 @@ use roble_format::batch::Batch;
 
 /// The first entry the memtable holds for `user`, which is its newest version.
 fn newest(table: &Memtable, user: &[u8]) -> Option<(u64, Kind, Vec<u8>)> {
-    let mut it = table.iter();
-    it.seek_ge(&key::search_key(user)).expect("seek");
+    let mut it = table.cursor();
+    it.seek_ge(table, &key::search_key(user)).expect("seek");
     if !it.is_valid() {
         return None;
     }
-    let k = roble_format::InternalKey::decode(it.key()).expect("decode");
+    let k = roble_format::InternalKey::decode(it.key(table)).expect("decode");
     if k.user_key != user {
         return None;
     }
-    Some((k.seq_num, k.kind, it.value().to_vec()))
+    Some((k.seq_num, k.kind, it.value(table).to_vec()))
 }
 
 #[test]
@@ -371,16 +377,16 @@ fn range_deletions_are_kept_apart_from_the_point_keys() {
     assert_eq!(t.seq_num, 8, "it took the sequence number of its position");
 
     // Walking the point keys meets no tombstone.
-    let mut it = table.iter();
-    it.first();
+    let mut it = table.cursor();
+    it.first(&table);
     let mut kinds = Vec::new();
     while it.is_valid() {
         kinds.push(
-            roble_format::InternalKey::decode(it.key())
+            roble_format::InternalKey::decode(it.key(&table))
                 .expect("decode")
                 .kind,
         );
-        it.next();
+        it.next(&table);
     }
     assert_eq!(kinds, vec![Kind::Set, Kind::Set]);
 }

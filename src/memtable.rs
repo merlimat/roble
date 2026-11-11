@@ -356,10 +356,14 @@ impl Memtable {
         Ok(seq)
     }
 
-    /// An iterator over the memtable, positioned nowhere.
-    pub fn iter(&self) -> MemtableIter<'_> {
-        MemtableIter {
-            table: self,
+    /// A cursor over the memtable, positioned nowhere.
+    ///
+    /// The cursor does not borrow the memtable: every operation is given it
+    /// again. That is what lets a scan hold one beside an `Rc` to the
+    /// memtable itself — the same reason the block cursor stopped borrowing
+    /// its block (§4), and the same shape.
+    pub fn cursor(&self) -> MemtableCursor {
+        MemtableCursor {
             at: NIL,
             valid: false,
         }
@@ -373,13 +377,17 @@ impl Memtable {
 }
 
 /// A position in a memtable.
-pub struct MemtableIter<'a> {
-    table: &'a Memtable,
+///
+/// Holds a position and nothing else; the memtable is passed to each call.
+/// The caller is responsible for passing the same one — this is a cursor, not
+/// a handle.
+#[derive(Clone, Copy, Debug)]
+pub struct MemtableCursor {
     at: u32,
     valid: bool,
 }
 
-impl<'a> MemtableIter<'a> {
+impl MemtableCursor {
     /// Whether it is on an entry.
     pub fn is_valid(&self) -> bool {
         self.valid
@@ -389,18 +397,18 @@ impl<'a> MemtableIter<'a> {
     ///
     /// # Panics
     /// If it is not on an entry.
-    pub fn key(&self) -> &'a [u8] {
-        assert!(self.valid, "key() on an iterator that is not on an entry");
-        self.table.key(self.at)
+    pub fn key<'a>(&self, table: &'a Memtable) -> &'a [u8] {
+        assert!(self.valid, "key() on a cursor that is not on an entry");
+        table.key(self.at)
     }
 
     /// Its value.
     ///
     /// # Panics
     /// If it is not on an entry.
-    pub fn value(&self) -> &'a [u8] {
-        assert!(self.valid, "value() on an iterator that is not on an entry");
-        self.table.value(self.at)
+    pub fn value<'a>(&self, table: &'a Memtable) -> &'a [u8] {
+        assert!(self.valid, "value() on a cursor that is not on an entry");
+        table.value(self.at)
     }
 
     fn place(&mut self, at: u32) {
@@ -409,12 +417,12 @@ impl<'a> MemtableIter<'a> {
     }
 
     /// Positions on the first entry.
-    pub fn first(&mut self) {
-        self.place(self.table.link(NIL, 0));
+    pub fn first(&mut self, table: &Memtable) {
+        self.place(table.link(NIL, 0));
     }
 
     /// Positions on the last entry.
-    pub fn last(&mut self) {
+    pub fn last(&mut self, table: &Memtable) {
         // Walk down from the top level, which is what the levels are for.
         //
         // Walking level zero alone would reach the same node, just by hopping
@@ -423,9 +431,9 @@ impl<'a> MemtableIter<'a> {
         // many hops it took, which is a worse thing to write down than this
         // sentence.
         let mut at = NIL;
-        for level in (0..self.table.height).rev() {
+        for level in (0..table.height).rev() {
             loop {
-                let next = self.table.link(at, level);
+                let next = table.link(at, level);
                 if next == NIL {
                     break;
                 }
@@ -437,11 +445,11 @@ impl<'a> MemtableIter<'a> {
 
     /// Steps forward.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) {
+    pub fn next(&mut self, table: &Memtable) {
         if !self.valid {
             return;
         }
-        self.place(self.table.link(self.at, 0));
+        self.place(table.link(self.at, 0));
     }
 
     /// Steps backward.
@@ -449,26 +457,26 @@ impl<'a> MemtableIter<'a> {
     /// A search, not a step: the links only run forwards. This is why reverse
     /// iteration over a memtable costs a descent per entry where forward costs
     /// a pointer hop.
-    pub fn prev(&mut self) {
+    pub fn prev(&mut self, table: &Memtable) {
         if !self.valid {
             return;
         }
-        let key = self.table.key(self.at).to_vec();
-        let prev = self.table.predecessors(&key);
+        let key = table.key(self.at).to_vec();
+        let prev = table.predecessors(&key);
         self.place(prev[0]);
     }
 
     /// Positions on the first entry at or after `target`.
-    pub fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+    pub fn seek_ge(&mut self, table: &Memtable, target: &[u8]) -> Result<()> {
         check(target)?;
-        self.place(self.table.first_at_or_after(target));
+        self.place(table.first_at_or_after(target));
         Ok(())
     }
 
     /// Positions on the last entry before `target`.
-    pub fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
+    pub fn seek_lt(&mut self, table: &Memtable, target: &[u8]) -> Result<()> {
         check(target)?;
-        let prev = self.table.predecessors(target);
+        let prev = table.predecessors(target);
         self.place(prev[0]);
         Ok(())
     }

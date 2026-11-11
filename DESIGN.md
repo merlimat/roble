@@ -34,11 +34,19 @@
 > model-based tests against a `BTreeMap` are worth having: the oracle is only
 > interesting because a skiplist reaches the same answer by a different route.
 >
-> It now takes a **batch**: entry `i` of a batch committed at `s` gets `s + i`,
+> It takes a **batch**: entry `i` of a batch committed at `s` gets `s + i`,
 > which is what makes a later write in the same batch win, and range deletions
-> go to a list of their own rather than among the point keys. Nothing calls it
-> yet — `write` and the read path's view of unflushed writes are the next
-> piece.
+> go to a list of their own rather than among the point keys. `write` applies
+> one, and **`get` and `scan` see what it wrote** — shadowing a table's older
+> value, hiding it with a delete, covering it with a range tombstone.
+>
+> A scan is a snapshot, and cheaply: it records the sequence number it began
+> at and ignores anything above. A write during a scan takes a higher number
+> and is invisible to it, with nothing copied and nothing reference-counted.
+>
+> **What is written is not yet durable.** §6's `write(batch, sync)` logs the
+> batch before applying it, so that nothing is readable that is not
+> recoverable; the log is next, and the signature gains its `sync` then.
 >
 > A log that still holds writes is **refused** until replay lands, since
 > opening without it would discard writes that were already acknowledged.
@@ -467,7 +475,15 @@ compaction drops it. That is the cost the format chooses for us (§2).
 ### Iterators
 
 Forward and reverse, bounded, over a snapshot. `seek_ge` / `seek_lt` /
-`next` / `prev`. Reverse iteration over an LSM is more expensive than forward,
+`next` / `prev`.
+
+**The snapshot is a sequence number.** A scan takes the highest sequence
+number in use when it is made and ignores anything above it, so a write that
+happens while it is open is simply not its business. Nothing is copied and
+nothing is reference counted: sequence numbers only go up, and a table's
+contents are all older than any scan, so the rule has to be applied in exactly
+one place — the memtable. An explicit `snapshot()` handle is the same
+mechanism with the number kept for longer (§4). Reverse iteration over an LSM is more expensive than forward,
 which Oxia's `KeyRangeScanReverse` uses; it is worth measuring early.
 
 There are two reasons it is dearer, and they compound. Within a block,

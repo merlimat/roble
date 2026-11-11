@@ -47,7 +47,135 @@ use roble_format::key::{self, Kind};
 use crate::env::Disk;
 use crate::error::Result;
 use crate::read::successor;
+use std::cell::RefCell;
+
+use crate::memtable::{Memtable, MemtableCursor};
 use crate::table::{OpenTable, TableIter, covered_by_tombstone, is_deletion};
+
+/// One source of entries in a merge: a table, or the memtable.
+///
+/// The two differ in more than where their bytes are. A table's contents are
+/// fixed, so everything in it is older than any scan; the memtable is still
+/// being written to, so a scan has to ignore what arrived after it began.
+/// That is what `snapshot` is for, and it is the only place it is needed.
+enum Source<D: Disk> {
+    Table(TableIter<D>),
+    Mem(MemSource),
+}
+
+/// The memtable, as a merge source.
+///
+/// Holds the current key copied out rather than borrowed: the memtable lives
+/// behind a `RefCell` so that a write can reach it, and a borrow of that
+/// cannot be held between calls.
+///
+/// Note that a cursor which has gone invalid stays invalid — stepping it does
+/// nothing — so a scan that began on an empty memtable never looks at it
+/// again. That happens to give the same answers as the snapshot rule, since
+/// anything written later is above the snapshot anyway, but it is **not** the
+/// rule: with a memtable that was not empty, the cursor walks right into the
+/// new entries and only the sequence number keeps them out.
+struct MemSource {
+    table: Rc<RefCell<Memtable>>,
+    cursor: MemtableCursor,
+    key: Vec<u8>,
+    valid: bool,
+}
+
+impl MemSource {
+    fn capture(&mut self) {
+        let table = self.table.borrow();
+        self.valid = self.cursor.is_valid();
+        if self.valid {
+            self.key.clear();
+            self.key.extend_from_slice(self.cursor.key(&table));
+        }
+    }
+}
+
+impl<D: Disk> Source<D> {
+    fn is_valid(&self) -> bool {
+        match self {
+            Source::Table(it) => it.is_valid(),
+            Source::Mem(m) => m.valid,
+        }
+    }
+
+    fn key(&self) -> &[u8] {
+        match self {
+            Source::Table(it) => it.key(),
+            Source::Mem(m) => &m.key,
+        }
+    }
+
+    async fn entry(&self) -> Result<crate::table::Entry> {
+        match self {
+            Source::Table(it) => it.entry().await,
+            Source::Mem(m) => {
+                let table = m.table.borrow();
+                Ok(crate::table::Entry {
+                    key: m.key.clone(),
+                    value: m.cursor.value(&table).to_vec(),
+                })
+            }
+        }
+    }
+
+    async fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
+        match self {
+            Source::Table(it) => it.seek_ge(target).await,
+            Source::Mem(m) => {
+                m.cursor.seek_ge(&m.table.borrow(), target)?;
+                m.capture();
+                Ok(())
+            }
+        }
+    }
+
+    async fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
+        match self {
+            Source::Table(it) => it.seek_lt(target).await,
+            Source::Mem(m) => {
+                m.cursor.seek_lt(&m.table.borrow(), target)?;
+                m.capture();
+                Ok(())
+            }
+        }
+    }
+
+    async fn last(&mut self) -> Result<()> {
+        match self {
+            Source::Table(it) => it.last().await,
+            Source::Mem(m) => {
+                m.cursor.last(&m.table.borrow());
+                m.capture();
+                Ok(())
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Result<()> {
+        match self {
+            Source::Table(it) => it.next().await,
+            Source::Mem(m) => {
+                m.cursor.next(&m.table.borrow());
+                m.capture();
+                Ok(())
+            }
+        }
+    }
+
+    async fn prev(&mut self) -> Result<()> {
+        match self {
+            Source::Table(it) => it.prev().await,
+            Source::Mem(m) => {
+                m.cursor.prev(&m.table.borrow());
+                m.capture();
+                Ok(())
+            }
+        }
+    }
+}
 
 /// Which way the iterators are currently positioned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,8 +195,18 @@ struct Current {
 /// Forward and reverse, optionally bounded. The bounds are half-open as
 /// Pebble's are: `lower` is included and `upper` is not.
 pub struct Scan<D: Disk> {
-    iters: Vec<TableIter<D>>,
+    iters: Vec<Source<D>>,
     tables: Vec<Rc<OpenTable<D>>>,
+    /// Kept for its range tombstones, which are not in any source.
+    memtable: Option<Rc<RefCell<Memtable>>>,
+    /// The highest sequence number this scan can see.
+    ///
+    /// Taken when the scan is made, so a write that happens while it is open
+    /// is invisible to it: the new entry has a higher sequence number and is
+    /// skipped. That is the whole of the snapshot (§4) — no copying, no
+    /// reference counts, just a number and the fact that sequence numbers
+    /// only go up.
+    snapshot: u64,
     lower: Option<Vec<u8>>,
     upper: Option<Vec<u8>>,
     dir: Dir,
@@ -80,13 +218,26 @@ impl<D: Disk> Scan<D> {
     /// (excluded), positioned nowhere.
     pub fn new(
         tables: Vec<Rc<OpenTable<D>>>,
+        memtable: Option<Rc<RefCell<Memtable>>>,
+        snapshot: u64,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
     ) -> Self {
-        let iters = tables.iter().map(|t| t.iter()).collect();
+        let mut iters: Vec<Source<D>> = tables.iter().map(|t| Source::Table(t.iter())).collect();
+        if let Some(m) = &memtable {
+            let cursor = m.borrow().cursor();
+            iters.push(Source::Mem(MemSource {
+                table: Rc::clone(m),
+                cursor,
+                key: Vec::new(),
+                valid: false,
+            }));
+        }
         Scan {
             iters,
             tables,
+            memtable,
+            snapshot,
             lower,
             upper,
             dir: Dir::Forward,
@@ -204,15 +355,8 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             };
-
-            // The least internal key is the newest version of the least user
-            // key, so this entry is the candidate without further searching.
-            let entry = self.iters[w].entry().await?;
-            let decoded = InternalKey::decode(&entry.key)?;
-            let user = decoded.user_key.to_vec();
-            let (seq, kind) = (decoded.seq_num, decoded.kind);
-
-            self.skip_forward_over(&user).await?;
+            let user = InternalKey::decode(self.iters[w].key())?.user_key.to_vec();
+            let chosen = self.take_newest_visible(&user, Dir::Forward).await?;
 
             if let Some(upper) = &self.upper
                 && user >= *upper
@@ -220,11 +364,10 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             }
-            if self.visible(&user, seq, kind)? {
-                self.current = Some(Current {
-                    user,
-                    value: entry.value,
-                });
+            if let Some((seq, kind, value)) = chosen
+                && self.visible(&user, seq, kind)?
+            {
+                self.current = Some(Current { user, value });
                 return Ok(());
             }
         }
@@ -238,34 +381,7 @@ impl<D: Disk> Scan<D> {
                 return Ok(());
             };
             let user = InternalKey::decode(self.iters[w].key())?.user_key.to_vec();
-
-            // Walk every iterator back over this user key, keeping the
-            // smallest internal key seen — which is its newest version. The
-            // largest, which `greatest` found, is the oldest.
-            let mut newest: Option<(Vec<u8>, Vec<u8>)> = None;
-            for i in 0..self.iters.len() {
-                loop {
-                    if !self.iters[i].is_valid() {
-                        break;
-                    }
-                    let here = self.iters[i].key().to_vec();
-                    if InternalKey::decode(&here)?.user_key != user.as_slice() {
-                        break;
-                    }
-                    let better = match &newest {
-                        None => true,
-                        Some((best, _)) => key::compare(&here, best)?.is_lt(),
-                    };
-                    if better {
-                        let e = self.iters[i].entry().await?;
-                        newest = Some((e.key, e.value));
-                    }
-                    self.iters[i].prev().await?;
-                }
-            }
-            let (key_bytes, value) = newest.expect("the winning iterator held this user key");
-            let decoded = InternalKey::decode(&key_bytes)?;
-            let (seq, kind) = (decoded.seq_num, decoded.kind);
+            let chosen = self.take_newest_visible(&user, Dir::Reverse).await?;
 
             if let Some(lower) = &self.lower
                 && user < *lower
@@ -273,11 +389,57 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             }
-            if self.visible(&user, seq, kind)? {
+            if let Some((seq, kind, value)) = chosen
+                && self.visible(&user, seq, kind)?
+            {
                 self.current = Some(Current { user, value });
                 return Ok(());
             }
         }
+    }
+
+    /// Steps every source over every version of `user`, returning the newest
+    /// one the snapshot can see.
+    ///
+    /// The same rule both ways: among the versions a source holds, take the
+    /// highest sequence number at or below the snapshot. Going forward the
+    /// first version met is the newest, so this usually stops at once; going
+    /// backward the first met is the oldest, so it reads them all. That
+    /// asymmetry is why reverse is dearer, and it is the same one the block
+    /// cursor has.
+    ///
+    /// Every source ends past the key — forward, past its last version;
+    /// backward, before its first — so the caller can simply go round again.
+    async fn take_newest_visible(
+        &mut self,
+        user: &[u8],
+        dir: Dir,
+    ) -> Result<Option<(u64, Kind, Vec<u8>)>> {
+        let mut chosen: Option<(u64, Kind, Vec<u8>)> = None;
+        for i in 0..self.iters.len() {
+            loop {
+                if !self.iters[i].is_valid() {
+                    break;
+                }
+                let here = self.iters[i].key().to_vec();
+                let k = InternalKey::decode(&here)?;
+                if k.user_key != user {
+                    break;
+                }
+                // A version written after this scan began is not its business.
+                if k.seq_num <= self.snapshot
+                    && chosen.as_ref().is_none_or(|(seq, _, _)| k.seq_num > *seq)
+                {
+                    let entry = self.iters[i].entry().await?;
+                    chosen = Some((k.seq_num, k.kind, entry.value));
+                }
+                match dir {
+                    Dir::Forward => self.iters[i].next().await?,
+                    Dir::Reverse => self.iters[i].prev().await?,
+                }
+            }
+        }
+        Ok(chosen)
     }
 
     /// The iterator on the least internal key, if any is still positioned.
@@ -318,29 +480,28 @@ impl<D: Disk> Scan<D> {
         Ok(best)
     }
 
-    /// Steps every iterator forward past every version of `user`.
-    async fn skip_forward_over(&mut self, user: &[u8]) -> Result<()> {
-        for i in 0..self.iters.len() {
-            loop {
-                if !self.iters[i].is_valid() {
-                    break;
-                }
-                let here = self.iters[i].key().to_vec();
-                if InternalKey::decode(&here)?.user_key != user {
-                    break;
-                }
-                self.iters[i].next().await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Whether the newest version of `user` is a live value.
     fn visible(&self, user: &[u8], seq: u64, kind: Kind) -> Result<bool> {
         if is_deletion(kind) {
             return Ok(false);
         }
-        Ok(!covered_by_tombstone(&self.tables, user, seq)?)
+        if covered_by_tombstone(&self.tables, user, seq)? {
+            return Ok(false);
+        }
+        // The memtable's tombstones are not in any source — they are kept
+        // apart from the point keys (§4) — so they are consulted here.
+        if let Some(m) = &self.memtable {
+            for t in m.borrow().tombstones() {
+                if t.seq_num > seq
+                    && t.seq_num <= self.snapshot
+                    && t.start.as_slice() <= user
+                    && user < t.end.as_slice()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -369,6 +530,8 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
         }
         Ok(Scan::new(
             tables,
+            Some(Rc::clone(&self.memtable)),
+            self.snapshot(),
             lower.map(|b| b.to_vec()),
             upper.map(|b| b.to_vec()),
         ))
