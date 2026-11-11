@@ -1,52 +1,41 @@
 # roble — design
 
-> Status: **M1 is complete, and M2 has started.** This document fixes the
-> compatibility target (§3), the decisions that differ from encina's (§4), and
-> the order the work goes in (§13).
+> Status: **M1 and M2 are complete, and M3 has started.** This document fixes
+> the compatibility target (§3), the decisions that differ from encina's (§4),
+> and the order the work goes in (§13).
 >
-> M2 so far: the env, the filesystem and the disk of §10, with a compio
-> implementation and an in-memory one that can be made to fail or crash at any
-> single operation; `open`, which reads a database directory — its markers, and
-> its MANIFEST replayed into a version — and refuses one it cannot read whole
-> (§6); and **seeking inside a table**: internal-key ordering, a block cursor
-> that searches the restart array and steps either way, index descent through
-> one or two levels, and the floor and ceiling seeks of §6 in callback form.
+> **M1, the format crate.** `roble-format` encodes and decodes Pebble's files,
+> each structure pinned against Go Pebble rather than against a reading of it:
+> sstables both ways, range deletions, the bloom filter bit-for-bit,
+> value-block resolution, none/Snappy/Zstd and both checksums, the batch
+> representation byte-for-byte, record framing in both wire formats, version
+> edits, and the file and marker names. `roble sst dump` and `roble manifest
+> dump` print them.
 >
-> and `get`, the five comparisons of §6 merged across every level with point
-> deletes and range tombstones applied, judged against Pebble's own answers on
-> a database with overlapping tables in L0 above a compacted level.
+> **M2, reading.** The env, filesystem and disk of §10, with a compio
+> implementation and an in-memory one that can fail or crash at any single
+> operation. `open`, which reads a database directory — its markers, its
+> MANIFEST replayed into a version — and refuses one it cannot read whole (§6).
+> Seeking inside a table: internal-key ordering, a block cursor that searches
+> the restart array and steps either way without borrowing its block, and index
+> descent through one or two levels. The table and block caches of §8, shared
+> per thread, so a table is opened once and a block fetched once. And over all
+> of it, `get` with the five comparisons of §6 and `scan` in both directions,
+> bounded, with point deletes and range tombstones applied.
 >
-> and the **table cache** of §8: open readers with their index, filter and
-> tombstones, bounded by count and shared by every store on a thread, with
-> data blocks fetched one at a time by handle rather than whole files.
+> Each is judged against Go Pebble: whole databases under `tests/golden/` that
+> Pebble's own reader describes, seek probes and read probes and scan walks
+> that Pebble answers and roble has to reproduce exactly.
 >
-> and the **block cache**: decoded blocks keyed by store, table and offset,
-> under a byte budget, evicted by the same CLOCK.
+> **M3, writing**, has started with the **memtable**: a skiplist over an arena,
+> keyed by internal key, its links indices rather than pointers so the
+> structure needs no `unsafe`, its shape a function of a seed so a run replays
+> (§9). This is the first thing roble writes, and so the first place §12's
+> model-based tests against a `BTreeMap` are worth having: the oracle is only
+> interesting because a skiplist reaches the same answer by a different route.
 >
-> and the first half of scans: a block cursor that **does not borrow its
-> block**, and a resumable iterator over one table that steps either way
-> across block boundaries.
->
-> and **scans**: those iterators merged across every table, with deletions and
-> range tombstones applied, bounded, behind `seek_ge`/`seek_lt`/`next`/`prev`
-> in both directions.
->
-> That completes M2's read path. `get` still does its own merge inside one
-> call and still re-seeks per rejected key (§6); it can be rebuilt on a scan,
-> which is a tidying rather than a gap.
->
-> `open` is judged against whole databases Go Pebble wrote, committed under
-> `tests/golden/`, where Pebble's own reader describes the directory and roble
-> has to agree with it exactly. A log that still holds writes is **refused**
-> until replay lands in M3, since opening without it would discard writes that
-> were already acknowledged.
->
-> `roble-format` encodes and decodes Pebble's files, each structure pinned
-> against Go Pebble rather than against a reading of it: sstables both ways,
-> range deletions, the bloom filter bit-for-bit, value-block resolution,
-> none/Snappy/Zstd and both checksums, the batch representation byte-for-byte,
-> record framing in both wire formats, and version edits. `roble sst dump` and
-> `roble manifest dump` print them.
+> A log that still holds writes is **refused** until replay lands, since
+> opening without it would discard writes that were already acknowledged.
 >
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
@@ -778,12 +767,13 @@ in both directions.
   log segment — because a refusal that is not tested is a refusal that panics or
   half-reads instead. The files are committed. roble's tests read them and
   compare against the harness's dump of the same files.
-- **Reads are judged against Pebble, not against a model.** §12 asks for
-  model-based property tests against a `BTreeMap`, and that is the right oracle
-  once roble can **write**: the model and the store can then be driven by the
-  same operations. While roble only reads, the operations are Pebble's, and
-  Pebble is both the only model available and the stronger one, since it is the
-  thing roble has to agree with. So `harness/read-probes` builds a database
+- **Reads are judged against Pebble; what roble writes is judged against a
+  model.** While roble could only read, the operations were Pebble's, so Pebble
+  was both the only model available and the stronger one. The memtable is the
+  first thing roble writes, so the `BTreeMap` model this section asks for
+  finally has something to model — and it is worth having precisely because a
+  skiplist reaches the same answers by a different route. Two `BTreeMap`s
+  agreeing would say nothing. So `harness/read-probes` builds a database
   from a seeded, deliberately unkind history — a small key alphabet so
   overwrites and deletes pile up on the same keys, range deletions cutting
   across flushed tables, explicit flushes and compactions leaving overlapping
