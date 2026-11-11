@@ -74,6 +74,9 @@ pub struct Opened<'a, F: Fs> {
     memtable: std::cell::RefCell<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>>,
     /// The log this store appends to, if it has one.
     log: std::cell::RefCell<Option<Log<F::Disk>>>,
+    /// Whether this store was opened with the WAL off, so that `flush` is
+    /// the only durability point (§4).
+    disable_wal: bool,
     /// The next sequence number to hand out.
     ///
     /// Starts past the MANIFEST's last, so nothing written here can collide
@@ -95,24 +98,24 @@ pub struct Opened<'a, F: Fs> {
     /// deleted.
     markers: std::cell::RefCell<Vec<String>>,
     /// How large the MANIFEST may grow before a flush replaces it.
-    max_manifest_bytes: std::cell::Cell<u64>,
+    max_manifest_bytes: u64,
     /// What replaying the MANIFEST established, and what a flush adds to.
     versions: std::cell::RefCell<VersionSet>,
 }
 
-/// Opens the database in `dir` with caches of its own.
+/// Opens the database in `dir` with the defaults.
 ///
-/// A store that shares a thread with others should be opened with
-/// [`open_with`] instead, so that one budget covers them all (§8).
+/// A store that shares a thread with others, or that wants Oxia's
+/// configuration, is opened with [`open_with`] instead (§8, §11).
 pub async fn open<'a, E: Env>(env: &'a E, dir: &Path) -> Result<Opened<'a, E::Fs>> {
-    open_with(env, dir, crate::cache::Caches::default()).await
+    open_with(env, dir, crate::options::Options::default()).await
 }
 
-/// Opens the database in `dir`, drawing on `caches`.
+/// Opens the database in `dir` as `options` says.
 pub async fn open_with<'a, E: Env>(
     env: &'a E,
     dir: &Path,
-    caches: crate::cache::Caches<E::Fs>,
+    options: crate::options::Options<E::Fs>,
 ) -> Result<Opened<'a, E::Fs>> {
     let fs = env.fs();
 
@@ -212,7 +215,12 @@ pub async fn open_with<'a, E: Env>(
     // The log the store carries on writing to, opened where the replay
     // stopped. Overwriting a torn tail is the point: those bytes were never
     // acknowledged.
-    let log = match replayed.tail {
+    //
+    // With the WAL off there is none, which is not the same as having
+    // skipped the replay above: the records already in a log were
+    // acknowledged when they were written, whatever this store has been
+    // asked to do from here (§6).
+    let log = match replayed.tail.filter(|_| !options.disable_wal) {
         Some((log_num, at)) => {
             let path = dir.join(roble_format::files::log_filename(log_num));
             let disk = fs.open(&path, Access::ReadWrite).await?;
@@ -235,8 +243,9 @@ pub async fn open_with<'a, E: Env>(
     Ok(Opened {
         _lock: lock,
         fs,
-        store_id: caches.new_store_id(),
-        caches,
+        store_id: options.caches.new_store_id(),
+        caches: options.caches,
+        disable_wal: options.disable_wal,
         memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
@@ -247,7 +256,7 @@ pub async fn open_with<'a, E: Env>(
             marker_iter: manifest_marker_iter,
         }),
         markers: std::cell::RefCell::new(markers),
-        max_manifest_bytes: std::cell::Cell::new(crate::rotate::MAX_MANIFEST_BYTES),
+        max_manifest_bytes: options.max_manifest_bytes,
         versions: std::cell::RefCell::new(versions),
     })
 }
@@ -467,43 +476,62 @@ impl<F: Fs> Opened<'_, F> {
     /// recoverable** (§6). `sync` decides whether the write is durable when
     /// this returns or merely written — without it the batch survives the
     /// store going away but not the machine.
+    ///
+    /// With the WAL off there is no log step and `sync` is refused rather
+    /// than ignored: nothing but `flush` can make a write durable, and
+    /// saying otherwise would be the silent half of a data loss.
     pub async fn write(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
+        // Refused before anything is stamped, so a write that cannot keep
+        // its promise changes nothing. Pebble refuses this too, and the
+        // reason is the same: with no log there is nowhere for a sync to
+        // make the batch durable, and returning `Ok` would be a promise of
+        // durability that only `flush` can keep (§4).
+        if sync && self.disable_wal {
+            return Err(Error::Unsupported(format!(
+                "{} was opened with the WAL off, so a write cannot be made durable on its \
+                 own; flush instead",
+                self.dir.display()
+            )));
+        }
+
         let base = self.next_seq.get();
         batch.set_seq_num(base);
 
-        // The log, with the borrow released before any waiting: a `RefCell`
-        // held across an await is a panic waiting for the first reader that
-        // arrives in the middle of a write.
-        let Some((disk, log_num, at)) = self
-            .log
-            .borrow()
-            .as_ref()
-            .map(|l| (std::rc::Rc::clone(&l.disk), l.log_num, l.at))
-        else {
-            return Err(Error::Unsupported(format!(
-                "{} holds no log file, so a write could not be recovered",
-                self.dir.display()
-            )));
-        };
+        if !self.disable_wal {
+            // The log, with the borrow released before any waiting: a
+            // `RefCell` held across an await is a panic waiting for the
+            // first reader that arrives in the middle of a write.
+            let Some((disk, log_num, at)) = self
+                .log
+                .borrow()
+                .as_ref()
+                .map(|l| (std::rc::Rc::clone(&l.disk), l.log_num, l.at))
+            else {
+                return Err(Error::Unsupported(format!(
+                    "{} holds no log file, so a write could not be recovered",
+                    self.dir.display()
+                )));
+            };
 
-        let mut writer = roble_format::record::RecordWriter::resuming(log_num as u32, at);
-        writer.write_record(batch.as_bytes())?;
-        let framed = writer.as_bytes().to_vec();
-        let end = writer.position();
+            let mut writer = roble_format::record::RecordWriter::resuming(log_num as u32, at);
+            writer.write_record(batch.as_bytes())?;
+            let framed = writer.as_bytes().to_vec();
+            let end = writer.position();
 
-        let (result, _) = disk
-            .write(
-                crate::buf::WriteBuf::new(framed),
-                at as u64,
-                Default::default(),
-            )
-            .await;
-        result?;
-        if sync {
-            disk.sync(Default::default()).await?;
-        }
-        if let Some(log) = self.log.borrow_mut().as_mut() {
-            log.at = end;
+            let (result, _) = disk
+                .write(
+                    crate::buf::WriteBuf::new(framed),
+                    at as u64,
+                    Default::default(),
+                )
+                .await;
+            result?;
+            if sync {
+                disk.sync(Default::default()).await?;
+            }
+            if let Some(log) = self.log.borrow_mut().as_mut() {
+                log.at = end;
+            }
         }
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
@@ -556,18 +584,9 @@ impl<F: Fs> Opened<'_, F> {
     }
 
     /// How large the MANIFEST may grow before a flush replaces it
-    /// (`crate::rotate`).
+    /// (`crate::rotate`), as [`crate::Options`] was asked for.
     pub fn max_manifest_bytes(&self) -> u64 {
-        self.max_manifest_bytes.get()
-    }
-
-    /// Sets that limit.
-    ///
-    /// The one knob on a store so far, and it is here because a rotation that
-    /// only happens after 128 MiB of MANIFEST is a rotation no test can
-    /// reach. When options arrive this moves into them.
-    pub fn set_max_manifest_bytes(&self, bytes: u64) {
-        self.max_manifest_bytes.set(bytes);
+        self.max_manifest_bytes
     }
 
     /// Points the store at a MANIFEST the marker now names.
@@ -603,6 +622,11 @@ impl<F: Fs> Opened<'_, F> {
     /// Puts a fresh memtable in front, leaving any open scan on the old one.
     pub(crate) fn install_fresh_memtable(&self, fresh: crate::memtable::Memtable) {
         *self.memtable.borrow_mut() = std::rc::Rc::new(std::cell::RefCell::new(fresh));
+    }
+
+    /// Whether this store was opened with the WAL off.
+    pub fn wal_disabled(&self) -> bool {
+        self.disable_wal
     }
 
     /// Points the store at a different log, which must already exist.

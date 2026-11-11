@@ -1,0 +1,91 @@
+// Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! What a store is told when it opens (§4, §11).
+//!
+//! Three settings, and only one of them is a policy: `disable_wal` changes
+//! where durability comes from, and so changes what `write` promises. The
+//! other two are budgets.
+
+use crate::cache::Caches;
+use crate::env::Fs;
+
+/// How a store is opened.
+pub struct Options<F: Fs> {
+    /// The caches it draws on, shared with every other store on the thread
+    /// that was given the same handle (§8).
+    pub(crate) caches: Caches<F>,
+    /// Whether to skip the log entirely.
+    pub(crate) disable_wal: bool,
+    /// How large the MANIFEST may grow before a flush replaces it.
+    pub(crate) max_manifest_bytes: u64,
+}
+
+impl<F: Fs> Default for Options<F> {
+    fn default() -> Self {
+        Options {
+            caches: Caches::default(),
+            disable_wal: false,
+            max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
+        }
+    }
+}
+
+impl<F: Fs> Options<F> {
+    /// The defaults: caches of this store's own, and a WAL.
+    pub fn new() -> Self {
+        Options::default()
+    }
+
+    /// Draws on `caches` rather than on caches of this store's own.
+    ///
+    /// What makes one budget cover every store on a thread (§8), and what
+    /// makes the budget mean anything: a hundred shards with a cache each is
+    /// a hundred budgets.
+    pub fn caches(mut self, caches: Caches<F>) -> Self {
+        self.caches = caches;
+        self
+    }
+
+    /// Turns the WAL off, making `flush` the only durability point.
+    ///
+    /// This is Oxia's configuration (§1): its replication log is the source
+    /// of truth, so the store need only be durable at `flush`, and Oxia
+    /// replays everything after that. A write then reaches the memtable and
+    /// nothing else, and a crash takes the database back to its last flush.
+    ///
+    /// It does not stop a log being *read*. A database written with a WAL and
+    /// reopened without one still has its unflushed logs replayed, because
+    /// those records were acknowledged and dropping them silently is the one
+    /// thing an open may not do (§6).
+    ///
+    /// That crossover leaves one wart, kept rather than fixed because the
+    /// fix would be machinery for a configuration nobody runs: a store with
+    /// no WAL never moves the minimum unflushed log number, so a log it
+    /// replayed is replayed again at every later open, even once a flush has
+    /// put those records in a table. Re-applying them costs time and nothing
+    /// else — every entry arrives with the sequence number it was written
+    /// with, so a newer value or tombstone still wins.
+    pub fn disable_wal(mut self, disable: bool) -> Self {
+        self.disable_wal = disable;
+        self
+    }
+
+    /// How large the MANIFEST may grow before a flush replaces it
+    /// (`crate::rotate`).
+    pub fn max_manifest_bytes(mut self, bytes: u64) -> Self {
+        self.max_manifest_bytes = bytes;
+        self
+    }
+}

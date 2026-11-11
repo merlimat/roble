@@ -271,9 +271,9 @@ async fn a_flush_rotates_a_manifest_that_outgrows_its_limit() {
     // write, so the limit comes down instead; what is under test is that a
     // flush notices and rotates, not the number.
     let (env, dir) = load("db-reads").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let options = roble::Options::new().max_manifest_bytes(8 * 1024);
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
     let first = db.manifest_filename();
-    db.set_max_manifest_bytes(8 * 1024);
 
     let mut rounds = 0;
     while db.manifest_filename() == first {
