@@ -14,10 +14,19 @@
 
 //! [`DefaultEnv`]: databases in the file system, on compio.
 //!
-//! The uncached open, the `flock` lock and the directory sync are encina's,
-//! adapted: `O_DIRECT` where the file system takes it, `F_NOCACHE` on macOS,
-//! and a lock that belongs to the open rather than the process so that a
-//! second thread of this process is kept out too (DESIGN.md §10).
+//! The `flock` lock and the directory sync are encina's, adapted: a lock that
+//! belongs to the open rather than the process, so that a second thread of this
+//! process is kept out too (DESIGN.md §10).
+//!
+//! **No direct I/O here, deliberately.** encina opens with `O_DIRECT` because
+//! its file is pages: every request it makes is already aligned in offset,
+//! length and buffer address. A Pebble file is not pages. Its footer is 53
+//! bytes at the end, its metaindex a few dozen, its MANIFEST a chain of partial
+//! chunks — and `O_DIRECT` answers such a request with `EINVAL` rather than
+//! serving it. Direct I/O therefore belongs under the block cache, which
+//! already reads the enclosing aligned span and keeps the block (§8), as a
+//! [`Disk`] that aligns what it is handed. Until that exists these files go
+//! through the page cache, which is also what Pebble does.
 
 use std::future::Future;
 use std::io;
@@ -59,12 +68,12 @@ impl Fs for FileFs {
     type Lock = FileLock;
 
     async fn create(&self, path: &Path) -> Result<FileDisk> {
-        let file = open_uncached(path, true, true).await?;
+        let file = open_file(path, true, true).await?;
         Ok(FileDisk { file })
     }
 
     async fn open(&self, path: &Path, access: Access) -> Result<FileDisk> {
-        let file = open_uncached(path, access == Access::ReadWrite, false).await?;
+        let file = open_file(path, access == Access::ReadWrite, false).await?;
         Ok(FileDisk { file })
     }
 
@@ -198,40 +207,18 @@ impl Disk for FileDisk {
     }
 }
 
-/// Opens a file for I/O that bypasses the OS page cache, which would otherwise
-/// keep a second copy of every block: `O_DIRECT` on Linux where the file
-/// system supports it, `F_NOCACHE` on macOS.
-async fn open_uncached(path: &Path, writable: bool, truncate: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options
+/// Opens a file, creating it when the open is for writing.
+///
+/// Through the page cache: the note at the top of this module says why an
+/// uncached open cannot serve a 53-byte footer.
+async fn open_file(path: &Path, writable: bool, truncate: bool) -> Result<File> {
+    let file = OpenOptions::new()
         .read(true)
         .write(writable)
         .create(writable)
-        .truncate(truncate);
-    #[cfg(target_os = "linux")]
-    {
-        let mut direct = options.clone();
-        direct.custom_flags(libc::O_DIRECT);
-        match direct.open(path).await {
-            Ok(file) => return Ok(file),
-            // Some file systems, tmpfs among them, do not support O_DIRECT.
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    let file = options.open(path).await?;
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: the descriptor is open for the duration of the call, and
-        // F_NOCACHE takes an int. This is one of the two places the engine
-        // needs libc; roble-format needs none and forbids unsafe outright.
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
+        .truncate(truncate)
+        .open(path)
+        .await?;
     Ok(file)
 }
 

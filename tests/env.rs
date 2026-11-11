@@ -127,6 +127,48 @@ both!(a_write_at_an_offset_grows_the_file, |fs, dir| {
     assert_eq!(&read_file(fs, &path).await[8..], b"tail");
 });
 
+both!(any_byte_range_is_a_valid_request, |fs, dir| {
+    // The contract direct I/O quietly broke: a footer is 53 bytes at the end of
+    // the file, a metaindex a few dozen somewhere in the middle, and neither is
+    // aligned to anything. A disk that reads in aligned units has to align them
+    // itself; it may not refuse them. On Linux `O_DIRECT` refused them, and
+    // this suite noticed only because one CI runner happened to allow the flag.
+    let path = dir.join("unaligned.sst");
+    let bytes: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+
+    // Written in three runs, no offset or length among them aligned to a block.
+    let disk = fs.create(&path).await.expect("create");
+    let mut at = 0usize;
+    for len in [1usize, 53, 4946] {
+        let (result, _) = disk
+            .write(
+                WriteBuf::new(bytes[at..at + len].to_vec()),
+                at as u64,
+                Default::default(),
+            )
+            .await;
+        result.expect("an unaligned write is a valid request");
+        at += len;
+    }
+    disk.sync(Default::default()).await.expect("sync");
+    disk.close().await.expect("close");
+
+    let disk = fs.open(&path, Access::ReadOnly).await.expect("open");
+    // The last 53 bytes, which is how a footer is found.
+    let (result, buf) = disk
+        .read(ReadBuf::with_len(53), 4947, Default::default())
+        .await;
+    result.expect("the footer-sized tail is a valid request");
+    assert_eq!(buf.as_slice(), &bytes[4947..]);
+
+    // And an odd range from the middle, which is how a metaindex is read.
+    let (result, buf) = disk
+        .read(ReadBuf::with_len(37), 1013, Default::default())
+        .await;
+    result.expect("an unaligned read is a valid request");
+    assert_eq!(buf.as_slice(), &bytes[1013..1050]);
+});
+
 both!(rename_replaces_and_is_visible_at_once, |fs, dir| {
     // Marker rotation depends on this: a reader must see one name or the
     // other, never neither.
@@ -137,6 +179,22 @@ both!(rename_replaces_and_is_visible_at_once, |fs, dir| {
     fs.rename(&from, &to).await.expect("rename");
     assert_eq!(read_file(fs, &to).await, b"new");
     assert!(fs.open(&from, Access::ReadOnly).await.is_err());
+});
+
+both!(a_directory_sync_is_accepted, |fs, dir| {
+    // Against a real file system this can only check that the call succeeds:
+    // whether the name reached the platter is what `SimFs` is for, below. That
+    // is still worth a case, because `sync_dir` is a platform call on a
+    // directory handle and nothing else here exercises the real one — the kind
+    // of hole that let an unaligned-I/O bug reach `main`.
+    write_file(fs, &dir.join("000001.sst"), b"table bytes").await;
+    fs.sync_dir(&dir)
+        .await
+        .expect("syncing a directory should succeed");
+    // Twice, and on a directory with nothing new in it.
+    fs.sync_dir(&dir)
+        .await
+        .expect("a second sync should succeed");
 });
 
 both!(link_shares_the_bytes_without_copying_them, |fs, dir| {
