@@ -113,6 +113,20 @@ jobs:
           done
           exit $status
 
+      # Pebble's answers to the seek probes have to be what the pinned harness
+      # still gives. This file is the ground truth for every seek roble makes,
+      # so a silent drift here would quietly stop testing the read path.
+      - name: the seek probes are still what Pebble answers
+        run: |
+          regenerated="$(mktemp -d)"
+          trap 'rm -rf "$regenerated"' EXIT
+          cp format/tests/golden/*.sst "$regenerated/"
+          (cd harness && go run ./seek-probes "$regenerated")
+          if ! diff -u format/tests/golden/seeks.txt "$regenerated/seeks.txt"; then
+            echo "::error file=format/tests/golden/seeks.txt::stale; regenerate with 'cd harness && go run ./seek-probes ../format/tests/golden'"
+            exit 1
+          fi
+
       # The same check for the whole-database fixtures. These are generated
       # with compression off, so unlike the sstable corpus their table sizes
       # are portable between architectures and the dumps compare exactly.
