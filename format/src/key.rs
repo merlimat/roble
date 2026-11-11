@@ -28,6 +28,21 @@ pub const TRAILER_LEN: usize = 8;
 /// The largest sequence number, used as a boundary sentinel.
 pub const SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 
+/// The bit an **uncommitted batch** sets in place of a sequence number it has
+/// not been given yet (Pebble's `SeqNumBatchBit`).
+///
+/// A batch that can be read back through itself has to order its own entries
+/// against the store's, and it has no sequence numbers to do it with: those
+/// are handed out when it commits. So while it is being built, entry `i`
+/// stands in at `SEQ_NUM_BATCH | i` — above every number a committed entry
+/// can hold, so the batch always wins, and in the order it was written, so a
+/// later entry wins over an earlier one for the same key.
+///
+/// These numbers never leave the batch's own index. The repr carries no
+/// sequence numbers at all until commit stamps the header, so nothing with
+/// this bit set is ever written to a log, a table or a MANIFEST.
+pub const SEQ_NUM_BATCH: u64 = 1 << 55;
+
 /// `InternalKeyKindSSTableInternalObsoleteBit`: set in a Pebblev4 block to mark
 /// a key no reader needs. roble honours it and never sets it (DESIGN.md §3).
 pub const OBSOLETE_BIT: u8 = 64;

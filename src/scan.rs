@@ -197,8 +197,11 @@ struct Current {
 pub struct Scan<D: Disk> {
     iters: Vec<Source<D>>,
     tables: Vec<Rc<OpenTable<D>>>,
-    /// Kept for its range tombstones, which are not in any source.
-    memtable: Option<Rc<RefCell<Memtable>>>,
+    /// Kept for their range tombstones, which are not in any source.
+    ///
+    /// More than one when a scan is reading through an uncommitted batch
+    /// (`crate::batch`): the store's memtable, and the batch's own index.
+    memtables: Vec<Rc<RefCell<Memtable>>>,
     /// The highest sequence number this scan can see.
     ///
     /// Taken when the scan is made, so a write that happens while it is open
@@ -218,13 +221,13 @@ impl<D: Disk> Scan<D> {
     /// (excluded), positioned nowhere.
     pub fn new(
         tables: Vec<Rc<OpenTable<D>>>,
-        memtable: Option<Rc<RefCell<Memtable>>>,
+        memtables: Vec<Rc<RefCell<Memtable>>>,
         snapshot: u64,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
     ) -> Self {
         let mut iters: Vec<Source<D>> = tables.iter().map(|t| Source::Table(t.iter())).collect();
-        if let Some(m) = &memtable {
+        for m in &memtables {
             let cursor = m.borrow().cursor();
             iters.push(Source::Mem(MemSource {
                 table: Rc::clone(m),
@@ -236,7 +239,7 @@ impl<D: Disk> Scan<D> {
         Scan {
             iters,
             tables,
-            memtable,
+            memtables,
             snapshot,
             lower,
             upper,
@@ -427,7 +430,7 @@ impl<D: Disk> Scan<D> {
                     break;
                 }
                 // A version written after this scan began is not its business.
-                if k.seq_num <= self.snapshot
+                if visible_at(k.seq_num, self.snapshot)
                     && chosen.as_ref().is_none_or(|(seq, _, _)| k.seq_num > *seq)
                 {
                     let entry = self.iters[i].entry().await?;
@@ -488,12 +491,12 @@ impl<D: Disk> Scan<D> {
         if covered_by_tombstone(&self.tables, user, seq)? {
             return Ok(false);
         }
-        // The memtable's tombstones are not in any source — they are kept
+        // A memtable's tombstones are not in any source — they are kept
         // apart from the point keys (§4) — so they are consulted here.
-        if let Some(m) = &self.memtable {
+        for m in &self.memtables {
             for t in m.borrow().tombstones() {
                 if t.seq_num > seq
-                    && t.seq_num <= self.snapshot
+                    && visible_at(t.seq_num, self.snapshot)
                     && t.start.as_slice() <= user
                     && user < t.end.as_slice()
                 {
@@ -503,6 +506,22 @@ impl<D: Disk> Scan<D> {
         }
         Ok(true)
     }
+}
+
+/// Whether an entry numbered `seq` is one a scan at `snapshot` may see.
+///
+/// Two rules, and the second is the whole of reading through an uncommitted
+/// batch. An ordinary entry is visible when it was written at or before the
+/// scan began. A batch's own entries carry [`key::SEQ_NUM_BATCH`] in place of
+/// numbers they have not been given yet, and are always visible, because they
+/// are what the scan was made to read through.
+///
+/// No second snapshot is needed for them, as Pebble's `base.Visible` has: a
+/// batch index is only ever a source of a scan made from that same batch, and
+/// nothing else in the database can carry the bit — committing replaces those
+/// stand-ins with real sequence numbers.
+fn visible_at(seq: u64, snapshot: u64) -> bool {
+    seq <= snapshot || seq & key::SEQ_NUM_BATCH != 0
 }
 
 impl<F: crate::env::Fs> crate::Opened<'_, F> {
@@ -518,10 +537,25 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Scan<F::Disk>> {
+        self.scan_with(Vec::new(), lower, upper).await
+    }
+
+    /// The same, with `extra` memtables merged in ahead of the store's.
+    ///
+    /// What an uncommitted batch reads through (`crate::batch`): its index is
+    /// a memtable like any other, and its entries win because of the numbers
+    /// they carry rather than because of where they are in this list.
+    pub(crate) async fn scan_with(
+        &self,
+        extra: Vec<Rc<RefCell<Memtable>>>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<Scan<F::Disk>> {
         // Every table of the version. A table whose key range misses the
         // bounds could be left out, but that is the version's business to
         // decide and it costs nothing here: an iterator over a table outside
         // the bounds goes invalid on its first seek.
+        //
         // The file numbers first, so the borrow is released before any
         // waiting: opening a table is I/O, and a `RefCell` held across it
         // would collide with the flush that is allowed to run meanwhile.
@@ -535,9 +569,11 @@ impl<F: crate::env::Fs> crate::Opened<'_, F> {
         for file_num in file_nums {
             tables.push(self.open_table(file_num).await?);
         }
+        let mut memtables = extra;
+        memtables.push(self.memtable());
         Ok(Scan::new(
             tables,
-            Some(self.memtable()),
+            memtables,
             self.snapshot(),
             lower.map(|b| b.to_vec()),
             upper.map(|b| b.to_vec()),

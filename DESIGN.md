@@ -1,6 +1,6 @@
 # roble — design
 
-> Status: **M1 and M2 are complete, and M3 has started.** This document fixes
+> Status: **M1, M2 and M3 are complete.** This document fixes
 > the compatibility target (§3), the decisions that differ from encina's (§4),
 > and the order the work goes in (§13).
 >
@@ -64,6 +64,16 @@
 > is the one-way door, and it moves last — the new MANIFEST is a file nothing
 > refers to until it does, and the old MANIFEST and the old marker are
 > obsolete the moment it has.
+>
+> And **indexed batches**, which Oxia reads back through themselves before
+> committing (§6), so this is not optional. A batch has no sequence numbers
+> while it is being built — those are handed out at commit — so each of its
+> entries stands in at `SEQ_NUM_BATCH | i`, Pebble's `SeqNumBatchBit`: above
+> every number a committed entry can hold, and ascending in the order the
+> entries were written. The merge then needs no special case at all, and the
+> one rule added is that a number carrying that bit is visible to the scan
+> reading through it. The index is a memtable like any other, so the batch is
+> a merge source like any other.
 >
 > And **the WAL off**, which is not an absence but a different place for
 > durability to come from, and the configuration Oxia runs: a write reaches
@@ -828,8 +838,8 @@ let db = open_with(&DefaultEnv, "data/shard-3", Options::new().caches(caches)).a
 let mut batch = db.batch();            // indexed: readable through itself
 batch.put(b"/users/alice", b"...")?;
 batch.delete_range(b"/sessions/", b"/sessions0")?;
-let seen = batch.get(b"/users/alice").await?;
-batch.commit(Sync::No).await?;         // appended to the WAL, not synced
+let seen = batch.get(b"/users/alice", Comparison::Equal).await?;
+batch.commit(false).await?;            // appended to the WAL, not synced
 db.flush().await?;                     // a table; the logs it covers can go
 
 let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
