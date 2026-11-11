@@ -99,6 +99,9 @@ pub struct Opened<'a, F: Fs> {
     markers: std::cell::RefCell<Vec<String>>,
     /// How large the MANIFEST may grow before a flush replaces it.
     max_manifest_bytes: u64,
+    /// Whether an append to the MANIFEST has failed, after which this store
+    /// records nothing more (`crate::flush`).
+    manifest_failed: std::cell::Cell<bool>,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -293,6 +296,7 @@ pub async fn open_with<'a, E: Env>(
         records_in_tables: std::cell::Cell::new(0),
         markers: std::cell::RefCell::new(markers),
         max_manifest_bytes: options.max_manifest_bytes,
+        manifest_failed: std::cell::Cell::new(false),
         l0_compaction_threshold: options.l0_compaction_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
         compaction_unit: options.compaction_unit,
@@ -655,6 +659,17 @@ impl<F: Fs> Opened<'_, F> {
     /// Which iteration of `marker.manifest.*` names the current MANIFEST.
     pub(crate) fn manifest_marker_iter(&self) -> u64 {
         self.manifest.borrow().marker_iter
+    }
+
+    /// Whether an append to the MANIFEST has failed, which is the end of
+    /// this store's writing life (`crate::flush`).
+    pub(crate) fn manifest_failed(&self) -> bool {
+        self.manifest_failed.get()
+    }
+
+    /// Takes account of an append to the MANIFEST that failed.
+    pub(crate) fn saw_manifest_failure(&self) {
+        self.manifest_failed.set(true);
     }
 
     /// How large the MANIFEST may grow before a flush replaces it
