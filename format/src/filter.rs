@@ -230,23 +230,27 @@ impl FilterBuilder {
     }
 
     /// Encodes the filter block.
+    ///
+    /// Nothing added encodes to nothing, as Pebble's `tableFilterWriter`
+    /// returns nil for a table with no point key and its layout writer stores
+    /// that as a zero-length block. The five-byte header alone would be worse
+    /// than useless: [`Filter::from_block`] exempts length 0 only, so roble's
+    /// own reader would refuse a block roble had just written, while Pebble
+    /// would read it as excluding every key. The writer never calls this on an
+    /// empty builder, and this is what keeps that from mattering if it ever
+    /// does.
     pub fn finish(&self) -> Vec<u8> {
-        let lines = if self.hashes.is_empty() {
-            0usize
-        } else {
-            let mut l = (self.hashes.len() * self.bits_per_key).div_ceil(CACHE_LINE_BITS as usize);
-            // Pebble forces an odd line count so that more of the hash decides
-            // which line a key lands in.
-            if l.is_multiple_of(2) {
-                l += 1;
-            }
-            l
-        };
+        if self.hashes.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = (self.hashes.len() * self.bits_per_key).div_ceil(CACHE_LINE_BITS as usize);
+        // Pebble forces an odd line count so that more of the hash decides
+        // which line a key lands in.
+        if lines.is_multiple_of(2) {
+            lines += 1;
+        }
         let n_bytes = lines * CACHE_LINE_SIZE;
         let mut buf = vec![0u8; n_bytes + 5];
-        if lines == 0 {
-            return buf;
-        }
         let probes = probes_for(self.bits_per_key);
         let lines_u32 = lines as u32;
         for &h0 in &self.hashes {
@@ -291,6 +295,13 @@ mod tests {
         let mut builder = FilterBuilder::new(DEFAULT_BITS_PER_KEY);
         builder.add_key(b"k");
         assert!(matches!(Filter::from_block(&builder.finish()), Ok(Some(_))));
+
+        // And the writer's own empty block is one the reader accepts, which
+        // is the half that would bite: a builder with nothing in it must not
+        // encode to the five-byte header that `from_block` refuses.
+        let empty = FilterBuilder::new(DEFAULT_BITS_PER_KEY).finish();
+        assert!(empty.is_empty(), "an empty builder encodes to nothing");
+        assert!(matches!(Filter::from_block(&empty), Ok(None)));
     }
 
     #[test]
