@@ -70,6 +70,16 @@ async fn flush_batch<F: Fs>(db: &roble::Opened<'_, F>, batch: &mut Batch) -> u64
     db.flush().await.expect("flush").expect("a table")
 }
 
+/// The one table a compaction was expected to write.
+fn one_output(outputs: Vec<u64>) -> u64 {
+    assert_eq!(
+        outputs.len(),
+        1,
+        "expected one output table, got {outputs:?}"
+    );
+    outputs[0]
+}
+
 /// How many bytes every table of the version takes.
 fn table_bytes<F: Fs>(db: &roble::Opened<'_, F>) -> u64 {
     db.versions()
@@ -107,11 +117,7 @@ async fn a_compaction_changes_no_answer() {
         "the later write should already win"
     );
 
-    let out = db
-        .compact(0, &[a, b])
-        .await
-        .expect("compact")
-        .expect("an output table");
+    let out = one_output(db.compact(0, &[a, b]).await.expect("compact"));
 
     assert_eq!(
         contents(&db).await,
@@ -166,11 +172,7 @@ async fn a_compaction_drops_what_it_may() {
     let before = contents(&db).await;
     let bytes_before = table_bytes(&db);
 
-    let out = db
-        .compact(0, &inputs)
-        .await
-        .expect("compact")
-        .expect("an output table");
+    let out = one_output(db.compact(0, &inputs).await.expect("compact"));
 
     assert_eq!(
         contents(&db).await,
@@ -226,11 +228,7 @@ async fn a_deletion_with_nothing_below_it_goes() {
         None
     );
 
-    let out = db
-        .compact(0, &[a, b])
-        .await
-        .expect("compact")
-        .expect("an output table");
+    let out = one_output(db.compact(0, &[a, b]).await.expect("compact"));
 
     assert_eq!(
         db.get(b"doomed", Comparison::Equal).await.expect("get"),
@@ -272,16 +270,8 @@ async fn a_deletion_with_something_below_it_stays() {
     let mut old = Batch::new();
     old.put(b"buried", b"old value").expect("put");
     let a = flush_batch(&db, &mut old).await;
-    let in_l1 = db
-        .compact(0, &[a])
-        .await
-        .expect("compact")
-        .expect("a table");
-    let in_l2 = db
-        .compact(1, &[in_l1])
-        .await
-        .expect("compact")
-        .expect("a table");
+    let in_l1 = one_output(db.compact(0, &[a]).await.expect("compact"));
+    let in_l2 = one_output(db.compact(1, &[in_l1]).await.expect("compact"));
     assert!(
         db.versions()
             .version
@@ -295,10 +285,7 @@ async fn a_deletion_with_something_below_it_stays() {
     gone.delete(b"buried").expect("delete");
     let b = flush_batch(&db, &mut gone).await;
 
-    db.compact(0, &[b])
-        .await
-        .expect("compact")
-        .expect("a table");
+    db.compact(0, &[b]).await.expect("compact");
     assert_eq!(
         db.get(b"buried", Comparison::Equal).await.expect("get"),
         None,
@@ -348,10 +335,7 @@ async fn overlapping_range_tombstones_are_fragmented() {
         "and the overlap should be covered"
     );
 
-    db.compact(0, &[a, b, c])
-        .await
-        .expect("compact")
-        .expect("an output table");
+    db.compact(0, &[a, b, c]).await.expect("compact");
     assert_eq!(
         contents(&db).await,
         before,
@@ -401,11 +385,7 @@ async fn a_key_a_tombstone_covers_is_dropped() {
         .map(|t| t.size)
         .sum::<u64>();
 
-    let out = db
-        .compact(0, &[a, b])
-        .await
-        .expect("compact")
-        .expect("an output table");
+    let out = one_output(db.compact(0, &[a, b]).await.expect("compact"));
 
     assert_eq!(
         contents(&db).await,
@@ -439,9 +419,8 @@ async fn a_compaction_that_drops_everything_writes_no_table() {
     let only = flush_batch(&db, &mut batch).await;
 
     let before = contents(&db).await;
-    assert_eq!(
-        db.compact(0, &[only]).await.expect("compact"),
-        None,
+    assert!(
+        db.compact(0, &[only]).await.expect("compact").is_empty(),
         "nothing survived, so there is no table to write"
     );
     assert_eq!(contents(&db).await, before);
@@ -471,11 +450,7 @@ async fn a_compaction_collects_the_tables_it_replaced() {
     batch.put(b"collected", b"yes").expect("put");
     let a = flush_batch(&db, &mut batch).await;
 
-    let out = db
-        .compact(0, &[a])
-        .await
-        .expect("compact")
-        .expect("a table");
+    let out = one_output(db.compact(0, &[a]).await.expect("compact"));
 
     let names: Vec<String> = env
         .sim()
@@ -511,11 +486,7 @@ async fn a_compaction_pulls_in_the_tables_it_would_overlap() {
             .expect("put");
     }
     let a = flush_batch(&db, &mut low).await;
-    let settled = db
-        .compact(0, &[a])
-        .await
-        .expect("compact")
-        .expect("a table");
+    let settled = one_output(db.compact(0, &[a]).await.expect("compact"));
 
     let mut overlapping = Batch::new();
     for i in 3..9 {
@@ -526,10 +497,7 @@ async fn a_compaction_pulls_in_the_tables_it_would_overlap() {
     let b = flush_batch(&db, &mut overlapping).await;
 
     let before = contents(&db).await;
-    db.compact(0, &[b])
-        .await
-        .expect("compact")
-        .expect("a table");
+    db.compact(0, &[b]).await.expect("compact");
 
     assert_eq!(
         contents(&db).await,
@@ -581,10 +549,7 @@ async fn a_compaction_survives_a_reopen() {
         second.delete(b"s01").expect("delete");
         let b = flush_batch(&db, &mut second).await;
 
-        db.compact(0, &[a, b])
-            .await
-            .expect("compact")
-            .expect("a table");
+        db.compact(0, &[a, b]).await.expect("compact");
         expected = contents(&db).await;
     }
 
@@ -627,10 +592,7 @@ async fn a_scan_open_across_a_compaction_keeps_reading() {
     scan.first().await.expect("first");
     let started_on = scan.key().to_vec();
 
-    db.compact(0, &[a, b])
-        .await
-        .expect("compact")
-        .expect("a table");
+    db.compact(0, &[a, b]).await.expect("compact");
 
     // The scan walks to the end on tables the compaction has replaced and
     // the sweep has deleted.
@@ -651,6 +613,210 @@ async fn a_scan_open_across_a_compaction_keeps_reading() {
             "the scan should still read every key it was opened over"
         );
     }
+}
+
+/// Opens with a target file size small enough that a test can cross it.
+async fn open_splitting<'a>(env: &'a SimEnv, dir: &Path, target: u64) -> roble::Opened<'a, SimFs> {
+    roble::open_with(env, dir, roble::Options::new().target_file_size(target))
+        .await
+        .expect("open")
+}
+
+#[compio::test]
+async fn a_compaction_splits_its_output_at_the_target_size() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = open_splitting(&env, &dir, 4096).await;
+
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..200 {
+        batch
+            .put(format!("p{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut batch).await;
+
+    let before = contents(&db).await;
+    let outputs = db.compact(0, &[a]).await.expect("compact");
+    assert!(
+        outputs.len() > 3,
+        "40 KiB of keys against a 4 KiB target should be several tables, got {outputs:?}"
+    );
+    assert_eq!(contents(&db).await, before, "splitting changed an answer");
+    assert!(
+        db.versions().next_file_num > *outputs.iter().max().expect("an output"),
+        "the edit has to spend a file number for every output, or the next \
+         table written takes a name one of these already has"
+    );
+    // Each level below aims at twice the one above: deeper levels hold more
+    // and are rewritten less often, so larger files there cost fewer of them.
+    assert_eq!(
+        db.target_file_size(2),
+        db.target_file_size(1) * 2,
+        "the target should double with depth"
+    );
+    assert_eq!(db.target_file_size(0), 4096);
+
+    // In key order, and every table but the last at least the target.
+    let in_l1: Vec<roble::Table> = db.versions().version.level(1).to_vec();
+    assert_eq!(
+        in_l1.iter().map(|t| t.file_num).collect::<Vec<_>>(),
+        outputs,
+        "the version should hold the outputs, in the order they were written"
+    );
+    for pair in in_l1.windows(2) {
+        assert!(
+            pair[0].largest_user_key().expect("largest")
+                < pair[1].smallest_user_key().expect("smallest"),
+            "tables {} and {} are not in key order",
+            pair[0].file_num,
+            pair[1].file_num
+        );
+    }
+    for t in &in_l1[..in_l1.len() - 1] {
+        assert!(
+            t.size >= 2048,
+            "table {} is {} bytes against a 4096 target, so the split is not the target's",
+            t.file_num,
+            t.size
+        );
+    }
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "and it should read back the same"
+    );
+}
+
+#[compio::test]
+async fn a_tombstone_outside_a_table_is_not_written_into_it() {
+    // A tombstone over a narrow range, and keys spread far wider: most of
+    // the outputs lie entirely outside it, and clipping leaves them nothing
+    // at all. Writing that nothing is a range deletion whose start is not
+    // below its end, which the block builder refuses outright.
+    let (env, dir) = load("db-twin-a").await;
+    let db = open_splitting(&env, &dir, 2048).await;
+
+    let mut below = Batch::new();
+    for i in 0..200 {
+        below
+            .put(format!("n{i:04}").as_bytes(), b"old")
+            .expect("put");
+    }
+    let deep = flush_batch(&db, &mut below).await;
+    db.compact(0, &[deep]).await.expect("compact");
+
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    batch
+        .delete_range(b"n0100", b"n0102")
+        .expect("delete_range");
+    for i in 0..200 {
+        batch
+            .put(format!("n{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut batch).await;
+
+    let before = contents(&db).await;
+    let outputs = db.compact(0, &[a]).await.expect("compact");
+    assert!(
+        outputs.len() > 4,
+        "it should have split well past the tombstone: {outputs:?}"
+    );
+    assert_eq!(contents(&db).await, before, "splitting changed an answer");
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(contents(&db).await, before);
+}
+
+#[compio::test]
+async fn a_tombstone_across_a_split_leaves_tables_that_touch() {
+    // The shape this whole change turns on. A range deletion that spans a
+    // split is clipped at the boundary, so the table before it ends at the
+    // exclusive sentinel — the end key at the largest sequence number there
+    // is — and the table after begins at that very user key. The two meet at
+    // one key without overlapping, and a check that reads the bound as
+    // inclusive refuses a database Pebble itself writes.
+    let (env, dir) = load("db-twin-a").await;
+    let db = open_splitting(&env, &dir, 4096).await;
+
+    // Something below, so the tombstone is not elided for having nothing
+    // left to hide.
+    let mut old = Batch::new();
+    for i in 0..20 {
+        old.put(format!("q{i:04}").as_bytes(), b"old").expect("put");
+    }
+    let deep = flush_batch(&db, &mut old).await;
+    for level in 0..3 {
+        let tables: Vec<u64> = db
+            .versions()
+            .version
+            .level(level)
+            .iter()
+            .filter(|t| level > 0 || t.file_num == deep)
+            .map(|t| t.file_num)
+            .collect();
+        if !tables.is_empty() {
+            db.compact(level, &tables).await.expect("compact");
+        }
+    }
+
+    // The tombstone, then keys newer than it inside its range, so there is
+    // something left to split among.
+    let mut sweep = Batch::new();
+    sweep
+        .delete_range(b"q0000", b"q9999")
+        .expect("delete_range");
+    let b = flush_batch(&db, &mut sweep).await;
+
+    let value = vec![b'v'; 200];
+    let mut fresh = Batch::new();
+    for i in 0..200 {
+        fresh
+            .put(format!("q{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    let c = flush_batch(&db, &mut fresh).await;
+
+    let before = contents(&db).await;
+    let outputs = db.compact(0, &[b, c]).await.expect("compact");
+    assert!(outputs.len() > 1, "it should have split: {outputs:?}");
+
+    let in_l1: Vec<roble::Table> = db.versions().version.level(1).to_vec();
+    let mut touching = 0;
+    for pair in in_l1.windows(2) {
+        let (before_t, after_t) = (&pair[0], &pair[1]);
+        if before_t.largest_user_key().expect("largest")
+            == after_t.smallest_user_key().expect("smallest")
+        {
+            touching += 1;
+            assert!(
+                before_t.largest_is_exclusive().expect("exclusive"),
+                "tables {} and {} share a bound that is not an exclusive sentinel",
+                before_t.file_num,
+                after_t.file_num
+            );
+        }
+    }
+    assert!(
+        touching > 0,
+        "no two outputs met at a key, so nothing here tests the rule: {:?}",
+        in_l1.iter().map(|t| t.file_num).collect::<Vec<_>>()
+    );
+
+    assert_eq!(contents(&db).await, before, "splitting changed an answer");
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "and the version with touching bounds should replay"
+    );
 }
 
 #[compio::test]

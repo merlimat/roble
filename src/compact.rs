@@ -68,6 +68,12 @@ use crate::open::Opened;
 use crate::table::{OpenTable, is_deletion};
 use crate::version::Table as TableMeta;
 
+/// How large a table a compaction into L0 aims to write.
+///
+/// Pebble's `TargetFileSizes[0]`, with each level below it twice the one
+/// above.
+pub const TARGET_FILE_SIZE: u64 = 2 << 20;
+
 impl<F: Fs> Opened<'_, F> {
     /// Compacts the named tables of `level` into `level + 1`.
     ///
@@ -75,10 +81,10 @@ impl<F: Fs> Opened<'_, F> {
     /// the result would overlap a table already there and Pebble leaves no
     /// overlap below L0.
     ///
-    /// Returns the output table's file number, or `None` when the merge
-    /// dropped everything it read, which is what a level of nothing but
-    /// superseded keys compacts to.
-    pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Option<u64>> {
+    /// Returns the output tables' file numbers, in key order. Empty when the
+    /// merge dropped everything it read, which is what a level of nothing
+    /// but superseded keys compacts to.
+    pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
         let output_level = level + 1;
         if output_level >= NUM_LEVELS {
             return Err(Error::Unsupported(format!(
@@ -97,35 +103,32 @@ impl<F: Fs> Opened<'_, F> {
             tables.push(self.open_table(meta.file_num).await?);
         }
 
-        let file_num = self.versions().next_file_num;
-        let merged = merge(&tables, &below).await?;
+        let first_file_num = self.versions().next_file_num;
+        let merged = merge(&tables, &below, self.target_file_size(output_level)).await?;
 
-        let edit = match merged {
-            Some((bytes, bounds)) => {
-                let mut new_table = bounds.into_new_table(output_level, file_num)?;
-                new_table.size = bytes.len() as u64;
-                self.write_table(file_num, bytes).await?;
-                VersionEdit {
-                    comparer_name: None,
-                    min_unflushed_log_num: None,
-                    obsolete_prev_log_num: None,
-                    next_file_num: Some(file_num + 1),
-                    last_seq_num: Some(self.snapshot()),
-                    deleted_tables: inputs.iter().map(|(l, m)| (*l, m.file_num)).collect(),
-                    new_tables: vec![new_table],
-                }
-            }
-            // Nothing survived. The inputs still go: an edit that only
-            // deletes is as much a compaction as one that writes.
-            None => VersionEdit {
-                comparer_name: None,
-                min_unflushed_log_num: None,
-                obsolete_prev_log_num: None,
-                next_file_num: None,
-                last_seq_num: Some(self.snapshot()),
-                deleted_tables: inputs.iter().map(|(l, m)| (*l, m.file_num)).collect(),
-                new_tables: Vec::new(),
-            },
+        // Every output written and made durable before the edit that claims
+        // any of them: a crash in the middle leaves files nothing refers to,
+        // which the sweep collects, and the database exactly as it was.
+        let mut new_tables = Vec::with_capacity(merged.len());
+        for (i, (bytes, bounds)) in merged.into_iter().enumerate() {
+            let file_num = first_file_num + i as u64;
+            let mut new_table = bounds.into_new_table(output_level, file_num)?;
+            new_table.size = bytes.len() as u64;
+            self.write_table(file_num, bytes).await?;
+            new_tables.push(new_table);
+        }
+
+        // Nothing survived? The inputs still go: an edit that only deletes is
+        // as much a compaction as one that writes.
+        let edit = VersionEdit {
+            comparer_name: None,
+            min_unflushed_log_num: None,
+            obsolete_prev_log_num: None,
+            next_file_num: (!new_tables.is_empty())
+                .then(|| first_file_num + new_tables.len() as u64),
+            last_seq_num: Some(self.snapshot()),
+            deleted_tables: inputs.iter().map(|(l, m)| (*l, m.file_num)).collect(),
+            new_tables,
         };
 
         // The one-way door, in the same place a flush puts it: before this
@@ -138,7 +141,7 @@ impl<F: Fs> Opened<'_, F> {
         }
         let _ = self.remove_obsolete_files().await;
 
-        Ok(edit.new_tables.first().map(|t| t.file_num))
+        Ok(edit.new_tables.iter().map(|t| t.file_num).collect())
     }
 
     /// The tables a compaction reads, and the key ranges below it.
@@ -227,11 +230,8 @@ impl<F: Fs> Opened<'_, F> {
 async fn merge<D: Disk>(
     tables: &[Rc<OpenTable<D>>],
     below: &[(Vec<u8>, Vec<u8>)],
-) -> Result<Option<(Vec<u8>, Bounds)>> {
-    let mut writer = TableWriter::new(WriterOptions::default())?;
-    let mut bounds = Bounds::default();
-    let mut wrote = false;
-
+    target_bytes: u64,
+) -> Result<Vec<(Vec<u8>, Bounds)>> {
     let mut iters = Vec::new();
     for t in tables {
         let mut it = t.iter();
@@ -251,7 +251,10 @@ async fn merge<D: Disk>(
     // walking it would have to decide what an overlap meant.
     let tombstones = fragment(tables);
 
+    let mut outputs = Vec::new();
+    let mut open = Output::new(None)?;
     let mut seen: Option<Vec<u8>> = None;
+
     while let Some(w) = least(&iters)? {
         let encoded = iters[w].key().to_vec();
         let k = InternalKey::decode(&encoded)?;
@@ -263,31 +266,124 @@ async fn merge<D: Disk>(
         seen = Some(user.clone());
 
         if newest && keep(&user, k.seq_num, k.kind, &tombstones, below) {
+            // The break comes *before* the key rather than after, so the
+            // span that closes ends at a key the next table holds and the
+            // two tables meet rather than overlap. Only a user key the
+            // output has not started yet may be a boundary, and after the
+            // drops above every surviving user key appears exactly once, so
+            // any of them will do.
+            if open.estimate >= target_bytes && !open.is_empty() {
+                let finished = std::mem::replace(&mut open, Output::new(Some(user.clone()))?);
+                outputs.push(finished.finish(&tombstones, Some(&user))?);
+            }
             let entry = iters[w].entry().await?;
-            writer.add(k, &entry.value)?;
-            bounds.saw_key(&encoded)?;
-            bounds.saw_seq(k.seq_num);
-            wrote = true;
+            open.add(k, &encoded, &entry.value)?;
         }
         iters[w].next().await?;
     }
 
-    for t in &tombstones {
-        writer.add_range_deletion(&t.start, &t.end, t.seq_num)?;
-        bounds.saw_seq(t.seq_num);
-        bounds.saw_key(&key::encode(&t.start, t.seq_num, key::Kind::RangeDelete))?;
-        bounds.saw_key(&key::encode(
-            &t.end,
-            key::SEQ_NUM_MAX,
-            key::Kind::RangeDelete,
-        ))?;
-        wrote = true;
+    outputs.push(open.finish(&tombstones, None)?);
+    Ok(outputs.into_iter().flatten().collect())
+}
+
+/// One table a compaction is building, and the span of keys it owns.
+///
+/// The span is what the tombstones are clipped to, and it is half-open: from
+/// the key this table started at, up to but not including the key the next
+/// one starts at. The first table's span has no lower bound and the last
+/// one's no upper.
+struct Output {
+    writer: TableWriter,
+    bounds: Bounds,
+    start: Option<Vec<u8>>,
+    /// Roughly how many bytes of keys and values have gone in, which is what
+    /// the target is compared against. The table itself is smaller once its
+    /// blocks are built, and larger by its index and filter; an estimate is
+    /// what Pebble splits on too.
+    estimate: u64,
+    points: usize,
+}
+
+impl Output {
+    fn new(start: Option<Vec<u8>>) -> Result<Self> {
+        Ok(Output {
+            writer: TableWriter::new(WriterOptions::default())?,
+            bounds: Bounds::default(),
+            start,
+            estimate: 0,
+            points: 0,
+        })
     }
 
-    if !wrote {
-        return Ok(None);
+    fn is_empty(&self) -> bool {
+        self.points == 0
     }
-    Ok(Some((writer.finish()?, bounds)))
+
+    fn add(&mut self, key: InternalKey<'_>, encoded: &[u8], value: &[u8]) -> Result<()> {
+        self.estimate += (encoded.len() + value.len()) as u64;
+        self.points += 1;
+        self.bounds.saw_key(encoded)?;
+        self.bounds.saw_seq(key.seq_num);
+        self.writer.add(key, value)?;
+        Ok(())
+    }
+
+    /// Writes the tombstones this table owns and finishes it.
+    ///
+    /// A tombstone that straddles the boundary is clipped to it, which is
+    /// what makes the two tables meet at one user key rather than overlap
+    /// across it: this table's largest key becomes the exclusive sentinel at
+    /// `end`, and the next table's smallest is `end` itself.
+    fn finish(
+        mut self,
+        tombstones: &[Tombstone],
+        end: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, Bounds)>> {
+        let mut wrote = self.points > 0;
+        for t in tombstones {
+            let Some(clipped) = clip(t, self.start.as_deref(), end) else {
+                continue;
+            };
+            self.writer
+                .add_range_deletion(&clipped.start, &clipped.end, clipped.seq_num)?;
+            self.bounds.saw_seq(clipped.seq_num);
+            self.bounds.saw_key(&key::encode(
+                &clipped.start,
+                clipped.seq_num,
+                key::Kind::RangeDelete,
+            ))?;
+            self.bounds.saw_key(&key::encode(
+                &clipped.end,
+                key::SEQ_NUM_MAX,
+                key::Kind::RangeDelete,
+            ))?;
+            wrote = true;
+        }
+        if !wrote {
+            return Ok(None);
+        }
+        Ok(Some((self.writer.finish()?, self.bounds)))
+    }
+}
+
+/// A tombstone cut down to `[lo, hi)`, or `None` if nothing of it is left.
+fn clip(t: &Tombstone, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Option<Tombstone> {
+    let start = match lo {
+        Some(lo) if lo > t.start.as_slice() => lo,
+        _ => &t.start,
+    };
+    let end = match hi {
+        Some(hi) if hi < t.end.as_slice() => hi,
+        _ => &t.end,
+    };
+    if start >= end {
+        return None;
+    }
+    Some(Tombstone {
+        start: start.to_vec(),
+        end: end.to_vec(),
+        seq_num: t.seq_num,
+    })
 }
 
 /// Whether the newest version of a key survives the compaction.
