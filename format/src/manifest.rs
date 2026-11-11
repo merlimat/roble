@@ -581,4 +581,207 @@ mod tests {
             let _ = VersionEdit::decode(&full[..cut]);
         }
     }
+
+    /// Builds a version edit's bytes a tag at a time.
+    ///
+    /// `VersionEdit::encode` only writes the tags roble writes, which is why
+    /// it cannot produce any of the edits below: every one of them is a tag
+    /// Pebble or RocksDB writes and roble has to read — or refuse — without
+    /// ever writing one itself.
+    #[derive(Default)]
+    struct Edit(Vec<u8>);
+
+    impl Edit {
+        fn tag(mut self, tag: u64) -> Self {
+            put_uvarint(&mut self.0, tag);
+            self
+        }
+        fn num(mut self, v: u64) -> Self {
+            put_uvarint(&mut self.0, v);
+            self
+        }
+        fn bytes(mut self, b: &[u8]) -> Self {
+            put_uvarint(&mut self.0, b.len() as u64);
+            self.0.extend_from_slice(b);
+            self
+        }
+        fn decode(&self) -> Result<VersionEdit> {
+            VersionEdit::decode(&self.0)
+        }
+    }
+
+    /// An internal key, as a new-table bound has to be.
+    fn bound(user: &[u8], seq: u64) -> Vec<u8> {
+        crate::key::encode_with_trailer(user, (seq << 8) | crate::key::Kind::Set.to_byte() as u64)
+    }
+
+    #[test]
+    fn a_compact_pointer_is_read_and_dropped() {
+        // RocksDB stopped writing these; Pebble reads past them. A MANIFEST
+        // old enough to hold one still has to open, and the fields have to be
+        // consumed or every tag after it would be read at the wrong offset.
+        let edit = Edit::default()
+            .tag(TAG_COMPACT_POINTER)
+            .num(3)
+            .bytes(b"a-key")
+            .tag(TAG_NEXT_FILE_NUMBER)
+            .num(42)
+            .decode()
+            .expect("a compact pointer is dropped, not refused");
+        assert_eq!(
+            edit.next_file_num,
+            Some(42),
+            "the tag after it must still be read at the right offset"
+        );
+    }
+
+    #[test]
+    fn a_custom_field_that_may_be_ignored_is_ignored() {
+        // Pebble's rule: a tag without the non-safe-ignore bit describes
+        // something a reader can do without.
+        let edit = Edit::default()
+            .tag(TAG_NEW_FILE4)
+            .num(0)
+            .num(7)
+            .num(100)
+            .bytes(&bound(b"a", 1))
+            .bytes(&bound(b"z", 2))
+            .num(1)
+            .num(2)
+            .num(3)
+            .bytes(b"whatever")
+            .num(CUSTOM_TAG_TERMINATE)
+            .decode()
+            .expect("an ignorable field is ignored");
+        assert_eq!(edit.new_tables.len(), 1);
+        assert_eq!(edit.new_tables[0].file_num, 7);
+    }
+
+    #[test]
+    fn a_path_id_in_the_tag_is_read_and_dropped() {
+        // TAG_NEW_FILE3 carries RocksDB's path ID between the file number and
+        // the size. Skipping it would read the size as the path and every
+        // field after it one place late.
+        let edit = Edit::default()
+            .tag(TAG_NEW_FILE3)
+            .num(2)
+            .num(9)
+            .num(0)
+            .num(500)
+            .bytes(&bound(b"a", 1))
+            .bytes(&bound(b"z", 2))
+            .num(3)
+            .num(4)
+            .decode()
+            .expect("a path id is dropped, not refused");
+        let t = &edit.new_tables[0];
+        assert_eq!((t.level, t.file_num, t.size), (2, 9, 500));
+        assert_eq!((t.smallest_seq_num, t.largest_seq_num), (3, 4));
+    }
+
+    #[test]
+    fn a_creation_time_that_is_not_one_number_is_refused() {
+        let err = Edit::default()
+            .tag(TAG_NEW_FILE4)
+            .num(0)
+            .num(7)
+            .num(100)
+            .bytes(&bound(b"a", 1))
+            .bytes(&bound(b"z", 2))
+            .num(1)
+            .num(2)
+            .num(CUSTOM_TAG_CREATION_TIME)
+            .bytes(&[1, 2, 3, 4])
+            .num(CUSTOM_TAG_TERMINATE)
+            .decode()
+            .expect_err("trailing bytes after the time");
+        assert!(
+            format!("{err}").contains("creation time is not a lone uvarint"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_needs_compaction_field_that_is_not_one_byte_is_refused() {
+        // Pebble writes a single byte here and reads it as a bool. A field of
+        // another length is not a longer bool — it is a field this reader has
+        // misunderstood, and guessing at `field[0]` would mark a table for
+        // compaction on the strength of whatever happened to be first.
+        let err = Edit::default()
+            .tag(TAG_NEW_FILE4)
+            .num(0)
+            .num(7)
+            .num(100)
+            .bytes(&bound(b"a", 1))
+            .bytes(&bound(b"z", 2))
+            .num(1)
+            .num(2)
+            .num(CUSTOM_TAG_NEEDS_COMPACTION)
+            .bytes(&[1, 1])
+            .num(CUSTOM_TAG_TERMINATE)
+            .decode()
+            .expect_err("two bytes where one was expected");
+        assert!(
+            format!("{err}").contains("needs-compaction field is 2 bytes, want 1"),
+            "got {err:?}"
+        );
+    }
+
+    /// The tags and custom fields that say the table must be read a way roble
+    /// cannot read it, each refused by name.
+    ///
+    /// These are §3's pin expressed in the MANIFEST: every one of them is
+    /// announced before any sstable is opened, so refusing here is refusing
+    /// before a single wrong byte has been read.
+    #[test]
+    fn a_table_roble_cannot_read_is_refused_from_the_manifest() {
+        // Range keys and backing tables already have a case above, in
+        // `the_structures_roble_refuses_are_refused_by_name`. The blob-file
+        // tags did not: they arrive with Pebblev6, so a MANIFEST naming one
+        // is a database written past the pin.
+        for tag in [TAG_NEW_BLOB_FILE, TAG_DELETED_BLOB_FILE] {
+            let err = Edit::default()
+                .tag(tag)
+                .decode()
+                .expect_err("a blob file must be refused");
+            assert!(format!("{err}").contains("blob file"), "got {err:?}");
+        }
+
+        // And the custom fields, which need a whole new-table entry in front
+        // of them before the field is reached.
+        let with_custom = |custom: u64, payload: &[u8]| {
+            let mut e = Edit::default()
+                .tag(TAG_NEW_FILE4)
+                .num(0)
+                .num(7)
+                .num(100)
+                .bytes(&bound(b"a", 1))
+                .bytes(&bound(b"z", 2))
+                .num(1)
+                .num(2)
+                .num(custom);
+            if !payload.is_empty() {
+                e = e.bytes(payload);
+            }
+            e.decode().expect_err("a field roble cannot ignore")
+        };
+
+        let err = with_custom(CUSTOM_TAG_SYNTHETIC_PREFIX, b"p");
+        assert!(format!("{err}").contains("synthetic prefix"), "got {err:?}");
+
+        let err = with_custom(CUSTOM_TAG_BLOB_REFERENCES, b"b");
+        assert!(format!("{err}").contains("blob references"), "got {err:?}");
+
+        let err = with_custom(CUSTOM_TAG_PATH_ID, b"");
+        assert!(format!("{err}").contains("path-id"), "got {err:?}");
+
+        // An unknown tag with the non-safe-ignore bit set. Pebble's own rule
+        // is that such a tag changes how the table must be read, so skipping
+        // it would be reading the table wrong rather than reading less of it.
+        let err = with_custom(CUSTOM_TAG_NON_SAFE_IGNORE_MASK | 6, b"x");
+        assert!(
+            format!("{err}").contains("may not be ignored"),
+            "got {err:?}"
+        );
+    }
 }
