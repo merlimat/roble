@@ -1,3 +1,30 @@
+[package]
+name = "roble"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Embedded ordered key-value store whose on-disk files are Pebble's"
+
+[dependencies]
+compio = { version = "0.19.2", features = ["fs"] }
+roble-format = { path = "format" }
+
+[dev-dependencies]
+compio = { version = "0.19.2", features = ["fs", "macros"] }
+tempfile = "3"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+# The format crate needs no unsafe and forbids it. The engine needs exactly two
+# libc calls — flock and F_NOCACHE — so it denies unsafe and allows it at those
+# two call sites, each with a SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
 [workspace]
 members = ["cli", "format", "compat/minlz", "compat/sst-roundtrip"]
 resolver = "3"

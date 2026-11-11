@@ -1,8 +1,13 @@
 # roble — design
 
-> Status: **M1 is complete.** This document fixes the compatibility target
-> (§3), the decisions that differ from encina's (§4), and the order the work
-> goes in (§13). M2, read-only, is next.
+> Status: **M1 is complete, and M2 has started.** This document fixes the
+> compatibility target (§3), the decisions that differ from encina's (§4), and
+> the order the work goes in (§13).
+>
+> M2's first piece is in: the env, the filesystem and the disk of §10, with a
+> compio implementation and an in-memory one that can be made to fail or crash
+> at any single operation. The engine itself — opening a database, the version,
+> the caches, the iterator tree — is next.
 >
 > `roble-format` encodes and decodes Pebble's files, each structure pinned
 > against Go Pebble rather than against a reading of it: sstables both ways,
@@ -590,6 +595,13 @@ pub trait Fs {
 than whole pages, since there is no page size, and it keeps the request classes,
 so a compaction's reads can be told apart from a lookup's — an LSM has more use
 for that than encina does.
+
+Two details settled while writing it. A read that cannot be filled whole fails
+with `UnexpectedEof` rather than coming back short: a partly filled buffer
+cannot be told from a corrupt block, and the difference decides whether to
+refuse a database. And `Fs` is a trait beside `Env` rather than methods on it,
+because that is the seam Oxia already injects — it passes a `vfs.FS` and keeps
+Pebble's scheduling and clock, so the two must be separable.
 
 Everything else carries over: buffers are owned and returned, a disk that keeps
 one cannot make roble touch memory it lends, a read in flight is polled from a
