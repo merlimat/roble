@@ -63,6 +63,15 @@ type fixture struct {
 	// asks for tables roble must refuse rather than misread, so that the
 	// refusal is exercised instead of asserted.
 	rangeKeys [][2]string
+	// comparer overrides the bytewise one. Only the name matters: the
+	// ordering is the same, which is the point — roble must refuse the table
+	// for what it says it was written with, not for the keys being out of
+	// order.
+	comparer *pebble.Comparer
+	// noDump says Pebble's own reader cannot open this table with the default
+	// options, so there is nothing to dump and nothing for roble's dump to be
+	// compared against.
+	noDump bool
 }
 
 // checksumOrDefault keeps crc32c as the default, as Pebble does, so only the
@@ -247,6 +256,26 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, v5)
 
+	// A comparer roble does not serve. §3 pins the key ordering to the
+	// bytewise comparer, and Oxia's own `oxia-slash-spans` is the one a real
+	// database could carry: it splits keys on slashes, so a reader that
+	// ignored the name would compare them in an order the table was not
+	// written in and answer every seek slightly wrong. The keys here are in
+	// bytewise order and the ordering is unchanged — only the name differs,
+	// so what is refused is the claim rather than the bytes.
+	slashSpans := *sstable.DefaultComparer
+	slashSpans.Name = "oxia-slash-spans"
+	cmp := fixture{name: "refuse-comparer", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression,
+		comparer: &slashSpans, noDump: true}
+	for i := 0; i < 6; i++ {
+		cmp.entries = append(cmp.entries, entry{
+			userKey: oxiaKey(13, i), seqNum: pebble.SeqNum(1000 + i),
+			kind: pebble.InternalKeyKindSet, value: []byte("c"),
+		})
+	}
+	fs = append(fs, cmp)
+
 	// Zstd data blocks. ZstdCompression is used directly rather than
 	// GoodCompression: Good embeds fastestCompression, which is MinLZ on
 	// amd64, and Pebble then silently swaps the whole profile for Snappy
@@ -374,6 +403,14 @@ func fixtures() []fixture {
 	return fs
 }
 
+// comparerOrDefault is the bytewise comparer unless the fixture names another.
+func (f fixture) comparerOrDefault() *pebble.Comparer {
+	if f.comparer != nil {
+		return f.comparer
+	}
+	return sstable.DefaultComparer
+}
+
 func write(path string, f fixture) error {
 	file, err := vfs.Default.Create(path, "golden-sst")
 	if err != nil {
@@ -384,7 +421,7 @@ func write(path string, f fixture) error {
 		BlockSize:    f.blockSize,
 		Compression:  f.compress,
 		Checksum:     f.checksumOrDefault(),
-		Comparer:     sstable.DefaultComparer,
+		Comparer:     f.comparerOrDefault(),
 		MergerName:   "pebble.concatenate",
 		FilterPolicy: f.filter,
 	}
@@ -530,7 +567,7 @@ func main() {
 		// A dump exists to be compared against roble's reading of the same
 		// bytes, so a table roble refuses outright has nothing to compare and
 		// gets none. Pebble can still read it; roble is the one that cannot.
-		if f.format > sstable.TableFormatPebblev4 {
+		if f.format > sstable.TableFormatPebblev4 || f.noDump {
 			st, _ := os.Stat(sst)
 			fmt.Printf("%-14s %10s %10d %8s  %s\n",
 				f.name, "-", st.Size(), "-", "above the pin")

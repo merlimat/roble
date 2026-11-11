@@ -82,6 +82,11 @@ impl<D: Disk> OpenTable<D> {
         let meta_bytes = fetch(&disk, footer.metaindex, footer.checksum).await?;
         let metaindex = Metaindex::parse(&Block::new(&meta_bytes)?)?;
 
+        // Untested, with a reason (§12): every writer that exists emits a
+        // properties block, so a metaindex without one is a table built by
+        // hand. It is checked anyway because the comparer below is read from
+        // it, and a missing block there would otherwise be a silent "no
+        // comparer named" rather than a refusal.
         let Some(props_handle) = metaindex.properties else {
             return Err(Error::Format(roble_format::Error::Corrupt(
                 "table has no properties block".to_string(),
@@ -209,6 +214,12 @@ impl<D: Disk> OpenTable<D> {
         let value = match decoded.value {
             Value::InPlace(b) => b.to_vec(),
             Value::ValueHandle(h) => self.resolve(h).await?,
+            // Untested, with a reason rather than a test (§12), and the
+            // reason is that an earlier refusal gets there first: blob
+            // handles arrive with Pebblev6, and the footer refuses anything
+            // above v4 before a block is read. This stays as the backstop for
+            // the day the pin moves, where it would become reachable in the
+            // same change that raised it.
             Value::BlobHandle(_) => {
                 return Err(Error::Unsupported(
                     "a value stored in a blob file, which is above roble's pin".to_string(),
@@ -223,6 +234,12 @@ impl<D: Disk> OpenTable<D> {
         let handle = roble_format::value_block::Handle::decode(handle_bytes)?;
         let block_handle = self
             .value_blocks
+            // Untested, with a reason (§12). A handle naming a block the
+            // table does not have cannot come from any writer: Pebble's
+            // numbers them as it writes them, and roble's own writer does the
+            // same. Reaching it needs a table built by hand, and one whose
+            // value-block index was edited after its checksum was computed,
+            // or the block check fires first.
             .get(handle.block_num as usize)
             .ok_or_else(|| {
                 Error::Corrupt(format!(
