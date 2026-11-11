@@ -349,7 +349,10 @@ impl<F: Fs> Opened<'_, F> {
         }
         let path = self.dir.join(roble_format::files::table_filename(file_num));
         let disk = self.fs.open(&path, Access::ReadOnly).await?;
-        let table = std::rc::Rc::new(crate::table::OpenTable::open(file_num, disk).await?);
+        let table = std::rc::Rc::new(
+            crate::table::OpenTable::open(file_num, disk, self.caches.blocks(self.store_id))
+                .await?,
+        );
         self.caches
             .hold_table(self.store_id, file_num, std::rc::Rc::clone(&table));
         Ok(table)

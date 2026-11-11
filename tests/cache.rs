@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
+use roble::cache::{DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 use roble::sim::{SimEnv, SimFs};
 use roble::{Caches, Comparison, Disk, Fs, WriteBuf};
 
@@ -102,7 +103,7 @@ async fn a_cache_bounded_to_one_table_still_answers() {
     // reader every table but one is evicted between reads, and the answers
     // must not change.
     let (env, dir, _) = load("db-reads").await;
-    let caches = Caches::new(1);
+    let caches = Caches::new(1, DEFAULT_BLOCK_BYTES);
     let db = roble::open_with(&env, &dir, caches.clone())
         .await
         .expect("open");
@@ -143,7 +144,7 @@ async fn two_stores_sharing_a_cache_do_not_read_each_others_tables() {
     // was part of the key. The generator now asserts the twins collide.
     let (env_a, dir_a, _) = load("db-twin-a").await;
     let (env_b, dir_b, _) = load("db-twin-b").await;
-    let shared: Caches<SimFs> = Caches::new(64);
+    let shared: Caches<SimFs> = Caches::new(64, DEFAULT_BLOCK_BYTES);
 
     let a = roble::open_with(&env_a, &dir_a, shared.clone())
         .await
@@ -178,5 +179,141 @@ async fn two_stores_sharing_a_cache_do_not_read_each_others_tables() {
         shared.open_tables(),
         2,
         "both tables should be held separately in the one cache"
+    );
+}
+
+#[compio::test]
+async fn a_repeated_read_touches_no_disk_at_all() {
+    // With the table open and its blocks held, the second identical read has
+    // nothing left to fetch. Zero rather than "less" is the right assertion:
+    // anything above it means something is being re-read that was already
+    // held.
+    let (env, dir, _) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let first = db.get(b"a0", Comparison::Equal).await.expect("get");
+    let after_first = env.sim().bytes_read();
+
+    let second = db.get(b"a0", Comparison::Equal).await.expect("get");
+    assert_eq!(
+        env.sim().bytes_read(),
+        after_first,
+        "the second read of the same key went to the disk again"
+    );
+    assert_eq!(first, second, "and it had better be the same answer");
+}
+
+#[compio::test]
+async fn the_block_budget_is_kept_and_the_answers_do_not_change() {
+    // A budget small enough that blocks are evicted between reads. Eviction
+    // has to be survivable, not merely correct.
+    let roomy = {
+        let (env, dir, _) = load("db-reads").await;
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut out = Vec::new();
+        for probe in [b"a0".as_slice(), b"c2", b"f3", b"u2", b"w0"] {
+            out.push(db.get(probe, Comparison::Ceiling).await.expect("get"));
+        }
+        out
+    };
+
+    let (env, dir, _) = load("db-reads").await;
+    let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, 4096);
+    let db = roble::open_with(&env, &dir, caches.clone())
+        .await
+        .expect("open");
+
+    let mut cramped = Vec::new();
+    for probe in [b"a0".as_slice(), b"c2", b"f3", b"u2", b"w0"] {
+        cramped.push(db.get(probe, Comparison::Ceiling).await.expect("get"));
+        assert!(
+            caches.block_bytes() <= 4096,
+            "the cache held {} bytes against a budget of 4096",
+            caches.block_bytes()
+        );
+    }
+    assert_eq!(cramped, roomy, "eviction changed an answer");
+}
+
+#[compio::test]
+async fn a_block_is_cached_decoded_rather_than_as_it_was_read() {
+    // §8: a compressed block is decompressed once and kept that way, so what
+    // is cached is no longer the bytes that came off the disk. The snappy
+    // fixture is the one place that difference is visible — in an
+    // uncompressed table the two are the same and the claim is untestable.
+    let sst = Path::new(env!("CARGO_MANIFEST_DIR")).join("format/tests/golden/snappy.sst");
+    let bytes = std::fs::read(&sst).expect("read the snappy fixture");
+
+    let env = SimEnv::new();
+    let fs: &SimFs = env.sim();
+    fs.mkdir_all(Path::new("/t")).await.expect("mkdir");
+    let path = PathBuf::from("/t/000001.sst");
+    let disk = fs.create(&path).await.expect("create");
+    let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
+    result.expect("write");
+    disk.close().await.expect("close");
+
+    let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, DEFAULT_BLOCK_BYTES);
+    let blocks = caches.blocks(0);
+    let disk = fs.open(&path, roble::Access::ReadOnly).await.expect("open");
+    let table = roble::table::OpenTable::open(1, disk, blocks.clone())
+        .await
+        .expect("open table");
+
+    let before = fs.bytes_read();
+    let target = roble_format::key::search_key(b"");
+    table
+        .seek_ge(&target)
+        .await
+        .expect("seek")
+        .expect("an entry");
+    let read = fs.bytes_read() - before;
+
+    assert!(read > 0, "the seek should have fetched a block");
+    assert!(
+        blocks.bytes_held() as u64 > read,
+        "the cache holds {} bytes for a block read as {read}; a compressed block kept \
+         as it was read would hold no more than it cost to fetch",
+        blocks.bytes_held()
+    );
+}
+
+#[compio::test]
+async fn two_stores_blocks_do_not_collide_either() {
+    // The twins share file number 000004, and their blocks share offsets too.
+    // Keying blocks by file number and offset alone would alias them.
+    let (env_a, dir_a, _) = load("db-twin-a").await;
+    let (env_b, dir_b, _) = load("db-twin-b").await;
+    let shared: Caches<SimFs> = Caches::new(64, DEFAULT_BLOCK_BYTES);
+
+    let a = roble::open_with(&env_a, &dir_a, shared.clone())
+        .await
+        .expect("open a");
+    let b = roble::open_with(&env_b, &dir_b, shared.clone())
+        .await
+        .expect("open b");
+
+    let from_a = a.get(b"a0", Comparison::Equal).await.expect("get");
+    let from_b = b.get(b"b0", Comparison::Equal).await.expect("get");
+    assert!(
+        from_a.is_some() && from_b.is_some(),
+        "each holds its own key"
+    );
+    assert_ne!(from_a, from_b);
+    assert!(
+        shared.blocks_held() >= 2,
+        "the two stores' blocks should be held apart, not aliased: {} held",
+        shared.blocks_held()
+    );
+
+    // And still right when read again, now from the cache.
+    assert_eq!(a.get(b"a0", Comparison::Equal).await.expect("get"), from_a);
+    assert_eq!(b.get(b"b0", Comparison::Equal).await.expect("get"), from_b);
+    assert!(
+        a.get(b"b0", Comparison::Equal)
+            .await
+            .expect("get")
+            .is_none(),
+        "store a must not find store b's key through a shared block"
     );
 }

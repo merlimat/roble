@@ -39,7 +39,7 @@ mod error;
 mod file;
 
 pub use buf::{ReadBuf, WriteBuf};
-pub use cache::Caches;
+pub use cache::{BlockCache, Caches};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};

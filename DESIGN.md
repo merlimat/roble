@@ -20,11 +20,12 @@
 > tombstones, bounded by count and shared by every store on a thread, with
 > data blocks fetched one at a time by handle rather than whole files.
 >
-> Still to come in M2: the block cache, which goes in front of that per-handle
-> fetch, and then scans. `get` still does its whole merge inside one call, and
-> there is no public iterator — a cursor that outlives a call has to hold the
-> blocks it is reading, so scans wait for the thing that owns blocks (§8).
-> §6 records what that costs.
+> and the **block cache**: decoded blocks keyed by store, table and offset,
+> under a byte budget, evicted by the same CLOCK.
+>
+> Still to come in M2: scans. `get` does its whole merge inside one call and
+> there is no public iterator yet; §6 records what that costs. The caches that
+> a cursor needs now exist, so that is what unblocks it.
 >
 > `open` is judged against whole databases Go Pebble wrote, committed under
 > `tests/golden/`, where Pebble's own reader describes the directory and roble
@@ -572,6 +573,14 @@ offset that is not aligned, so a read covers the enclosing aligned span and the
 block cache keeps the block, not the span. Frames are size-classed rather than
 encina's uniform 4 KiB, since blocks vary and a value block or a two-level index
 partition may be larger.
+
+**As built, the block cache holds decoded blocks on the heap, and neither
+size-classed frames nor span-aligned reads exist yet.** Both serve direct I/O,
+and direct I/O is not what the engine does today (§10): a frame pool with no
+aligned reads to fill it would be machinery with no caller. They arrive
+together, and the cache's shape — one owner of a block's bytes, keyed by store,
+table and offset — is what they slot into. What does exist is the budget and
+the eviction, which are what bound a node running hundreds of shards.
 
 That span-aligned read is also the only place direct I/O can live. The
 structures that find a block are small and unaligned — a 53-byte footer at the
