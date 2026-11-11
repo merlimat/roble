@@ -229,3 +229,68 @@ impl<'a> InternalKey<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind, its byte and its name, pinned one row at a time.
+    ///
+    /// A round trip alone would not do: two constants swapped in both
+    /// directions survive `from_byte(to_byte(k)) == k` and still write a
+    /// trailer Pebble reads as the wrong kind. The bytes are Pebble's, so they
+    /// are asserted against literals rather than against each other.
+    ///
+    /// Most of these never appear in a table roble reads — it refuses them
+    /// (§3) — which is exactly why nothing else reaches them: a kind roble
+    /// declines still has to be decoded correctly to be declined for the right
+    /// reason.
+    #[test]
+    fn every_kind_keeps_pebbles_byte_and_its_name() {
+        let table: &[(Kind, u8, &str)] = &[
+            (Kind::Delete, 0, "del"),
+            (Kind::Set, 1, "set"),
+            (Kind::Merge, 2, "merge"),
+            (Kind::SingleDelete, 7, "singledel"),
+            (Kind::RangeDelete, 15, "rangedel"),
+            (Kind::Separator, 17, "separator"),
+            (Kind::SetWithDelete, 18, "setwithdel"),
+            (Kind::RangeKeyDelete, 19, "rangekeydel"),
+            (Kind::RangeKeyUnset, 20, "rangekeyunset"),
+            (Kind::RangeKeySet, 21, "rangekeyset"),
+            (Kind::IngestSst, 22, "ingestsst"),
+            (Kind::DeleteSized, 23, "delsized"),
+            (Kind::Excise, 24, "excise"),
+        ];
+        for &(kind, byte, name) in table {
+            assert_eq!(kind.to_byte(), byte, "{kind:?} encodes to {byte}");
+            assert_eq!(
+                Kind::from_byte(byte).expect("a kind roble knows"),
+                kind,
+                "byte {byte} decodes to {kind:?}"
+            );
+            assert_eq!(kind.name(), name, "{kind:?} is named {name:?}");
+        }
+        assert_eq!(
+            table.len(),
+            13,
+            "a kind was added to the enum without a row here"
+        );
+    }
+
+    #[test]
+    fn a_byte_that_is_no_kind_is_corrupt_rather_than_guessed() {
+        // 3 is LogData, which Pebble writes only into a WAL and never into a
+        // table; the rest are gaps between the kinds and past the end.
+        for b in [3u8, 4, 8, 16, 25, 99, 255] {
+            let Err(err) = Kind::from_byte(b) else {
+                panic!("byte {b} is not a kind roble serves");
+            };
+            let text = format!("{err}");
+            assert!(
+                text.contains(&b.to_string()),
+                "the error should name the byte, got {text:?}"
+            );
+        }
+    }
+}

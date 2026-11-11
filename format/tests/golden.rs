@@ -397,3 +397,58 @@ fn the_writer_refuses_what_roble_does_not_write() {
     };
     assert!(w.add(earlier, b"v").is_err(), "descending keys must fail");
 }
+
+/// A MERGE key is refused wherever it is met, and for its own reason.
+///
+/// `refuse-merge.sst` is ordinary apart from one entry: the table opens, since
+/// nothing about its structure is unsupported, and the kind is only met when
+/// an entry is read. That is the point — the refusal has to come from reading,
+/// not from the header.
+///
+/// All three read paths are checked because `check_kind` is public for exactly
+/// this: a kind refused when a table is scanned and served when it is sought
+/// would be worse than either.
+#[test]
+fn a_merge_key_is_refused_by_every_path_that_reads_one() {
+    let bytes =
+        std::fs::read(golden_dir().join("refuse-merge.sst")).expect("read refuse-merge.sst");
+    let table = Table::open(&bytes).expect("the table itself is well formed");
+
+    let merge_key = b"/oxia/default/shard-0009/users/00000003";
+    let target = roble_format::key::search_key(merge_key);
+
+    let scanned = table
+        .for_each_entry(|_, _| Ok(()))
+        .expect_err("a scan must refuse the MERGE key");
+    let sought = table
+        .seek_ge(&target, |_, _| Ok(()))
+        .expect_err("a seek_ge onto the MERGE key must refuse it");
+    // seek_lt from just past the key lands on it.
+    let after = roble_format::key::search_key(b"/oxia/default/shard-0009/users/00000004");
+    let backwards = table
+        .seek_lt(&after, |_, _| Ok(()))
+        .expect_err("a seek_lt onto the MERGE key must refuse it");
+
+    for (path, err) in [
+        ("scan", &scanned),
+        ("seek_ge", &sought),
+        ("seek_lt", &backwards),
+    ] {
+        let text = format!("{err}");
+        assert!(
+            text.contains("MERGE keys: Oxia configures no merger"),
+            "{path} should name the merger, got {text:?}"
+        );
+        assert!(
+            matches!(err, roble_format::Error::Unsupported(_)),
+            "{path}: expected Unsupported, got {err:?}"
+        );
+    }
+
+    // The keys around it are ordinary, so what is refused is the kind and not
+    // the file: a seek that stops short of the MERGE key still answers.
+    let before = roble_format::key::search_key(b"/oxia/default/shard-0009/users/00000001");
+    table
+        .seek_ge(&before, |_, _| Ok(()))
+        .expect("a seek that does not reach the MERGE key still answers");
+}
