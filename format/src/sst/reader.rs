@@ -74,6 +74,11 @@ impl Metaindex {
         // Pebble refuses a v1 range-deletion block too: it is unfragmented,
         // and every format roble can open is past the point where one could
         // legitimately exist (`sstable/reader.go`).
+        // Untested, with a reason rather than a test (§12), and the same
+        // reason either side of the flag: no Pebble that could have written a
+        // table roble opens still writes `rocksdb.range_del`. It is refused
+        // because a reader that ignored the name would miss every deletion in
+        // it, which is worse than refusing a table nobody has.
         if parsed.range_del_v1_present {
             return Error::unsupported(
                 "table has an unfragmented v1 range-deletion block (rocksdb.range_del)",
@@ -116,6 +121,11 @@ impl<'a> Table<'a> {
                 let block = decode_block_at(bytes, h, footer.checksum)?;
                 Properties::decode(&Block::new(block.as_slice())?)?
             }
+            // Untested, with a reason (§12), as its twin in the engine is:
+            // every writer that exists emits a properties block, so a
+            // metaindex without one is a table built by hand. Checked anyway
+            // because the comparer below is read from it, and a missing block
+            // would otherwise be a silent "no comparer named".
             None => return Error::corrupt("table has no properties block"),
         };
 
@@ -182,6 +192,10 @@ impl<'a> Table<'a> {
     /// `blocks` comes from [`Table::value_blocks`].
     pub fn resolve_value(&self, blocks: &[BlockHandle], handle_bytes: &[u8]) -> Result<Vec<u8>> {
         let handle = crate::value_block::Handle::decode(handle_bytes)?;
+        // Untested, with a reason (§12), as its twin in the engine is: no
+        // writer numbers value blocks wrongly, and reaching this needs a
+        // table whose value-block index was edited after its checksum was
+        // computed, or the block check fires first.
         let block_handle = blocks.get(handle.block_num as usize).ok_or_else(|| {
             Error::Corrupt(format!(
                 "value handle names block {} of {}",
@@ -210,6 +224,10 @@ impl<'a> Table<'a> {
     /// algorithm and quietly got another would otherwise still pass, since
     /// every algorithm decodes to the same entries.
     pub fn block_compression(&self, handle: BlockHandle) -> Result<Compression> {
+        // The `None` below is untested for the same reason as the truncation
+        // check in `decode_block_at`: a handle reaching past the end is
+        // refused at the footer, before anything asks what a block was
+        // compressed with.
         let at = usize::try_from(handle.offset + handle.length)
             .map_err(|_| Error::Corrupt(format!("block offset {} too large", handle.offset)))?;
         match self.bytes.get(at) {
@@ -260,21 +278,6 @@ impl<'a> Table<'a> {
             out.extend(index_entries_of(&Block::new(part.as_slice())?)?);
         }
         Ok(out)
-    }
-
-    /// Whether the table's filter rules `user_key` out.
-    ///
-    /// `true` when there is no filter, because a table without one rules
-    /// nothing out. A `false` is final: the key is not in this table, and no
-    /// block need be read for it (§6).
-    pub fn may_contain(&self, user_key: &[u8]) -> Result<bool> {
-        let Some(block) = self.filter_block()? else {
-            return Ok(true);
-        };
-        Ok(match crate::filter::Filter::from_block(block.as_slice())? {
-            Some(filter) => filter.may_contain(user_key),
-            None => true,
-        })
     }
 
     /// Calls `f` with the first entry at or after `target`, and returns
@@ -386,6 +389,11 @@ fn decode_block_at(
         .checked_add(len)
         .and_then(|e| e.checked_add(TRAILER_SIZE))
         .ok_or_else(|| Error::Corrupt("block span overflows".to_string()))?;
+    // Untested, with a reason (§12): the footer refuses a handle that runs
+    // past the end before any block is read, and a table cut short enough to
+    // strand a data block has lost the footer with it, since the footer is
+    // the last thing in the file. This is the backstop for an index that
+    // names a block the file does not reach — bytes no writer produces.
     if end > bytes.len() {
         return Error::truncated("block", end, bytes.len());
     }
@@ -491,6 +499,8 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
         } else if name == META_RANGE_DEL_V2 {
             handles.range_del = Some(handle);
         } else if name == META_RANGE_DEL_V1 {
+            // Set here and refused in `Metaindex::parse`, which is where the
+            // reason for both is written.
             range_del_v1_present = true;
         } else if name == META_RANGE_KEY {
             range_key_present = true;
