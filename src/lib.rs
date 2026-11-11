@@ -29,6 +29,7 @@
 pub mod buf;
 pub mod cache;
 pub mod env;
+pub mod memtable;
 pub mod open;
 pub mod read;
 pub mod scan;
