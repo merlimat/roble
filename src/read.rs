@@ -37,12 +37,8 @@
 //! and `seek_ge`/`next`/`prev` over a snapshot arrive with the table cache
 //! that can hold an open reader.
 
-use std::rc::Rc;
-
-use roble_format::block::Value;
+use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
-use roble_format::rangedel::Tombstone;
-use roble_format::sst::Table;
 
 use crate::env::Fs;
 use crate::error::Result;
@@ -197,17 +193,12 @@ impl<F: Fs> Opened<'_, F> {
             if meta.largest_user_key()? < from {
                 continue;
             }
-            let bytes = self.table_bytes(meta.file_num).await?;
-            let table = Table::open(&bytes)?;
-            let mut here: Option<Vec<u8>> = None;
-            table.seek_ge(&target, |k, _| {
-                here = Some(k.user_key.to_vec());
-                Ok(())
-            })?;
-            if let Some(k) = here
-                && best.as_ref().is_none_or(|b| k < *b)
-            {
-                best = Some(k);
+            let table = self.open_table(meta.file_num).await?;
+            if let Some(entry) = table.seek_ge(&target).await? {
+                let k = InternalKey::decode(&entry.key)?.user_key.to_vec();
+                if best.as_ref().is_none_or(|b| k < *b) {
+                    best = Some(k);
+                }
             }
         }
         Ok(best)
@@ -221,17 +212,12 @@ impl<F: Fs> Opened<'_, F> {
             if meta.smallest_user_key()? >= bound {
                 continue;
             }
-            let bytes = self.table_bytes(meta.file_num).await?;
-            let table = Table::open(&bytes)?;
-            let mut here: Option<Vec<u8>> = None;
-            table.seek_lt(&target, |k, _| {
-                here = Some(k.user_key.to_vec());
-                Ok(())
-            })?;
-            if let Some(k) = here
-                && best.as_ref().is_none_or(|b| k > *b)
-            {
-                best = Some(k);
+            let table = self.open_table(meta.file_num).await?;
+            if let Some(entry) = table.seek_lt(&target).await? {
+                let k = InternalKey::decode(&entry.key)?.user_key.to_vec();
+                if best.as_ref().is_none_or(|b| k > *b) {
+                    best = Some(k);
+                }
             }
         }
         Ok(best)
@@ -249,8 +235,7 @@ impl<F: Fs> Opened<'_, F> {
             if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
                 continue;
             }
-            let bytes = self.table_bytes(meta.file_num).await?;
-            let table = Table::open(&bytes)?;
+            let table = self.open_table(meta.file_num).await?;
             // The filter is consulted only here: it answers about one key, and
             // the ordered comparisons are asking about a range (§6).
             //
@@ -262,26 +247,24 @@ impl<F: Fs> Opened<'_, F> {
                 continue;
             }
 
-            let mut here: Option<Candidate> = None;
-            table.seek_ge(&target, |k, v| {
-                if k.user_key != user {
-                    // The table has no version of this key; the seek landed
-                    // past it.
-                    return Ok(());
-                }
-                // Trailers sort descending, so the first entry a seek finds
-                // for a user key is that table's newest version of it.
-                here = Some(Candidate {
-                    trailer: (k.seq_num << 8) | k.kind.to_byte() as u64,
-                    kind: k.kind,
-                    value: resolve(&table, v)?,
-                });
-                Ok(())
-            })?;
-            if let Some(c) = here
-                && best.as_ref().is_none_or(|b| c.trailer > b.trailer)
-            {
-                best = Some(c);
+            let Some(entry) = table.seek_ge(&target).await? else {
+                continue;
+            };
+            let k = InternalKey::decode(&entry.key)?;
+            if k.user_key != user {
+                // The table has no version of this key; the seek landed past
+                // it.
+                continue;
+            }
+            // Trailers sort descending, so the first entry a seek finds for a
+            // user key is that table's newest version of it.
+            let candidate = Candidate {
+                trailer: (k.seq_num << 8) | k.kind.to_byte() as u64,
+                kind: k.kind,
+                value: entry.value,
+            };
+            if best.as_ref().is_none_or(|b| candidate.trailer > b.trailer) {
+                best = Some(candidate);
             }
         }
         Ok(best)
@@ -311,7 +294,7 @@ impl<F: Fs> Opened<'_, F> {
             if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
                 continue;
             }
-            for t in self.tombstones(meta.file_num).await?.iter() {
+            for t in self.open_table(meta.file_num).await?.tombstones.iter() {
                 if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
                     return Ok(false);
                 }
@@ -330,32 +313,5 @@ impl<F: Fs> Opened<'_, F> {
             .levels()
             .flat_map(|(_, tables)| tables.iter().cloned())
             .collect()
-    }
-
-    /// The tombstones of one table, read once and kept.
-    async fn tombstones(&self, file_num: u64) -> Result<Rc<Vec<Tombstone>>> {
-        if let Some(held) = self.tombstone_cache.borrow().get(&file_num) {
-            return Ok(Rc::clone(held));
-        }
-        let bytes = self.table_bytes(file_num).await?;
-        let tombs = Rc::new(Table::open(&bytes)?.range_deletions()?);
-        self.tombstone_cache
-            .borrow_mut()
-            .insert(file_num, Rc::clone(&tombs));
-        Ok(tombs)
-    }
-}
-
-/// Resolves a value, following a value-block handle when there is one.
-fn resolve(table: &Table<'_>, value: Value<'_>) -> roble_format::Result<Vec<u8>> {
-    match value {
-        Value::InPlace(b) => Ok(b.to_vec()),
-        Value::ValueHandle(h) => {
-            let blocks = table.value_blocks()?;
-            table.resolve_value(&blocks, h)
-        }
-        Value::BlobHandle(_) => Err(roble_format::Error::Unsupported(
-            "a value stored in a blob file, which is above roble's pin".to_string(),
-        )),
     }
 }

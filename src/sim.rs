@@ -89,9 +89,14 @@ struct State {
     locked: BTreeMap<PathBuf, bool>,
     /// Operations counted so far, which a scenario uses to decide where to
     /// inject a failure next.
+    //
+    // `bytes_read` sits beside it below.
     ops: u64,
     /// The operation number that should fail, if any.
     fail_at: Option<u64>,
+    /// Bytes handed back by reads, so a test can tell a store that fetches
+    /// the blocks it needs from one that reads whole files.
+    bytes_read: u64,
 }
 
 impl State {
@@ -121,6 +126,11 @@ impl SimFs {
     }
 
     /// How many operations have been performed.
+    pub fn bytes_read(&self) -> u64 {
+        self.state.borrow().bytes_read
+    }
+
+    /// How many operations have run.
     pub fn ops(&self) -> u64 {
         self.state.borrow().ops
     }
@@ -357,6 +367,7 @@ impl Disk for SimDisk {
         if let Err(e) = state.step(Op::Read) {
             return (Err(e), buf);
         }
+        state.bytes_read += buf.len() as u64;
         let Some(file) = state.files.get(&self.path) else {
             return (
                 Err(Error::Io(io::Error::new(

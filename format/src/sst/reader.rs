@@ -53,6 +53,36 @@ pub struct Metaindex {
     pub value_index: Option<crate::value_block::ValueIndex>,
 }
 
+impl Metaindex {
+    /// Parses a metaindex block, applying the refusals of §3.
+    ///
+    /// Public for the same reason as [`index_entries_of`]: an engine with a
+    /// block cache fetches the metaindex itself, and it must refuse the same
+    /// tables [`Table::open`] does. Putting the refusals here rather than in
+    /// the caller is what stops one path from reading a table the other turns
+    /// away.
+    pub fn parse(block: &Block<'_>) -> Result<Metaindex> {
+        let parsed = parse_metaindex(block)?;
+
+        // A range-key block means a key roble does not serve, and a file that
+        // should not exist in an Oxia database at all.
+        if parsed.range_key_present {
+            return Error::unsupported(
+                "table has a range-key block, which Oxia never writes and roble does not read",
+            );
+        }
+        // Pebble refuses a v1 range-deletion block too: it is unfragmented,
+        // and every format roble can open is past the point where one could
+        // legitimately exist (`sstable/reader.go`).
+        if parsed.range_del_v1_present {
+            return Error::unsupported(
+                "table has an unfragmented v1 range-deletion block (rocksdb.range_del)",
+            );
+        }
+        Ok(parsed.handles)
+    }
+}
+
 /// A readable Pebble sstable over bytes already in memory.
 ///
 /// The format crate does no I/O (DESIGN.md §7), so a table is a byte slice.
@@ -79,24 +109,7 @@ impl<'a> Table<'a> {
         let footer = Footer::decode(bytes, bytes.len() as u64)?;
 
         let metaindex_block = decode_block_at(bytes, footer.metaindex, footer.checksum)?;
-        let metaindex = parse_metaindex(&Block::new(metaindex_block.as_slice())?)?;
-
-        // A range-key block means a key roble does not serve, and a file that
-        // should not exist in an Oxia database at all (DESIGN.md §3).
-        if metaindex.range_key_present {
-            return Error::unsupported(
-                "table has a range-key block, which Oxia never writes and roble does not read",
-            );
-        }
-        // Pebble refuses a v1 range-deletion block too: it is unfragmented,
-        // and every format roble can open is past the point where one could
-        // legitimately exist (`sstable/reader.go`).
-        if metaindex.range_del_v1_present {
-            return Error::unsupported(
-                "table has an unfragmented v1 range-deletion block (rocksdb.range_del)",
-            );
-        }
-        let metaindex = metaindex.handles;
+        let metaindex = Metaindex::parse(&Block::new(metaindex_block.as_slice())?)?;
 
         let properties = match metaindex.properties {
             Some(h) => {
@@ -239,12 +252,12 @@ impl<'a> Table<'a> {
         let top = self.decode_block(self.footer.index)?;
         let top_block = Block::new(top.as_slice())?;
         if !self.two_level_index {
-            return collect_index(&top_block);
+            return index_entries_of(&top_block);
         }
         let mut out = Vec::new();
-        for partition in collect_index(&top_block)? {
+        for partition in index_entries_of(&top_block)? {
             let part = self.decode_block(partition.handle)?;
-            out.extend(collect_index(&Block::new(part.as_slice())?)?);
+            out.extend(index_entries_of(&Block::new(part.as_slice())?)?);
         }
         Ok(out)
     }
@@ -373,24 +386,16 @@ fn decode_block_at(
     if end > bytes.len() {
         return Error::truncated("block", end, bytes.len());
     }
-    let data = &bytes[start..start + len];
-    let trailer = &bytes[start + len..end];
-    let block_type = trailer[0];
-    let stored = u32::from_le_bytes(trailer[1..5].try_into().expect("4 bytes"));
-
-    let computed = checksum.compute(data, block_type)?;
-    if computed != stored {
-        return Err(Error::ChecksumMismatch {
-            offset: handle.offset,
-            stored,
-            computed,
-        });
-    }
-    crate::block::decode_compressed(Compression::from_byte(block_type)?, data)
+    // One implementation, shared with the engine's fetched-block path.
+    crate::block::decode_fetched(&bytes[start..end], handle.offset, checksum)
 }
 
-/// Reads an index block's values as block handles.
-fn collect_index(block: &Block<'_>) -> Result<Vec<IndexEntry>> {
+/// Reads an index block's separators and block handles.
+///
+/// Public because an engine that fetched the index block itself has to parse
+/// it the same way, and a second implementation of this is a second place for
+/// a two-level index to be read wrongly.
+pub fn index_entries_of(block: &Block<'_>) -> Result<Vec<IndexEntry>> {
     let mut out = Vec::new();
     // The raw iterator: an index separator is an internal key, but its value
     // is a block handle and never carries a value prefix byte.
@@ -408,13 +413,17 @@ fn collect_index(block: &Block<'_>) -> Result<Vec<IndexEntry>> {
 
 /// The first index entry whose separator reaches `target`, or one past the end.
 ///
+/// Public so that an engine fetching blocks itself uses this search rather
+/// than writing a second one; the unit tests below pin the equality case that
+/// the golden corpus cannot reach.
+///
 /// "Reaches" means at or past, equality included, and the equality matters: a
 /// separator is an internal key at or above every key in the block it bounds,
 /// and it may *be* one of them, so a target equal to a separator is answered
 /// by that block and not the next. The golden corpus cannot tell the two
 /// apart, because it probes with search keys whose trailer no real separator
 /// carries, so this is pinned by the unit test below instead.
-fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<usize> {
+pub fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<usize> {
     let (mut lo, mut hi) = (0usize, index.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -428,7 +437,10 @@ fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<usize>
 }
 
 /// Refuses a key roble does not serve, wherever it is met.
-fn check_kind(key: crate::InternalKey<'_>) -> Result<()> {
+///
+/// Public for the engine's own seeks: a kind refused when a table is scanned
+/// and served when it is sought would be worse than either.
+pub fn check_kind(key: crate::InternalKey<'_>) -> Result<()> {
     if !key.kind.is_accepted() {
         return Error::unsupported(format!(
             "key kind {} is not served by roble",

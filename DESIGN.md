@@ -16,11 +16,15 @@
 > deletes and range tombstones applied, judged against Pebble's own answers on
 > a database with overlapping tables in L0 above a compacted level.
 >
-> Still to come in M2: the table and block caches, and then scans. Those two
-> are one piece, not two — a cursor that outlives a call has to hold the blocks
-> it is reading, and the thing that owns blocks is the cache (§8). Until then
-> `get` does its whole merge inside one call, tables are read whole, and there
-> is no public iterator. §10 records what that costs.
+> and the **table cache** of §8: open readers with their index, filter and
+> tombstones, bounded by count and shared by every store on a thread, with
+> data blocks fetched one at a time by handle rather than whole files.
+>
+> Still to come in M2: the block cache, which goes in front of that per-handle
+> fetch, and then scans. `get` still does its whole merge inside one call, and
+> there is no public iterator — a cursor that outlives a call has to hold the
+> blocks it is reading, so scans wait for the thing that owns blocks (§8).
+> §6 records what that costs.
 >
 > `open` is judged against whole databases Go Pebble wrote, committed under
 > `tests/golden/`, where Pebble's own reader describes the directory and roble
@@ -426,12 +430,15 @@ reason to check: a table whose keys do not match the bounds its MANIFEST entry
 gives it would otherwise spin forever instead of returning an error, and an
 engine that hangs is worse than one that refuses (§2).
 
-Two costs of the same missing piece are worth naming rather than discovering.
-The four ordered comparisons re-seek every candidate table once per key they
-reject, so a long run of deleted keys costs a seek per table per key; a
-resumable iterator would step instead. And a table is read whole the first
-time it is touched. Both are the block cache's to fix, and both are why there
-is no public scan iterator yet: it would inherit them and be hard to unpick.
+One cost of the same missing piece is worth naming rather than discovering:
+the four ordered comparisons re-seek every candidate table once per key they
+reject, so a long run of deleted keys costs a seek per table per key. A
+resumable iterator would step instead, which is why there is no public scan
+iterator yet — it would inherit that and be hard to unpick.
+
+(A table is no longer read whole. The table cache holds an open reader with
+its footer, index, filter and tombstones, and data blocks are fetched one at a
+time by handle.)
 
 ### `delete_range(start..end)`
 
@@ -539,6 +546,20 @@ and passed to every store opened on it through `Options`, holding:
   eviction, as encina's leaf cache;
 - a **table cache**, open readers with their index and filter blocks, bounded by
   count, since an open reader costs file descriptors as well as memory.
+
+Both are keyed by **store and file number**, not by file number alone. File
+numbers are per database, so two shards on one thread both have a table
+000007; a cache keyed by the number alone hands one shard the other's table,
+which is a wrong answer rather than an error. Pebble has the same problem and
+solves it the same way, with a per-database cache id.
+
+Eviction is CLOCK rather than LRU: a second-chance bit per entry and a hand
+that sweeps, which costs one bit and no reordering on a hit, where an LRU
+would write to shared state on every read. A newly inserted entry arrives with
+its bit set, so being referenced buys one reprieve from the sweep rather than
+immunity. An entry larger than the whole budget is not cached at all, since
+evicting everything to make room for one oversized thing is worse than not
+caching it.
 
 A node runs hundreds of shards, so a per-store budget — encina's model — would
 either waste memory on cold shards or starve hot ones. Dividing one node budget

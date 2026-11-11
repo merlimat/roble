@@ -27,19 +27,22 @@
 //! is how §12 tests the failure paths.
 
 pub mod buf;
+pub mod cache;
 pub mod env;
 pub mod open;
 pub mod read;
 pub mod sim;
+pub mod table;
 pub mod version;
 
 mod error;
 mod file;
 
 pub use buf::{ReadBuf, WriteBuf};
+pub use cache::Caches;
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
-pub use open::{Opened, open};
+pub use open::{Opened, open, open_with};
 pub use read::{Comparison, Found};
 pub use version::{Table, Version, VersionSet};
