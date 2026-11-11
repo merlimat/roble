@@ -499,3 +499,71 @@ fn the_reader_refuses_a_foreign_comparer_too() {
         "expected Unsupported, got {err:?}"
     );
 }
+
+/// A table with no point key answers every read, rather than refusing them.
+///
+/// The shape is the one `compat/sst-roundtrip` round-trips as `rangedel-only`
+/// and [#24] gave the engine a test for: a flush whose every write was a
+/// `DeleteRange`. The reader has its own copies of the same three questions,
+/// reached by the dump command rather than by a database read, and its index
+/// is empty for all of them.
+///
+/// "Answers" rather than "finds": a seek returns `false` for having found
+/// nothing, which is not the same as an error, and the tombstones are still
+/// there to be read.
+#[test]
+fn a_table_with_no_point_key_answers_every_read() {
+    use roble_format::sst::{TableWriter, WriterOptions};
+
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    w.add_range_deletion(b"/oxia/a", b"/oxia/z", 5)
+        .expect("tombstone");
+    let bytes = w.finish().expect("finish");
+
+    let table = Table::open(&bytes).expect("an empty table still opens");
+    assert_eq!(
+        table.range_deletions().expect("tombstones").len(),
+        1,
+        "the tombstone survived"
+    );
+
+    let target = roble_format::key::search_key(b"/oxia/m");
+    assert!(
+        !table.seek_ge(&target, |_, _| Ok(())).expect("seek_ge"),
+        "seek_ge found nothing"
+    );
+    assert!(
+        !table.seek_lt(&target, |_, _| Ok(())).expect("seek_lt"),
+        "seek_lt found nothing"
+    );
+
+    let mut seen = 0;
+    table
+        .for_each_entry(|_, _| {
+            seen += 1;
+            Ok(())
+        })
+        .expect("scan");
+    assert_eq!(seen, 0, "there is nothing to scan");
+}
+
+/// A table with no filter block says so, rather than reporting an empty one.
+///
+/// Most of the corpus has no filter — only `bloom` is written with one — and
+/// the difference between "no filter" and "a filter that matches nothing" is
+/// the difference between reading a table and skipping it (§6). Pebble's
+/// `rocksdb.filter.policy` property is absent here, and `filter_block` has to
+/// agree with it.
+#[test]
+fn a_table_without_a_filter_has_no_filter_block() {
+    let bytes = std::fs::read(golden_dir().join("simple.sst")).expect("read simple.sst");
+    let table = Table::open(&bytes).expect("open simple.sst");
+    assert!(
+        table.filter_block().expect("read the metaindex").is_none(),
+        "simple.sst is written without a filter policy"
+    );
+    assert!(
+        table.properties().string("rocksdb.filter.policy").is_none(),
+        "and says so in its properties"
+    );
+}
