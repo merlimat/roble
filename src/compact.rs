@@ -107,7 +107,13 @@ impl<F: Fs> Opened<'_, F> {
         }
 
         let first_file_num = self.versions().next_file_num;
-        let merged = merge(&tables, &below, self.target_file_size(output_level)).await?;
+        let merged = merge(
+            &tables,
+            &below,
+            self.target_file_size(output_level),
+            self.compaction_unit(),
+        )
+        .await?;
 
         // Every output written and made durable before the edit that claims
         // any of them: a crash in the middle leaves files nothing refers to,
@@ -251,7 +257,12 @@ async fn merge<D: Disk>(
     tables: &[Rc<OpenTable<D>>],
     below: &[(Vec<u8>, Vec<u8>)],
     target_bytes: u64,
+    unit: u64,
 ) -> Result<Vec<(Vec<u8>, Bounds, u64)>> {
+    // The thread goes back to whatever else is ready every `unit` entries,
+    // so a merge of a million keys is a million keys' worth of work rather
+    // than a million keys' worth of waiting for everyone else (§9).
+    let mut pacer = crate::work::Pacer::new(unit);
     let mut iters = Vec::new();
     for t in tables {
         let mut it = t.iter();
@@ -300,6 +311,7 @@ async fn merge<D: Disk>(
             open.add(k, &encoded, &entry.value)?;
         }
         iters[w].next().await?;
+        pacer.did(1).await;
     }
 
     outputs.push(open.finish(&tombstones, None)?);

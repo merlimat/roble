@@ -120,6 +120,7 @@ pub struct Opened<'a, F: Fs> {
     l0_compaction_threshold: u64,
     lbase_max_bytes: u64,
     target_file_size: u64,
+    compaction_unit: u64,
     /// What replaying the MANIFEST established, and what a flush adds to.
     versions: std::cell::RefCell<VersionSet>,
 }
@@ -294,6 +295,7 @@ pub async fn open_with<'a, E: Env>(
         max_manifest_bytes: options.max_manifest_bytes,
         l0_compaction_threshold: options.l0_compaction_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
+        compaction_unit: options.compaction_unit,
         target_file_size: options.target_file_size,
         versions: std::cell::RefCell::new(versions),
     })
@@ -669,6 +671,11 @@ impl<F: Fs> Opened<'_, F> {
     /// How many bytes L1 may hold, each level below it ten times more.
     pub fn lbase_max_bytes(&self) -> u64 {
         self.lbase_max_bytes
+    }
+
+    /// How many entries a compaction merges before it hands the thread back.
+    pub fn compaction_unit(&self) -> u64 {
+        self.compaction_unit
     }
 
     /// How large a table a compaction into `level` aims to write.
