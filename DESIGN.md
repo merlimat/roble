@@ -846,6 +846,9 @@ in both directions.
   the last `flush()` with `disable_wal`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or
   a half-rotated marker must leave the database openable.
+  CI measures coverage on every pull request (`cargo llvm-cov`), posts the totals
+  as a status, and lists the lines and regions no test runs, such as the error
+  branch of a `?`. An uncovered failure path needs a test or a written reason.
 - **Benchmarks** against Go Pebble on Oxia's shape: small records, hundreds of
   shards, batches per write, floor lookups, reverse scans, and a checkpoint under
   load. Compressed against uncompressed is a first-class comparison (§8), as is

@@ -1,0 +1,81 @@
+# Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Coverage
+
+on:
+  pull_request:
+  # A pull request can restore the cache main saved, but not another pull
+  # request's, so only runs on main save it (save-if below).
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  # To post the totals as a commit status.
+  statuses: write
+
+# A new push to a pull request cancels its previous run. A run on main finishes,
+# to save its cache.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Test coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # The compat crates are harnesses that compat/*/run.sh drives against Go,
+      # not crates with tests of their own: counted here they would only report
+      # their own binaries as unrun. cargo-llvm-cov leaves out tests.rs; sim.rs
+      # is test code too, the simulated filesystem the failure-path tests drive.
+      - name: Run the tests under cargo-llvm-cov
+        run: >
+          cargo llvm-cov --workspace --locked
+          --exclude minlz-compat --exclude sst-roundtrip
+          --json --output-path target/coverage.json
+          --ignore-filename-regex 'src/sim\.rs$'
+      - name: Summarize
+        id: summary
+        run: python3 .github/scripts/coverage-summary.py target/coverage.json
+      - name: Post the totals as a commit status
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOTALS: ${{ steps.summary.outputs.totals }}
+        run: >
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA"
+          -f state=success -f context=coverage -f description="$TOTALS"
+          -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      # A pull request from a fork gets a read-only token, which can't post a status.
+      - name: Note that a fork gets no status
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: >
+          echo "This pull request comes from a fork, whose token can't post the totals
+          as a status." >> "$GITHUB_STEP_SUMMARY"
