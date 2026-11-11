@@ -79,7 +79,7 @@ pub struct Found {
 /// extends it, and so is at or after `user || 0`, or differs from it at some
 /// byte, and compares the same way against both. It is how a search steps past
 /// a user key it has rejected without having to enumerate its versions.
-fn successor(user: &[u8]) -> Vec<u8> {
+pub(crate) fn successor(user: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(user.len() + 1);
     out.extend_from_slice(user);
     out.push(0);
@@ -272,10 +272,7 @@ impl<F: Fs> Opened<'_, F> {
 
     /// Whether `found` is a live value for `user`.
     async fn visible(&self, user: &[u8], found: &Candidate) -> Result<bool> {
-        if matches!(
-            found.kind,
-            Kind::Delete | Kind::SingleDelete | Kind::DeleteSized
-        ) {
+        if crate::table::is_deletion(found.kind) {
             return Ok(false);
         }
         // A range tombstone newer than the entry covers it. Older ones do not,
@@ -290,15 +287,15 @@ impl<F: Fs> Opened<'_, F> {
         // before it — and it is written that way for that reason, not because
         // a test demanded it.
         let seq = found.trailer >> 8;
+        let mut tables = Vec::new();
         for meta in self.live_tables() {
             if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
                 continue;
             }
-            for t in self.open_table(meta.file_num).await?.tombstones.iter() {
-                if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
-                    return Ok(false);
-                }
-            }
+            tables.push(self.open_table(meta.file_num).await?);
+        }
+        if crate::table::covered_by_tombstone(&tables, user, seq)? {
+            return Ok(false);
         }
         Ok(true)
     }
