@@ -64,6 +64,7 @@ pub struct OpenTable<D: Disk> {
     value_blocks: Vec<BlockHandle>,
     /// Its range tombstones, decoded once.
     pub tombstones: Vec<Tombstone>,
+    blocks: crate::cache::BlockCache,
 }
 
 impl<D: Disk> OpenTable<D> {
@@ -73,7 +74,7 @@ impl<D: Disk> OpenTable<D> {
     /// [`Metaindex::parse`] rather than written again: a table refused when it
     /// is read whole and accepted when it is read block by block would be
     /// worse than either.
-    pub async fn open(file_num: u64, disk: D) -> Result<Self> {
+    pub async fn open(file_num: u64, disk: D, blocks: crate::cache::BlockCache) -> Result<Self> {
         let size = disk.len().await?;
         let tail = read_tail(&disk, FOOTER_LEN.min(size as usize), Default::default()).await?;
         let footer = Footer::decode(&tail, size)?;
@@ -138,6 +139,7 @@ impl<D: Disk> OpenTable<D> {
             filter,
             value_blocks,
             tombstones,
+            blocks,
         })
     }
 
@@ -151,11 +153,27 @@ impl<D: Disk> OpenTable<D> {
         Ok(roble_format::filter::Filter::new(bits)?.may_contain(user_key))
     }
 
+    /// One block, from the cache if it is there and from the file if not.
+    ///
+    /// Only the blocks a read touches go through the cache: the metaindex,
+    /// properties, index, filter and tombstones are read once when the table
+    /// is opened and kept in this struct, so caching them as well would spend
+    /// the block budget on bytes that are already held.
+    async fn block(&self, handle: BlockHandle) -> Result<Rc<Vec<u8>>> {
+        if let Some(held) = self.blocks.get(self.file_num, handle.offset) {
+            return Ok(held);
+        }
+        let bytes = fetch(&self.disk, handle, self.footer.checksum).await?;
+        self.blocks
+            .hold(self.file_num, handle.offset, Rc::clone(&bytes));
+        Ok(bytes)
+    }
+
     /// The first entry at or after `target`.
     pub async fn seek_ge(&self, target: &[u8]) -> Result<Option<Entry>> {
         let start = first_block_at_or_after(&self.index, target)?;
         for entry in &self.index[start..] {
-            let bytes = fetch(&self.disk, entry.handle, self.footer.checksum).await?;
+            let bytes = self.block(entry.handle).await?;
             let block = Block::new(&bytes)?;
             let mut cursor = block.data_cursor(self.footer.format);
             cursor.seek_ge(target)?;
@@ -176,7 +194,7 @@ impl<D: Disk> OpenTable<D> {
         let start = first_block_at_or_after(&self.index, target)?;
         let mut i = start.min(self.index.len() - 1);
         loop {
-            let bytes = fetch(&self.disk, self.index[i].handle, self.footer.checksum).await?;
+            let bytes = self.block(self.index[i].handle).await?;
             let block = Block::new(&bytes)?;
             let mut cursor = block.data_cursor(self.footer.format);
             cursor.seek_lt(target)?;
@@ -221,7 +239,7 @@ impl<D: Disk> OpenTable<D> {
                     self.value_blocks.len()
                 ))
             })?;
-        let bytes = fetch(&self.disk, *block_handle, self.footer.checksum).await?;
+        let bytes = self.block(*block_handle).await?;
         Ok(roble_format::value_block::value_in_block(&bytes, handle)?.to_vec())
     }
 

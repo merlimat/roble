@@ -138,6 +138,13 @@ func build(dir string) ([][]byte, error) {
 	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
 		return pebble.DBCompressionNone
 	})
+	// Small blocks, so every table holds several of them.
+	//
+	// With one data block per table every block sits at offset 0, and a block
+	// cache that lost the offset from its key would still find the right
+	// block every time — the fixture would look like it exercised the cache
+	// and would not.
+	smallBlocks(opts)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return nil, err
@@ -311,6 +318,14 @@ func build(dir string) ([][]byte, error) {
 	return keys, db.Close()
 }
 
+// smallBlocks makes each level write small data blocks.
+func smallBlocks(o *pebble.Options) {
+	for i := range o.Levels {
+		o.Levels[i].BlockSize = 128
+		o.Levels[i].IndexBlockSize = 128
+	}
+}
+
 // probesFor is every key worth asking about: the alphabet, the keys just
 // either side of each, and a few outside it entirely.
 func probesFor(keys [][]byte) [][]byte {
@@ -349,6 +364,7 @@ func probe(dir string, keys [][]byte) (string, error) {
 	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
 		return pebble.DBCompressionNone
 	})
+	smallBlocks(opts)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return "", err

@@ -45,6 +45,12 @@ use crate::table::OpenTable;
 /// a file descriptor.
 pub const DEFAULT_OPEN_TABLES: usize = 128;
 
+/// How many bytes of data blocks one thread keeps by default.
+///
+/// A size rather than a count, because blocks vary: a 16 KiB data block and a
+/// much larger value block cannot be budgeted the same way.
+pub const DEFAULT_BLOCK_BYTES: usize = 32 << 20;
+
 struct Slot<K, V> {
     key: K,
     value: V,
@@ -167,12 +173,84 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
 /// The table cache's shape: a CLOCK of open readers, shared by `Rc`.
 type TableClock<F> = Rc<RefCell<Clock<TableKey, Rc<OpenTable<<F as Fs>::Disk>>>>>;
 
+/// The block cache's shape. Not parameterised by the filesystem: a block is
+/// bytes, and keeping it that way is what stops a cycle — the table cache
+/// holds open tables, and an open table holds one of these.
+type BlockClock = Rc<RefCell<Clock<BlockKey, Rc<Vec<u8>>>>>;
+
+/// What identifies a block: the store, the table, and where in it.
+///
+/// The store for the same reason tables need it — file numbers are per
+/// database — and the offset rather than the block's index, because that is
+/// what a handle gives and what survives a table being reopened.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct BlockKey {
+    store: u64,
+    file_num: u64,
+    offset: u64,
+}
+
+/// One store's view of the block cache.
+///
+/// Held by every open table, which is why it carries the store id rather than
+/// taking one per call: a table belongs to exactly one store.
+#[derive(Clone)]
+pub struct BlockCache {
+    clock: BlockClock,
+    store: u64,
+}
+
+impl BlockCache {
+    /// The decoded block at `offset`, if it is still held.
+    ///
+    /// Decoded, not as read: a compressed block is decompressed once and kept
+    /// that way, so what is cached is no longer the bytes that came off the
+    /// disk (§8).
+    pub fn get(&self, file_num: u64, offset: u64) -> Option<Rc<Vec<u8>>> {
+        self.clock.borrow_mut().get(&BlockKey {
+            store: self.store,
+            file_num,
+            offset,
+        })
+    }
+
+    /// Keeps a decoded block, evicting until it fits.
+    pub fn hold(&self, file_num: u64, offset: u64, bytes: Rc<Vec<u8>>) {
+        let cost = bytes.len();
+        self.clock.borrow_mut().insert(
+            BlockKey {
+                store: self.store,
+                file_num,
+                offset,
+            },
+            bytes,
+            cost,
+        );
+    }
+
+    /// How many bytes of blocks are held, across every store.
+    pub fn bytes_held(&self) -> usize {
+        self.clock.borrow().used()
+    }
+
+    /// How many blocks are held, across every store.
+    pub fn len(&self) -> usize {
+        self.clock.borrow().len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// The caches every store on one thread shares.
 ///
 /// Cloning is cheap and shares: two stores given the same `Caches` draw on one
 /// budget, which is the point (§8).
 pub struct Caches<F: Fs> {
     tables: TableClock<F>,
+    blocks: BlockClock,
     next_store: Rc<std::cell::Cell<u64>>,
 }
 
@@ -195,18 +273,38 @@ impl<F: Fs> Clone for Caches<F> {
     fn clone(&self) -> Self {
         Caches {
             tables: Rc::clone(&self.tables),
+            blocks: Rc::clone(&self.blocks),
             next_store: Rc::clone(&self.next_store),
         }
     }
 }
 
 impl<F: Fs> Caches<F> {
-    /// Caches holding `open_tables` readers.
-    pub fn new(open_tables: usize) -> Self {
+    /// Caches holding `open_tables` readers and `block_bytes` of blocks.
+    pub fn new(open_tables: usize, block_bytes: usize) -> Self {
         Caches {
             tables: Rc::new(RefCell::new(Clock::new(open_tables))),
+            blocks: Rc::new(RefCell::new(Clock::new(block_bytes))),
             next_store: Rc::new(std::cell::Cell::new(0)),
         }
+    }
+
+    /// One store's view of the block cache.
+    pub fn blocks(&self, store: u64) -> BlockCache {
+        BlockCache {
+            clock: Rc::clone(&self.blocks),
+            store,
+        }
+    }
+
+    /// How many bytes of blocks are held.
+    pub fn block_bytes(&self) -> usize {
+        self.blocks.borrow().used()
+    }
+
+    /// How many blocks are held.
+    pub fn blocks_held(&self) -> usize {
+        self.blocks.borrow().len()
     }
 
     /// An identifier for a store about to draw on these caches.
@@ -239,7 +337,7 @@ impl<F: Fs> Caches<F> {
 
 impl<F: Fs> Default for Caches<F> {
     fn default() -> Self {
-        Caches::new(DEFAULT_OPEN_TABLES)
+        Caches::new(DEFAULT_OPEN_TABLES, DEFAULT_BLOCK_BYTES)
     }
 }
 
