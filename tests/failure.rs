@@ -340,3 +340,73 @@ async fn a_recovery_that_fails_partway_loses_nothing_that_was_durable() {
         );
     }
 }
+
+/// A disk that keeps the buffer it was handed, at any one operation.
+///
+/// This is §12's third pass, and the one the simulator could not do until it
+/// grew a seam: "once more with the operation returning other buffers than it
+/// was given, which the disk keeps until the run ends."
+///
+/// A disk is allowed to do this. `Disk::read` and `Disk::write` take a buffer
+/// by value and return one, and nothing in the trait says it is the same
+/// buffer — a kernel that still owns the memory returns another. What the
+/// engine must not do is read the buffer it got back as though it were the
+/// one it sent, which is why the one it gets back is poisoned rather than
+/// zeroed: `0xa5` through a key or a block header is visibly wrong, where
+/// zeroes read as a plausible empty.
+///
+/// **What this does not yet catch.** §8's size-classed frames do not exist —
+/// they arrive with direct I/O — so a withheld buffer is a `Vec` whose memory
+/// is merely kept, not a frame held out of a pool. The accounting half of
+/// this pass therefore has nothing to account for yet. What it does catch
+/// today is an engine that uses a buffer after the call that borrowed it
+/// failed, and that is worth having before the frames arrive rather than
+/// after.
+#[compio::test]
+async fn a_disk_that_keeps_its_buffer_is_survived() {
+    for wal in [true, false] {
+        let total = count_operations(wal).await;
+        let mut kept_any = 0u64;
+
+        for n in 1..=total {
+            let (env, dir) = load("db-simple").await;
+            env.sim().withhold_at(n);
+            // Allowed to fail. Not allowed to read the buffer it did not get
+            // back, or to leave a database that will not open.
+            let _ = scenario(&env, &dir, wal).await;
+            kept_any += env.sim().withheld() as u64;
+            env.sim().stop_withholding();
+
+            let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                panic!(
+                    "wal={wal}: withholding the buffer of operation {n} of {total} left a \
+                     database that will not open: {e}"
+                )
+            });
+            let found = contents(&db).await;
+            assert!(
+                durable_prefix(&found).is_some(),
+                "wal={wal}: withholding the buffer of operation {n} of {total} left a gap \
+                 in what survived"
+            );
+            // The poison must not have reached the store. A key or a value
+            // made of it would mean the engine read a buffer it had handed
+            // away, and the scan above would have carried it here.
+            for (key, value) in &found {
+                assert!(
+                    !key.iter().all(|b| *b == 0xa5) && !value.iter().all(|b| *b == 0xa5),
+                    "wal={wal}: withholding the buffer of operation {n} of {total} let a \
+                     withheld buffer reach the store"
+                );
+            }
+        }
+
+        // Most operations are not reads or writes — an open, a sync, a
+        // listing — so this does not expect every one to withhold. It does
+        // expect the seam to have fired, or the sweep is an ordinary run.
+        assert!(
+            kept_any > 0,
+            "wal={wal}: no operation ever withheld a buffer, so this swept nothing"
+        );
+    }
+}

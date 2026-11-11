@@ -40,6 +40,11 @@ use crate::buf::{ReadBuf, WriteBuf};
 use crate::env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 use crate::error::{Error, Result};
 
+/// What a withheld buffer is filled with instead: not zero, so that an
+/// engine reading it after the error gets something that cannot be mistaken
+/// for data it wrote.
+const POISON: u8 = 0xa5;
+
 /// What a simulated operation is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -94,6 +99,12 @@ struct State {
     ops: u64,
     /// The operation number that should fail, if any.
     fail_at: Option<u64>,
+    /// The operation number that should withhold its buffer, if any.
+    withhold_at: Option<u64>,
+    /// The buffers withheld so far, kept so that the memory behind them is
+    /// not reused while a test is still running — which is the whole point of
+    /// withholding one.
+    withheld: Vec<Vec<u8>>,
     /// Bytes handed back by reads, so a test can tell a store that fetches
     /// the blocks it needs from one that reads whole files.
     bytes_read: u64,
@@ -101,6 +112,20 @@ struct State {
 
 impl State {
     /// Counts an operation and says whether it should fail.
+    /// Whether the operation just counted should keep its buffer.
+    fn withholds(&self) -> bool {
+        self.withhold_at == Some(self.ops)
+    }
+
+    /// Keeps `bytes` and hands back a buffer of the same length that is not
+    /// it, poisoned so that reading it is visibly wrong rather than quietly
+    /// stale.
+    fn withhold(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        let len = bytes.len();
+        self.withheld.push(bytes);
+        vec![POISON; len]
+    }
+
     fn step(&mut self, op: Op) -> Result<()> {
         self.ops += 1;
         if self.fail_at == Some(self.ops) {
@@ -144,6 +169,34 @@ impl SimFs {
     /// Stops failing.
     pub fn stop_failing(&self) {
         self.state.borrow_mut().fail_at = None;
+    }
+
+    /// Makes the `n`th operation from now hand back a buffer that is not the
+    /// one it was given, counting from one (DESIGN.md §12).
+    ///
+    /// A disk is allowed to do this: `Disk::read` and `Disk::write` take a
+    /// buffer by value and return one, and nothing in the trait says it is
+    /// the same buffer. A kernel that still owns the memory it was handed
+    /// returns another, and an engine that assumed otherwise would be reading
+    /// bytes it no longer owns.
+    ///
+    /// The buffer handed back is poisoned rather than zeroed, so that an
+    /// engine which uses it after the error reads something visibly wrong
+    /// instead of something plausible. The buffer taken is kept until the
+    /// filesystem is dropped, which is what keeps its memory out of use.
+    pub fn withhold_at(&self, n: u64) {
+        let mut state = self.state.borrow_mut();
+        state.withhold_at = Some(state.ops + n);
+    }
+
+    /// Stops withholding.
+    pub fn stop_withholding(&self) {
+        self.state.borrow_mut().withhold_at = None;
+    }
+
+    /// How many buffers the disk is still holding.
+    pub fn withheld(&self) -> usize {
+        self.state.borrow().withheld.len()
     }
 
     /// Drops everything not made durable, as a machine crash would.
@@ -367,6 +420,15 @@ impl Disk for SimDisk {
         if let Err(e) = state.step(Op::Read) {
             return (Err(e), buf);
         }
+        if state.withholds() {
+            let kept = state.withhold(buf.into_vec());
+            return (
+                Err(Error::Io(io::Error::other(
+                    "simulated disk kept the read's buffer",
+                ))),
+                ReadBuf::from_vec(kept),
+            );
+        }
         state.bytes_read += buf.len() as u64;
         let Some(file) = state.files.get(&self.path) else {
             return (
@@ -403,6 +465,15 @@ impl Disk for SimDisk {
         let mut state = self.fs.state.borrow_mut();
         if let Err(e) = state.step(Op::Write) {
             return (Err(e), buf);
+        }
+        if state.withholds() {
+            let kept = state.withhold(buf.into_vec());
+            return (
+                Err(Error::Io(io::Error::other(
+                    "simulated disk kept the write's buffer",
+                ))),
+                WriteBuf::new(kept),
+            );
         }
         if !self.writable {
             return (
