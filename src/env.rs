@@ -27,9 +27,12 @@
 //!
 //! **A read is a byte range.** encina reads whole pages, because its file is
 //! pages. A table has no page size: a block is wherever the index says, at
-//! whatever length. Alignment for direct I/O is therefore the caller's
-//! business — the block cache reads the enclosing aligned span and keeps the
-//! block, not the span (§8) — and not something [`Disk`] can do on its own.
+//! whatever length, and the footer that finds the index is 53 bytes at the end
+//! of the file. So a [`Disk`] serves any offset and any length. An
+//! implementation that reads in aligned units owes that contract its own
+//! alignment — reading the enclosing span and copying out, as the block cache
+//! does for its frames (§8) — rather than handing `EINVAL` back to a caller
+//! that asked for a footer.
 //!
 //! What carries over is the part that makes a run reproducible: buffers are
 //! owned and handed back, so a disk that keeps one cannot make roble touch
@@ -157,10 +160,10 @@ pub trait Fs {
 /// Requests move owned buffers, handed back with the outcome, so that a disk
 /// which keeps a buffer cannot make roble touch memory it still lends.
 ///
-/// Unlike encina's, a read here is a **byte range**: a table has no page size.
-/// With direct I/O the caller must pass an aligned offset and length — the
-/// block cache reads the enclosing aligned span and keeps the block (§8) —
-/// and a disk is free to reject anything else.
+/// Unlike encina's, a read here is a **byte range**: a table has no page size,
+/// and the structures that find a block are small and land where they land.
+/// Every offset and length is therefore valid, and a disk that reads in aligned
+/// units aligns them itself rather than refusing them.
 // `len` here is a file's size, not a collection's count, so the companion
 // `is_empty` clippy asks for would be noise. encina's Disk allows the same.
 #[allow(clippy::len_without_is_empty)]

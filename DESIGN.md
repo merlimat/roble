@@ -33,8 +33,8 @@ Pebble database and a roble database are the same database.
 Its first user is a Rust implementation of [Oxia](https://github.com/oxia-db/oxia)'s
 data server, where it replaces Pebble behind the `kvstore.KV` interface. roble
 takes encina's approach to threads and I/O — one `!Send` store per thread, its
-own cache, direct I/O, all I/O through a trait the caller can implement — and
-applies it to someone else's file format.
+own cache, all I/O through a trait the caller can implement — and applies it to
+someone else's file format.
 
 ## 1. Workload
 
@@ -280,7 +280,7 @@ cost a dead shard if Pebble ever produced one on its own.
 | Format | Pebble's, pinned at §3. roble defines no format of its own, and has no format version of its own. |
 | Durability | **A WAL, on by default.** `write(batch, sync)` appends the batch repr to the log as one record, syncs it if asked, and then applies it to the memtable; `flush()` writes a table, installs the version edit, and retires the logs that edit covers. `disable_wal` skips the log entirely, which is what Oxia sets: then `flush()` is the only durability point. A WAL is an integral part of an LSM rather than a feature of this workload, and roble has to read Pebble's logs regardless, so it is in v1 (M3) rather than deferred — but the no-WAL path is tested as a first-class configuration, because it is the one Oxia runs (§1). |
 | Threading | One `!Send` store per thread, as encina: a compio runtime's, or whatever runs an env the caller implements. No locks or atomics outside wakers. Oxia already shards; a shard's store is owned by one thread. |
-| Memory | **Caches belong to the thread, not the store** (§8): the block cache and the table cache are created per thread and shared by every store on it, within one budget. This differs from encina, where each store has its own, and follows Oxia, where hundreds of shards share one cache. No OS page cache and no `mmap`: direct I/O. |
+| Memory | **Caches belong to the thread, not the store** (§8): the block cache and the table cache are created per thread and shared by every store on it, within one budget. This differs from encina, where each store has its own, and follows Oxia, where hundreds of shards share one cache. No `mmap`. Direct I/O is the goal and not yet the state: it needs aligned frames under the block cache (§8, §10), so v1 reads through the page cache, as Pebble does. |
 | Compaction | Cooperative on the owning thread by default, paced in units of work as encina paces a large merge, so a seeded run replays. Offload to a pool is a capability of the env, not a default (§9). |
 | Allocation | No allocation on the read path for an uncompressed block, which is cached as read. A compressed block costs one buffer per miss, which is why uncompressed is the default. Batches, iterator state and compaction buffers reuse their memory. |
 | Keys and values | Byte strings, ordered bytewise. Limits are Pebble's, not roble's. Values are written in place; roble reads the value blocks Go writes but produces none (§3). **No custom comparator at all**: roble asserts the comparer name in the MANIFEST is `leveldb.BytewiseComparator` and refuses the database otherwise, `oxia-slash-spans` included. |
@@ -297,7 +297,7 @@ open ─► replay the logs the MANIFEST leaves unflushed ─► memtables      
                                                                                            │
 get / scan ─► iterator tree ─► memtables, L0 sublevels, L1..L6 ─┐                          │
                                                                 ▼                          ▼
-                                                    table cache ─► block cache ─► direct I/O
+                                                    table cache ─► block cache ─► file I/O
                                                    (open readers)   (per thread, budget)
 compaction ◄── picker (scores) ──► merge inputs ──► new sstables ──► version edit
 ```
@@ -500,11 +500,23 @@ by the number of threads keeps roble's total within a configured bound, which is
 the property encina insists on, while sharing within a thread. The sharing needs
 no atomics: it is all within one thread, behind `Rc`.
 
-**Direct I/O and alignment.** A block is 16 KiB at an offset that is not
-aligned, so a read covers the enclosing aligned span and the block cache keeps
-the block, not the span. Frames are size-classed rather than encina's uniform
-4 KiB, since blocks vary and a value block or a two-level index partition may be
-larger.
+**Alignment is the cache's problem, not the caller's.** A block is 16 KiB at an
+offset that is not aligned, so a read covers the enclosing aligned span and the
+block cache keeps the block, not the span. Frames are size-classed rather than
+encina's uniform 4 KiB, since blocks vary and a value block or a two-level index
+partition may be larger.
+
+That span-aligned read is also the only place direct I/O can live. The
+structures that find a block are small and unaligned — a 53-byte footer at the
+end of the file, a metaindex of a few dozen bytes, a MANIFEST of partial chunks
+— and `O_DIRECT` refuses such a request with `EINVAL` instead of serving it. So
+`Disk` accepts any offset and any length (§10), and an implementation that reads
+in aligned units aligns them itself. roble tried the other order first, setting
+`O_DIRECT` on the open and declaring alignment the caller's business, and every
+unaligned write failed on Linux while passing on macOS, where `F_NOCACHE`
+carries no such contract. Direct I/O returns with the frames, as a disk that
+aligns what it is handed, and the cost until then is the page cache's second
+copy — which is what Pebble pays today.
 
 **Compression is where "no allocation on the read path" breaks.** A Snappy block
 must be decompressed into a buffer, so a cached block is no longer the bytes
@@ -559,10 +571,11 @@ them, so roble exports the same two: memtable stalls and L0 stalls.
 ## 10. Concurrency and I/O
 
 Reuse encina's shape: a store opens in an `Env`, which opens its files and runs
-its tasks, and all I/O goes through a `Disk` whose requests move owned,
-aligned buffers. `Db` is `!Send` and `!Sync`, a cheap `Clone` handle shared by
-one thread's tasks. `DefaultEnv` uses compio, with `O_DIRECT` on Linux and
-`F_NOCACHE` on macOS.
+its tasks, and all I/O goes through a `Disk` whose requests move owned buffers.
+A request is any byte range: a disk may not refuse an offset or a length, which
+is what rules `O_DIRECT` out of the open and puts it under the block cache
+instead (§8). `Db` is `!Send` and `!Sync`, a cheap `Clone` handle shared by one
+thread's tasks. `DefaultEnv` uses compio.
 
 **What has to change, and why.** encina has one file, created once. An LSM
 creates, renames, links and deletes files constantly, and its correctness
