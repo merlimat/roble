@@ -526,6 +526,179 @@ async fn overlapping_tables_below_l0_are_refused() {
     }
 }
 
+// The rest of what the replay refuses. These are the checks that only ever run
+// on a MANIFEST that is already wrong, so without a case each they are a claim
+// rather than a guard — and a guard that fires for the wrong reason, or not at
+// all, is how a corrupt database gets opened and read as if it were sound.
+
+#[compio::test]
+async fn a_comparer_that_changes_mid_manifest_is_refused() {
+    // Pebble writes the comparer once, in the MANIFEST's first edit. A second
+    // and different one would mean the key encoding changed underneath a
+    // database that had already been written with the first.
+    let (env, dir) = Synth {
+        edits: vec![
+            VersionEdit {
+                comparer_name: Some(BYTEWISE.to_string()),
+                next_file_num: Some(10),
+                last_seq_num: Some(20),
+                ..Default::default()
+            },
+            VersionEdit {
+                comparer_name: Some("pebble.internal.testkeys".to_string()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("comparer changes from") && m.contains("mid-MANIFEST"),
+            "got: {m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn repeating_the_same_comparer_is_not_a_change() {
+    // The check is for a *different* name, not for a second mention: an edit
+    // that names the comparer it already had must still open, or the refusal
+    // above would fire on databases that are perfectly sound.
+    let (env, dir) = Synth {
+        edits: vec![
+            VersionEdit {
+                comparer_name: Some(BYTEWISE.to_string()),
+                next_file_num: Some(10),
+                last_seq_num: Some(20),
+                ..Default::default()
+            },
+            VersionEdit {
+                comparer_name: Some(BYTEWISE.to_string()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    roble::open(&env, &dir)
+        .await
+        .expect("naming the same comparer twice is not a change");
+}
+
+#[compio::test]
+async fn an_edit_adding_a_table_the_level_already_holds_is_refused() {
+    // The mirror of deleting a table a level does not hold. Letting it through
+    // would leave the level holding one file number twice, which every lookup
+    // below would then have to cope with.
+    let (env, dir) = Synth {
+        edits: vec![VersionEdit {
+            comparer_name: Some(BYTEWISE.to_string()),
+            next_file_num: Some(10),
+            last_seq_num: Some(20),
+            new_tables: vec![table(6, 7, b"a", b"c", 5), table(6, 7, b"d", b"f", 5)],
+            ..Default::default()
+        }],
+        tables: vec![7],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("adds table 7 to L6, which already holds it"),
+            "got: {m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_manifest_naming_no_comparer_is_refused() {
+    // Every other check in the replay compares keys. Without a comparer there
+    // is nothing to compare them with, so this refuses rather than assuming
+    // bytewise and checking an order the database may not be in.
+    let (env, dir) = Synth {
+        edits: vec![VersionEdit {
+            next_file_num: Some(10),
+            last_seq_num: Some(20),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(m.contains("MANIFEST names no comparer"), "got: {m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_table_whose_sequence_numbers_run_backwards_is_refused() {
+    // A table's bounds and its sequence numbers are decoded from the same
+    // edit, so a pair in the wrong order means one of the two was read wrongly
+    // — and reading them wrongly is how a table ends up invisible to a
+    // snapshot that should see it.
+    let (env, dir) = Synth {
+        edits: vec![VersionEdit {
+            comparer_name: Some(BYTEWISE.to_string()),
+            next_file_num: Some(10),
+            last_seq_num: Some(20),
+            new_tables: vec![NewTable {
+                smallest_seq_num: 9,
+                largest_seq_num: 4,
+                ..table(6, 7, b"a", b"m", 5)
+            }],
+            ..Default::default()
+        }],
+        tables: vec![7],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("L6 table 7: sequence numbers 9..4 run backwards"),
+            "got: {m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
+async fn a_table_above_the_manifests_last_sequence_number_is_refused() {
+    // The MANIFEST's last sequence number is what every snapshot is taken
+    // against. A table holding one above it was written after the edit that
+    // claims to describe the database, so the two disagree about what exists.
+    let (env, dir) = Synth {
+        edits: vec![VersionEdit {
+            comparer_name: Some(BYTEWISE.to_string()),
+            next_file_num: Some(10),
+            last_seq_num: Some(20),
+            new_tables: vec![NewTable {
+                largest_seq_num: 21,
+                ..table(6, 7, b"a", b"m", 5)
+            }],
+            ..Default::default()
+        }],
+        tables: vec![7],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    match roble::open(&env, &dir).await {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("L6 table 7: holds sequence number 21, above the MANIFEST's last 20"),
+            "got: {m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
 #[compio::test]
 async fn overlapping_tables_in_l0_are_normal() {
     // The same overlap one level up is what a flush produces every time.
