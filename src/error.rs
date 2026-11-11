@@ -84,3 +84,95 @@ impl From<roble_format::Error> for Error {
         Error::Format(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io() -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, "a reason the OS gave")
+    }
+
+    /// The prefix is the operator-facing distinction, so it is what is pinned.
+    ///
+    /// Every test in this crate matches on the variant — `Err(Error::Corrupt(m))`
+    /// and then `m.contains(..)` — which never formats anything. So the strings
+    /// someone reads when a database will not open had never been produced.
+    /// "corrupt:" means the file is damaged and "unsupported:" means roble is
+    /// the wrong reader for it, and those call for different actions.
+    #[test]
+    fn a_refusal_says_which_kind_of_refusal_it_is() {
+        assert_eq!(
+            Error::Corrupt("the MANIFEST ends early".to_string()).to_string(),
+            "corrupt: the MANIFEST ends early"
+        );
+        assert_eq!(
+            Error::Unsupported("range keys".to_string()).to_string(),
+            "unsupported: range keys"
+        );
+    }
+
+    /// The three that carry their own wording, unprefixed.
+    ///
+    /// `NotFound` is a sentence already — "no database in /tmp/x: it holds no
+    /// marker..." — and prefixing it would read as a category where the text
+    /// is the explanation. `Io` and `Format` defer to an error that has
+    /// already said it better than a wrapper could.
+    #[test]
+    fn the_errors_that_speak_for_themselves_are_not_dressed_up() {
+        assert_eq!(Error::Io(io()).to_string(), io().to_string());
+
+        let inner = roble_format::Error::Corrupt("a bad block".to_string());
+        assert_eq!(Error::Format(inner).to_string(), "corrupt: a bad block");
+
+        assert_eq!(
+            Error::NotFound("no database in /tmp/x".to_string()).to_string(),
+            "no database in /tmp/x"
+        );
+        assert_eq!(
+            Error::Locked.to_string(),
+            "the database directory is already open elsewhere"
+        );
+    }
+
+    /// What an error chain walker finds underneath.
+    ///
+    /// `anyhow` and `tracing` print the chain rather than the top line, so a
+    /// source that came back `None` would drop the operating system's own
+    /// wording from a log at the moment it was the only useful part.
+    #[test]
+    fn the_errors_that_wrap_another_hand_it_over() {
+        use std::error::Error as _;
+
+        let wrapped = Error::Io(io());
+        let source = wrapped.source().expect("an io error has a source");
+        assert_eq!(source.to_string(), io().to_string());
+
+        let inner = roble_format::Error::Corrupt("a bad block".to_string());
+        let wrapped = Error::Format(inner);
+        let source = wrapped.source().expect("a format error has a source");
+        assert!(source.to_string().contains("a bad block"), "{source}");
+
+        // And the ones that are the whole story have nothing underneath.
+        for e in [
+            Error::Locked,
+            Error::Unsupported("x".to_string()),
+            Error::Corrupt("x".to_string()),
+            Error::NotFound("x".to_string()),
+        ] {
+            assert!(e.source().is_none(), "{e} should have no source");
+        }
+    }
+
+    #[test]
+    fn an_io_error_becomes_one_of_ours_without_losing_its_kind() {
+        // The `?` in every filesystem call goes through this conversion, so
+        // the kind has to survive it: `main` tells a broken pipe from a real
+        // failure by asking for it.
+        let converted: Error = io().into();
+        match converted {
+            Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+}
