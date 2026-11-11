@@ -283,6 +283,27 @@ impl Memtable {
         &self.ranges
     }
 
+    /// Adds a range deletion, checking that it is one.
+    ///
+    /// An **empty** range is not an error. Pebble's `DeleteRange(a, a)` is
+    /// legal and covers nothing, and roble applies batches that came out of
+    /// Pebble's own WAL — so refusing one would mean refusing a database
+    /// Pebble wrote. It is dropped rather than stored, since a tombstone
+    /// covering nothing has nothing to say. A **reversed** range is
+    /// malformed, and that is refused.
+    pub(crate) fn add_range(&mut self, start: &[u8], end: &[u8], seq_num: u64) -> Result<()> {
+        match end.cmp(start) {
+            std::cmp::Ordering::Less => Err(Error::Corrupt(format!(
+                "a range deletion from {start:02x?} to {end:02x?}, which ends before it starts"
+            ))),
+            std::cmp::Ordering::Equal => Ok(()),
+            std::cmp::Ordering::Greater => {
+                self.insert_range(start, end, seq_num);
+                Ok(())
+            }
+        }
+    }
+
     /// Adds a range deletion.
     fn insert_range(&mut self, start: &[u8], end: &[u8], seq_num: u64) {
         // The bounds are not copied into the arena: the tombstone owns them,
@@ -320,25 +341,7 @@ impl Memtable {
                     let end = entry.value.ok_or_else(|| {
                         Error::Corrupt("a range deletion with no end key".to_string())
                     })?;
-                    // An **empty** range is not an error. Pebble's
-                    // `DeleteRange(a, a)` is legal and covers nothing, and
-                    // roble applies batches that came out of Pebble's own
-                    // WAL — so refusing one would mean refusing a database
-                    // Pebble wrote. It is dropped rather than stored, since a
-                    // tombstone covering nothing has nothing to say.
-                    //
-                    // A **reversed** range is malformed, and that is refused.
-                    match end.cmp(entry.key) {
-                        std::cmp::Ordering::Less => {
-                            return Err(Error::Corrupt(format!(
-                                "a range deletion from {:02x?} to {:02x?}, which ends \
-                                 before it starts",
-                                entry.key, end
-                            )));
-                        }
-                        std::cmp::Ordering::Equal => {}
-                        std::cmp::Ordering::Greater => self.insert_range(entry.key, end, seq),
-                    }
+                    self.add_range(entry.key, end, seq)?;
                 }
                 kind => {
                     if !kind.is_accepted() || kind == Kind::Merge {

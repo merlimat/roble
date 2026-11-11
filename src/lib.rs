@@ -26,6 +26,7 @@
 //! filesystem that can be made to fail or crash at any single operation, which
 //! is how §12 tests the failure paths.
 
+pub mod batch;
 pub mod buf;
 pub mod cache;
 pub mod env;
@@ -44,6 +45,7 @@ pub mod version;
 mod error;
 mod file;
 
+pub use batch::IndexedBatch;
 pub use buf::{ReadBuf, WriteBuf};
 pub use cache::{BlockCache, Caches};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};

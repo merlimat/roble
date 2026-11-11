@@ -34,8 +34,6 @@
 
 use std::path::PathBuf;
 
-use roble_format::batch::Batch;
-
 #[compio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -75,9 +73,14 @@ async fn main() {
     // Several batches, so the log holds more than one record, and one large
     // enough to span a 32 KiB block — the case where a chunk has to be split
     // and the second chunk's position depends on the first.
+    //
+    // Written through *indexed* batches, so what Pebble reads back is the
+    // representation one of those produces. The index itself never reaches
+    // the disk, which is the point: Go Pebble is what says the repr beneath
+    // it is unchanged by having an index over it.
     let mut wrote: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-    let mut batch = Batch::new();
+    let mut batch = db.batch();
     for i in 0..8 {
         let k = format!("wal-{i:03}").into_bytes();
         let v = format!("value-{i}").into_bytes();
@@ -86,30 +89,50 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("put: {e}")));
         wrote.push((k, v));
     }
-    db.write(&mut batch, !no_wal)
+    // Read back through itself before it commits, which is what Oxia does
+    // and what an index is for.
+    let seen = batch
+        .get(b"wal-000", roble::Comparison::Equal)
         .await
-        .unwrap_or_else(|e| fail(&format!("write: {e}")));
+        .unwrap_or_else(|e| fail(&format!("get through the batch: {e}")));
+    if seen.map(|f| f.value).as_deref() != Some(b"value-0".as_slice()) {
+        fail("the batch could not read back its own first key");
+    }
+    batch
+        .commit(!no_wal)
+        .await
+        .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
-    let mut batch = Batch::new();
+    let mut batch = db.batch();
     let big_key = b"wal-big".to_vec();
     let big_value = vec![b'x'; 40 * 1024];
     batch
         .put(&big_key, &big_value)
         .unwrap_or_else(|e| fail(&format!("put: {e}")));
     wrote.push((big_key, big_value));
-    db.write(&mut batch, !no_wal)
+    batch
+        .commit(!no_wal)
         .await
-        .unwrap_or_else(|e| fail(&format!("write: {e}")));
+        .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
     // A delete of a key the tables hold, so Pebble has to apply roble's
     // tombstone and not merely add keys.
-    let mut batch = Batch::new();
+    let mut batch = db.batch();
     batch
         .delete(b"alpha")
         .unwrap_or_else(|e| fail(&format!("delete: {e}")));
-    db.write(&mut batch, !no_wal)
+    if batch
+        .get(b"alpha", roble::Comparison::Equal)
         .await
-        .unwrap_or_else(|e| fail(&format!("write: {e}")));
+        .unwrap_or_else(|e| fail(&format!("get through the batch: {e}")))
+        .is_some()
+    {
+        fail("the batch did not read back its own delete");
+    }
+    batch
+        .commit(!no_wal)
+        .await
+        .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
     if flush {
         let table = db
