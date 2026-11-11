@@ -147,11 +147,11 @@ impl<F: Fs> Opened<'_, F> {
 
     /// Runs the compaction [`Opened::pick`] chose, if there is one.
     ///
-    /// Returns the output table's file number, `None` if nothing was worth
+    /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.
-    pub async fn compact_once(&self) -> Result<Option<u64>> {
+    pub async fn compact_once(&self) -> Result<Vec<u64>> {
         let Some(pick) = self.pick() else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         self.compact(pick.level, &pick.tables).await
     }

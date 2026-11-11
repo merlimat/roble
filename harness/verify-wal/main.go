@@ -120,7 +120,7 @@ func main() {
 	case "rotated":
 		fmt.Println("\nVERDICT: Go Pebble reads a database through a MANIFEST roble wrote from nothing")
 	case "compacted":
-		fmt.Println("\nVERDICT: Go Pebble reads a table roble compacted out of others")
+		fmt.Println("\nVERDICT: Go Pebble reads tables roble compacted out of others, meeting at exclusive bounds")
 	case "settled":
 		fmt.Println("\nVERDICT: Go Pebble reads a database roble spread across levels by itself")
 	case "no-wal":

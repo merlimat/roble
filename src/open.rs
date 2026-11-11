@@ -102,6 +102,7 @@ pub struct Opened<'a, F: Fs> {
     /// What the picker allows L0 and L1 to hold (`crate::pick`).
     l0_compaction_threshold: u64,
     lbase_max_bytes: u64,
+    target_file_size: u64,
     /// What replaying the MANIFEST established, and what a flush adds to.
     versions: std::cell::RefCell<VersionSet>,
 }
@@ -262,6 +263,7 @@ pub async fn open_with<'a, E: Env>(
         max_manifest_bytes: options.max_manifest_bytes,
         l0_compaction_threshold: options.l0_compaction_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
+        target_file_size: options.target_file_size,
         versions: std::cell::RefCell::new(versions),
     })
 }
@@ -612,6 +614,16 @@ impl<F: Fs> Opened<'_, F> {
     /// How many bytes L1 may hold, each level below it ten times more.
     pub fn lbase_max_bytes(&self) -> u64 {
         self.lbase_max_bytes
+    }
+
+    /// How large a table a compaction into `level` aims to write.
+    ///
+    /// Pebble's `TargetFileSizes`: L0's, then twice that for each level
+    /// below. Deeper levels hold more and are rewritten less often, so
+    /// larger files there cost fewer of them.
+    pub fn target_file_size(&self, level: u32) -> u64 {
+        self.target_file_size
+            .saturating_mul(1u64.checked_shl(level).unwrap_or(u64::MAX))
     }
 
     /// Points the store at a MANIFEST the marker now names.

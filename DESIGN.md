@@ -104,8 +104,14 @@
 > covers, and a deletion with nothing left below it to hide — and the third
 > is the one that resurrects keys when it is wrong, so it asks the version
 > rather than reading the level number. Overlapping tombstones are fragmented
-> into the shape a range-deletion block holds. **Go Pebble reads a table
-> roble compacted out of others.**
+> into the shape a range-deletion block holds, and the output is **split at a
+> target file size** — which is what puts a range deletion across a boundary,
+> clipped so that the table before it ends at the **exclusive sentinel** and
+> the table after begins at that very user key. Two tables of one level may
+> meet at a key without overlapping, and roble's own overlap check had been
+> reading the bound as inclusive and so would have refused a database Pebble
+> wrote. **Go Pebble reads tables roble compacted out of others, meeting at
+> exclusive bounds.**
 >
 > And the **picker**: every level scored against what it is allowed to hold —
 > L0 by table count, the rest by bytes — and the worst offender compacted into
@@ -431,6 +437,13 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   §6 says what it must not do.
 - **One flush and one compaction at a time per store**, both cooperative, so a
   write never waits on a compaction's merge for more than a slice of work (§9).
+- **A level's tables may touch but not overlap.** Two tables of one level may
+  share a user key at their bounds when the first ends there *exclusively* —
+  its largest key being a range deletion's end at the largest sequence number
+  there is, which a tombstone excludes. This is Pebble's rule from
+  `manifest.CheckOrdering`, and it is the ordinary result of a compaction
+  split inside a range deletion, so reading the bound as inclusive refuses
+  databases Pebble writes.
 - **Obsolete files are deleted only after the edit that retired them is
   durable**: at the end of a flush, and at an open, where the MANIFEST just
   replayed is as durable as it gets. A table goes when the current version
@@ -762,9 +775,11 @@ feed it, with `compact_once()` joining the two. What a merge drops, and why
 each is safe, is written out in `src/compact.rs`; what it does not drop yet is
 a range tombstone that has nothing left below it, since carrying a spent
 tombstone costs a reader a comparison and dropping a live one brings a key
-back from the dead. The output is one table: splitting at a target size is
-still owed, as are L0 sublevels, cooperative execution and the write-stall
-counters.
+back from the dead. The output is split at `Options::target_file_size` — 2 MiB
+for L0 and twice that for each level below, as Pebble's `TargetFileSizes` —
+and a tombstone straddling a split is clipped at it, so the tables either side
+meet at one user key rather than overlapping across it. L0 sublevels,
+cooperative execution and the write-stall counters are still owed.
 
 The picker is **not scheduled**: nothing runs a compaction behind the caller's
 back yet. Wiring it into a flush waits for the cooperative execution below,

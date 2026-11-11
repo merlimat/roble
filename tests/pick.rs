@@ -158,7 +158,7 @@ async fn the_worst_level_is_the_one_picked() {
         .iter()
         .map(|t| t.file_num)
         .collect();
-    db.compact(0, &l0).await.expect("compact").expect("a table");
+    db.compact(0, &l0).await.expect("compact");
     let l1_bytes: u64 = db.versions().version.level(1).iter().map(|t| t.size).sum();
     assert!(l1_bytes > 64, "L1 should be past its allowance");
 
@@ -205,7 +205,7 @@ async fn a_tie_goes_to_the_level_nearest_l0() {
             .iter()
             .map(|t| t.file_num)
             .collect();
-        db.compact(0, &l0).await.expect("compact").expect("a table");
+        db.compact(0, &l0).await.expect("compact");
         flush_keys(&db, "f", 0, 4).await;
         flush_keys(&db, "f", 4, 4).await;
 
@@ -258,7 +258,7 @@ async fn a_level_below_l0_is_picked_one_table_at_a_time() {
             .iter()
             .map(|t| t.file_num)
             .collect();
-        db.compact(0, &l0).await.expect("compact").expect("a table");
+        db.compact(0, &l0).await.expect("compact");
     }
     let in_l1: Vec<(u64, u64)> = db
         .versions()
@@ -323,10 +323,7 @@ async fn the_last_level_is_never_picked() {
         if tables.is_empty() {
             continue;
         }
-        db.compact(level, &tables)
-            .await
-            .expect("compact")
-            .expect("a table");
+        db.compact(level, &tables).await.expect("compact");
     }
     let last: u64 = db.versions().version.level(6).iter().map(|t| t.size).sum();
     assert!(
@@ -365,11 +362,8 @@ async fn the_allowance_grows_with_depth() {
             .iter()
             .map(|t| t.file_num)
             .collect();
-        let l1 = db.compact(0, &l0).await.expect("compact").expect("a table");
-        db.compact(1, &[l1])
-            .await
-            .expect("compact")
-            .expect("a table");
+        let l1 = db.compact(0, &l0).await.expect("compact");
+        db.compact(1, &l1).await.expect("compact");
         in_l2 = db
             .versions()
             .version

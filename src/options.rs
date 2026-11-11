@@ -34,6 +34,9 @@ pub struct Options<F: Fs> {
     pub(crate) l0_compaction_threshold: u64,
     /// How many bytes L1 may hold; each level below it ten times more.
     pub(crate) lbase_max_bytes: u64,
+    /// How large a table a compaction aims to write into L0; each level
+    /// below it twice as large.
+    pub(crate) target_file_size: u64,
 }
 
 impl<F: Fs> Default for Options<F> {
@@ -44,6 +47,7 @@ impl<F: Fs> Default for Options<F> {
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
+            target_file_size: crate::compact::TARGET_FILE_SIZE,
         }
     }
 }
@@ -106,6 +110,13 @@ impl<F: Fs> Options<F> {
     /// (`crate::pick`).
     pub fn lbase_max_bytes(mut self, bytes: u64) -> Self {
         self.lbase_max_bytes = bytes;
+        self
+    }
+
+    /// How large a table a compaction into L0 aims to write, each level
+    /// below it twice as large (`crate::compact`).
+    pub fn target_file_size(mut self, bytes: u64) -> Self {
+        self.target_file_size = bytes;
         self
     }
 }

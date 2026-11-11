@@ -25,7 +25,7 @@
 
 use std::collections::BTreeSet;
 
-use roble_format::key::InternalKey;
+use roble_format::key::{InternalKey, Kind};
 use roble_format::manifest::{NUM_LEVELS, NewTable, VersionEdit};
 
 use crate::error::{Error, Result};
@@ -80,6 +80,24 @@ impl Table {
     /// The user key part of its smallest bound.
     pub fn smallest_user_key(&self) -> Result<&[u8]> {
         Ok(InternalKey::decode(&self.smallest)?.user_key)
+    }
+
+    /// Whether its largest key excludes point keys at that user key.
+    ///
+    /// A table whose last thing is a range deletion ends at the **sentinel**
+    /// — the tombstone's end key at the largest sequence number there is —
+    /// and a tombstone's end is exclusive. So a table bounded that way holds
+    /// nothing at all at that user key, and the next table along may start
+    /// there without the two overlapping.
+    ///
+    /// Pebble calls this `IsExclusiveSentinel` and tests the sequence number
+    /// alone for a trailer, the kind as well for a whole key. roble checks
+    /// both: the kinds Pebble also accepts here are range keys, which roble
+    /// refuses outright (§3), so a key at the largest sequence number with
+    /// any other kind is a key roble should not be reading.
+    pub fn largest_is_exclusive(&self) -> Result<bool> {
+        let k = InternalKey::decode(&self.largest)?;
+        Ok(k.seq_num == roble_format::key::SEQ_NUM_MAX && k.kind == Kind::RangeDelete)
     }
 
     /// The user key part of its largest bound.
@@ -315,13 +333,26 @@ impl VersionSet {
                     t.smallest_user_key()?.to_vec(),
                     t.largest_user_key()?.to_vec(),
                     t.file_num,
+                    t.largest_is_exclusive()?,
                 ));
             }
             bounds.sort();
             for pair in bounds.windows(2) {
-                let ((_, before_largest, before), (after_smallest, _, after)) =
+                let ((_, before_largest, before, exclusive), (after_smallest, _, after, _)) =
                     (&pair[0], &pair[1]);
-                if before_largest >= after_smallest {
+                // Pebble's rule, from `manifest.CheckOrdering`:
+                //
+                //     v := cmp(prev.Largest().UserKey, f.Smallest().UserKey)
+                //     if v > 0 || (v == 0 && !prev.Largest().IsExclusiveSentinel())
+                //
+                // Two tables touching at one user key is not an overlap when
+                // the first ends there exclusively, and it is the ordinary
+                // shape of a compaction split inside a range deletion: the
+                // tombstone is clipped at the boundary, so the first table
+                // ends at the sentinel and the second begins at that key.
+                // Reading this as `>=` refuses a database Pebble wrote.
+                let touching = before_largest == after_smallest;
+                if before_largest > after_smallest || (touching && !exclusive) {
                     return Err(Error::Corrupt(format!(
                         "L{level} tables {before} and {after} overlap, which Pebble never \
                          leaves below L0"

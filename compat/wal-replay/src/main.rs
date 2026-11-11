@@ -76,6 +76,11 @@ async fn main() {
         // has something to do.
         options = options.l0_compaction_threshold(2).lbase_max_bytes(4096);
     }
+    if compact {
+        // Small enough that the merge below splits its output, which is what
+        // puts a range deletion across a boundary.
+        options = options.target_file_size(4096);
+    }
     let db = roble::open_with(&roble::DefaultEnv, &dir, options)
         .await
         .unwrap_or_else(|e| fail(&format!("open {}: {e}", dir.display())));
@@ -160,8 +165,9 @@ async fn main() {
 
     if compact {
         // A second table over the same keys, so the merge has versions to
-        // drop, plus a range deletion so the output carries a
-        // range-deletion block.
+        // drop; a range deletion so the output carries a range-deletion
+        // block; and enough bulk after it, inside its range, that the output
+        // splits with the tombstone across a boundary.
         let mut batch = db.batch();
         for i in 0..8 {
             let k = format!("wal-{i:03}").into_bytes();
@@ -172,8 +178,16 @@ async fn main() {
             wrote.push((k, b"compacted".to_vec()));
         }
         batch
-            .delete_range(b"wal-100", b"wal-200")
+            .delete_range(b"split-0000", b"split-9999")
             .unwrap_or_else(|e| fail(&format!("delete_range: {e}")));
+        let value = vec![b'v'; 200];
+        for i in 0..120 {
+            let k = format!("split-{i:04}").into_bytes();
+            batch
+                .put(&k, &value)
+                .unwrap_or_else(|e| fail(&format!("put: {e}")));
+            wrote.push((k, value.clone()));
+        }
         batch
             .commit(true)
             .await
@@ -193,9 +207,48 @@ async fn main() {
         let out = db
             .compact(0, &l0)
             .await
-            .unwrap_or_else(|e| fail(&format!("compact: {e}")))
-            .unwrap_or_else(|| fail("the compaction wrote nothing"));
-        println!("roble compacted {l0:?} into table {out:06} at L1");
+            .unwrap_or_else(|e| fail(&format!("compact: {e}")));
+        if out.is_empty() {
+            fail("the compaction wrote nothing");
+        }
+        if out.len() < 2 {
+            fail("the compaction did not split, so the touching bounds are untested");
+        }
+
+        // The shape the version's overlap rule has to accept, and that
+        // Pebble has to accept when it opens this directory: two tables of
+        // one level meeting at a single user key, the first ending there
+        // exclusively because a range deletion was clipped at the boundary.
+        let level: Vec<(u64, Vec<u8>, Vec<u8>, bool)> = db
+            .versions()
+            .version
+            .level(1)
+            .iter()
+            .map(|t| {
+                (
+                    t.file_num,
+                    t.smallest_user_key().expect("smallest").to_vec(),
+                    t.largest_user_key().expect("largest").to_vec(),
+                    t.largest_is_exclusive().expect("exclusive"),
+                )
+            })
+            .collect();
+        let touching = level
+            .windows(2)
+            .filter(|p| p[0].2 == p[1].1)
+            .inspect(|p| {
+                if !p[0].3 {
+                    fail("two tables share a bound that is not an exclusive sentinel");
+                }
+            })
+            .count();
+        if touching == 0 {
+            fail("no two outputs met at a key, so the exclusive bound is untested");
+        }
+        println!(
+            "roble compacted {l0:?} into {out:?} at L1, {touching} pair(s) meeting at an \
+             exclusive sentinel"
+        );
     }
 
     if settle {
@@ -220,13 +273,10 @@ async fn main() {
                 .unwrap_or_else(|e| fail(&format!("flush: {e}")));
 
             let mut ran = 0;
-            while db
-                .compact_once()
-                .await
-                .unwrap_or_else(|e| fail(&format!("compact_once: {e}")))
-                .is_some()
-                || db.pick().is_some()
-            {
+            while db.pick().is_some() {
+                db.compact_once()
+                    .await
+                    .unwrap_or_else(|e| fail(&format!("compact_once: {e}")));
                 ran += 1;
                 if ran > 50 {
                     fail("the picker never settled");
