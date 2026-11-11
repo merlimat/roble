@@ -103,6 +103,9 @@ pub struct Opened<'a, F: Fs> {
     /// what keeps the sweep from deleting one out from under a scan (§5,
     /// `crate::obsolete`).
     readers: std::rc::Rc<crate::obsolete::Readers>,
+    /// Whether an append to the MANIFEST has failed, after which this store
+    /// records nothing more (`crate::flush`).
+    manifest_failed: std::cell::Cell<bool>,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -306,6 +309,7 @@ pub async fn open_with<'a, E: Env>(
         markers: std::cell::RefCell::new(markers),
         max_manifest_bytes: options.max_manifest_bytes,
         readers: std::rc::Rc::new(crate::obsolete::Readers::default()),
+        manifest_failed: std::cell::Cell::new(false),
         l0_compaction_threshold: options.l0_compaction_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
         compaction_unit: options.compaction_unit,
@@ -679,6 +683,17 @@ impl<F: Fs> Opened<'_, F> {
     /// Lets go of the table cache's reader for one of this store's tables.
     pub(crate) fn forget_reader(&self, file_num: u64) {
         self.caches.forget_table(self.store_id, file_num);
+    }
+
+    /// Whether an append to the MANIFEST has failed, which is the end of
+    /// this store's writing life (`crate::flush`).
+    pub(crate) fn manifest_failed(&self) -> bool {
+        self.manifest_failed.get()
+    }
+
+    /// Takes account of an append to the MANIFEST that failed.
+    pub(crate) fn saw_manifest_failure(&self) {
+        self.manifest_failed.set(true);
     }
 
     /// How large the MANIFEST may grow before a flush replaces it

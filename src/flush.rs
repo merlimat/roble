@@ -164,7 +164,49 @@ impl<F: Fs> Opened<'_, F> {
 
     /// Appends one edit to the MANIFEST and syncs it, and says how large
     /// the file has grown.
+    ///
+    /// **A failure here ends this store's writing life.** The bytes of a
+    /// failed append stay where they were put — nothing truncates a
+    /// MANIFEST, and a crash would not undo them — so the next append lands
+    /// after them, and the sync of *that* record makes both durable. The
+    /// first of the two was written against a version the store then carried
+    /// on from unchanged, so the second says the same thing again: delete
+    /// the tables the first deleted. Replaying both is how a database stops
+    /// opening — "deletes table 7 from L0, which does not hold it" — and the
+    /// store that wrote it had been handed an error for each one.
+    ///
+    /// So the first failure is the last edit: every later append is refused.
+    /// Pebble reaches the same conclusion and acts on it harder, taking the
+    /// process down with `Fatalf` on a MANIFEST write error; refusing the
+    /// one store leaves a caller holding a hundred shards the other
+    /// ninety-nine.
+    ///
+    /// Either way the answer is to reopen, and that is sound whichever side
+    /// of the failure the file ended on: a record written whole replays, a
+    /// record torn across a block boundary is dropped with the tail, and the
+    /// tables of an edit that did not land are named by nothing and swept.
+    ///
+    /// A **write** is not refused, with a log or without one. It appends to
+    /// the log and the memtable and says nothing to the MANIFEST, so it can
+    /// still be exactly as durable as it promises — and refusing it would
+    /// throw away records the log would otherwise have kept.
     pub(crate) async fn append_version_edit(&self, edit: &VersionEdit) -> Result<u64> {
+        if self.manifest_failed() {
+            return Err(Error::Corrupt(
+                "an earlier version edit failed to append, so this store records no more; \
+                 reopen the database"
+                    .to_string(),
+            ));
+        }
+        let appended = self.append_edit(edit).await;
+        if appended.is_err() {
+            self.saw_manifest_failure();
+        }
+        appended
+    }
+
+    /// The append itself, whose every failure the caller above makes final.
+    async fn append_edit(&self, edit: &VersionEdit) -> Result<u64> {
         let path = self.dir.join(self.manifest_filename());
         let disk = self.fs().open(&path, Access::ReadWrite).await?;
         let at = disk.len().await? as usize;
