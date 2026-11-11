@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use roble::cache::{DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 use roble::sim::{SimEnv, SimFs};
-use roble::{Caches, Comparison, Disk, Fs, WriteBuf};
+use roble::{Caches, Comparison, Disk, Fs, Options, WriteBuf};
 
 /// Loads a committed fixture directory into a simulated filesystem.
 async fn load(name: &str) -> (SimEnv, PathBuf, u64) {
@@ -104,7 +104,7 @@ async fn a_cache_bounded_to_one_table_still_answers() {
     // must not change.
     let (env, dir, _) = load("db-reads").await;
     let caches = Caches::new(1, DEFAULT_BLOCK_BYTES);
-    let db = roble::open_with(&env, &dir, caches.clone())
+    let db = roble::open_with(&env, &dir, Options::new().caches(caches.clone()))
         .await
         .expect("open");
 
@@ -146,10 +146,10 @@ async fn two_stores_sharing_a_cache_do_not_read_each_others_tables() {
     let (env_b, dir_b, _) = load("db-twin-b").await;
     let shared: Caches<SimFs> = Caches::new(64, DEFAULT_BLOCK_BYTES);
 
-    let a = roble::open_with(&env_a, &dir_a, shared.clone())
+    let a = roble::open_with(&env_a, &dir_a, Options::new().caches(shared.clone()))
         .await
         .expect("open a");
-    let b = roble::open_with(&env_b, &dir_b, shared.clone())
+    let b = roble::open_with(&env_b, &dir_b, Options::new().caches(shared.clone()))
         .await
         .expect("open b");
 
@@ -219,7 +219,7 @@ async fn the_block_budget_is_kept_and_the_answers_do_not_change() {
 
     let (env, dir, _) = load("db-reads").await;
     let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, 4096);
-    let db = roble::open_with(&env, &dir, caches.clone())
+    let db = roble::open_with(&env, &dir, Options::new().caches(caches.clone()))
         .await
         .expect("open");
 
@@ -286,10 +286,10 @@ async fn two_stores_blocks_do_not_collide_either() {
     let (env_b, dir_b, _) = load("db-twin-b").await;
     let shared: Caches<SimFs> = Caches::new(64, DEFAULT_BLOCK_BYTES);
 
-    let a = roble::open_with(&env_a, &dir_a, shared.clone())
+    let a = roble::open_with(&env_a, &dir_a, Options::new().caches(shared.clone()))
         .await
         .expect("open a");
-    let b = roble::open_with(&env_b, &dir_b, shared.clone())
+    let b = roble::open_with(&env_b, &dir_b, Options::new().caches(shared.clone()))
         .await
         .expect("open b");
 

@@ -19,6 +19,10 @@
 //! which means Pebble replaying roble's framing, roble's batch
 //! representation, and roble's sequence numbers.
 //!
+//! `--no-wal` opens the same database in Oxia's configuration, where a write
+//! reaches the memtable and nothing else: what Pebble reads back then came
+//! through a table and a MANIFEST edit alone, with the log untouched.
+//!
 //! `--rotate` flushes and then replaces the MANIFEST, so the file Pebble
 //! replays is one roble wrote from nothing — every table at every level,
 //! described by roble's snapshot edit and named by roble's marker.
@@ -36,7 +40,7 @@ use roble_format::batch::Batch;
 async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: wal-replay <database-dir> [--flush|--rotate|--swept]");
+        eprintln!("usage: wal-replay <database-dir> [--flush|--rotate|--no-wal|--swept]");
         std::process::exit(2);
     };
     // With `--flush` the same writes go through a table and a MANIFEST edit
@@ -44,18 +48,22 @@ async fn main() {
     // other half of the round trip. With `--swept` roble writes nothing and
     // the only change to the directory is what its open deleted.
     let mode = args.next();
-    let (flush, rotate, swept) = match mode.as_deref() {
-        None => (false, false, false),
-        Some("--flush") => (true, false, false),
+    let (flush, rotate, no_wal, swept) = match mode.as_deref() {
+        None => (false, false, false, false),
+        Some("--flush") => (true, false, false, false),
         // `--rotate` goes further than `--flush`: the MANIFEST Pebble reads
         // from afterwards is not one Pebble ever wrote a byte of.
-        Some("--rotate") => (true, true, false),
-        Some("--swept") => (false, false, true),
+        Some("--rotate") => (true, true, false, false),
+        // `--no-wal` is Oxia's own configuration: nothing reaches the log, so
+        // the flush is the only thing that happened.
+        Some("--no-wal") => (true, false, true, false),
+        Some("--swept") => (false, false, false, true),
         Some(other) => fail(&format!("unknown mode {other}")),
     };
 
     let before = names_in(&dir);
-    let db = roble::open(&roble::DefaultEnv, &dir)
+    let options = roble::Options::new().disable_wal(no_wal);
+    let db = roble::open_with(&roble::DefaultEnv, &dir, options)
         .await
         .unwrap_or_else(|e| fail(&format!("open {}: {e}", dir.display())));
 
@@ -78,7 +86,7 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("put: {e}")));
         wrote.push((k, v));
     }
-    db.write(&mut batch, true)
+    db.write(&mut batch, !no_wal)
         .await
         .unwrap_or_else(|e| fail(&format!("write: {e}")));
 
@@ -89,7 +97,7 @@ async fn main() {
         .put(&big_key, &big_value)
         .unwrap_or_else(|e| fail(&format!("put: {e}")));
     wrote.push((big_key, big_value));
-    db.write(&mut batch, true)
+    db.write(&mut batch, !no_wal)
         .await
         .unwrap_or_else(|e| fail(&format!("write: {e}")));
 
@@ -99,7 +107,7 @@ async fn main() {
     batch
         .delete(b"alpha")
         .unwrap_or_else(|e| fail(&format!("delete: {e}")));
-    db.write(&mut batch, true)
+    db.write(&mut batch, !no_wal)
         .await
         .unwrap_or_else(|e| fail(&format!("write: {e}")));
 
@@ -110,6 +118,14 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("flush: {e}")))
             .unwrap_or_else(|| fail("flush wrote nothing"));
         println!("roble flushed the memtable to table {table:06}");
+    }
+
+    if no_wal {
+        let logs = names_in(&dir)
+            .into_iter()
+            .filter(|n| n.ends_with(".log"))
+            .collect::<Vec<_>>();
+        println!("roble wrote with the WAL off; the logs it left alone are {logs:?}");
     }
 
     if rotate {

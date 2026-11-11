@@ -65,18 +65,27 @@
 > refers to until it does, and the old MANIFEST and the old marker are
 > obsolete the moment it has.
 >
-> Five gates hold it up. **A crash replays** to the last synced write and no
-> further. **Go Pebble replays the log roble wrote**, when nothing has been
-> flushed, so every key it finds came out of the log. And **Go Pebble reads
-> the table roble wrote, through the MANIFEST roble appended**, when the same
-> writes have been flushed — the MANIFEST's `min_unflushed_log_num` has moved
-> past roble's log by then, so Pebble does not replay it and the keys can
-> only have come from the table. **That closes M3's round trip.** The fourth
-> **Go Pebble reads a database through a MANIFEST roble wrote from nothing**,
-> after a rotation — every table at every level described by roble's snapshot
-> edit and named by roble's marker. And the fifth guards the deletions: **Go
-> Pebble reads a database roble has deleted from**, after roble opens one and
-> does nothing but collect.
+> And **the WAL off**, which is not an absence but a different place for
+> durability to come from, and the configuration Oxia runs: a write reaches
+> the memtable and nothing else, `flush` is the only promise the store makes,
+> and a `sync` is refused rather than ignored. A log already holding records
+> is still replayed, because those writes were acknowledged whatever this
+> store has since been told.
+>
+> Six gates hold it up. **A crash replays** to the last synced write with the
+> WAL on, and **to the last flush with it off** — both tested, since the
+> second is the one Oxia runs. **Go Pebble replays the log roble wrote**,
+> when nothing has been flushed, so every key it finds came out of the log.
+> **Go Pebble reads the table roble wrote, through the MANIFEST roble
+> appended**, when the same writes have been flushed — the MANIFEST's
+> `min_unflushed_log_num` has moved past roble's log by then, so Pebble does
+> not replay it and the keys can only have come from the table. **That closes
+> M3's round trip.** **Go Pebble reads a database through a MANIFEST roble
+> wrote from nothing**, after a rotation. **Go Pebble reads what roble wrote
+> with the WAL off**, where the table and the MANIFEST edit are the only
+> things that happened. And the last guards the deletions: **Go Pebble reads
+> a database roble has deleted from**, after roble opens one and does nothing
+> but collect.
 >
 > How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
 > table roble writes; `harness/golden-sst` and `harness/record-files` go the
@@ -435,8 +444,11 @@ does not, while `DELSIZED` does (`batchrepr.Reader.Next`).
 `write()` assigns sequence numbers, appends the repr to the log as one record,
 syncs the log if `sync` is set, and then applies the entries to the memtable — in
 that order, so nothing is ever readable that a replay would not recover. With
-`disable_wal` the log step is skipped and `sync` means nothing: durability is
-`flush()`'s job alone (§4). A batch whose entries would exceed the memtable
+`disable_wal` the log step is skipped and durability is `flush()`'s job alone
+(§4). A `sync` is then **refused** rather than ignored, which is what Pebble
+does (`DB.Apply`: "pebble: WAL disabled") and the correction this document
+needed: a caller that asked for durability and got `Ok` would have none, and
+finding out would mean losing the write. A batch whose entries would exceed the memtable
 rotates it first, which rotates the log with it.
 
 roble writes recyclable chunks, as Go does at the pin, but **does not recycle log
@@ -557,8 +569,8 @@ point at which Oxia's data becomes durable. The logs below that number are then
 obsolete, and are deleted like any other obsolete file — including one Pebble
 had kept back to recycle, which roble does not do and so has no use for.
 
-Past `max_manifest_bytes` — 128 MiB, Pebble's `MaxManifestFileSize` — that same
-flush **rotates** the MANIFEST: a fresh file holding one snapshot edit of the
+Past `Options::max_manifest_bytes` — 128 MiB, Pebble's `MaxManifestFileSize` —
+that same flush **rotates** the MANIFEST: a fresh file holding one snapshot edit of the
 whole version, and then `marker.manifest.*` moved to name it. The marker moves
 last and is the one-way door; roble syncs the directory between creating the new
 marker and letting the old one go, so no crash can land with no marker at all.
@@ -811,7 +823,7 @@ this trait is the same seam it already relies on.
 
 ```rust
 let caches = Caches::new(CacheOptions::default().block_cache_bytes(512 << 20));
-let db = Db::open(&DefaultEnv, "data/shard-3", Options::new().caches(&caches)).await?;
+let db = open_with(&DefaultEnv, "data/shard-3", Options::new().caches(caches)).await?;
 
 let mut batch = db.batch();            // indexed: readable through itself
 batch.put(b"/users/alice", b"...")?;

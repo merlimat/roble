@@ -21,7 +21,8 @@
 //!    name never reached the disk is a table the MANIFEST will point at and
 //!    nobody can open.
 //! 2. Create the log the store will write to next, and sync the directory
-//!    again.
+//!    again. With the WAL off there is no log, so this step and the edit's
+//!    minimum unflushed log number both fall away.
 //! 3. Append the version edit to the MANIFEST and sync **that**. Until this
 //!    moment the new table is a file nothing refers to, and a crash leaves
 //!    the database exactly as it was, with the old log still holding every
@@ -58,14 +59,16 @@ impl<F: Fs> Opened<'_, F> {
             return Ok(None);
         }
 
-        // File numbers for the table and for the log that follows it.
+        // File numbers for the table and, when there is a WAL, for the log
+        // that follows it.
         let (table_num, log_num, next_file_num) = {
             let versions = self.versions();
-            (
-                versions.next_file_num,
-                versions.next_file_num + 1,
-                versions.next_file_num + 2,
-            )
+            let table_num = versions.next_file_num;
+            if self.wal_disabled() {
+                (table_num, None, table_num + 1)
+            } else {
+                (table_num, Some(table_num + 1), table_num + 2)
+            }
         };
 
         let (bytes, new_table) = build_table(&memtable.borrow(), table_num)?;
@@ -84,17 +87,27 @@ impl<F: Fs> Opened<'_, F> {
         self.fs().sync_dir(&self.dir).await?;
 
         // 2. The log the store writes to next. It has to exist before the
-        //    MANIFEST points at it.
-        let log_path = self.dir.join(roble_format::files::log_filename(log_num));
-        let log_disk = self.fs().create(&log_path).await?;
-        log_disk.sync(Default::default()).await?;
-        log_disk.close().await?;
-        self.fs().sync_dir(&self.dir).await?;
+        //    MANIFEST points at it. With the WAL off there is none, and so
+        //    nothing to create and nothing for the edit below to retire.
+        if let Some(log_num) = log_num {
+            let log_path = self.dir.join(roble_format::files::log_filename(log_num));
+            let log_disk = self.fs().create(&log_path).await?;
+            log_disk.sync(Default::default()).await?;
+            log_disk.close().await?;
+            self.fs().sync_dir(&self.dir).await?;
+        }
 
         // 3. The edit. Before this the table is a file nothing refers to.
+        // With the WAL off the edit says nothing about log numbers, which
+        // leaves the MANIFEST's where it was. Pebble writes a zero there,
+        // because with the WAL off every one of its memtables carries log
+        // number zero — but a database written *with* a WAL and reopened
+        // without one has a real minimum, and writing zero over it would
+        // make logs that are already in a table live again, and then
+        // replayed.
         let edit = VersionEdit {
             comparer_name: None,
-            min_unflushed_log_num: Some(log_num),
+            min_unflushed_log_num: log_num,
             obsolete_prev_log_num: None,
             next_file_num: Some(next_file_num),
             last_seq_num: Some(self.snapshot()),
@@ -106,7 +119,9 @@ impl<F: Fs> Opened<'_, F> {
         // 4. Bookkeeping a replay would redo anyway.
         self.versions_mut().apply(&edit)?;
         self.install_fresh_memtable(Memtable::new(self.snapshot().wrapping_add(1)));
-        self.install_log(log_num).await?;
+        if let Some(log_num) = log_num {
+            self.install_log(log_num).await?;
+        }
 
         // 5. A MANIFEST that has outgrown its limit is replaced by one
         //    holding a snapshot of the version, so a reopen replays one

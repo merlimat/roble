@@ -27,7 +27,10 @@
 # file Pebble replays is one roble wrote from nothing, naming every table at
 # every level.
 #
-# The fourth makes the opposite claim. roble opens a database and writes
+# The fourth is Oxia's own configuration: the WAL off, so the table and the
+# MANIFEST edit are the only things that happened and the log is untouched.
+#
+# The fifth makes the opposite claim. roble opens a database and writes
 # nothing, so the only thing that changed is what roble deleted on the way
 # in. Pebble then has to read a directory roble has removed files from.
 #
@@ -44,7 +47,7 @@ trap 'rm -rf "$out"' EXIT
 # into a table through a MANIFEST edit roble appended. The first tests
 # Pebble replaying roble's log; the second tests Pebble reading roble's
 # table and believing roble's MANIFEST.
-for mode in log flushed rotated swept; do
+for mode in log flushed rotated no-wal swept; do
   db="$out/$mode"
   # The swept run needs a database Pebble left something obsolete in, which
   # db-simple is not: Pebble closed db-unflushed-wal holding a log it had
@@ -59,6 +62,7 @@ for mode in log flushed rotated swept; do
   case "$mode" in
     flushed) cargo run --release --quiet -p wal-replay -- "$db" --flush ;;
     rotated) cargo run --release --quiet -p wal-replay -- "$db" --rotate ;;
+    no-wal)  cargo run --release --quiet -p wal-replay -- "$db" --no-wal ;;
     swept)   cargo run --release --quiet -p wal-replay -- "$db" --swept ;;
     *)       cargo run --release --quiet -p wal-replay -- "$db" ;;
   esac
