@@ -207,4 +207,67 @@ mod tests {
         data.extend_from_slice(&[0x80, 0x80, 0x40]); // uvarint, ~1 MiB
         assert!(decode(Compression::Zstd, &data).is_err());
     }
+
+    /// Every algorithm's name, which nothing had asked for.
+    ///
+    /// `indicator_values_are_rocksdbs` above already round-trips every byte,
+    /// so the bytes are not repeated here. What it never does is call `name`,
+    /// and a name is what the refusals below put in front of whoever has to
+    /// act on them.
+    #[test]
+    fn every_algorithm_says_what_it_is() {
+        let names: &[(Compression, &str)] = &[
+            (Compression::None, "none"),
+            (Compression::Snappy, "snappy"),
+            (Compression::Zlib, "zlib"),
+            (Compression::Bzip2, "bzip2"),
+            (Compression::Lz4, "lz4"),
+            (Compression::Lz4hc, "lz4hc"),
+            (Compression::Xpress, "xpress"),
+            (Compression::Zstd, "zstd"),
+            (Compression::MinLz, "minlz"),
+        ];
+        for &(c, name) in names {
+            assert_eq!(c.name(), name, "{c:?}");
+        }
+        assert_eq!(names.len(), 9, "an algorithm was added without a row here");
+    }
+
+    /// The algorithms roble declines, each by name.
+    ///
+    /// MinLZ gets its own wording because it is the one that could plausibly
+    /// be reached by mistake: Pebble's "good" compression profile is MinLZ on
+    /// amd64, and the thing worth saying is that Pebble *replaces* it with
+    /// Snappy at or below Pebblev4 — so a MinLZ block here was not written by
+    /// a Pebble at all.
+    #[test]
+    fn an_algorithm_roble_does_not_decode_is_refused_by_name() {
+        let err = decode(Compression::MinLz, b"whatever").expect_err("minlz");
+        let text = format!("{err}");
+        assert!(text.contains("MinLZ") && text.contains("written by something else"));
+
+        for c in [
+            Compression::Zlib,
+            Compression::Bzip2,
+            Compression::Lz4,
+            Compression::Lz4hc,
+            Compression::Xpress,
+        ] {
+            let err = decode(c, b"whatever").expect_err("not decoded");
+            let text = format!("{err}");
+            assert!(
+                text.contains(c.name()) && text.contains("no Pebble"),
+                "{c:?}: got {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snappy_block_that_is_not_snappy_is_refused() {
+        // The decoder's own complaint is carried through rather than replaced:
+        // whoever is looking at a corrupt block wants to know what the
+        // decompressor made of it.
+        let err = decode(Compression::Snappy, b"not a snappy block").expect_err("not snappy");
+        assert!(format!("{err}").contains("snappy block:"), "got {err:?}");
+    }
 }

@@ -118,3 +118,81 @@ impl Properties {
         self.raw.iter().map(|(k, v)| (k.as_slice(), v.as_slice()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{Block, BlockBuilder};
+
+    /// A properties block, framed the way `TableWriter` frames one.
+    ///
+    /// Names must ascend: it is a row block, and the reader walks it in order.
+    fn props(pairs: &[(&str, &[u8])]) -> Properties {
+        let mut b = BlockBuilder::new(usize::MAX);
+        let mut prev: Vec<u8> = Vec::new();
+        for (name, value) in pairs {
+            b.add(name.as_bytes(), value, prev.len(), None, false);
+            prev = name.as_bytes().to_vec();
+        }
+        let bytes = b.finish().to_vec();
+        Properties::decode(&Block::new(&bytes).expect("a block")).expect("properties")
+    }
+
+    /// A property that is not there is absent, not zero.
+    ///
+    /// Every one of these is optional, and the difference matters: a table
+    /// with no `rocksdb.num.entries` has not told anyone how many entries it
+    /// holds, which is not the same as holding none. Reading the first as the
+    /// second is how a reader decides a table is empty and skips it.
+    #[test]
+    fn a_property_that_is_not_there_is_absent_rather_than_zero() {
+        let p = props(&[("rocksdb.comparator", b"leveldb.BytewiseComparator")]);
+        assert_eq!(p.uvarint("rocksdb.num.entries").expect("absent"), None);
+        assert_eq!(p.num_entries().expect("absent"), None);
+        assert_eq!(p.num_data_blocks().expect("absent"), None);
+        assert_eq!(p.merger_name(), None);
+        // And the index type, where absent means single-level rather than
+        // unknown: RocksDB wrote the property only once two-level existed.
+        assert!(!p.is_two_level_index().expect("absent"));
+    }
+
+    #[test]
+    fn a_property_that_is_there_is_read() {
+        let p = props(&[
+            ("rocksdb.merge.operator", b"pebble.concatenate".as_slice()),
+            ("rocksdb.num.entries", &[42]),
+        ]);
+        assert_eq!(p.num_entries().expect("present"), Some(42));
+        assert_eq!(p.merger_name(), Some("pebble.concatenate"));
+    }
+
+    /// A uvarint property with anything after the number is refused.
+    ///
+    /// The trailing bytes are the tell: a property this reader has
+    /// misunderstood looks exactly like one it has read correctly, right up
+    /// to the bytes it did not consume.
+    #[test]
+    fn a_uvarint_property_with_trailing_bytes_is_refused() {
+        let p = props(&[("rocksdb.num.entries", &[42, 0, 0])]);
+        let err = p
+            .uvarint("rocksdb.num.entries")
+            .expect_err("trailing bytes");
+        assert!(
+            format!("{err}").contains("3 bytes for a uvarint of 1"),
+            "got {err:?}"
+        );
+    }
+
+    /// The index-type property is a four-byte number, and anything else is
+    /// refused rather than guessed at.
+    ///
+    /// Guessing would decide whether the index has one level or two, which is
+    /// the difference between reading a table's index and reading the first
+    /// block of its second level as if it were the whole thing.
+    #[test]
+    fn an_index_type_that_is_not_four_bytes_is_refused() {
+        let p = props(&[("rocksdb.block.based.table.index.type", &[0, 0])]);
+        let err = p.is_two_level_index().expect_err("two bytes");
+        assert!(format!("{err}").contains("2 bytes, want 4"), "got {err:?}");
+    }
+}
