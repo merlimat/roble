@@ -410,3 +410,93 @@ async fn a_disk_that_keeps_its_buffer_is_survived() {
         );
     }
 }
+
+/// Whether an error is this store refusing to record anything more.
+fn refuses_to_record(e: &roble::Error) -> bool {
+    matches!(e, roble::Error::Corrupt(m) if m.contains("records no more"))
+}
+
+/// The scenario again, carried on through its failures rather than stopped at
+/// the first, saying how many calls were refused outright.
+async fn careless(env: &SimEnv, dir: &Path, wal: bool) -> roble::Result<usize> {
+    let db = roble::open_with(env, dir, options(wal)).await?;
+    let mut refused = 0;
+    for key in &WRITTEN[..2] {
+        let mut batch = Batch::new();
+        batch.put(key, b"written")?;
+        let _ = db.write(&mut batch, wal).await;
+        // Both called, and neither allowed to end the run.
+        let failed = [db.flush().await.err(), db.compact_once().await.err()];
+        refused += failed
+            .iter()
+            .flatten()
+            .filter(|e| refuses_to_record(e))
+            .count();
+    }
+    let mut tail = Batch::new();
+    tail.put(WRITTEN[2], b"written")?;
+    let _ = db.write(&mut tail, wal).await;
+    Ok(refused)
+}
+
+/// A store told to carry on after a failure still leaves a database that
+/// opens.
+///
+/// The three sweeps above stop at the first error, which is what a careful
+/// caller does, and they are the stronger test of everything that happens
+/// *before* a version edit is written. This one is the careless caller — the
+/// one that logs the error and asks again — and it is the only one that
+/// reaches what happens after. A failed append leaves its record in the
+/// MANIFEST, because nothing truncates one and no crash would undo it, and
+/// the store carries on from a version that record changed and it did not.
+/// What the next edit then says contradicts it. This is the sweep with the
+/// log on, failing the sync of a flush's edit:
+///
+/// ```text
+/// edit 6: new=[(0, 8)]                   the flush's edit; its sync failed
+/// edit 7: deleted=[(0, 7)] new=[(1, 8)]  the compaction, reusing number 8
+/// ```
+///
+/// A file number handed out twice, naming a table at two levels, and the
+/// compaction's output written over the flush's table. Three edits later the
+/// sweep collects the file and the database stops opening: "L0 table 8 is in
+/// the MANIFEST but not in /db". Every step of the way the store had been
+/// handed an error it could have stopped at, so the store has to stop
+/// itself.
+///
+/// What this does **not** check is §12's prefix. A caller that ignores a
+/// failed write and goes on to the next key has asked for the gap it gets;
+/// the invariant it has not waived is that the database still opens.
+#[compio::test]
+async fn a_store_that_is_told_to_carry_on_still_leaves_a_database_that_opens() {
+    for wal in [true, false] {
+        let total = count_operations(wal).await;
+        let mut refusals = 0;
+
+        for n in 1..=total {
+            let (env, dir) = load("db-simple").await;
+            env.sim().fail_at(n);
+            refusals += careless(&env, &dir, wal).await.unwrap_or(0);
+            env.sim().stop_failing();
+
+            let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                panic!(
+                    "wal={wal}: carrying on past a failure at operation {n} of {total} \
+                     left a database that will not open: {e}"
+                )
+            });
+            // Read, not merely opened: a version naming a table that is not
+            // there opens and fails on the first scan.
+            let _ = contents(&db).await;
+        }
+
+        // The guard that keeps this from passing for the wrong reason. If no
+        // injection ever landed on a MANIFEST append, nothing above reached
+        // the door this test is about and every reopen succeeded trivially.
+        assert!(
+            refusals > 0,
+            "wal={wal}: no injection made a version edit fail to append, so nothing \
+             here exercised the refusal that keeps the MANIFEST honest"
+        );
+    }
+}
