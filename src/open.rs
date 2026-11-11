@@ -77,6 +77,8 @@ pub struct Opened<'a, F: Fs> {
     /// Whether this store was opened with the WAL off, so that `flush` is
     /// the only durability point (§4).
     disable_wal: bool,
+    /// Whether a flush leaves the picker's compaction for the caller (§9).
+    disable_automatic_compactions: bool,
     /// The next sequence number to hand out.
     ///
     /// Starts past the MANIFEST's last, so nothing written here can collide
@@ -295,6 +297,7 @@ pub async fn open_with<'a, E: Env>(
         store_id: options.caches.new_store_id(),
         caches: options.caches,
         disable_wal: options.disable_wal,
+        disable_automatic_compactions: options.disable_automatic_compactions,
         memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
@@ -827,6 +830,11 @@ impl<F: Fs> Opened<'_, F> {
     /// Whether this store was opened with the WAL off.
     pub fn wal_disabled(&self) -> bool {
         self.disable_wal
+    }
+
+    /// Whether this store leaves compaction to its caller (§9).
+    pub fn automatic_compactions_disabled(&self) -> bool {
+        self.disable_automatic_compactions
     }
 
     /// Points the store at a different log, which must already exist.

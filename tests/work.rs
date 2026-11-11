@@ -158,9 +158,18 @@ async fn pacing_changes_no_answer() {
     let mut contents = Vec::new();
     for unit in [0, 1, 7, 1000] {
         let (env, dir) = load("db-reads").await;
-        let db = roble::open_with(&env, &dir, Options::new().compaction_unit(unit))
-            .await
-            .expect("open");
+        // The compaction is this test's own: it names the tables and
+        // compares what came out, so the flush that fed it is left to do
+        // nothing but flush.
+        let db = roble::open_with(
+            &env,
+            &dir,
+            Options::new()
+                .compaction_unit(unit)
+                .disable_automatic_compactions(true),
+        )
+        .await
+        .expect("open");
 
         let mut batch = Batch::new();
         for i in 0..100 {

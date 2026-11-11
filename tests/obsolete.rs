@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, WriteBuf};
+use roble::{Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 use roble_format::files::{self, FileType};
 
@@ -92,6 +92,19 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
         scan.next().await.expect("next");
     }
     out
+}
+
+/// Opens with compaction left to the caller.
+///
+/// A flush runs the compaction the picker chose unless it is told not to.
+/// The tests that use this are about what a flush does on its own — the
+/// table it adds, the log it retires — and a compaction following it would
+/// change the version before the assertion could read it.
+/// `tests/schedule.rs` is where the scheduling is the subject.
+async fn open_unscheduled<'a>(env: &'a SimEnv, dir: &Path) -> roble::Opened<'a, SimFs> {
+    roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
+        .await
+        .expect("open")
 }
 
 #[compio::test]
@@ -169,7 +182,7 @@ async fn a_log_pebble_kept_for_recycling_is_collected() {
 #[compio::test]
 async fn a_flush_retires_the_log_it_replaced() {
     let (env, dir) = load("db-reads").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let db = open_unscheduled(&env, &dir).await;
     let old_log = db.current_log().expect("a log to write to");
 
     let mut batch = Batch::new();
@@ -493,7 +506,7 @@ async fn the_table_goes_once_the_scan_does() {
 #[compio::test]
 async fn a_sweep_keeps_the_readers_the_version_still_names() {
     let (env, dir) = load("db-reads").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let db = open_unscheduled(&env, &dir).await;
 
     // A read leaves a reader open for the table that answered it.
     db.get(b"a0", Comparison::Equal).await.expect("get");

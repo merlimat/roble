@@ -54,7 +54,41 @@ impl<F: Fs> Opened<'_, F> {
     /// Returns the new table's file number, or `None` when there was nothing
     /// to write. With the WAL off this is the only durability point (§7);
     /// with it on, it is what lets a log be retired.
+    ///
+    /// A flush is also where the store notices it has too many tables, so a
+    /// flush that wrote one runs the compaction the picker chose before
+    /// returning, unless [`crate::Options::disable_automatic_compactions`]
+    /// says otherwise (§9, `crate::pick`). The number here names the table
+    /// *this flush wrote*, which that compaction may already have merged
+    /// away — a caller holding it has a file number and not a promise.
+    ///
+    /// The two are timed apart, which is why the timing is inside
+    /// `flush_inner` rather than here: `roble.flush.duration` covers the
+    /// flush and stops where it ends, and a compaction's time is its own, in
+    /// `roble.compaction.duration`. A flush that reported the compaction it
+    /// scheduled as part of itself would make its own latency graph
+    /// unreadable — the number an operator watches would jump by whatever a
+    /// merge happened to cost.
+    ///
+    /// Untested, with a reason (§12). Telling a timer that stops here from
+    /// one that spans the compaction is a claim about elapsed time, and §10
+    /// keeps the clock out of the tests; the only test would be a duration
+    /// threshold, which would pin the machine it ran on rather than this.
+    /// `tests/metrics.rs` does not collect histograms at all, for the
+    /// separate reason written at the top of it.
     pub async fn flush(&self) -> Result<Option<u64>> {
+        let flushed = self.flush_inner().await?;
+        // Nothing written is nothing changed, and so nothing new for the
+        // picker to see: its answer is the one it already gave, which the
+        // flush that wrote the last table already ran.
+        if flushed.is_some() {
+            self.maybe_compact().await;
+        }
+        Ok(flushed)
+    }
+
+    /// The flush proper: the table, the log, the edit, the bookkeeping.
+    async fn flush_inner(&self) -> Result<Option<u64>> {
         let _timer = self.metrics.flush.start();
         let memtable = self.memtable();
         if memtable.borrow().is_empty() && memtable.borrow().tombstones().is_empty() {

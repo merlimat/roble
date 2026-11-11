@@ -31,6 +31,9 @@ pub struct Options<F: Fs> {
     pub(crate) caches: Caches<F>,
     /// Whether to skip the log entirely.
     pub(crate) disable_wal: bool,
+    /// Whether a flush leaves the compaction the picker chose for the
+    /// caller to run.
+    pub(crate) disable_automatic_compactions: bool,
     /// How large the MANIFEST may grow before a flush replaces it.
     pub(crate) max_manifest_bytes: u64,
     /// How many tables L0 may hold before the picker wants it compacted.
@@ -54,6 +57,7 @@ impl<F: Fs> Default for Options<F> {
         Options {
             caches: Caches::default(),
             disable_wal: false,
+            disable_automatic_compactions: false,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
@@ -102,6 +106,21 @@ impl<F: Fs> Options<F> {
     /// with, so a newer value or tombstone still wins.
     pub fn disable_wal(mut self, disable: bool) -> Self {
         self.disable_wal = disable;
+        self
+    }
+
+    /// Leaves compaction entirely to the caller.
+    ///
+    /// Pebble's `DisableAutomaticCompactions`, and wanted for the same two
+    /// reasons: a test that drives compaction by hand needs the store to
+    /// hold still, and a caller that would rather compact when it knows it
+    /// is idle needs the store not to decide for it. `compact_once` is
+    /// still there for both.
+    ///
+    /// A store with this set still *reports* that it has fallen behind, in
+    /// `roble.compaction.debt`. It simply does nothing about it.
+    pub fn disable_automatic_compactions(mut self, disable: bool) -> Self {
+        self.disable_automatic_compactions = disable;
         self
     }
 

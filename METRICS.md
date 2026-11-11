@@ -93,6 +93,10 @@ scan and one entry. `Equal` is a point lookup and counts neither.
 | `roble.compaction.tables` | counter | `{table}` | Tables that compactions read and wrote |
 | `roble.compaction.io` | counter | By | Bytes that compactions read and wrote |
 
+A compaction a flush ran for itself is a compaction like any other: it counts in
+`roble.compactions`, and its time is `roble.compaction.duration` and not part of
+`roble.flush.duration`, which ends where the flush does (§9).
+
 **Write amplification** is every byte written over the bytes a flush had to write:
 
 ```

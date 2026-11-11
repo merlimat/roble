@@ -809,8 +809,8 @@ tombstone costs a reader a comparison and dropping a live one brings a key
 back from the dead. The output is split at `Options::target_file_size` — 2 MiB
 for L0 and twice that for each level below, as Pebble's `TargetFileSizes` —
 and a tombstone straddling a split is clipped at it, so the tables either side
-meet at one user key rather than overlapping across it. L0 sublevels,
-cooperative execution and the write-stall counters are still owed.
+meet at one user key rather than overlapping across it. L0 sublevels and the
+write-stall counters are still owed.
 
 A compaction is paced in units of work (`crate::work`): every
 `Options::compaction_unit` entries it hands the executor back and resumes, so
@@ -819,9 +819,26 @@ unit is entries and not time, because §10 lets a store read the clock only
 where the env allows it, and a job that yielded on a timer would stop a seeded
 run replaying.
 
-The picker is still **not scheduled**: nothing runs a compaction behind the
-caller's back. What is left for that is a store that can be handed to a task
-of its own, which is an ownership question rather than a pacing one.
+**What runs it.** A flush that wrote a table runs the compaction the picker
+chose, before it returns, unless `Options::disable_automatic_compactions`
+says otherwise — Pebble's switch of the same name, wanted for the same two
+reasons: a caller that would rather compact when it knows it is idle, and a
+test that names its own inputs. So a store that is written to keeps itself in
+shape without the caller ever naming a table, and the two are timed apart:
+`roble.flush.duration` ends where the flush does, and the compaction's time
+is its own.
+
+**One compaction per flush**, which is the analogue of Pebble's one
+concurrent compaction. A flush adds a single table to L0 and a compaction of
+L0 takes all of it, so one per flush more than keeps up with the level a
+flush fills; below L0 the levels trade off, because the picker's next answer
+is whichever is furthest past its allowance. What a flush deliberately does
+*not* do is drain a backlog it did not create, since its caller is waiting on
+it — Pebble answers that with the stop-writes thresholds a write stalls on,
+and roble owes those. And what still has no trigger at all is an **idle**
+store draining a backlog: nothing runs a compaction behind the caller's back,
+which needs a store that can be handed to a task of its own — an ownership
+question rather than a pacing one.
 
 Compaction is the cost encina does not pay, and the only background CPU work in
 roble. Leveled, with L0 as sublevels, and a **picker** — the component that
