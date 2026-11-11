@@ -27,9 +27,13 @@
 > block**, and a resumable iterator over one table that steps either way
 > across block boundaries.
 >
-> Still to come in M2: the merge of those iterators across levels, with
-> tombstones, behind a public `seek_ge`/`seek_lt`/`next`/`prev`. `get` still
-> does its own merge inside one call; §6 records what that costs.
+> and **scans**: those iterators merged across every table, with deletions and
+> range tombstones applied, bounded, behind `seek_ge`/`seek_lt`/`next`/`prev`
+> in both directions.
+>
+> That completes M2's read path. `get` still does its own merge inside one
+> call and still re-seeks per rejected key (§6); it can be rebuilt on a scan,
+> which is a tidying rather than a gap.
 >
 > `open` is judged against whole databases Go Pebble wrote, committed under
 > `tests/golden/`, where Pebble's own reader describes the directory and roble
@@ -435,11 +439,14 @@ reason to check: a table whose keys do not match the bounds its MANIFEST entry
 gives it would otherwise spin forever instead of returning an error, and an
 engine that hangs is worse than one that refuses (§2).
 
-One cost of the same missing piece is worth naming rather than discovering:
-the four ordered comparisons re-seek every candidate table once per key they
-reject, so a long run of deleted keys costs a seek per table per key. A
-resumable iterator would step instead, which is why there is no public scan
-iterator yet — it would inherit that and be hard to unpick.
+One cost is worth naming rather than discovering: the four ordered
+comparisons re-seek every candidate table once per key they reject, so a long
+run of deleted keys costs a seek per table per key. **A scan does not pay
+this** — its iterators keep their place and step — so `get`'s ordered
+comparisons should in time be a scan positioned once and read, rather than
+their own merge. They are kept separate for now because `get` is pinned
+against Pebble as it stands and rewriting it is a change worth making on its
+own.
 
 (A table is no longer read whole. The table cache holds an open reader with
 its footer, index, filter and tombstones, and data blocks are fetched one at a

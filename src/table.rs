@@ -458,3 +458,31 @@ impl<D: Disk> TableIter<D> {
         Ok(())
     }
 }
+
+/// Whether `kind` is a deletion, and so hides the key rather than giving it a
+/// value.
+pub fn is_deletion(kind: roble_format::key::Kind) -> bool {
+    use roble_format::key::Kind;
+    matches!(kind, Kind::Delete | Kind::SingleDelete | Kind::DeleteSized)
+}
+
+/// Whether any table's range tombstone covers `user` with a sequence number
+/// above `seq`.
+///
+/// A tombstone deletes what came before it, so this is a sequence-number
+/// comparison and not a level one. Shared by `get` and by scans, because a key
+/// that one hides and the other shows would be worse than either.
+pub fn covered_by_tombstone<D: Disk>(
+    tables: &[Rc<OpenTable<D>>],
+    user: &[u8],
+    seq: u64,
+) -> Result<bool> {
+    for table in tables {
+        for t in &table.tombstones {
+            if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}

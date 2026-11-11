@@ -136,10 +136,14 @@ jobs:
           regenerated="$(mktemp -d)"
           trap 'rm -rf "$regenerated"' EXIT
           (cd harness && go run ./read-probes "$regenerated")
-          if ! diff -u tests/golden/db-reads.probes "$regenerated/db-reads.probes"; then
-            echo "::error file=tests/golden/db-reads.probes::stale; regenerate with 'cd harness && go run ./read-probes ../tests/golden'"
-            exit 1
-          fi
+          status=0
+          for name in db-reads.probes db-reads.scans; do
+            if ! diff -u "tests/golden/$name" "$regenerated/$name"; then
+              echo "::error file=tests/golden/$name::stale; regenerate with 'cd harness && go run ./read-probes ../tests/golden'"
+              status=1
+            fi
+          done
+          exit $status
 
       # The same check for the whole-database fixtures. These are generated
       # with compression off, so unlike the sstable corpus their table sizes

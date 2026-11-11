@@ -69,6 +69,13 @@ func main() {
 	if err := os.WriteFile(filepath.Join(out, "db-reads.probes"), []byte(dump), 0o644); err != nil {
 		fail(err)
 	}
+	scans, err := scanDump(dir, keys)
+	if err != nil {
+		fail(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "db-reads.scans"), []byte(scans), 0o644); err != nil {
+		fail(err)
+	}
 	fmt.Printf("db-reads: %d probe keys\n", len(probesFor(keys)))
 }
 
@@ -408,6 +415,152 @@ func probe(dir string, keys [][]byte) (string, error) {
 		fmt.Fprintf(&out, "  lower %s\n", at(iter, iter.SeekLT(p)))
 	}
 	return out.String(), iter.Error()
+}
+
+// scanDump records what Pebble's iterator does when it is walked rather than
+// seeked once: both directions end to end, a seek followed by steps, and a
+// bounded scan. A seek that lands correctly but cannot be stepped away from is
+// the bug a merging iterator actually has, and only this can see it.
+func scanDump(dir string, keys [][]byte) (string, error) {
+	opts := &pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+		ReadOnly:                    true,
+	}
+	opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
+		return pebble.DBCompressionNone
+	})
+	smallBlocks(opts)
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+
+	var out strings.Builder
+
+	walk := func(name string, io *pebble.IterOptions, forward bool) error {
+		it, err := db.NewIter(io)
+		if err != nil {
+			return err
+		}
+		defer it.Close()
+		fmt.Fprintf(&out, "%s\n", name)
+		ok := it.First()
+		if !forward {
+			ok = it.Last()
+		}
+		for ; ok; ok = step(it, forward) {
+			fmt.Fprintf(&out, "  %s %s\n",
+				hex.EncodeToString(it.Key()), hex.EncodeToString(it.Value()))
+		}
+		return it.Error()
+	}
+
+	if err := walk("forward", &pebble.IterOptions{}, true); err != nil {
+		return "", err
+	}
+	if err := walk("reverse", &pebble.IterOptions{}, false); err != nil {
+		return "", err
+	}
+	// A bounded scan, half-open as Pebble's bounds are. The bounds are keys
+	// that exist, so that "lower is included" and "upper is excluded" are
+	// actually exercised: with bounds that fall between keys, an inclusive
+	// upper bound and an exclusive one give the same answers.
+	// "b2" and "d3" are keys the database actually holds and shows — bounds
+	// that fall between keys, or on keys that were deleted, make an inclusive
+	// upper bound and an exclusive one give the same answers.
+	bounded := &pebble.IterOptions{LowerBound: []byte("b2"), UpperBound: []byte("d3")}
+	if err := walk("bounded-forward", bounded, true); err != nil {
+		return "", err
+	}
+	if err := walk("bounded-reverse", bounded, false); err != nil {
+		return "", err
+	}
+
+	// Seeks that fall outside the bounds, which a walk from first() or last()
+	// never makes: the iterator has to clamp them rather than step outside.
+	{
+		bit, err := db.NewIter(bounded)
+		if err != nil {
+			return "", err
+		}
+		out.WriteString("bounded-seeks\n")
+		fmt.Fprintf(&out, "  below %s\n", where(bit, bit.SeekGE([]byte("a0"))))
+		fmt.Fprintf(&out, "  above %s\n", where(bit, bit.SeekLT([]byte("zz"))))
+		fmt.Fprintf(&out, "  at-lower %s\n", where(bit, bit.SeekGE([]byte("b2"))))
+		fmt.Fprintf(&out, "  at-upper %s\n", where(bit, bit.SeekLT([]byte("d3"))))
+		if err := bit.Error(); err != nil {
+			return "", err
+		}
+		if err := bit.Close(); err != nil {
+			return "", err
+		}
+	}
+
+	// Seek, then step: the part a single seek cannot check.
+	it, err := db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return "", err
+	}
+	defer it.Close()
+	for _, p := range probesFor(keys) {
+		fmt.Fprintf(&out, "from %s\n", hex.EncodeToString(p))
+		ok := it.SeekGE(p)
+		for n := 0; n < 3; n++ {
+			fmt.Fprintf(&out, "  fwd %s\n", where(it, ok))
+			if !ok {
+				break
+			}
+			ok = it.Next()
+		}
+		ok = it.SeekLT(p)
+		for n := 0; n < 3; n++ {
+			fmt.Fprintf(&out, "  rev %s\n", where(it, ok))
+			if !ok {
+				break
+			}
+			ok = it.Prev()
+		}
+		// And a turn, each way. Forward then back exercises one direction
+		// change; backward then forward exercises the other, and only the
+		// second one reaches the re-seek that `next` does after a reverse
+		// step.
+		ok = it.SeekGE(p)
+		if ok {
+			ok = it.Next()
+		}
+		if ok {
+			ok = it.Prev()
+		}
+		fmt.Fprintf(&out, "  turn %s\n", where(it, ok))
+
+		ok = it.SeekLT(p)
+		if ok {
+			ok = it.Prev()
+		}
+		if ok {
+			ok = it.Next()
+		}
+		fmt.Fprintf(&out, "  turn-back %s\n", where(it, ok))
+	}
+	return out.String(), it.Error()
+}
+
+func step(it *pebble.Iterator, forward bool) bool {
+	if forward {
+		return it.Next()
+	}
+	return it.Prev()
+}
+
+func where(it *pebble.Iterator, ok bool) string {
+	if !ok {
+		return "none"
+	}
+	return fmt.Sprintf("%s %s",
+		hex.EncodeToString(it.Key()), hex.EncodeToString(it.Value()))
 }
 
 func at(iter *pebble.Iterator, ok bool) string {
