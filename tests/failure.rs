@@ -247,3 +247,166 @@ async fn a_crash_at_any_single_operation_keeps_a_prefix_of_what_was_written() {
         );
     }
 }
+
+/// Replays the scenario up to a failure at `n` and then crashes, leaving the
+/// store exactly as a machine that died there would.
+///
+/// The simulated filesystem is deterministic, so this is reproducible: the
+/// same `n` gives the same bytes on disk every time, which is what lets the
+/// test below compare two recoveries of the same crash.
+async fn crashed_at(n: u64, wal: bool) -> (SimEnv, PathBuf) {
+    let (env, dir) = load("db-simple").await;
+    env.sim().fail_at(n);
+    let _ = scenario(&env, &dir, wal).await;
+    env.sim().stop_failing();
+    env.sim().crash();
+    (env, dir)
+}
+
+/// A recovery that fails partway must leave the store where it found it.
+///
+/// This is the case a crash loop makes: a machine dies, comes back, fails
+/// while recovering, and dies again. Opening is not a read-only act — it
+/// replays a log, it can rotate a marker, it deletes files the version no
+/// longer names — so a recovery that gets halfway and stops has done some of
+/// that and not the rest.
+///
+/// What must hold is that it has not *destroyed* anything: the next open
+/// finds exactly what a clean recovery would have found. A recovery that
+/// truncated a log before reading it, or retired a table before the version
+/// edit naming its replacement was durable, would pass every test in this
+/// file except this one — it only shows up when the recovery itself is
+/// interrupted.
+#[compio::test]
+async fn a_recovery_that_fails_partway_loses_nothing_that_was_durable() {
+    for wal in [true, false] {
+        let total = count_operations(wal).await;
+        let mut interrupted = 0u64;
+
+        for n in 1..=total {
+            // What an uninterrupted recovery of this crash finds.
+            let (env, dir) = crashed_at(n, wal).await;
+            let expected = {
+                let db = roble::open(&env, &dir).await.expect("a clean recovery");
+                durable_prefix(&contents(&db).await).expect("a prefix")
+            };
+
+            // And how many operations that recovery takes, so that each one
+            // can be failed in turn.
+            let (counting, counting_dir) = crashed_at(n, wal).await;
+            let before = counting.sim().ops();
+            {
+                let _db = roble::open(&counting, &counting_dir)
+                    .await
+                    .expect("a clean recovery");
+            }
+            let recovery_ops = counting.sim().ops() - before;
+
+            for m in 1..=recovery_ops {
+                let (env, dir) = crashed_at(n, wal).await;
+                env.sim().fail_at(m);
+                if roble::open(&env, &dir).await.is_err() {
+                    interrupted += 1;
+                }
+                env.sim().stop_failing();
+
+                let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                    panic!(
+                        "wal={wal}: a recovery of the crash at {n} that failed at its own \
+                         operation {m} left a database that will not open: {e}"
+                    )
+                });
+                let found = durable_prefix(&contents(&db).await).unwrap_or_else(|| {
+                    panic!(
+                        "wal={wal}: a failed recovery of the crash at {n} left a gap in \
+                         what survived"
+                    )
+                });
+                assert_eq!(
+                    found, expected,
+                    "wal={wal}: a recovery of the crash at {n} that failed at its own \
+                     operation {m} changed what survived"
+                );
+            }
+        }
+
+        // The same guard as the sweeps above: if failing an operation of the
+        // recovery stopped stopping it, every inner run would be an ordinary
+        // open and the comparison would be against itself.
+        assert!(
+            interrupted > 0,
+            "wal={wal}: no injected failure ever interrupted a recovery, so this \
+             compared a clean open against a clean open"
+        );
+    }
+}
+
+/// A disk that keeps the buffer it was handed, at any one operation.
+///
+/// This is §12's third pass, and the one the simulator could not do until it
+/// grew a seam: "once more with the operation returning other buffers than it
+/// was given, which the disk keeps until the run ends."
+///
+/// A disk is allowed to do this. `Disk::read` and `Disk::write` take a buffer
+/// by value and return one, and nothing in the trait says it is the same
+/// buffer — a kernel that still owns the memory returns another. What the
+/// engine must not do is read the buffer it got back as though it were the
+/// one it sent, which is why the one it gets back is poisoned rather than
+/// zeroed: `0xa5` through a key or a block header is visibly wrong, where
+/// zeroes read as a plausible empty.
+///
+/// **What this does not yet catch.** §8's size-classed frames do not exist —
+/// they arrive with direct I/O — so a withheld buffer is a `Vec` whose memory
+/// is merely kept, not a frame held out of a pool. The accounting half of
+/// this pass therefore has nothing to account for yet. What it does catch
+/// today is an engine that uses a buffer after the call that borrowed it
+/// failed, and that is worth having before the frames arrive rather than
+/// after.
+#[compio::test]
+async fn a_disk_that_keeps_its_buffer_is_survived() {
+    for wal in [true, false] {
+        let total = count_operations(wal).await;
+        let mut kept_any = 0u64;
+
+        for n in 1..=total {
+            let (env, dir) = load("db-simple").await;
+            env.sim().withhold_at(n);
+            // Allowed to fail. Not allowed to read the buffer it did not get
+            // back, or to leave a database that will not open.
+            let _ = scenario(&env, &dir, wal).await;
+            kept_any += env.sim().withheld() as u64;
+            env.sim().stop_withholding();
+
+            let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                panic!(
+                    "wal={wal}: withholding the buffer of operation {n} of {total} left a \
+                     database that will not open: {e}"
+                )
+            });
+            let found = contents(&db).await;
+            assert!(
+                durable_prefix(&found).is_some(),
+                "wal={wal}: withholding the buffer of operation {n} of {total} left a gap \
+                 in what survived"
+            );
+            // The poison must not have reached the store. A key or a value
+            // made of it would mean the engine read a buffer it had handed
+            // away, and the scan above would have carried it here.
+            for (key, value) in &found {
+                assert!(
+                    !key.iter().all(|b| *b == 0xa5) && !value.iter().all(|b| *b == 0xa5),
+                    "wal={wal}: withholding the buffer of operation {n} of {total} let a \
+                     withheld buffer reach the store"
+                );
+            }
+        }
+
+        // Most operations are not reads or writes — an open, a sync, a
+        // listing — so this does not expect every one to withhold. It does
+        // expect the seam to have fired, or the sweep is an ordinary run.
+        assert!(
+            kept_any > 0,
+            "wal={wal}: no operation ever withheld a buffer, so this swept nothing"
+        );
+    }
+}
