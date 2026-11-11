@@ -252,3 +252,171 @@ fn the_wrong_kind_of_file_is_refused() {
     assert!(!out.status.success(), "a table is not a MANIFEST");
     assert!(!stderr(&out).is_empty());
 }
+
+/// The layout names what each table actually holds.
+///
+/// `--layout` is the one place the command says something the dump does not,
+/// so what it says has to be true of the file rather than of the last fixture
+/// anyone looked at. Each of these is a structure only some tables have, and
+/// `valueblocks` alone — the fixture the test above uses — has none of the
+/// first three.
+#[test]
+fn the_layout_names_what_each_table_holds() {
+    for (fixture, expected) in [
+        // A bloom filter, which only this fixture is written with.
+        ("bloom", "filter"),
+        // Range deletions, which live in a metaindex block of their own.
+        ("rangedel", "range-del"),
+        // An index too big for one block, so the index is two levels.
+        ("multiblock", "two-level"),
+        // And the one the test above already covers, kept so that a change
+        // making them all say the same thing would show up here.
+        ("valueblocks", "value-index"),
+    ] {
+        let path = golden(&format!("{fixture}.sst"));
+        let out = roble(&["sst", "dump", "--layout", path.to_str().unwrap()]);
+        assert!(out.status.success(), "{}: {}", fixture, stderr(&out));
+        assert!(
+            stdout(&out).contains(expected),
+            "{fixture}'s layout should mention {expected:?}"
+        );
+    }
+
+    // The negative half: a table without a filter must not claim one, or
+    // "filter" would mean nothing wherever it appears.
+    let path = golden("simple.sst");
+    let out = roble(&["sst", "dump", "--layout", path.to_str().unwrap()]);
+    let text = stdout(&out);
+    let metaindex = text
+        .lines()
+        .find(|l| l.starts_with("metaindex "))
+        .expect("a metaindex line");
+    assert!(
+        !metaindex.contains("filter"),
+        "simple.sst has no filter, got {metaindex:?}"
+    );
+}
+
+/// A reader that goes away stops the dump quietly.
+///
+/// `roble sst dump big.sst | head` is how a dump is read more often than it is
+/// read whole, and the pipe closes while the command is still writing. Rust
+/// leaves SIGPIPE ignored, so the write comes back as an error rather than
+/// killing the process, and it is the command's job to tell that case apart
+/// from a real failure: a broken pipe is success and anything else is not.
+///
+/// `snappy` is used because its dump is a quarter of a megabyte, well past
+/// any pipe buffer — a fixture small enough to fit would be written in one go
+/// and never meet the closed reader.
+#[test]
+fn a_reader_that_goes_away_is_not_an_error() {
+    use std::process::Stdio;
+
+    let path = golden("snappy.sst");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_roble"))
+        .args(["sst", "dump", path.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run roble");
+
+    // Close the read end while the command is still writing.
+    drop(child.stdout.take().expect("stdout is piped"));
+
+    let out = child.wait_with_output().expect("wait for roble");
+    assert!(
+        out.status.success(),
+        "a closed reader should be a quiet stop, got {} and {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "nothing should be said about it, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Writes a MANIFEST of framed records into a temporary file.
+fn a_manifest(name: &str, records: &[Vec<u8>]) -> PathBuf {
+    use roble_format::record::RecordWriter;
+
+    let mut writer = RecordWriter::legacy();
+    for record in records {
+        writer.write_record(record).expect("frame the record");
+    }
+    let path = std::env::temp_dir().join(format!("roble-cli-{name}-{}", std::process::id()));
+    std::fs::write(&path, writer.finish()).expect("write the manifest");
+    path
+}
+
+/// A record that frames correctly but is not a version edit is reported with
+/// its number.
+///
+/// The number is the point. A MANIFEST is a sequence, and "this file is bad"
+/// is not something anyone can act on — "version edit 3" says which edit to
+/// look at, and that the three before it decoded.
+#[test]
+fn a_record_that_is_not_a_version_edit_is_reported_with_its_number() {
+    let good = roble_format::manifest::VersionEdit {
+        comparer_name: Some("leveldb.BytewiseComparator".to_string()),
+        next_file_num: Some(10),
+        ..Default::default()
+    }
+    .encode();
+    // Tag 99 is not a tag any Pebble writes.
+    let path = a_manifest("bad-edit", &[good.clone(), good, vec![99, 1, 2, 3]]);
+
+    let out = roble(&["manifest", "dump", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("version edit 2"),
+        "the refusal should say which edit, got {err:?}"
+    );
+}
+
+/// The rare fields of an edit reach the dump.
+///
+/// A dump exists to show what is in a file, so the fields that appear once in
+/// a database's life are exactly the ones worth pinning: they are the fields
+/// nobody will notice the absence of. The bound here is deliberately not a
+/// decodable internal key, because a dump that hid an unreadable bound would
+/// hide the thing someone opened the dump to find.
+#[test]
+fn the_dump_shows_the_fields_an_edit_rarely_carries() {
+    use roble_format::manifest::{NewTable, VersionEdit};
+
+    let edit = VersionEdit {
+        comparer_name: Some("leveldb.BytewiseComparator".to_string()),
+        next_file_num: Some(10),
+        last_seq_num: Some(20),
+        obsolete_prev_log_num: Some(7),
+        new_tables: vec![NewTable {
+            level: 0,
+            file_num: 4,
+            size: 100,
+            // Too short to hold the eight-byte trailer an internal key ends
+            // with, so the dump has to say so rather than drop it.
+            smallest: b"short".to_vec(),
+            largest: b"short".to_vec(),
+            smallest_seq_num: 1,
+            largest_seq_num: 2,
+            marked_for_compaction: true,
+            creation_time: 0,
+        }],
+        ..Default::default()
+    };
+    let path = a_manifest("rare-fields", &[edit.encode()]);
+
+    let out = roble(&["manifest", "dump", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for expected in ["prev-log 7", "marked-for-compaction", "<undecodable:"] {
+        assert!(text.contains(expected), "the dump should show {expected:?}");
+    }
+}
