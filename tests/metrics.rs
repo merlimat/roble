@@ -42,8 +42,9 @@ use opentelemetry_sdk::metrics::{
     InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
 };
 
+use roble::cache::DEFAULT_OPEN_TABLES;
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, Options, WriteBuf};
+use roble::{Caches, Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 
 /// A reader the test keeps a handle to, so it can collect on demand.
@@ -135,7 +136,34 @@ fn by_attr(reader: &Reader, tag: &KeyValue, name: &str, key: &str) -> BTreeMap<S
             .find(|a| a.key.as_str() == key)
             .map(|a| a.value.to_string())
             .expect("the attribute the metric is split by");
-        out.insert(at, value);
+        // Summed, not replaced: several series can share the value this is
+        // grouping by. `roble.cache.lookups` has four, and grouping them by
+        // result alone puts the block cache's hits and the table cache's
+        // into one number.
+        *out.entry(at).or_default() += value;
+    }
+    out
+}
+
+/// One cache's hits and misses, which is two attributes deep: grouping by
+/// the result alone adds the block cache's to the table cache's, and then a
+/// hit counted against the wrong cache looks like no change at all.
+fn lookups(reader: &Reader, tag: &KeyValue, cache: &str) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    for (metric, attributes, value) in points(reader) {
+        if metric != "roble.cache.lookups" || !attributes.contains(tag) {
+            continue;
+        }
+        let of = |key: &str| {
+            attributes
+                .iter()
+                .find(|a| a.key.as_str() == key)
+                .map(|a| a.value.to_string())
+                .expect("the attribute")
+        };
+        if of("roble.cache") == cache {
+            out.insert(of("roble.cache.result"), value);
+        }
     }
     out
 }
@@ -560,6 +588,231 @@ async fn open_scans_are_counted_until_they_are_dropped() {
         collected(reader(), &tag).get("roble.scans.open").copied(),
         Some(0),
         "and a store that goes on reporting scans nobody holds is how a leak hides"
+    );
+}
+
+#[compio::test]
+async fn every_read_write_and_sync_is_counted() {
+    let (options, tag) = metered("disk-io");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    // A lookup opens a table and reads blocks out of it.
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let read = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction");
+    let ops = by_attr(reader(), &tag, "roble.disk.operations", "disk.io.direction");
+    assert!(read["read"] > 0, "a lookup read bytes: {read:?}");
+    assert!(ops["read"] > 1, "in more than one request: {ops:?}");
+
+    // A write goes to the log; a flush writes a table and a MANIFEST record.
+    let mut batch = Batch::new();
+    batch.put(b"io", b"counted").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    let after_write = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction");
+    assert!(
+        after_write["write"] > 0,
+        "the log append should have been counted: {after_write:?}"
+    );
+
+    db.flush().await.expect("flush").expect("a table");
+    let after_flush = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction");
+    assert!(
+        after_flush["write"] > after_write["write"],
+        "and the table and the version edit too: {after_flush:?}"
+    );
+    let ops = by_attr(reader(), &tag, "roble.disk.operations", "disk.io.direction");
+    assert!(
+        ops["write"] >= 3,
+        "the log, the table and the edit: {ops:?}"
+    );
+
+    // And a compaction writes its outputs through the same counters.
+    let in_l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    let outputs = db.compact(0, &in_l0).await.expect("compact");
+    let written: u64 = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .filter(|t| outputs.contains(&t.file_num))
+        .map(|t| t.size)
+        .sum();
+    assert!(written > 0, "the compaction wrote a table");
+    let after_compaction = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction");
+    assert!(
+        after_compaction["write"] - after_flush["write"] >= written as i64,
+        "a compaction's outputs should be counted, not just its version edit: \
+         {after_compaction:?} against {after_flush:?}, for {written} bytes of table"
+    );
+}
+
+#[compio::test]
+async fn the_caches_report_what_they_hold_and_the_store_what_it_looked_for() {
+    // The budget and what is held belong to the `Caches`, which every store
+    // on a thread shares; who looked, and whether they found it, belongs to
+    // the store that looked.
+    let cache_tag = KeyValue::new("case", "caches");
+    let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, 64 << 10)
+        .meter_provider(&METRICS.0, std::slice::from_ref(&cache_tag));
+
+    let (options, tag) = metered("cache-lookups");
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open_with(&env, &dir, options.caches(caches.clone()))
+        .await
+        .expect("open");
+
+    let limits = by_attr(reader(), &cache_tag, "roble.cache.limit", "roble.cache");
+    assert_eq!(
+        limits.get("block").copied(),
+        Some(64 << 10),
+        "the block budget is the caches' own: {limits:?}"
+    );
+    assert_eq!(
+        limits.get("table").copied(),
+        Some(DEFAULT_OPEN_TABLES as i64)
+    );
+
+    // Two reads of the same key: the first misses in both caches, the second
+    // finds what the first left behind.
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let before: Vec<BTreeMap<String, i64>> = ["block", "table"]
+        .iter()
+        .map(|cache| lookups(reader(), &tag, cache))
+        .collect();
+    for (cache, counts) in ["block", "table"].iter().zip(&before) {
+        assert!(
+            counts["miss"] > 0,
+            "the first read missed in the {cache} cache: {counts:?}"
+        );
+    }
+    assert_eq!(
+        before[0].get("hit").copied(),
+        Some(0),
+        "and the block cache was empty: {:?}",
+        before[0]
+    );
+
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    for (cache, was) in ["block", "table"].iter().zip(&before) {
+        let now = lookups(reader(), &tag, cache);
+        assert!(
+            now["hit"] > was["hit"],
+            "the second read should have hit what the first left in the {cache} cache: \
+             {now:?} against {was:?}"
+        );
+    }
+
+    let used = by_attr(reader(), &cache_tag, "roble.cache.usage", "roble.cache");
+    assert!(
+        used["block"] > 0,
+        "the block cache holds what the reads fetched: {used:?}"
+    );
+    assert!(used["table"] > 0, "and a reader per table opened: {used:?}");
+    assert!(
+        used["block"] <= (64 << 10),
+        "never more than its budget: {used:?}"
+    );
+}
+
+#[compio::test]
+async fn a_small_cache_reports_what_it_evicted() {
+    let cache_tag = KeyValue::new("case", "evictions");
+    // Room for a handful of the fixture's 128-byte blocks, so a walk over
+    // the whole database has to push some of them out again.
+    let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, 1024)
+        .meter_provider(&METRICS.0, std::slice::from_ref(&cache_tag));
+
+    let (options, _) = metered("eviction-store");
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open_with(&env, &dir, options.caches(caches))
+        .await
+        .expect("open");
+
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+    while scan.is_valid() {
+        scan.next().await.expect("next");
+    }
+    drop(scan);
+
+    let evicted = by_attr(reader(), &cache_tag, "roble.cache.evictions", "roble.cache");
+    assert!(
+        evicted.get("block").copied().unwrap_or(0) > 0,
+        "a 4 KiB block cache walked over a whole database evicts: {evicted:?}"
+    );
+}
+
+#[compio::test]
+async fn the_records_estimate_climbs_to_what_the_store_holds() {
+    let (options, tag) = metered("records");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    // Nothing opened yet, so nothing is known: the estimate starts at what
+    // the memtable holds, which is nothing.
+    assert_eq!(
+        collected(reader(), &tag)
+            .get("roble.records.estimate")
+            .copied(),
+        Some(0),
+        "no table has been read, so none has been counted"
+    );
+
+    // Writing is exact at once.
+    let mut batch = Batch::new();
+    for i in 0..9 {
+        batch.put(format!("r{i}").as_bytes(), b"v").expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    assert_eq!(
+        collected(reader(), &tag)
+            .get("roble.records.estimate")
+            .copied(),
+        Some(9),
+        "the memtable's entries count straight away"
+    );
+
+    // A flush knows its own output, so the estimate does not dip.
+    db.flush().await.expect("flush").expect("a table");
+    assert_eq!(
+        collected(reader(), &tag)
+            .get("roble.records.estimate")
+            .copied(),
+        Some(9),
+        "the memtable emptied into a table the store wrote and counted"
+    );
+
+    // And reading a table the store never wrote teaches it that one too.
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let both = collected(reader(), &tag)["roble.records.estimate"];
+    assert!(
+        both > 9,
+        "the fixture's own table should have been counted once it was read: {both}"
+    );
+
+    // A compaction merges the two into one. The table that left the version
+    // has to stop being counted, or every compaction would inflate the
+    // estimate by what it rewrote.
+    let in_l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    assert_eq!(in_l0.len(), 2);
+    db.compact(0, &in_l0).await.expect("compact");
+    let after = collected(reader(), &tag)["roble.records.estimate"];
+    assert_eq!(
+        after, both,
+        "the merge dropped no key, so the estimate should not have moved: {after} \
+         against {both}"
     );
 }
 

@@ -67,6 +67,10 @@ pub struct Clock<K: Eq + Hash + Clone, V: Clone> {
     hand: usize,
     used: usize,
     budget: usize,
+    /// What the caches export, if anything, and which of the two this is
+    /// (`crate::metrics`).
+    metrics: Option<std::rc::Rc<crate::metrics::CacheMetrics>>,
+    which: usize,
 }
 
 impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
@@ -79,6 +83,8 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
             hand: 0,
             used: 0,
             budget,
+            metrics: None,
+            which: 0,
         }
     }
 
@@ -99,6 +105,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
         if cost > self.budget {
             return;
         }
+        self.usage_changed();
         if let Some(&at) = self.index.get(&key) {
             if let Some(old) = self.slots[at].take() {
                 self.used -= old.cost;
@@ -126,6 +133,26 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
         };
         self.index.insert(key, at);
         self.used += cost;
+        self.usage_changed();
+    }
+
+    /// Restates what the cache holds, for whatever is recording.
+    fn usage_changed(&self) {
+        if let Some((usage, _, _)) = self.metrics.as_ref().map(|m| m.of(self.which)) {
+            usage.set(self.used as i64);
+        }
+    }
+
+    /// Records the handles this cache reports through, and its budget.
+    pub(crate) fn record_into(
+        &mut self,
+        metrics: std::rc::Rc<crate::metrics::CacheMetrics>,
+        which: usize,
+    ) {
+        let (_, limit, _) = metrics.of(which);
+        limit.set(self.budget as i64);
+        self.metrics = Some(metrics);
+        self.which = which;
     }
 
     /// Sweeps until `need` more fits, clearing second chances as it goes.
@@ -148,6 +175,10 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
                     self.index.remove(&slot.key);
                     self.used -= slot.cost;
                     self.free.push(self.hand);
+                    if let Some((_, _, evictions)) = self.metrics.as_ref().map(|m| m.of(self.which))
+                    {
+                        evictions.add(1);
+                    }
                 }
             }
             self.hand = (self.hand + 1) % self.slots.len();
@@ -252,6 +283,8 @@ pub struct Caches<F: Fs> {
     tables: TableClock<F>,
     blocks: BlockClock,
     next_store: Rc<std::cell::Cell<u64>>,
+    /// What the caches themselves export, held so a clone shares it.
+    metrics: Rc<crate::metrics::CacheMetrics>,
 }
 
 /// What identifies a table inside a shared cache.
@@ -275,6 +308,7 @@ impl<F: Fs> Clone for Caches<F> {
             tables: Rc::clone(&self.tables),
             blocks: Rc::clone(&self.blocks),
             next_store: Rc::clone(&self.next_store),
+            metrics: Rc::clone(&self.metrics),
         }
     }
 }
@@ -286,7 +320,30 @@ impl<F: Fs> Caches<F> {
             tables: Rc::new(RefCell::new(Clock::new(open_tables))),
             blocks: Rc::new(RefCell::new(Clock::new(block_bytes))),
             next_store: Rc::new(std::cell::Cell::new(0)),
+            metrics: Rc::new(crate::metrics::CacheMetrics::default()),
         }
+    }
+
+    /// Exports what the caches hold through `provider`, with `attributes`.
+    ///
+    /// Theirs rather than any store's: a `Caches` is shared by every store on
+    /// a thread (§8), so its budget, what it holds and what it evicts are
+    /// facts about the thread, and a series per store would be the same
+    /// number repeated. Which store *looked* in it is the store's own
+    /// `roble.cache.lookups`.
+    pub fn meter_provider<P: opentelemetry::metrics::MeterProvider + ?Sized>(
+        self,
+        provider: &P,
+        attributes: &[opentelemetry::KeyValue],
+    ) -> Self {
+        let metrics = Rc::new(crate::metrics::CacheMetrics::new(provider, attributes));
+        self.blocks
+            .borrow_mut()
+            .record_into(Rc::clone(&metrics), crate::metrics::BLOCK_CACHE);
+        self.tables
+            .borrow_mut()
+            .record_into(Rc::clone(&metrics), crate::metrics::TABLE_CACHE);
+        Caches { metrics, ..self }
     }
 
     /// One store's view of the block cache.

@@ -43,6 +43,9 @@ the caller's choosing.
 | `roble.level` | `roble.level.*` | `0`–`6` |
 | `disk.io.direction` | `roble.compaction.*` | `read`, `write` |
 | `error.type` | `roble.*.errors` | `io`, `locked`, `format`, `unsupported`, `corrupt`, `not_found` |
+| `disk.io.direction` | `roble.disk.*` | `read`, `write` |
+| `roble.cache` | `roble.cache.*` | `block`, `table` |
+| `roble.cache.result` | `roble.cache.lookups` | `hit`, `miss` |
 
 A handle exists for every value of `error.type` from the moment a store opens,
 so the series are there at zero before anything has gone wrong.
@@ -106,6 +109,57 @@ Both halves are counters rather than histograms so that the ratio can be taken.
 | `roble.level.size` | up-down counter | By | Bytes of the tables in each level |
 | `roble.disk.size` | up-down counter | By | Bytes of every file in the store's directory |
 | `roble.compaction.debt` | up-down counter | By | Bytes the levels hold above what their allowances let them |
+| `roble.records.estimate` | up-down counter | `{record}` | Records the store holds, counting every version of a key and every tombstone |
+
+`roble.records.estimate` is an estimate for one reason: the count is in each
+table's properties block, which is read when the table is opened, and no
+MANIFEST records it. A store learns a table's count the first time something
+has reason to read it, rather than opening every table at once and making an
+open pay for a metric — so after a reopen the number climbs to the truth as
+the store is used. A flush and a compaction know their own outputs outright,
+so a store that writes is exact from the start.
+
+## Disk
+
+| Metric | Instrument | Unit | What it says |
+|---|---|---|---|
+| `roble.disk.io` | counter | By | Bytes the store read from and wrote to its files |
+| `roble.disk.operations` | counter | `{operation}` | Read and write requests the store made |
+| `roble.disk.read.duration` | latency | s | Time a read of a file takes |
+| `roble.disk.sync.duration` | latency | s | Time a sync of a file takes |
+
+Both carry `disk.io.direction`, so IOPS is the rate of
+`roble.disk.operations` and throughput the rate of `roble.disk.io`. These count
+what the store asked the filesystem for, which is what a cache miss costs; a
+read served from the block cache makes no request and appears in
+`roble.cache.lookups` instead.
+
+## Caches
+
+A `Caches` is shared by every store on a thread (§8), so what it holds and what
+it evicts are facts about the thread, and it exports them through its own
+provider:
+
+```rust
+let caches = Caches::new(128, 32 << 20)
+    .meter_provider(&provider, &[KeyValue::new("thread", "0")]);
+```
+
+| Metric | Instrument | Unit | What it says |
+|---|---|---|---|
+| `roble.cache.usage` | up-down counter | — | What the caches hold: bytes for blocks, open readers for tables |
+| `roble.cache.limit` | up-down counter | — | What they may hold |
+| `roble.cache.evictions` | counter | `{entry}` | Entries evicted to make room |
+
+Which store *looked* in a cache is a different question, and the store answers
+that one:
+
+| Metric | Instrument | Unit | What it says |
+|---|---|---|---|
+| `roble.cache.lookups` | counter | `{lookup}` | Tables and blocks the store looked for, by `roble.cache` and `roble.cache.result` |
+
+A `Caches` with no provider of its own records nothing, whatever the stores
+drawing on it do.
 
 `roble.disk.size` is measured from the directory, so it counts the MANIFEST, the
 logs, the markers and anything obsolete that the sweep has not collected yet — not
@@ -143,8 +197,10 @@ what each becomes here.
 | `pebble_num_files_total` | `roble.level.tables`, summed over levels |
 | `pebble_write_amplification_percent` | the ratio above |
 | `pebble_read_iterators` | `roble.scans.open` |
-| `pebble_block_cache_used` / `_hits` / `_misses`, `pebble_max_cache_size` | *not yet* — see below |
-| `pebble_read` | *not yet* — the disk's bytes, below |
+| `pebble_block_cache_used` | `roble.cache.usage{roble.cache="block"}` |
+| `pebble_max_cache_size` | `roble.cache.limit{roble.cache="block"}` |
+| `pebble_block_cache_hits` / `_misses` | `roble.cache.lookups`, by `roble.cache.result` |
+| `pebble_read` | `roble.disk.io{disk.io.direction="read"}` |
 | `pebble_l0_sublevels` | *not yet* — roble has no L0 sublevels |
 | `kv_pebble_write_stalls`, `kv_pebble_write_stall_time` | *not yet* — below |
 
@@ -154,15 +210,6 @@ to poll and nothing to memoize.
 
 ## Not here yet
 
-- **The caches' usage, and their hits and misses.** A `Caches` is shared by every
-  store on a thread (§8), so these belong to it rather than to any one store, and
-  it has no meter of its own yet.
-- **Disk I/O: bytes, operations and their latency.** Every read and write a store
-  issues, including a compaction's, which is what gives IOPS and read
-  amplification.
-- **An estimate of the records a store holds.** The count is in each table's
-  properties block, which is read when a table is opened; summing it means opening
-  every table of the version, which a store does not do today.
 - **The two write stalls** of §9, and the time spent in them — a write waiting
   for a memtable, and a write waiting for L0 to drain. Nothing stalls yet, and a
   counter for an event that cannot happen says nothing; they arrive with the

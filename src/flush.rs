@@ -72,6 +72,7 @@ impl<F: Fs> Opened<'_, F> {
             }
         };
 
+        let entries = memtable.borrow().len() as u64;
         let (bytes, new_table) = build_table(&memtable.borrow(), table_num)?;
         self.metrics.flush_size.record(bytes.len() as u64);
         self.metrics.flush_bytes.add(bytes.len() as u64);
@@ -81,11 +82,16 @@ impl<F: Fs> Opened<'_, F> {
             .dir
             .join(roble_format::files::table_filename(table_num));
         let disk = self.fs().create(&path).await?;
+        let written = bytes.len();
         let (result, _) = disk
             .write(WriteBuf::new(bytes), 0, Default::default())
             .await;
         result?;
-        disk.sync(Default::default()).await?;
+        self.metrics.written.add(written);
+        {
+            let _timer = self.metrics.sync_duration.start();
+            disk.sync(Default::default()).await?;
+        }
         disk.close().await?;
         self.fs().sync_dir(&self.dir).await?;
 
@@ -150,6 +156,8 @@ impl<F: Fs> Opened<'_, F> {
         self.measure_disk().await;
         self.metrics.flushes.add(1);
         self.saw_debt();
+        self.saw_table_entries(table_num, Some(entries));
+        self.recount_records();
         Ok(Some(table_num))
     }
 
@@ -165,11 +173,16 @@ impl<F: Fs> Opened<'_, F> {
         writer.write_record(&edit.encode())?;
         let framed = writer.as_bytes().to_vec();
 
+        let written = framed.len();
         let (result, _) = disk
             .write(WriteBuf::new(framed), at as u64, Default::default())
             .await;
         result?;
-        disk.sync(Default::default()).await?;
+        self.metrics.written.add(written);
+        {
+            let _timer = self.metrics.sync_duration.start();
+            disk.sync(Default::default()).await?;
+        }
         disk.close().await?;
         Ok(writer.position() as u64)
     }
