@@ -20,9 +20,12 @@
 //! that no longer exists. So the rule is written as a list of what may go,
 //! never as a list of what must stay, and the fall-through is to keep:
 //!
-//! - A **table** goes when the current version names it at no level. A table
-//!   the version does not name is unreachable: every read starts from the
-//!   version, so no code path can ask for it.
+//! - A **table** goes when the current version names it at no level **and
+//!   no reader is open for it**. The version is where every read starts, so
+//!   a table it does not name is one nothing can newly ask for — but a scan
+//!   that began before the version changed holds open readers of its own,
+//!   and those are exactly the reads that would find the file gone. See
+//!   [`Readers`].
 //! - A **log** goes when its number is below `min_unflushed_log_num`. That
 //!   counter is the MANIFEST's statement that every record in the logs below
 //!   it is in a table, and it is durable before any file is touched.
@@ -59,7 +62,8 @@
 //! Pebble does not either — because an unlink that a crash undoes merely
 //! brings back a file that is still obsolete.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use roble_format::files::{self, FileType, MARKER_MANIFEST};
@@ -137,16 +141,79 @@ fn is_obsolete(name: &str, live: &Live) -> bool {
     }
 }
 
+/// How many readers are open for each table (§5).
+///
+/// This is the reference counting §5 asks for, counted per table rather than
+/// per version. A scan owns an `Rc<OpenTable>` for every table of the
+/// version it began on, so keeping those tables is keeping that version, and
+/// a table counted here is one some reader can still ask for a block of.
+/// Pebble arrives at the same guarantee from the other side — it reference
+/// counts the version itself and collects a file once no live version names
+/// it — but roble already holds the references where they matter, so
+/// counting them needs no second structure to keep in step with the first.
+///
+/// Every count is one `OpenTable`'s whole life: taken when one is built and
+/// given back when it is dropped, both in `crate::table`, so nothing here
+/// depends on a caller remembering.
+#[derive(Default)]
+pub(crate) struct Readers {
+    open: RefCell<BTreeMap<u64, usize>>,
+}
+
+impl Readers {
+    /// Takes account of a reader that has just been opened.
+    pub(crate) fn opened(&self, file_num: u64) {
+        *self.open.borrow_mut().entry(file_num).or_insert(0) += 1;
+    }
+
+    /// Takes account of one that has just been dropped.
+    pub(crate) fn closed(&self, file_num: u64) {
+        let mut open = self.open.borrow_mut();
+        let Some(n) = open.get_mut(&file_num) else {
+            // Untested, with a reason (§12): a count is taken when an
+            // `OpenTable` is built and given back when that same one is
+            // dropped, so a number arriving here is a number this map
+            // holds. It returns rather than panicking because this runs in
+            // a `Drop` — and if the pairing ever did break, a count left
+            // behind only delays a file to the next sweep, where a panic
+            // while unwinding would take the process.
+            return;
+        };
+        *n -= 1;
+        if *n == 0 {
+            open.remove(&file_num);
+        }
+    }
+
+    /// The tables at least one reader is open for.
+    pub(crate) fn open(&self) -> BTreeSet<u64> {
+        self.open.borrow().keys().copied().collect()
+    }
+}
+
 /// Deletes every obsolete file among `names`, and says which it deleted.
+///
+/// A table that `in_use` names is left where it is, however obsolete: the
+/// file is unreachable to anything starting from the version, and still open
+/// to a reader that started before it changed. Nothing is lost by waiting —
+/// the next sweep finds it again, as it does every file this leaves behind.
 pub(crate) async fn remove_obsolete<F: Fs>(
     fs: &F,
     dir: &Path,
     names: &[String],
     live: &Live,
+    in_use: &BTreeSet<u64>,
 ) -> Result<Vec<String>> {
     let mut removed = Vec::new();
     for name in names {
         if !is_obsolete(name, live) {
+            continue;
+        }
+        // A table a reader still has open is left where it is. Only a
+        // table has readers, and a file number names one file, so nothing
+        // else can match: the numbers come from the one counter the
+        // MANIFEST carries.
+        if files::parse_filename(name).is_some_and(|p| in_use.contains(&p.file_num)) {
             continue;
         }
         fs.remove(&dir.join(name)).await?;
@@ -162,9 +229,8 @@ impl<F: Fs> Opened<'_, F> {
     /// never has to. It is public for the caller who flushes rarely and
     /// wants the space back, and for a test that wants to watch.
     ///
-    /// The table cache is not consulted, and does not need to be: a reader is
-    /// only ever opened for a table the version names, so no entry can be
-    /// holding one of the files this deletes.
+    /// A table a reader is still open for is left for a later sweep, and the
+    /// table cache's own reader is let go of first (§5).
     pub async fn remove_obsolete_files(&self) -> Result<Vec<String>> {
         let names: Vec<String> = self
             .fs()
@@ -182,8 +248,31 @@ impl<F: Fs> Opened<'_, F> {
             let versions = self.versions();
             Live::of(&versions, manifest_num, &names)?
         };
-        let removed = remove_obsolete(self.fs(), &self.dir, &names, &live).await?;
+        let in_use = self.release_dead_readers(&live);
+        let removed = remove_obsolete(self.fs(), &self.dir, &names, &live, &in_use).await?;
         self.forget_markers(&removed);
         Ok(removed)
+    }
+
+    /// Lets go of the table cache's readers for tables the version no longer
+    /// names, and says which tables a reader is open for after that.
+    ///
+    /// The two halves are in this order because the cache is not a reader in
+    /// the sense the sweep cares about. It holds one for as long as its
+    /// budget allows and nobody may be reading it, so leaving it there would
+    /// make a file wait for cache pressure rather than for whoever is
+    /// actually reading it. Pebble evicts from its own table cache at
+    /// exactly this point, and for this reason.
+    ///
+    /// So the second `open()` is not the first: letting go of a reader
+    /// nothing else holds drops it, and dropping it is what takes its count
+    /// back out.
+    fn release_dead_readers(&self, live: &Live) -> BTreeSet<u64> {
+        for file_num in self.readers().open() {
+            if !live.tables.contains(&file_num) {
+                self.forget_reader(file_num);
+            }
+        }
+        self.readers().open()
     }
 }

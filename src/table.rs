@@ -87,6 +87,9 @@ pub struct OpenTable<D: Disk> {
     blocks: crate::cache::BlockCache,
     /// What the store that opened it records, if anything.
     metrics: Option<Rc<crate::metrics::Metrics>>,
+    /// Where to give its count back when it is dropped, if the store that
+    /// opened it is counting (§5, `crate::obsolete`).
+    readers: Option<Rc<crate::obsolete::Readers>>,
     /// How many entries its properties block says it holds, when it says.
     ///
     /// Read while the table is being opened, so learning it costs nothing: a
@@ -103,7 +106,7 @@ impl<D: Disk> OpenTable<D> {
     /// is read whole and accepted when it is read block by block would be
     /// worse than either.
     pub async fn open(file_num: u64, disk: D, blocks: crate::cache::BlockCache) -> Result<Self> {
-        OpenTable::open_metered(file_num, disk, blocks, None).await
+        OpenTable::open_metered(file_num, disk, blocks, None, None).await
     }
 
     /// The same, counting every read it makes against a store's handles.
@@ -116,6 +119,7 @@ impl<D: Disk> OpenTable<D> {
         disk: D,
         blocks: crate::cache::BlockCache,
         metrics: Option<Rc<crate::metrics::Metrics>>,
+        readers: Option<Rc<crate::obsolete::Readers>>,
     ) -> Result<Self> {
         let size = disk.len().await?;
         let tail = read_tail(&disk, FOOTER_LEN.min(size as usize), Default::default()).await?;
@@ -184,6 +188,12 @@ impl<D: Disk> OpenTable<D> {
         };
 
         let entries = properties.num_entries()?;
+        // Counted here and nowhere else, so that the count exists for
+        // exactly as long as the reader does: a table whose open failed
+        // above was never built and has nothing to give back.
+        if let Some(readers) = &readers {
+            readers.opened(file_num);
+        }
         Ok(OpenTable {
             file_num,
             entries,
@@ -195,6 +205,7 @@ impl<D: Disk> OpenTable<D> {
             tombstones,
             blocks,
             metrics,
+            readers,
         })
     }
 
@@ -580,4 +591,18 @@ pub fn covered_by_tombstone<D: Disk>(
         }
     }
     Ok(false)
+}
+
+/// Gives back the reason the obsolete sweep had to leave this table's file
+/// alone (§5, `crate::obsolete`).
+///
+/// The last reader of a table the version has stopped naming is what the
+/// sweep is waiting for, and this is the only thing that knows when it has
+/// gone.
+impl<D: Disk> Drop for OpenTable<D> {
+    fn drop(&mut self) {
+        if let Some(readers) = &self.readers {
+            readers.closed(self.file_num);
+        }
+    }
 }

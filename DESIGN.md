@@ -438,11 +438,18 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   skiplist replaces it the day a workload shows it needs one. A
   full memtable becomes immutable and queues for flush; the arena is released
   when its table is written.
-- **Versions are immutable and reference counted.** A version is the set of
-  files per level, with L0 as sublevels. A flush or a compaction produces a
-  version edit, which is appended to the MANIFEST and then applied; a reader
-  holding an older version is unaffected, so a snapshot costs one reference
-  count, as an encina iterator does.
+- **Versions are immutable, and what they name is reference counted.** A
+  version is the set of files per level, with L0 as sublevels. A flush or a
+  compaction produces a version edit, which is appended to the MANIFEST and
+  then applied; a reader holding an older version is unaffected, so a
+  snapshot costs one reference count, as an encina iterator does. The count
+  is kept per **table** rather than per version, because that is where roble
+  already holds the references: a scan owns an `Rc<OpenTable>` for every
+  table of the version it began on, so keeping those tables alive is keeping
+  that version alive, and the sweep below asks whether a table has a reader
+  rather than whether a version has a holder. Pebble counts the version and
+  collects a file once no live version names it, which is the same guarantee
+  with a second structure to keep in step with the first.
 - **Files are immutable, so there is nothing to lock.** A block is found through
   the table cache (an open reader per file, with its index and filter) and the
   block cache (decoded blocks, keyed by file number and offset). A
@@ -468,7 +475,10 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
 - **Obsolete files are deleted only after the edit that retired them is
   durable**: at the end of a flush, and at an open, where the MANIFEST just
   replayed is as durable as it gets. A table goes when the current version
-  names it at no level; a log goes when its number is below
+  names it at no level **and no reader is open for it** — the table cache's
+  own reader is let go of first, as Pebble evicts from its table cache at the
+  same point, so that a file waits for whoever is reading it rather than for
+  cache pressure; a log goes when its number is below
   `min_unflushed_log_num`; a MANIFEST goes when the manifest marker names a
   different one; a marker goes when a higher iteration of a name roble moves
   is there; everything else stays, including every name roble cannot parse. The directory is **not** synced afterwards, as Pebble does not

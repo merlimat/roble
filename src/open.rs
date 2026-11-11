@@ -99,6 +99,10 @@ pub struct Opened<'a, F: Fs> {
     markers: std::cell::RefCell<Vec<String>>,
     /// How large the MANIFEST may grow before a flush replaces it.
     max_manifest_bytes: u64,
+    /// How many readers are open for each of this store's tables, which is
+    /// what keeps the sweep from deleting one out from under a scan (§5,
+    /// `crate::obsolete`).
+    readers: std::rc::Rc<crate::obsolete::Readers>,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -223,9 +227,17 @@ pub async fn open_with<'a, E: Env>(
     //    failure is swallowed: a leftover file is no reason to refuse a
     //    database that reads.
     let live = crate::obsolete::Live::of(&versions, parsed.file_num, &names)?;
-    let swept = crate::obsolete::remove_obsolete(fs, dir, &names, &live)
-        .await
-        .unwrap_or_default();
+    // No reader can be open yet: the store being opened has made none, and
+    // another process holding the directory is what the lock refuses.
+    let swept = crate::obsolete::remove_obsolete(
+        fs,
+        dir,
+        &names,
+        &live,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .unwrap_or_default();
 
     // The next sequence number never goes backwards: a write replay brought
     // back must not be overwritten by one numbered the same (§6).
@@ -293,6 +305,7 @@ pub async fn open_with<'a, E: Env>(
         records_in_tables: std::cell::Cell::new(0),
         markers: std::cell::RefCell::new(markers),
         max_manifest_bytes: options.max_manifest_bytes,
+        readers: std::rc::Rc::new(crate::obsolete::Readers::default()),
         l0_compaction_threshold: options.l0_compaction_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
         compaction_unit: options.compaction_unit,
@@ -657,6 +670,17 @@ impl<F: Fs> Opened<'_, F> {
         self.manifest.borrow().marker_iter
     }
 
+    /// How many readers this store has open for each of its tables
+    /// (`crate::obsolete`).
+    pub(crate) fn readers(&self) -> &std::rc::Rc<crate::obsolete::Readers> {
+        &self.readers
+    }
+
+    /// Lets go of the table cache's reader for one of this store's tables.
+    pub(crate) fn forget_reader(&self, file_num: u64) {
+        self.caches.forget_table(self.store_id, file_num);
+    }
+
     /// How large the MANIFEST may grow before a flush replaces it
     /// (`crate::rotate`), as [`crate::Options`] was asked for.
     pub fn max_manifest_bytes(&self) -> u64 {
@@ -834,6 +858,7 @@ impl<F: Fs> Opened<'_, F> {
                 disk,
                 self.caches.blocks(self.store_id),
                 Some(std::rc::Rc::clone(&self.metrics)),
+                Some(std::rc::Rc::clone(&self.readers)),
             )
             .await?,
         );

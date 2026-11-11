@@ -114,6 +114,11 @@ impl<F: Fs> Opened<'_, F> {
             self.compaction_unit(),
         )
         .await?;
+        // Read, and done with. The readers are dropped here rather than at
+        // the end of the function because the sweep below cannot collect a
+        // table something still has open, and these are its inputs (§5,
+        // `crate::obsolete`).
+        drop(tables);
 
         // Every output written and made durable before the edit that claims
         // any of them: a crash in the middle leaves files nothing refers to,
