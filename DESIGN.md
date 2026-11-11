@@ -12,13 +12,15 @@
 > that searches the restart array and steps either way, index descent through
 > one or two levels, and the floor and ceiling seeks of §6 in callback form.
 >
-> The read path above a single table — the merge across L0 sublevels and
-> L1..L6, range tombstones, `get`'s five comparisons — is next, with the block
-> and table caches under it. Seeking came first because its failure modes are
-> its own: a full scan cannot tell a correct seek from one that lands on the
-> wrong side of a block boundary. The format crate deliberately does not own
-> block buffers, so it seeks within blocks a caller hands it; the resumable
-> iterator belongs with the cache that owns the frames (§8).
+> and `get`, the five comparisons of §6 merged across every level with point
+> deletes and range tombstones applied, judged against Pebble's own answers on
+> a database with overlapping tables in L0 above a compacted level.
+>
+> Still to come in M2: the table and block caches, and then scans. Those two
+> are one piece, not two — a cursor that outlives a call has to hold the blocks
+> it is reading, and the thing that owns blocks is the cache (§8). Until then
+> `get` does its whole merge inside one call, tables are read whole, and there
+> is no public iterator. §10 records what that costs.
 >
 > `open` is judged against whole databases Go Pebble wrote, committed under
 > `tests/golden/`, where Pebble's own reader describes the directory and roble
@@ -412,6 +414,25 @@ the seek.
 Reads lend their key and value to a closure, as encina's do, so a cached
 uncompressed block is read without copying.
 
+**As built, `get` returns the key and value owned rather than lending them.**
+The closure exists to avoid copying out of a cached block, and there is no
+block cache yet: every read today fetches the bytes afresh, so the closure
+would hand out a borrow of something about to be dropped and save nothing. It
+arrives with the cache, which is also when it starts to pay.
+
+Both ordered searches check that their bound moves outward each time round and
+refuse if it has not. On a well-formed database it always does, which is the
+reason to check: a table whose keys do not match the bounds its MANIFEST entry
+gives it would otherwise spin forever instead of returning an error, and an
+engine that hangs is worse than one that refuses (§2).
+
+Two costs of the same missing piece are worth naming rather than discovering.
+The four ordered comparisons re-seek every candidate table once per key they
+reject, so a long run of deleted keys costs a seek per table per key; a
+resumable iterator would step instead. And a table is read whole the first
+time it is touched. Both are the block cache's to fix, and both are why there
+is no public scan iterator yet: it would inherit them and be hard to unpick.
+
 ### `delete_range(start..end)`
 
 A range tombstone, written to the memtable's range-deletion skiplist and then to
@@ -705,6 +726,24 @@ in both directions.
   log segment — because a refusal that is not tested is a refusal that panics or
   half-reads instead. The files are committed. roble's tests read them and
   compare against the harness's dump of the same files.
+- **Reads are judged against Pebble, not against a model.** §12 asks for
+  model-based property tests against a `BTreeMap`, and that is the right oracle
+  once roble can **write**: the model and the store can then be driven by the
+  same operations. While roble only reads, the operations are Pebble's, and
+  Pebble is both the only model available and the stronger one, since it is the
+  thing roble has to agree with. So `harness/read-probes` builds a database
+  from a seeded, deliberately unkind history — a small key alphabet so
+  overwrites and deletes pile up on the same keys, range deletions cutting
+  across flushed tables, explicit flushes and compactions leaving overlapping
+  tables in L0 above a compacted level — and records Pebble's answer to each of
+  the five comparisons for every probe key. The BTreeMap model moves to M3.
+  Two details that are load-bearing rather than incidental: the generator
+  **refuses to write a fixture that collapsed into a single level**, because
+  such a fixture tests the merge not at all and nothing else would notice; and
+  `SINGLEDEL` and `DELSIZED`, which roble reads and never writes, are written
+  by hand on keys the random rounds cannot touch, since both kinds have
+  invariants a random mix would break and a kind that is never any key's newest
+  entry never has its visibility tested.
 - **Seeks are pinned separately from scans.** `harness/seek-probes` runs
   Pebble's own iterator over every table in the corpus and writes down what
   `SeekGE` and `SeekLT` answer for probes derived from that table's keys —
