@@ -256,7 +256,7 @@ async fn a_manifest_that_outgrows_a_block_still_reads() {
 
     {
         let db = roble::open(&env, &dir).await.expect("open");
-        let path = dir.join(&db.manifest_filename);
+        let path = dir.join(db.manifest_filename());
         let mut rounds = 0;
         loop {
             let mut batch = Batch::new();

@@ -19,6 +19,10 @@
 //! which means Pebble replaying roble's framing, roble's batch
 //! representation, and roble's sequence numbers.
 //!
+//! `--rotate` flushes and then replaces the MANIFEST, so the file Pebble
+//! replays is one roble wrote from nothing — every table at every level,
+//! described by roble's snapshot edit and named by roble's marker.
+//!
 //! `--swept` makes the opposite claim, about what roble *removed*: it opens a
 //! database and writes nothing at all, leaving only the obsolete files roble
 //! collected on the way in. Pebble then has to open a directory roble has
@@ -32,7 +36,7 @@ use roble_format::batch::Batch;
 async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: wal-replay <database-dir> [--flush|--swept]");
+        eprintln!("usage: wal-replay <database-dir> [--flush|--rotate|--swept]");
         std::process::exit(2);
     };
     // With `--flush` the same writes go through a table and a MANIFEST edit
@@ -40,10 +44,13 @@ async fn main() {
     // other half of the round trip. With `--swept` roble writes nothing and
     // the only change to the directory is what its open deleted.
     let mode = args.next();
-    let (flush, swept) = match mode.as_deref() {
-        None => (false, false),
-        Some("--flush") => (true, false),
-        Some("--swept") => (false, true),
+    let (flush, rotate, swept) = match mode.as_deref() {
+        None => (false, false, false),
+        Some("--flush") => (true, false, false),
+        // `--rotate` goes further than `--flush`: the MANIFEST Pebble reads
+        // from afterwards is not one Pebble ever wrote a byte of.
+        Some("--rotate") => (true, true, false),
+        Some("--swept") => (false, false, true),
         Some(other) => fail(&format!("unknown mode {other}")),
     };
 
@@ -103,6 +110,17 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("flush: {e}")))
             .unwrap_or_else(|| fail("flush wrote nothing"));
         println!("roble flushed the memtable to table {table:06}");
+    }
+
+    if rotate {
+        let manifest = db
+            .rotate_manifest()
+            .await
+            .unwrap_or_else(|e| fail(&format!("rotate: {e}")));
+        db.remove_obsolete_files()
+            .await
+            .unwrap_or_else(|e| fail(&format!("sweep: {e}")));
+        println!("roble rotated the MANIFEST to {manifest}, written from nothing");
     }
 
     // What Pebble should find, in the format its reader prints.

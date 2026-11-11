@@ -27,9 +27,10 @@
 //!    the database exactly as it was, with the old log still holding every
 //!    write. After it, the table is the database's and the old log is no
 //!    longer needed.
-//! 4. Only then swap the memtable and the log in memory, and collect what
-//!    the edit retired — the log it replaced is now a file the MANIFEST has
-//!    moved past (`crate::obsolete`).
+//! 4. Only then swap the memtable and the log in memory, replace the
+//!    MANIFEST if it has outgrown its limit (`crate::rotate`), and collect
+//!    what the edit retired — the log it replaced is now a file the MANIFEST
+//!    has moved past (`crate::obsolete`).
 //!
 //! The one-way door is step 3. Everything before it is reversible by doing
 //! nothing; everything after it is bookkeeping that a replay would redo.
@@ -100,14 +101,24 @@ impl<F: Fs> Opened<'_, F> {
             deleted_tables: Vec::new(),
             new_tables: vec![new_table],
         };
-        self.append_version_edit(&edit).await?;
+        let manifest_bytes = self.append_version_edit(&edit).await?;
 
         // 4. Bookkeeping a replay would redo anyway.
         self.versions_mut().apply(&edit)?;
         self.install_fresh_memtable(Memtable::new(self.snapshot().wrapping_add(1)));
         self.install_log(log_num).await?;
 
-        // 5. What the edit retired: the log this flush replaced, and any
+        // 5. A MANIFEST that has outgrown its limit is replaced by one
+        //    holding a snapshot of the version, so a reopen replays one
+        //    record and not a million (`crate::rotate`). Swallowed for the
+        //    same reason as the sweep below: the flush is durable, and a
+        //    rotation that did not happen is one the next flush attempts
+        //    again.
+        if manifest_bytes >= self.max_manifest_bytes() {
+            let _ = self.rotate_manifest().await;
+        }
+
+        // 6. What the edit retired: the log this flush replaced, and any
         //    table an earlier flush wrote whose edit never landed. The
         //    failure is swallowed on purpose — the flush is durable and a
         //    file that would not delete is one nothing refers to, which the
@@ -117,9 +128,10 @@ impl<F: Fs> Opened<'_, F> {
         Ok(Some(table_num))
     }
 
-    /// Appends one edit to the MANIFEST and syncs it.
-    async fn append_version_edit(&self, edit: &VersionEdit) -> Result<()> {
-        let path = self.dir.join(&self.manifest_filename);
+    /// Appends one edit to the MANIFEST and syncs it, and says how large
+    /// the file has grown.
+    async fn append_version_edit(&self, edit: &VersionEdit) -> Result<u64> {
+        let path = self.dir.join(self.manifest_filename());
         let disk = self.fs().open(&path, Access::ReadWrite).await?;
         let at = disk.len().await? as usize;
 
@@ -134,7 +146,7 @@ impl<F: Fs> Opened<'_, F> {
         result?;
         disk.sync(Default::default()).await?;
         disk.close().await?;
-        Ok(())
+        Ok(writer.position() as u64)
     }
 }
 

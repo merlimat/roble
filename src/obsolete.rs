@@ -26,18 +26,25 @@
 //! - A **log** goes when its number is below `min_unflushed_log_num`. That
 //!   counter is the MANIFEST's statement that every record in the logs below
 //!   it is in a table, and it is durable before any file is touched.
+//! - A **MANIFEST** goes when the manifest marker names a different one —
+//!   which catches both the file a rotation replaced and the file a rotation
+//!   wrote and never got to point at (`crate::rotate`). Pebble keeps one
+//!   previous MANIFEST for people to look at when something has gone wrong;
+//!   roble keeps none, because nothing reads it.
+//! - A **marker** goes when a higher iteration of the same name is there, and
+//!   only for the markers roble itself moves. A leftover iteration of
+//!   somebody else's marker is somebody else's.
 //! - Everything else stays, including every name roble cannot parse. A
 //!   database directory may hold files that are none of roble's business, and
-//!   a name it cannot reason about is one it cannot decide about. Markers are
-//!   among them: a `marker.` name parses as no file type, and retiring one
-//!   belongs to the code that moves it, which is the only code that knows
-//!   which iteration is current.
+//!   a name it cannot reason about is one it cannot decide about.
 //!
 //! Two leaks make this worth having. A flush retires the log it replaced, and
 //! without deletion every flush leaves one behind for the lifetime of the
 //! database. And a crash between writing a table and recording it in the
 //! MANIFEST leaves a table nothing refers to — the flush was right to write
-//! it first (§6), and this is what collects it afterwards.
+//! it first (§6), and this is what collects it afterwards. Rotation adds two
+//! more of the same shape: the MANIFEST it leaves behind, and the marker
+//! iteration it moved past.
 //!
 //! **When** matters as much as what. Deletion runs only after the edit that
 //! retired the file is durable: at the end of a flush, and at an open, where
@@ -55,11 +62,12 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use roble_format::files::{self, FileType};
+use roble_format::files::{self, FileType, MARKER_MANIFEST};
 
 use crate::env::Fs;
 use crate::error::Result;
 use crate::open::Opened;
+use crate::version::VersionSet;
 
 /// What the database still refers to.
 pub(crate) struct Live {
@@ -67,22 +75,50 @@ pub(crate) struct Live {
     pub tables: BTreeSet<u64>,
     /// The first log whose records no table holds.
     pub min_unflushed_log_num: u64,
+    /// The file number of the MANIFEST the manifest marker names.
+    pub manifest_num: u64,
+    /// Iterations of `marker.manifest.*` a higher one has replaced.
+    pub obsolete_markers: BTreeSet<String>,
+}
+
+impl Live {
+    /// Reads what the database refers to out of a version set and a listing.
+    ///
+    /// The listing is where the markers come from, because which iteration is
+    /// current is a fact about the directory rather than about the version —
+    /// and [`files::current_marker`] is already the one place that decides
+    /// it, refusals included.
+    pub fn of(versions: &VersionSet, manifest_num: u64, names: &[String]) -> Result<Self> {
+        let obsolete_markers =
+            match files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)? {
+                Some(current) => current.obsolete.into_iter().collect(),
+                None => BTreeSet::new(),
+            };
+        Ok(Live {
+            tables: versions.version.table_file_nums(),
+            min_unflushed_log_num: versions.min_unflushed_log_num,
+            manifest_num,
+            obsolete_markers,
+        })
+    }
 }
 
 /// Whether `name` is a file the database no longer refers to.
 fn is_obsolete(name: &str, live: &Live) -> bool {
+    // Markers first: a `marker.` name is none of `parse_filename`'s business,
+    // and which iteration is current cannot be read off one name anyway.
+    if name.starts_with("marker.") {
+        return live.obsolete_markers.contains(name);
+    }
     let Some(parsed) = files::parse_filename(name) else {
         return false;
     };
     match parsed.file_type {
         FileType::Table => !live.tables.contains(&parsed.file_num),
         FileType::Log => parsed.file_num < live.min_unflushed_log_num,
-
-        // The current MANIFEST, and so far the only one: roble appends to the
-        // MANIFEST it was opened with and has never rotated to another, so
-        // there is no older one to collect. When rotation arrives it brings
-        // the rule for retiring them with it.
-        FileType::Manifest => false,
+        // Any MANIFEST but the one the marker names: the file a rotation
+        // replaced, or the one a rotation wrote and never pointed at.
+        FileType::Manifest => parsed.file_num != live.manifest_num,
         // roble writes no OPTIONS file and reads nothing from one, so it
         // cannot say which of several is current — and the one that is
         // current is how Pebble reports the settings a database was written
@@ -130,15 +166,6 @@ impl<F: Fs> Opened<'_, F> {
     /// only ever opened for a table the version names, so no entry can be
     /// holding one of the files this deletes.
     pub async fn remove_obsolete_files(&self) -> Result<Vec<String>> {
-        // The borrow is released before the listing: a `RefCell` held across
-        // an await is a panic waiting for the next reader.
-        let live = {
-            let versions = self.versions();
-            Live {
-                tables: versions.version.table_file_nums(),
-                min_unflushed_log_num: versions.min_unflushed_log_num,
-            }
-        };
         let names: Vec<String> = self
             .fs()
             .list(&self.dir)
@@ -146,6 +173,17 @@ impl<F: Fs> Opened<'_, F> {
             .iter()
             .map(|e| e.name.to_string_lossy().into_owned())
             .collect();
-        remove_obsolete(self.fs(), &self.dir, &names, &live).await
+        let manifest_num = files::parse_filename(&self.manifest_filename())
+            .map(|p| p.file_num)
+            .expect("the MANIFEST is named by a marker that parsed");
+        // The borrow is released before the await: a `RefCell` held across
+        // one is a panic waiting for the next reader.
+        let live = {
+            let versions = self.versions();
+            Live::of(&versions, manifest_num, &names)?
+        };
+        let removed = remove_obsolete(self.fs(), &self.dir, &names, &live).await?;
+        self.forget_markers(&removed);
+        Ok(removed)
     }
 }

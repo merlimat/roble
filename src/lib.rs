@@ -34,6 +34,7 @@ pub mod memtable;
 pub mod obsolete;
 pub mod open;
 pub mod read;
+pub mod rotate;
 pub mod scan;
 pub mod sim;
 pub mod table;
