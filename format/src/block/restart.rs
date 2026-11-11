@@ -105,6 +105,12 @@ fn parts_of<'a>(block: &Block<'a>) -> Parts<'a> {
 impl<'a> Parts<'a> {
     /// The offset of restart point `i`, with the stolen high bit masked off.
     fn restart_offset(&self, i: usize) -> Result<usize> {
+        // Untested, with a reason rather than a test (§12). Every caller
+        // derives `i` from `num_restarts` — the binary searches bound
+        // themselves by it and `last` takes the final one — so an index past
+        // the end is a bug in this file rather than bytes off a disk. It
+        // stays because the array is indexed without bounds checks below it,
+        // and a wrong index there would read the entries as offsets.
         if i >= self.num_restarts {
             return Error::corrupt(format!(
                 "restart {i} of a block with {} restarts",
@@ -313,6 +319,13 @@ impl Cursor {
             let pos = self.end;
             self.place(&parts, pos, true)?;
         }
+        // Untested, with a reason (§12). Overshooting means a restart
+        // offset that does not fall on an entry boundary, and the scan from
+        // it decodes whatever is at that offset as an entry — which the
+        // checks in `place` and `decode_entry` refuse first, for any bytes
+        // that could be built to reach here. It stays as the one that would
+        // catch a misalignment those two happened to accept, since the
+        // alternative is a cursor quietly on the wrong entry.
         if self.end != target {
             return Error::corrupt(format!(
                 "scanning back from restart {restart} overshot: an entry ends at {}, not {target}",
@@ -677,5 +690,152 @@ mod tests {
             crate::key::SEARCH_TRAILER,
             (crate::key::SEQ_NUM_MAX << 8) | Kind::Excise.to_byte() as u64
         );
+    }
+
+    /// A block from entry bytes and restart offsets, neither of which has to
+    /// make sense.
+    ///
+    /// `BlockBuilder` only produces blocks that do, which is what makes it
+    /// useless for the checks below: every one of them is about bytes a
+    /// writer would never emit, arriving off a disk that did not keep them.
+    fn raw(entries: &[u8], restarts: &[u32]) -> Vec<u8> {
+        let mut out = entries.to_vec();
+        for r in restarts {
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        out.extend_from_slice(&(restarts.len() as u32).to_le_bytes());
+        out
+    }
+
+    /// One entry's bytes. Lengths below 128 are single-byte varints.
+    fn entry(shared: u8, unshared: u8, value_len: u8, rest: &[u8]) -> Vec<u8> {
+        let mut e = vec![shared, unshared, value_len];
+        e.extend_from_slice(rest);
+        e
+    }
+
+    #[test]
+    fn a_block_with_no_entries_leaves_the_cursor_nowhere() {
+        let data = raw(&[], &[0]);
+        let block = Block::new(&data).expect("a restart array and nothing else");
+        let mut c = Cursor::new();
+        c.first(&block).expect("first");
+        assert!(!c.is_valid(), "first");
+        c.last(&block).expect("last");
+        assert!(!c.is_valid(), "last");
+    }
+
+    #[test]
+    fn stepping_an_unpositioned_cursor_does_nothing() {
+        // Both are reached by a caller that steps without checking, which is
+        // every caller that has just run off one end.
+        let data = raw(&entry(0, 1, 0, b"a"), &[0]);
+        let block = Block::new(&data).expect("a block");
+        let mut c = Cursor::new();
+        assert!(!c.is_valid());
+        c.next(&block).expect("next");
+        assert!(!c.is_valid(), "next");
+        c.prev(&block).expect("prev");
+        assert!(!c.is_valid(), "prev");
+    }
+
+    #[test]
+    fn an_entry_sharing_with_a_key_that_is_not_there_is_refused() {
+        // At a fresh placement there is no previous key, so a shared count is
+        // not a short key but a lie about one.
+        let data = raw(&entry(3, 1, 0, b"a"), &[0]);
+        let block = Block::new(&data).expect("a block");
+        let err = Cursor::new()
+            .first(&block)
+            .expect_err("sharing with nothing");
+        assert!(
+            format!("{err}").contains("shares 3 bytes with no previous key"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_entry_sharing_more_than_the_previous_key_holds_is_refused() {
+        // Continuing from a one-byte key, claiming five shared bytes. Taking
+        // it at its word would read past the key and build one from whatever
+        // followed it in memory.
+        let mut entries = entry(0, 1, 0, b"a");
+        entries.extend_from_slice(&entry(5, 1, 0, b"b"));
+        let data = raw(&entries, &[0]);
+        let block = Block::new(&data).expect("a block");
+        let mut c = Cursor::new();
+        c.first(&block).expect("first");
+        let err = c.next(&block).expect_err("sharing too much");
+        assert!(
+            format!("{err}").contains("shares 5 bytes with a 1-byte previous key"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_restart_point_outside_the_entries_is_refused() {
+        // `Block::new` counts the restart array and checks it fits; it does
+        // not read the offsets in it.
+        let data = raw(&entry(0, 1, 0, b"a"), &[100]);
+        let block = Block::new(&data).expect("the array fits");
+        // `last` reads the final restart offset; `first` places at zero
+        // without consulting one, so it would not meet this.
+        let err = Cursor::new()
+            .last(&block)
+            .expect_err("a restart past the entries");
+        assert!(
+            format!("{err}").contains("points to 100, past the 4 bytes of entries"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_restart_entry_that_claims_a_shared_prefix_is_refused() {
+        // The binary search compares restart keys, so one that is not stored
+        // whole would be compared truncated and send the search the wrong way
+        // — which is a wrong answer rather than an error, unless it is caught
+        // here.
+        // Three restarts, so the search has a middle to land on: with one
+        // or two it never asks for a restart key at all.
+        let mut entries = entry(0, 1, 0, b"a");
+        entries.extend_from_slice(&entry(2, 1, 0, b"b"));
+        entries.extend_from_slice(&entry(0, 1, 0, b"c"));
+        let data = raw(&entries, &[0, 4, 8]);
+        let block = Block::new(&data).expect("a block");
+        let err = Cursor::new()
+            .seek_ge(&block, b"c")
+            .expect_err("a restart key that is not whole");
+        assert!(
+            format!("{err}").contains("a restart entry stores its key whole"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stepping_back_from_an_entry_no_restart_precedes_ends_the_walk() {
+        // The only restart starts at the second entry, so stepping back from
+        // it finds nothing before it and the cursor runs off the front.
+        let mut entries = entry(0, 1, 0, b"a");
+        entries.extend_from_slice(&entry(0, 1, 0, b"b"));
+        let data = raw(&entries, &[4]);
+        let block = Block::new(&data).expect("a block");
+        let mut c = Cursor::new();
+        c.first(&block).expect("first");
+        c.next(&block).expect("next");
+        assert!(c.is_valid(), "the second entry");
+        c.prev(&block).expect("prev");
+        assert!(!c.is_valid(), "nothing precedes it");
+    }
+
+    #[test]
+    fn an_entry_that_runs_past_the_block_is_refused() {
+        // A hundred bytes of key where four bytes of entries exist. Under
+        // 128, so the length is still the one-byte varint this helper writes.
+        let data = raw(&entry(0, 100, 0, b"a"), &[0]);
+        let block = Block::new(&data).expect("a block");
+        let err = Cursor::new()
+            .first(&block)
+            .expect_err("an entry past the end");
+        assert!(matches!(err, Error::Truncated { .. }), "got {err:?}");
     }
 }
