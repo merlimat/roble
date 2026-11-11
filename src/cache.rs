@@ -96,6 +96,24 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
         Some(slot.value.clone())
     }
 
+    /// Forgets `key`, if it is there.
+    ///
+    /// Not an eviction, and deliberately not counted as one: an eviction is
+    /// what a cache does to make room, and their number is how an operator
+    /// sees a budget that is too small. This is the opposite — the entry is
+    /// gone because the thing it described is gone — and counting it would
+    /// report pressure that never happened.
+    pub fn remove(&mut self, key: &K) {
+        let Some(at) = self.index.remove(key) else {
+            return;
+        };
+        if let Some(slot) = self.slots[at].take() {
+            self.used -= slot.cost;
+        }
+        self.free.push(at);
+        self.usage_changed();
+    }
+
     /// Adds `key`, evicting until it fits.
     ///
     /// An entry larger than the whole budget is **not** cached: evicting
@@ -384,6 +402,17 @@ impl<F: Fs> Caches<F> {
         self.tables
             .borrow_mut()
             .insert(TableKey { store, file_num }, table, 1);
+    }
+
+    /// Lets go of one store's reader for `file_num`.
+    ///
+    /// What the obsolete sweep calls before deleting a table: the cache
+    /// holds a reader for as long as its budget allows, and a reader nobody
+    /// is reading is not a reason to keep a file on disk (§5).
+    pub fn forget_table(&self, store: u64, file_num: u64) {
+        self.tables
+            .borrow_mut()
+            .remove(&TableKey { store, file_num });
     }
 
     /// How many tables are open.

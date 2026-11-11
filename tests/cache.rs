@@ -317,3 +317,33 @@ async fn two_stores_blocks_do_not_collide_either() {
         "store a must not find store b's key through a shared block"
     );
 }
+
+/// Forgetting an entry gives its room back.
+///
+/// `remove` has to return the cost along with the key. A cache told about
+/// enough deletions would otherwise stop holding anything, its budget spent
+/// on entries that are no longer there — and the obsolete sweep tells the
+/// table cache about every table it collects.
+#[test]
+fn forgetting_an_entry_gives_its_room_back() {
+    let mut clock: roble::cache::Clock<u64, u64> = roble::cache::Clock::new(2);
+    clock.insert(1, 10, 1);
+    clock.insert(2, 20, 1);
+
+    clock.remove(&1);
+    // Nothing, and not a panic: the sweep names files, not cache entries.
+    clock.remove(&99);
+    clock.insert(3, 30, 1);
+
+    assert_eq!(clock.get(&1), None, "the forgotten entry is gone");
+    assert_eq!(
+        clock.get(&2),
+        Some(20),
+        "the one that was not forgotten stays"
+    );
+    assert_eq!(
+        clock.get(&3),
+        Some(30),
+        "and the new one fits in the room the forgotten one gave back"
+    );
+}

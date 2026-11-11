@@ -394,3 +394,122 @@ async fn an_interrupted_flush_leaves_a_table_the_next_open_collects() {
          test proves nothing"
     );
 }
+
+/// The tables of L0, which the fixtures leave with something to compact.
+fn in_l0<F: Fs>(db: &roble::Opened<'_, F>) -> Vec<u64> {
+    let found: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    assert!(
+        found.len() > 1,
+        "the fixture should arrive with more than one table in L0 to compact"
+    );
+    found
+}
+
+/// A table a scan is still reading is not collected, however obsolete.
+///
+/// The version is where a read starts, so a table it no longer names is one
+/// nothing can newly ask for — and that is the whole of the old rule, which
+/// is where it went wrong. A scan holds open readers for the tables of the
+/// version it *began* on, and goes on asking them for blocks; a compaction
+/// that retired those tables and let the sweep delete them left the scan
+/// reading files that were not there.
+#[compio::test]
+async fn a_table_a_scan_is_reading_is_not_collected() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let retired = in_l0(&db);
+
+    // Opened before the compaction, and so holding readers for exactly the
+    // tables the compaction is about to retire.
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+
+    db.compact(0, &retired).await.expect("compact");
+
+    let names = listing(env.sim(), &dir).await;
+    for file_num in &retired {
+        let name = files::table_filename(*file_num);
+        assert!(
+            names.contains(&name),
+            "{name} was collected while a scan was reading it: {names:?}"
+        );
+    }
+
+    // And the point of the files being there: the scan reads to its end, and
+    // reads the database it started on.
+    let mut seen = Model::new();
+    while scan.is_valid() {
+        seen.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next().await.expect("next");
+    }
+    assert_eq!(
+        seen,
+        contents(&db).await,
+        "the scan should have read every key the compaction left"
+    );
+}
+
+/// And the file goes as soon as the last reader does.
+///
+/// The other half of the claim: leaving a file alone is a delay, not a leak.
+/// A sweep that skipped it has to collect it once the scan it was waiting
+/// for has gone — and the sweep a flush runs for itself would do this
+/// without being asked.
+#[compio::test]
+async fn the_table_goes_once_the_scan_does() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let retired = in_l0(&db);
+
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+    db.compact(0, &retired).await.expect("compact");
+    drop(scan);
+
+    let removed = db.remove_obsolete_files().await.expect("sweep");
+    for file_num in &retired {
+        let name = files::table_filename(*file_num);
+        assert!(
+            removed.contains(&name),
+            "{name} should have been collected once nothing was reading it: {removed:?}"
+        );
+    }
+}
+
+/// And the sweep lets go of only the readers the version has stopped naming.
+///
+/// Letting go of the rest as well changes no answer, which is exactly why it
+/// needs saying: every flush would empty the table cache, and the read after
+/// one would reopen every table it touched. The point of letting go at all
+/// is that a collected file should wait for whoever is reading it rather
+/// than for cache pressure — not that a sweep is a reason to forget a table
+/// the database is still built on.
+#[compio::test]
+async fn a_sweep_keeps_the_readers_the_version_still_names() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    // A read leaves a reader open for the table that answered it.
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let held = db.caches_for_test().open_tables();
+    assert!(held > 0, "a read should have left a reader open");
+
+    // A flush sweeps for itself, and retires none of the tables that reader
+    // belongs to.
+    let mut batch = Batch::new();
+    batch.put(b"swept", b"yes").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+
+    assert_eq!(
+        db.caches_for_test().open_tables(),
+        held,
+        "the sweep let go of a reader for a table the version still names"
+    );
+}
