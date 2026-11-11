@@ -29,6 +29,7 @@
 pub mod buf;
 pub mod env;
 pub mod open;
+pub mod read;
 pub mod sim;
 pub mod version;
 
@@ -40,4 +41,5 @@ pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
 pub use open::{Opened, open};
+pub use read::{Comparison, Found};
 pub use version::{Table, Version, VersionSet};

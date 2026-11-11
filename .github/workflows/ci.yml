@@ -127,6 +127,20 @@ jobs:
             exit 1
           fi
 
+      # Pebble's answers to the read probes, and the shape of the database they
+      # are asked of: the generator refuses to write a fixture that collapsed
+      # into one level, so a drift that flattened it fails here rather than
+      # quietly testing much less.
+      - name: the read probes are still what Pebble answers
+        run: |
+          regenerated="$(mktemp -d)"
+          trap 'rm -rf "$regenerated"' EXIT
+          (cd harness && go run ./read-probes "$regenerated")
+          if ! diff -u tests/golden/db-reads.probes "$regenerated/db-reads.probes"; then
+            echo "::error file=tests/golden/db-reads.probes::stale; regenerate with 'cd harness && go run ./read-probes ../tests/golden'"
+            exit 1
+          fi
+
       # The same check for the whole-database fixtures. These are generated
       # with compression off, so unlike the sstable corpus their table sizes
       # are portable between architectures and the dumps compare exactly.

@@ -1,0 +1,157 @@
+// Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Reading, judged against Pebble.
+//!
+//! `harness/read-probes` builds a database with a history messy enough to be
+//! worth reading — a small key alphabet so overwrites and deletes pile up,
+//! range deletions cutting across flushed tables, four overlapping tables in
+//! L0 above one in L6 — and writes down what Pebble answers to each of the
+//! five comparisons for every probe key. This asks roble the same questions
+//! and compares the whole text.
+//!
+//! Pebble is the oracle rather than a model written beside roble. §12 asks for
+//! model-based tests against a `BTreeMap`; those are worth writing in M3, when
+//! roble can write its own databases and the model can be driven by the same
+//! operations. Until then the operations are Pebble's, and Pebble is both the
+//! only available model and the stronger one, since it is the thing roble has
+//! to agree with.
+
+use std::path::{Path, PathBuf};
+
+use roble::{Comparison, Found};
+
+fn fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dst = tmp.path().join(name);
+    std::fs::create_dir(&dst).expect("create");
+    for entry in std::fs::read_dir(&src).expect("read fixture") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).expect("copy");
+    }
+    (tmp, dst)
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    assert!(s.len().is_multiple_of(2), "odd-length hex {s:?}");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A key-and-value answer, as the harness spells it.
+fn spell(found: &Option<Found>) -> String {
+    match found {
+        None => "none".to_string(),
+        Some(f) => format!("{} {}", hex(&f.key), hex(&f.value)),
+    }
+}
+
+#[compio::test]
+async fn roble_reads_what_go_pebble_reads() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let path = dir.join("db-reads.probes");
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}; regenerate with 'cd harness && go run ./read-probes ../tests/golden'",
+            path.display()
+        )
+    });
+
+    let (_tmp, db_dir) = fixture("db-reads");
+    let db = roble::open(&roble::DefaultEnv, &db_dir)
+        .await
+        .expect("open the database Go wrote");
+
+    // The shape the harness asserted when it built this: if a later change
+    // flattens it, the comparison below would still pass while testing much
+    // less, so it is checked here too.
+    assert!(
+        db.versions.version.level(0).len() >= 2,
+        "L0 should hold overlapping tables, holds {}",
+        db.versions.version.level(0).len()
+    );
+    assert!(
+        db.versions
+            .version
+            .levels()
+            .filter(|(_, t)| !t.is_empty())
+            .count()
+            >= 2,
+        "the database should span more than one level"
+    );
+
+    let probes: Vec<Vec<u8>> = expected
+        .lines()
+        .filter_map(|l| l.strip_prefix("probe "))
+        .map(unhex)
+        .collect();
+    assert!(!probes.is_empty(), "no probes in {}", path.display());
+
+    let mut out = String::new();
+    for probe in &probes {
+        out.push_str(&format!("probe {}\n", hex(probe)));
+
+        let equal = db.get(probe, Comparison::Equal).await.expect("equal");
+        // Pebble's Get answers with a value alone, the key being the probe.
+        out.push_str(&match &equal {
+            None => "  equal none\n".to_string(),
+            Some(f) => {
+                assert_eq!(
+                    &f.key, probe,
+                    "an Equal read must answer about the key asked"
+                );
+                format!("  equal {}\n", hex(&f.value))
+            }
+        });
+
+        for (name, how) in [
+            ("ceiling", Comparison::Ceiling),
+            ("higher", Comparison::Higher),
+            ("floor", Comparison::Floor),
+            ("lower", Comparison::Lower),
+        ] {
+            let found = db.get(probe, how).await.expect(name);
+            out.push_str(&format!("  {name} {}\n", spell(&found)));
+        }
+    }
+
+    if out != expected {
+        let (a, b) = (
+            out.lines().collect::<Vec<_>>(),
+            expected.lines().collect::<Vec<_>>(),
+        );
+        let at = a
+            .iter()
+            .zip(&b)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()));
+        let from = at.saturating_sub(6);
+        panic!(
+            "reads differ at line {}:\n  roble:  {:?}\n  pebble: {:?}\ncontext:\n{}",
+            at + 1,
+            a.get(at),
+            b.get(at),
+            b[from..(at + 2).min(b.len())].join("\n")
+        );
+    }
+}

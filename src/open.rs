@@ -52,9 +52,25 @@ use crate::version::VersionSet;
 /// This is what `open` has established, not yet a store you can read keys
 /// from: the memtables, caches and iterator tree are built on top of it.
 /// Dropping it releases the directory lock.
-pub struct Opened<F: Fs> {
+pub struct Opened<'a, F: Fs> {
     // Held, not used: dropping it is what releases the directory.
     _lock: F::Lock,
+    /// The filesystem the database's files are opened in.
+    fs: &'a F,
+    /// Table files, read whole and kept.
+    ///
+    /// **This is the seam the caches replace** (§8). A real read fetches the
+    /// blocks it needs, keyed by file number and offset, inside a budget;
+    /// this reads a whole table the first time anything touches it and never
+    /// lets go. That is wrong for a 64 MiB table and right for getting the
+    /// read path correct first, and it is why there is no public scan
+    /// iterator yet: a cursor that outlives a call has to hold the blocks it
+    /// is reading, and nothing here is fit to hold them.
+    table_cache: std::cell::RefCell<std::collections::BTreeMap<u64, std::rc::Rc<Vec<u8>>>>,
+    /// Each table's range tombstones, decoded once.
+    pub(crate) tombstone_cache: std::cell::RefCell<
+        std::collections::BTreeMap<u64, std::rc::Rc<Vec<roble_format::rangedel::Tombstone>>>,
+    >,
     /// The directory the database lives in.
     pub dir: PathBuf,
     /// The format major version it was written in.
@@ -68,7 +84,7 @@ pub struct Opened<F: Fs> {
 }
 
 /// Opens the database in `dir`.
-pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Opened<E::Fs>> {
+pub async fn open<'a, E: Env>(env: &'a E, dir: &Path) -> Result<Opened<'a, E::Fs>> {
     let fs = env.fs();
 
     // 1. The lock comes first, so nothing below races a second owner.
@@ -144,6 +160,9 @@ pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Opened<E::Fs>> {
 
     Ok(Opened {
         _lock: lock,
+        fs,
+        table_cache: Default::default(),
+        tombstone_cache: Default::default(),
         dir: dir.to_path_buf(),
         format_version,
         manifest_filename,
@@ -294,7 +313,7 @@ async fn refuse_unreplayed_logs<F: Fs>(
 
 // Written out rather than derived: the lock has no business in a debug line,
 // and a `Fs::Lock` is not required to be `Debug` at all.
-impl<F: Fs> std::fmt::Debug for Opened<F> {
+impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Opened")
             .field("dir", &self.dir)
@@ -306,7 +325,25 @@ impl<F: Fs> std::fmt::Debug for Opened<F> {
     }
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Opened<'_, F> {
+    /// The bytes of one table, read whole the first time and kept.
+    ///
+    /// See [`Opened`]'s `table_cache` for why this is whole files.
+    pub(crate) async fn table_bytes(&self, file_num: u64) -> Result<std::rc::Rc<Vec<u8>>> {
+        // The borrow is dropped before the read, so no borrow is held across
+        // an await.
+        if let Some(held) = self.table_cache.borrow().get(&file_num) {
+            return Ok(std::rc::Rc::clone(held));
+        }
+        let path = self.dir.join(roble_format::files::table_filename(file_num));
+        let disk = self.fs.open(&path, Access::ReadOnly).await?;
+        let bytes = std::rc::Rc::new(read_all(&disk, Default::default()).await?);
+        self.table_cache
+            .borrow_mut()
+            .insert(file_num, std::rc::Rc::clone(&bytes));
+        Ok(bytes)
+    }
+
     /// Renders what the directory says, in the text the Go harness's
     /// `db-fixture` prints from Pebble's own reader.
     ///
