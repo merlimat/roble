@@ -296,6 +296,25 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, rk)
 
+	// The other table roble must refuse, and the one a running system can
+	// produce by configuration rather than by corruption: a MERGE key, which
+	// is legal Pebble but needs a merger Oxia does not configure (§3). The
+	// point keys around it are ordinary, so what is refused is the kind and
+	// not the file.
+	mg := fixture{name: "refuse-merge", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression}
+	for i := 0; i < 6; i++ {
+		kind := pebble.InternalKeyKindSet
+		if i == 3 {
+			kind = pebble.InternalKeyKindMerge
+		}
+		mg.entries = append(mg.entries, entry{
+			userKey: oxiaKey(9, i), seqNum: pebble.SeqNum(600 + i),
+			kind: kind, value: []byte("m"),
+		})
+	}
+	fs = append(fs, mg)
+
 	// Range deletions, which live in their own block and never in a data
 	// block. Before this fixture existed, a table with tombstones read as
 	// though it had none and no test noticed.

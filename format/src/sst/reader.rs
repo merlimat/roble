@@ -444,14 +444,20 @@ pub fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<us
 /// Public for the engine's own seeks: a kind refused when a table is scanned
 /// and served when it is sought would be worse than either.
 pub fn check_kind(key: crate::InternalKey<'_>) -> Result<()> {
+    // MERGE first, and that order is the whole of why it is said twice.
+    // `is_accepted` does not list MERGE, so the general refusal below catches
+    // it too — and used to catch it first, which left this arm unreachable and
+    // the reason unsaid. A MERGE key is the one unserved kind an Oxia database
+    // can arrive with by configuration rather than by corruption, so it is
+    // worth naming: the answer is a merger, not a different file.
+    if key.kind == Kind::Merge {
+        return Error::unsupported("MERGE keys: Oxia configures no merger");
+    }
     if !key.kind.is_accepted() {
         return Error::unsupported(format!(
             "key kind {} is not served by roble",
             key.kind.name()
         ));
-    }
-    if key.kind == Kind::Merge {
-        return Error::unsupported("MERGE keys: Oxia configures no merger");
     }
     Ok(())
 }
@@ -510,6 +516,79 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
 mod tests {
     use super::*;
     use crate::block::BlockHandle;
+
+    fn key_of(kind: Kind) -> crate::InternalKey<'static> {
+        crate::InternalKey {
+            user_key: b"/oxia/default/shard-0000/users/00000000",
+            seq_num: 7,
+            kind,
+            obsolete: false,
+        }
+    }
+
+    /// Every kind roble serves passes, and every kind it does not is refused
+    /// with a reason that names it.
+    ///
+    /// Pebble puts none of the refused kinds in a data block — range keys live
+    /// in a block of their own, `IngestSst` and `Excise` only in a MANIFEST —
+    /// so a fixture cannot carry one and this is checked against the function.
+    /// MERGE is the exception and the one that matters, and `refuse-merge.sst`
+    /// carries it through the real read paths in `format/tests/golden.rs`.
+    #[test]
+    fn check_kind_serves_what_roble_serves_and_names_what_it_does_not() {
+        for kind in [
+            Kind::Set,
+            Kind::Delete,
+            Kind::SingleDelete,
+            Kind::RangeDelete,
+            Kind::Separator,
+            Kind::SetWithDelete,
+            Kind::DeleteSized,
+        ] {
+            check_kind(key_of(kind)).unwrap_or_else(|e| panic!("{kind:?} should be served: {e}"));
+        }
+
+        for kind in [
+            Kind::RangeKeyDelete,
+            Kind::RangeKeyUnset,
+            Kind::RangeKeySet,
+            Kind::IngestSst,
+            Kind::Excise,
+        ] {
+            let Err(err) = check_kind(key_of(kind)) else {
+                panic!("{kind:?} should be refused");
+            };
+            let text = format!("{err}");
+            assert!(
+                text.contains(kind.name()),
+                "the refusal should name {kind:?}, got {text:?}"
+            );
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "{kind:?}: expected Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    /// MERGE is refused for its own reason rather than the general one.
+    ///
+    /// `is_accepted` does not list MERGE either, so the general arm would
+    /// catch it — and did, which left the specific message unreachable. A
+    /// MERGE key is the one unserved kind a database can arrive with by
+    /// configuration rather than corruption, and the answer to it is a merger
+    /// rather than a different file, so the reason is worth keeping.
+    #[test]
+    fn a_merge_key_is_refused_for_the_merger_rather_than_the_kind() {
+        let Err(err) = check_kind(key_of(Kind::Merge)) else {
+            panic!("MERGE should be refused");
+        };
+        let text = format!("{err}");
+        assert!(text.contains("Oxia configures no merger"), "got {text:?}");
+        assert!(
+            !text.contains("is not served by roble"),
+            "the general refusal should not be the one that fires, got {text:?}"
+        );
+    }
 
     fn separator(user: &[u8], seq: u64) -> IndexEntry {
         IndexEntry {
