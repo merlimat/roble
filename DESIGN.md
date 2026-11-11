@@ -1,22 +1,23 @@
 # roble — design
 
-> Status: **M1 is under way, and the sstable round trip closes.** This document
-> fixes the compatibility target (§3), the decisions that differ from encina's
-> (§4), and the order the work goes in (§13).
+> Status: **M1 is complete.** This document fixes the compatibility target
+> (§3), the decisions that differ from encina's (§4), and the order the work
+> goes in (§13). M2, read-only, is next.
 >
-> In place, each pinned against Go Pebble rather than against a reading of it:
-> sstables both ways (footer, metaindex, properties, single- and two-level
-> indexes, row blocks, internal keys, the Pebblev3+ value prefix), range
-> deletions, the bloom filter bit-for-bit, none/Snappy/Zstd and both checksums,
-> the batch representation byte-for-byte, record framing in both wire formats,
-> version edits, and value-block resolution. `compat/sst-roundtrip` has Go Pebble read every table
-> roble writes; `harness/golden-sst` and `harness/record-files` go the other
-> way, the latter with a real WAL and MANIFEST.
+> `roble-format` encodes and decodes Pebble's files, each structure pinned
+> against Go Pebble rather than against a reading of it: sstables both ways,
+> range deletions, the bloom filter bit-for-bit, value-block resolution,
+> none/Snappy/Zstd and both checksums, the batch representation byte-for-byte,
+> record framing in both wire formats, and version edits. `roble sst dump` and
+> `roble manifest dump` print them.
 >
-> Still to come in M1: the `roble sst dump` and `roble manifest dump`
-> commands, whose output format is roble's own and so has no Go counterpart to
-> be checked against — the first piece of this milestone that cannot be pinned
-> byte for byte.
+> How each claim is held up: `compat/sst-roundtrip` has Go Pebble read every
+> table roble writes; `harness/golden-sst` and `harness/record-files` go the
+> other way, the latter with a real WAL and MANIFEST; `harness/batch-repr`
+> compares batch bytes. The golden corpus also holds a table roble must
+> **refuse**, so the refusals of §3 are exercised rather than asserted. The
+> one part with no Go counterpart is the dump commands' own presentation, and
+> their tests check only that they add nothing to what is pinned (§13).
 
 roble is an embedded, ordered key-value store for Rust, built on the
 [compio](https://github.com/compio-rs/compio) completion-based runtime. It is a

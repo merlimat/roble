@@ -59,6 +59,10 @@ type fixture struct {
 	// wantValueBlocks says the fixture exists to exercise value blocks, which
 	// needs the same user key more than once.
 	wantValueBlocks bool
+	// rangeKeys makes the fixture hold range keys, which roble refuses. §12
+	// asks for tables roble must refuse rather than misread, so that the
+	// refusal is exercised instead of asserted.
+	rangeKeys [][2]string
 }
 
 // checksumOrDefault keeps crc32c as the default, as Pebble does, so only the
@@ -276,6 +280,22 @@ func fixtures() []fixture {
 	}
 	fs = append(fs, vb)
 
+	// A table roble must refuse: range keys are legal Pebble and Oxia never
+	// writes them, so roble declines the table rather than reading past
+	// structures it does not understand (§3).
+	rk := fixture{name: "refuse-rangekeys", format: sstable.TableFormatPebblev4,
+		blockSize: 1024, compress: block.NoCompression}
+	for i := 0; i < 10; i++ {
+		rk.entries = append(rk.entries, entry{
+			userKey: oxiaKey(8, i), seqNum: pebble.SeqNum(500 + i),
+			kind: pebble.InternalKeyKindSet, value: []byte("p"),
+		})
+	}
+	rk.rangeKeys = [][2]string{
+		{"/oxia/default/shard-0008/users/00000002", "/oxia/default/shard-0008/users/00000005"},
+	}
+	fs = append(fs, rk)
+
 	// Range deletions, which live in their own block and never in a data
 	// block. Before this fixture existed, a table with tombstones read as
 	// though it had none and no test noticed.
@@ -324,6 +344,12 @@ func write(path string, f fixture) error {
 		ik := pebble.MakeInternalKey(e.userKey, e.seqNum, e.kind)
 		if err := w.Raw().Add(ik, e.value, false /* forceObsolete */); err != nil {
 			return fmt.Errorf("add %q: %w", e.userKey, err)
+		}
+	}
+	// Range keys, for a fixture whose point is that roble declines it.
+	for _, rk := range f.rangeKeys {
+		if err := w.RangeKeySet([]byte(rk[0]), []byte(rk[1]), nil /* suffix */, []byte("rk")); err != nil {
+			return fmt.Errorf("range key set %q..%q: %w", rk[0], rk[1], err)
 		}
 	}
 	// DeleteRange needs already-fragmented spans in sorted order.
