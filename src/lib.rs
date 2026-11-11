@@ -29,6 +29,7 @@
 pub mod batch;
 pub mod buf;
 pub mod cache;
+pub mod compact;
 pub mod env;
 pub mod flush;
 pub mod memtable;

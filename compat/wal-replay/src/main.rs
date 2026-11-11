@@ -38,7 +38,7 @@ use std::path::PathBuf;
 async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: wal-replay <database-dir> [--flush|--rotate|--no-wal|--swept]");
+        eprintln!("usage: wal-replay <database-dir> [--flush|--rotate|--compact|--no-wal|--swept]");
         std::process::exit(2);
     };
     // With `--flush` the same writes go through a table and a MANIFEST edit
@@ -46,16 +46,20 @@ async fn main() {
     // other half of the round trip. With `--swept` roble writes nothing and
     // the only change to the directory is what its open deleted.
     let mode = args.next();
-    let (flush, rotate, no_wal, swept) = match mode.as_deref() {
-        None => (false, false, false, false),
-        Some("--flush") => (true, false, false, false),
+    let (flush, rotate, compact, no_wal, swept) = match mode.as_deref() {
+        None => (false, false, false, false, false),
+        Some("--flush") => (true, false, false, false, false),
         // `--rotate` goes further than `--flush`: the MANIFEST Pebble reads
         // from afterwards is not one Pebble ever wrote a byte of.
-        Some("--rotate") => (true, true, false, false),
+        Some("--rotate") => (true, true, false, false, false),
+        // `--compact` goes further still: the table Pebble reads is one
+        // roble merged out of others, with fragmented range deletions and a
+        // version edit that deletes as well as adds.
+        Some("--compact") => (true, false, true, false, false),
         // `--no-wal` is Oxia's own configuration: nothing reaches the log, so
         // the flush is the only thing that happened.
-        Some("--no-wal") => (true, false, true, false),
-        Some("--swept") => (false, false, false, true),
+        Some("--no-wal") => (true, false, false, true, false),
+        Some("--swept") => (false, false, false, false, true),
         Some(other) => fail(&format!("unknown mode {other}")),
     };
 
@@ -141,6 +145,46 @@ async fn main() {
             .unwrap_or_else(|e| fail(&format!("flush: {e}")))
             .unwrap_or_else(|| fail("flush wrote nothing"));
         println!("roble flushed the memtable to table {table:06}");
+    }
+
+    if compact {
+        // A second table over the same keys, so the merge has versions to
+        // drop, plus a range deletion so the output carries a
+        // range-deletion block.
+        let mut batch = db.batch();
+        for i in 0..8 {
+            let k = format!("wal-{i:03}").into_bytes();
+            batch
+                .put(&k, b"compacted")
+                .unwrap_or_else(|e| fail(&format!("put: {e}")));
+            wrote.retain(|(key, _)| key != &k);
+            wrote.push((k, b"compacted".to_vec()));
+        }
+        batch
+            .delete_range(b"wal-100", b"wal-200")
+            .unwrap_or_else(|e| fail(&format!("delete_range: {e}")));
+        batch
+            .commit(true)
+            .await
+            .unwrap_or_else(|e| fail(&format!("commit: {e}")));
+        db.flush()
+            .await
+            .unwrap_or_else(|e| fail(&format!("flush: {e}")))
+            .unwrap_or_else(|| fail("flush wrote nothing"));
+
+        let l0: Vec<u64> = db
+            .versions()
+            .version
+            .level(0)
+            .iter()
+            .map(|t| t.file_num)
+            .collect();
+        let out = db
+            .compact(0, &l0)
+            .await
+            .unwrap_or_else(|e| fail(&format!("compact: {e}")))
+            .unwrap_or_else(|| fail("the compaction wrote nothing"));
+        println!("roble compacted {l0:?} into table {out:06} at L1");
     }
 
     if no_wal {

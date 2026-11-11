@@ -1,0 +1,673 @@
+// Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Compacting tables into the level below.
+//!
+//! A compaction is the first thing roble does that throws data away, so what
+//! every test here asks is the same question twice: did the database still
+//! answer the same afterwards, and did it actually throw anything away. The
+//! second half matters as much as the first — a compaction that kept
+//! everything would pass the first on its own.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use roble::sim::{SimEnv, SimFs};
+use roble::{Comparison, Disk, Fs, WriteBuf};
+use roble_format::batch::Batch;
+
+type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
+async fn load(name: &str) -> (SimEnv, PathBuf) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let fs: &SimFs = env.sim();
+    fs.mkdir_all(&dir).await.expect("mkdir");
+    for entry in std::fs::read_dir(&src).expect("read fixture") {
+        let entry = entry.expect("entry");
+        let bytes = std::fs::read(entry.path()).expect("read file");
+        let disk = fs
+            .create(&dir.join(entry.file_name()))
+            .await
+            .expect("create");
+        let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
+        result.expect("write");
+        disk.sync(()).await.expect("sync");
+        disk.close().await.expect("close");
+    }
+    fs.sync_dir(&dir).await.expect("sync dir");
+    (env, dir)
+}
+
+async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+    let mut out = Model::new();
+    while scan.is_valid() {
+        out.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next().await.expect("next");
+    }
+    out
+}
+
+/// Writes a batch and flushes it, giving one L0 table.
+async fn flush_batch<F: Fs>(db: &roble::Opened<'_, F>, batch: &mut Batch) -> u64 {
+    db.write(batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table")
+}
+
+/// How many bytes every table of the version takes.
+fn table_bytes<F: Fs>(db: &roble::Opened<'_, F>) -> u64 {
+    db.versions()
+        .version
+        .levels()
+        .flat_map(|(_, tables)| tables.iter().map(|t| t.size))
+        .sum()
+}
+
+#[compio::test]
+async fn a_compaction_changes_no_answer() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut first = Batch::new();
+    for i in 0..8 {
+        first
+            .put(format!("c{i:02}").as_bytes(), b"first")
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut first).await;
+
+    let mut second = Batch::new();
+    for i in 4..12 {
+        second
+            .put(format!("c{i:02}").as_bytes(), b"second")
+            .expect("put");
+    }
+    let b = flush_batch(&db, &mut second).await;
+
+    let before = contents(&db).await;
+    assert_eq!(
+        before.get(b"c05".as_slice()).map(|v| v.as_slice()),
+        Some(b"second".as_slice()),
+        "the later write should already win"
+    );
+
+    let out = db
+        .compact(0, &[a, b])
+        .await
+        .expect("compact")
+        .expect("an output table");
+
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "a compaction changed an answer"
+    );
+    // The fixture arrived with a table of its own in L0, which this
+    // compaction never named; what has to have left is the two inputs.
+    let in_l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    assert!(
+        !in_l0.contains(&a) && !in_l0.contains(&b),
+        "both inputs should have left L0, which still holds {in_l0:?}"
+    );
+    assert!(
+        db.versions()
+            .version
+            .level(1)
+            .iter()
+            .any(|t| t.file_num == out),
+        "and the output should be in L1"
+    );
+}
+
+#[compio::test]
+async fn a_compaction_drops_what_it_may() {
+    // The half a "no answer changed" test cannot see. Four tables holding
+    // the same eight keys over and over: the merge has to keep one version
+    // of each and throw away the other twenty-four entries.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut inputs = Vec::new();
+    for round in 0..4 {
+        let mut batch = Batch::new();
+        for i in 0..8 {
+            batch
+                .put(
+                    format!("dup{i}").as_bytes(),
+                    format!("round-{round}").as_bytes(),
+                )
+                .expect("put");
+        }
+        inputs.push(flush_batch(&db, &mut batch).await);
+    }
+
+    let before = contents(&db).await;
+    let bytes_before = table_bytes(&db);
+
+    let out = db
+        .compact(0, &inputs)
+        .await
+        .expect("compact")
+        .expect("an output table");
+
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "a compaction changed an answer"
+    );
+    for i in 0..8 {
+        assert_eq!(
+            db.get(format!("dup{i}").as_bytes(), Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"round-3".to_vec()),
+            "the newest version should be the one that survived"
+        );
+    }
+    let after = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .find(|t| t.file_num == out)
+        .expect("the output")
+        .size;
+    assert!(
+        after * 2 < bytes_before,
+        "four copies of the same keys compacted to {after} bytes from {bytes_before}, \
+         which is not a compaction"
+    );
+}
+
+#[compio::test]
+async fn a_deletion_with_nothing_below_it_goes() {
+    // A tombstone exists to hide an older version. Once nothing below the
+    // output holds the key there is nothing left to hide, and keeping it
+    // would cost every later read a comparison for ever.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut written = Batch::new();
+    // A second key, so the compaction has something to write and the output
+    // table's bounds are a statement about what it holds.
+    written.put(b"aaa", b"survivor").expect("put");
+    written.put(b"doomed", b"value").expect("put");
+    let a = flush_batch(&db, &mut written).await;
+
+    let mut deleted = Batch::new();
+    deleted.delete(b"doomed").expect("delete");
+    let b = flush_batch(&db, &mut deleted).await;
+
+    assert_eq!(
+        db.get(b"doomed", Comparison::Equal).await.expect("get"),
+        None
+    );
+
+    let out = db
+        .compact(0, &[a, b])
+        .await
+        .expect("compact")
+        .expect("an output table");
+
+    assert_eq!(
+        db.get(b"doomed", Comparison::Equal).await.expect("get"),
+        None,
+        "the key must stay deleted"
+    );
+    // Both the value and the tombstone went, so the output holds neither.
+    let table = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .find(|t| t.file_num == out)
+        .expect("the output")
+        .clone();
+    assert!(
+        !bounds_cover(&table, b"doomed"),
+        "the output still holds something for the deleted key: {:02x?}..{:02x?}",
+        table.smallest_user_key().expect("smallest"),
+        table.largest_user_key().expect("largest")
+    );
+}
+
+fn bounds_cover(table: &roble::Table, user: &[u8]) -> bool {
+    table.smallest_user_key().expect("smallest") <= user
+        && user <= table.largest_user_key().expect("largest")
+}
+
+#[compio::test]
+async fn a_deletion_with_something_below_it_stays() {
+    // The other half of the rule, and the half that resurrects keys when it
+    // is wrong: with an older version in a level below the output, the
+    // tombstone is the only thing keeping it hidden.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    // An older version pushed down to L2 first, so the deletion below will
+    // be compacted into L1 with something still underneath it.
+    let mut old = Batch::new();
+    old.put(b"buried", b"old value").expect("put");
+    let a = flush_batch(&db, &mut old).await;
+    let in_l1 = db
+        .compact(0, &[a])
+        .await
+        .expect("compact")
+        .expect("a table");
+    let in_l2 = db
+        .compact(1, &[in_l1])
+        .await
+        .expect("compact")
+        .expect("a table");
+    assert!(
+        db.versions()
+            .version
+            .level(2)
+            .iter()
+            .any(|t| t.file_num == in_l2),
+        "the old version should be sitting in L2"
+    );
+
+    let mut gone = Batch::new();
+    gone.delete(b"buried").expect("delete");
+    let b = flush_batch(&db, &mut gone).await;
+
+    db.compact(0, &[b])
+        .await
+        .expect("compact")
+        .expect("a table");
+    assert_eq!(
+        db.get(b"buried", Comparison::Equal).await.expect("get"),
+        None,
+        "the tombstone was dropped and the buried value came back"
+    );
+
+    // And it survives a reopen, which is where a lost tombstone shows up.
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        db.get(b"buried", Comparison::Equal).await.expect("get"),
+        None,
+    );
+}
+
+#[compio::test]
+async fn overlapping_range_tombstones_are_fragmented() {
+    // Two inputs whose tombstones overlap at neither bound. Concatenating
+    // them builds a range-deletion block the format refuses, so the merge
+    // has to cut them into fragments.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut keys = Batch::new();
+    for i in 0..12 {
+        keys.put(format!("r{i:02}").as_bytes(), b"value")
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut keys).await;
+
+    let mut first = Batch::new();
+    first.delete_range(b"r02", b"r08").expect("delete_range");
+    first.put(b"r04", b"back again").expect("put");
+    let b = flush_batch(&db, &mut first).await;
+
+    let mut second = Batch::new();
+    second.delete_range(b"r05", b"r11").expect("delete_range");
+    let c = flush_batch(&db, &mut second).await;
+
+    let before = contents(&db).await;
+    assert!(
+        before.contains_key(b"r04".as_slice()),
+        "the put after the first tombstone should have survived it"
+    );
+    assert!(
+        !before.contains_key(b"r06".as_slice()),
+        "and the overlap should be covered"
+    );
+
+    db.compact(0, &[a, b, c])
+        .await
+        .expect("compact")
+        .expect("an output table");
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "fragmenting the tombstones changed an answer"
+    );
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "and the fragments should read back the same"
+    );
+}
+
+#[compio::test]
+async fn a_key_a_tombstone_covers_is_dropped() {
+    // Keeping a covered key changes no answer — the tombstone goes into the
+    // output too, and readers apply it — so nothing a scan or a `get` says
+    // can tell the two apart. What can is the size of what was written, and
+    // a compaction that carries keys it has already decided are invisible is
+    // doing the one job it has badly.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let value = vec![b'v'; 200];
+    let mut keys = Batch::new();
+    for i in 0..40 {
+        keys.put(format!("t{i:02}").as_bytes(), &value)
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut keys).await;
+
+    let mut sweep = Batch::new();
+    sweep.delete_range(b"t00", b"t35").expect("delete_range");
+    let b = flush_batch(&db, &mut sweep).await;
+
+    let before = contents(&db).await;
+    let covered = (0..35).map(|i| format!("t{i:02}")).count();
+    assert_eq!(covered, 35);
+    let bytes_before = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .filter(|t| t.file_num == a || t.file_num == b)
+        .map(|t| t.size)
+        .sum::<u64>();
+
+    let out = db
+        .compact(0, &[a, b])
+        .await
+        .expect("compact")
+        .expect("an output table");
+
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "a compaction changed an answer"
+    );
+    let after = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .find(|t| t.file_num == out)
+        .expect("the output")
+        .size;
+    assert!(
+        after * 3 < bytes_before,
+        "thirty-five of forty keys were covered, but the output is {after} bytes \
+         against {bytes_before} in: the covered keys were carried along"
+    );
+}
+
+#[compio::test]
+async fn a_compaction_that_drops_everything_writes_no_table() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    // A key written and deleted, with nothing below: both go.
+    let mut batch = Batch::new();
+    batch.put(b"ephemeral", b"value").expect("put");
+    batch.delete(b"ephemeral").expect("delete");
+    let only = flush_batch(&db, &mut batch).await;
+
+    let before = contents(&db).await;
+    assert_eq!(
+        db.compact(0, &[only]).await.expect("compact"),
+        None,
+        "nothing survived, so there is no table to write"
+    );
+    assert_eq!(contents(&db).await, before);
+    let in_l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    assert!(
+        !in_l0.contains(&only),
+        "the input should be gone: L0 holds {in_l0:?}"
+    );
+    assert!(
+        db.versions().version.level(1).is_empty(),
+        "and nothing should have been put in its place"
+    );
+}
+
+#[compio::test]
+async fn a_compaction_collects_the_tables_it_replaced() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut batch = Batch::new();
+    batch.put(b"collected", b"yes").expect("put");
+    let a = flush_batch(&db, &mut batch).await;
+
+    let out = db
+        .compact(0, &[a])
+        .await
+        .expect("compact")
+        .expect("a table");
+
+    let names: Vec<String> = env
+        .sim()
+        .list(&dir)
+        .await
+        .expect("list")
+        .iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    let input = roble_format::files::table_filename(a);
+    let output = roble_format::files::table_filename(out);
+    assert!(
+        !names.contains(&input),
+        "the input table should have been collected: {names:?}"
+    );
+    assert!(
+        names.contains(&output),
+        "and the output should be there: {names:?}"
+    );
+}
+
+#[compio::test]
+async fn a_compaction_pulls_in_the_tables_it_would_overlap() {
+    // Pebble leaves no overlap below L0, so a table of L1 whose range meets
+    // the inputs' has to be rewritten with them rather than left beside the
+    // output.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut low = Batch::new();
+    for i in 0..6 {
+        low.put(format!("o{i:02}").as_bytes(), b"first")
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut low).await;
+    let settled = db
+        .compact(0, &[a])
+        .await
+        .expect("compact")
+        .expect("a table");
+
+    let mut overlapping = Batch::new();
+    for i in 3..9 {
+        overlapping
+            .put(format!("o{i:02}").as_bytes(), b"second")
+            .expect("put");
+    }
+    let b = flush_batch(&db, &mut overlapping).await;
+
+    let before = contents(&db).await;
+    db.compact(0, &[b])
+        .await
+        .expect("compact")
+        .expect("a table");
+
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "a compaction changed an answer"
+    );
+    assert!(
+        !db.versions()
+            .version
+            .level(1)
+            .iter()
+            .any(|t| t.file_num == settled),
+        "the overlapping L1 table should have been rewritten, not left beside the output"
+    );
+    assert_eq!(
+        db.versions().version.level(1).len(),
+        1,
+        "L1 should hold one table: {:?}",
+        db.versions()
+            .version
+            .level(1)
+            .iter()
+            .map(|t| t.file_num)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[compio::test]
+async fn a_compaction_survives_a_reopen() {
+    let (env, dir) = load("db-twin-a").await;
+    let expected;
+
+    {
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut first = Batch::new();
+        for i in 0..6 {
+            first
+                .put(format!("s{i:02}").as_bytes(), b"one")
+                .expect("put");
+        }
+        let a = flush_batch(&db, &mut first).await;
+
+        let mut second = Batch::new();
+        for i in 3..9 {
+            second
+                .put(format!("s{i:02}").as_bytes(), b"two")
+                .expect("put");
+        }
+        second.delete(b"s01").expect("delete");
+        let b = flush_batch(&db, &mut second).await;
+
+        db.compact(0, &[a, b])
+            .await
+            .expect("compact")
+            .expect("a table");
+        expected = contents(&db).await;
+    }
+
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        contents(&db).await,
+        expected,
+        "the compaction was recorded, so a reopen should find the same database"
+    );
+}
+
+#[compio::test]
+async fn a_scan_open_across_a_compaction_keeps_reading() {
+    // Why a compaction may drop every version but the newest without
+    // consulting a list of registered snapshots: a scan holds the tables it
+    // was made with, so it goes on reading those whatever the compaction
+    // writes and the sweep afterwards deletes. If that were not so, dropping
+    // superseded versions would change an open scan's answers underneath it.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut first = Batch::new();
+    for i in 0..8 {
+        first
+            .put(format!("w{i:02}").as_bytes(), b"one")
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut first).await;
+
+    let mut second = Batch::new();
+    for i in 0..8 {
+        second
+            .put(format!("w{i:02}").as_bytes(), b"two")
+            .expect("put");
+    }
+    let b = flush_batch(&db, &mut second).await;
+
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+    let started_on = scan.key().to_vec();
+
+    db.compact(0, &[a, b])
+        .await
+        .expect("compact")
+        .expect("a table");
+
+    // The scan walks to the end on tables the compaction has replaced and
+    // the sweep has deleted.
+    let mut seen = Model::new();
+    while scan.is_valid() {
+        seen.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next().await.expect("next");
+    }
+    assert!(
+        seen.contains_key(&started_on),
+        "the scan lost the key it was standing on"
+    );
+    for i in 0..8 {
+        assert_eq!(
+            seen.get(format!("w{i:02}").as_bytes())
+                .map(|v| v.as_slice()),
+            Some(b"two".as_slice()),
+            "the scan should still read every key it was opened over"
+        );
+    }
+}
+
+#[compio::test]
+async fn a_compaction_refuses_what_it_cannot_do() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    assert!(
+        db.compact(0, &[]).await.is_err(),
+        "a compaction of no tables has nothing to do"
+    );
+    assert!(
+        db.compact(0, &[999]).await.is_err(),
+        "L0 does not hold table 999"
+    );
+    assert!(
+        db.compact(6, &[1]).await.is_err(),
+        "there is nowhere below the last level"
+    );
+}

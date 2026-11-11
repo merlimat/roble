@@ -145,7 +145,7 @@ impl<F: Fs> Opened<'_, F> {
 
     /// Appends one edit to the MANIFEST and syncs it, and says how large
     /// the file has grown.
-    async fn append_version_edit(&self, edit: &VersionEdit) -> Result<u64> {
+    pub(crate) async fn append_version_edit(&self, edit: &VersionEdit) -> Result<u64> {
         let path = self.dir.join(self.manifest_filename());
         let disk = self.fs().open(&path, Access::ReadWrite).await?;
         let at = disk.len().await? as usize;
@@ -198,30 +198,18 @@ fn build_table(memtable: &Memtable, file_num: u64) -> Result<(Vec<u8>, NewTable)
     }
 
     let bytes = writer.finish()?;
-    let (Some(smallest), Some(largest)) = (bounds.smallest, bounds.largest) else {
-        return Err(Error::Corrupt(
-            "a memtable with entries produced no key bounds".to_string(),
-        ));
-    };
     let size = bytes.len() as u64;
-    Ok((
-        bytes,
-        NewTable {
-            level: 0,
-            file_num,
-            size,
-            smallest,
-            largest,
-            smallest_seq_num: bounds.smallest_seq,
-            largest_seq_num: bounds.largest_seq,
-            marked_for_compaction: false,
-            creation_time: 0,
-        },
-    ))
+    let mut new_table = bounds.into_new_table(0, file_num)?;
+    new_table.size = size;
+    Ok((bytes, new_table))
 }
 
 /// The least and greatest keys a table will hold, and their sequence numbers.
-struct Bounds {
+///
+/// Shared with `crate::compact`, which has to describe its output the same
+/// way: a bound computed one way by a flush and another by a compaction is a
+/// MANIFEST that lies about one of them.
+pub(crate) struct Bounds {
     smallest: Option<Vec<u8>>,
     largest: Option<Vec<u8>>,
     smallest_seq: u64,
@@ -254,7 +242,7 @@ impl Bounds {
     /// The comparison can fail, and when it does this says so rather than
     /// guessing: a bound chosen from a comparison that did not work is a
     /// table that lies about what it holds, and every reader believes it.
-    fn saw_key(&mut self, encoded: &[u8]) -> Result<()> {
+    pub(crate) fn saw_key(&mut self, encoded: &[u8]) -> Result<()> {
         match &self.smallest {
             Some(s) if key::compare(encoded, s)?.is_ge() => {}
             _ => self.smallest = Some(encoded.to_vec()),
@@ -267,8 +255,30 @@ impl Bounds {
     }
 
     /// Takes account of one more entry's sequence number.
-    fn saw_seq(&mut self, seq: u64) {
+    pub(crate) fn saw_seq(&mut self, seq: u64) {
         self.smallest_seq = self.smallest_seq.min(seq);
         self.largest_seq = self.largest_seq.max(seq);
+    }
+
+    /// The MANIFEST entry for a table with these bounds.
+    ///
+    /// `size` is left at zero for the caller to fill once the bytes exist.
+    pub(crate) fn into_new_table(self, level: u32, file_num: u64) -> Result<NewTable> {
+        let (Some(smallest), Some(largest)) = (self.smallest, self.largest) else {
+            return Err(Error::Corrupt(
+                "a table with entries produced no key bounds".to_string(),
+            ));
+        };
+        Ok(NewTable {
+            level,
+            file_num,
+            size: 0,
+            smallest,
+            largest,
+            smallest_seq_num: self.smallest_seq,
+            largest_seq_num: self.largest_seq,
+            marked_for_compaction: false,
+            creation_time: 0,
+        })
     }
 }
