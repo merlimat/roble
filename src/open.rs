@@ -339,14 +339,6 @@ async fn read_version_edits<F: Fs>(fs: &F, path: &Path, file_num: u64) -> Result
     Ok(edits)
 }
 
-/// Refuses a database whose logs still hold writes.
-///
-/// `disable_wal` leaves an empty log file behind rather than no log file, which
-/// is Oxia's shape (§1) and has to open. So the question is not whether a log
-/// exists but whether it holds a record: one record means a write was
-/// acknowledged and no table has it yet, and opening without it would discard
-/// that write silently. Replaying it is M3's work; until then this refuses,
-/// because that is the one answer that cannot lose data (§6).
 /// The log a store is writing to.
 struct Log<D: Disk> {
     disk: std::rc::Rc<D>,
