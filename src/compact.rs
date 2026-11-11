@@ -263,9 +263,13 @@ async fn merge<D: Disk>(
     // so a merge of a million keys is a million keys' worth of work rather
     // than a million keys' worth of waiting for everyone else (§9).
     let mut pacer = crate::work::Pacer::new(unit);
+    // Discarding, not keeping: a compaction reads every block of its inputs
+    // once and never comes back, so filling the block cache with them would
+    // evict what the foreground is reading and replace it with bytes nobody
+    // will ask for again (`crate::table::Caching`).
     let mut iters = Vec::new();
     for t in tables {
-        let mut it = t.iter();
+        let mut it = t.iter_with(crate::table::Caching::Discard);
         it.first().await?;
         iters.push(it);
     }

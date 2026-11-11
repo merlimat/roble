@@ -53,6 +53,26 @@ pub struct Entry {
     pub value: Vec<u8>,
 }
 
+/// What a block read does with what it fetched.
+///
+/// A read keeps its blocks, because the next read is likely to want them. A
+/// **compaction discards** them: it reads every block of its inputs exactly
+/// once and never comes back, so filling the cache with them evicts the
+/// blocks the foreground depends on and replaces them with bytes nobody will
+/// ask for again. Pebble draws the same line, reading a compaction's blocks
+/// into a buffer pool instead of the cache.
+///
+/// Either way the cache is **consulted**: a block that happens to be there
+/// already is free, and taking it costs the foreground nothing. What harms is
+/// putting one in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Caching {
+    /// Keep what was read, for the reads that follow.
+    Keep,
+    /// Read it and let it go.
+    Discard,
+}
+
 /// A table, open.
 pub struct OpenTable<D: Disk> {
     /// Its file number.
@@ -197,16 +217,16 @@ impl<D: Disk> OpenTable<D> {
     /// properties, index, filter and tombstones are read once when the table
     /// is opened and kept in this struct, so caching them as well would spend
     /// the block budget on bytes that are already held.
-    async fn block(&self, handle: BlockHandle) -> Result<Rc<Vec<u8>>> {
+    ///
+    /// `caching` decides what becomes of a block that had to be fetched (see
+    /// [`Caching`]). The lookup happens either way; only the filling is
+    /// conditional.
+    async fn block(&self, handle: BlockHandle, caching: Caching) -> Result<Rc<Vec<u8>>> {
         if let Some(held) = self.blocks.get(self.file_num, handle.offset) {
-            if let Some(m) = &self.metrics {
-                m.cache_lookups[crate::metrics::BLOCK_HIT].add(1);
-            }
+            self.looked(caching, crate::metrics::BLOCK_HIT);
             return Ok(held);
         }
-        if let Some(m) = &self.metrics {
-            m.cache_lookups[crate::metrics::BLOCK_MISS].add(1);
-        }
+        self.looked(caching, crate::metrics::BLOCK_MISS);
         let bytes = fetch(
             &self.disk,
             self.metrics.as_deref(),
@@ -214,9 +234,26 @@ impl<D: Disk> OpenTable<D> {
             self.footer.checksum,
         )
         .await?;
-        self.blocks
-            .hold(self.file_num, handle.offset, Rc::clone(&bytes));
+        if caching == Caching::Keep {
+            self.blocks
+                .hold(self.file_num, handle.offset, Rc::clone(&bytes));
+        }
         Ok(bytes)
+    }
+
+    /// Counts a cache lookup, unless it was a compaction's.
+    ///
+    /// A compaction reads every block of its inputs once and never returns,
+    /// so its hit rate is zero by construction and counting its lookups would
+    /// bury the only hit rate anybody asks about: whether the reads that come
+    /// from outside found what they needed.
+    fn looked(&self, caching: Caching, which: usize) {
+        if caching == Caching::Discard {
+            return;
+        }
+        if let Some(m) = &self.metrics {
+            m.cache_lookups[which].add(1);
+        }
     }
 
     /// The first entry at or after `target`.
@@ -231,7 +268,7 @@ impl<D: Disk> OpenTable<D> {
     pub async fn seek_ge(&self, target: &[u8]) -> Result<Option<Entry>> {
         let start = first_block_at_or_after(&self.index, target)?;
         for entry in &self.index[start..] {
-            let bytes = self.block(entry.handle).await?;
+            let bytes = self.block(entry.handle, Caching::Keep).await?;
             let block = Block::new(&bytes)?;
             let mut cursor = block.data_cursor(self.footer.format);
             cursor.seek_ge(&block, target)?;
@@ -291,7 +328,7 @@ impl<D: Disk> OpenTable<D> {
                     self.value_blocks.len()
                 ))
             })?;
-        let bytes = self.block(*block_handle).await?;
+        let bytes = self.block(*block_handle, Caching::Keep).await?;
         Ok(roble_format::value_block::value_in_block(&bytes, handle)?.to_vec())
     }
 }
@@ -336,6 +373,8 @@ async fn fetch<D: Disk>(
 /// rescans from a restart point.
 pub struct TableIter<D: Disk> {
     table: Rc<OpenTable<D>>,
+    /// What this iterator's block reads do with what they fetch.
+    caching: Caching,
     /// Which data block the cursor is in.
     at: usize,
     /// That block's bytes, once loaded.
@@ -346,7 +385,13 @@ pub struct TableIter<D: Disk> {
 impl<D: Disk> OpenTable<D> {
     /// An iterator over this table, positioned nowhere.
     pub fn iter(self: &Rc<Self>) -> TableIter<D> {
+        self.iter_with(Caching::Keep)
+    }
+
+    /// The same, saying what its block reads do with what they fetch.
+    pub fn iter_with(self: &Rc<Self>, caching: Caching) -> TableIter<D> {
         TableIter {
+            caching,
             cursor: roble_format::block::restart::DataCursor::new(self.footer.format),
             table: Rc::clone(self),
             at: 0,
@@ -379,7 +424,7 @@ impl<D: Disk> TableIter<D> {
     /// Loads block `at`, leaving the cursor unpositioned within it.
     async fn load(&mut self, at: usize) -> Result<()> {
         let handle = self.table.index[at].handle;
-        self.bytes = Some(self.table.block(handle).await?);
+        self.bytes = Some(self.table.block(handle, self.caching).await?);
         self.at = at;
         Ok(())
     }

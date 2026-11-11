@@ -445,7 +445,12 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   count, as an encina iterator does.
 - **Files are immutable, so there is nothing to lock.** A block is found through
   the table cache (an open reader per file, with its index and filter) and the
-  block cache (decoded blocks, keyed by file number and offset).
+  block cache (decoded blocks, keyed by file number and offset). A
+  **compaction consults the block cache but does not fill it**: it reads every
+  block of its inputs once and never returns, so leaving them behind would
+  evict what reads depend on and replace it with bytes nobody will ask for
+  again. Pebble draws the same line, reading a compaction's blocks into a
+  buffer pool instead of the cache.
 - **Reads assemble an iterator tree**: one iterator per memtable and per level,
   merged by internal key, with range-deletion iterators layered over them, and
   the sequence number of the snapshot deciding what is visible.
