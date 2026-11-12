@@ -261,6 +261,67 @@ paid for.
 
 The last line is the process's peak resident memory.
 
+## The allocator
+
+roble is a library, so `#[global_allocator]` is never its choice — it belongs
+to whatever binary links it, which for the first consumer is Oxia's data
+server. Two features exist to measure what that choice is worth, and they are
+mutually exclusive because each installs an allocator:
+
+```sh
+cargo run --release -p roble-bench --features mimalloc -- --dir /tmp/b --no-wal
+cargo run --release -p roble-bench --features count-alloc -- --dir /tmp/b --no-wal
+```
+
+`mimalloc` swaps the process allocator. `count-alloc` wraps the system one and
+counts, printing a final line of allocations and bytes asked for — as
+`<engine>\tallocs\t<n>\t<bytes>` under `--tsv`. Only Rust allocations: a
+`#[global_allocator]` does not reach RocksDB's C++ `new` or Pebble's Go heap,
+so this measures roble and encina.
+
+A phase's own count is the difference between a run with it and a run without
+it, which charges nothing to opening the store:
+
+```sh
+base=$(... --phases load,settle)
+with=$(... --phases load,settle,get)   # (with - base) / --reads
+```
+
+### What it measured
+
+On macOS, one shard, `--no-wal`, five paired interleaved repetitions, mimalloc
+against the system allocator:
+
+| phase | ratio |
+|---|---|
+| load | 1.19× |
+| scan | 1.13× |
+| scan-rev | 1.09× |
+| get | 1.46× |
+| floor | 1.09× |
+| peak RSS | 0.62× |
+
+The mechanism is one number: mimalloc saves a roughly **constant 12 ns per
+allocation** here — 11.6 and 12.2 ns/alloc on `get` at two store sizes, 9.6 and
+13.2 on `scan`, 7.6 and 10.7 on `load`, 20.0 on `floor` — and each phase's
+ratio is that divided by what the phase costs per operation. Nothing
+cache-shaped or locality-shaped is needed to explain it.
+
+Which is why the ratio is not a scoreboard to improve: it says how much a
+phase allocates, and the cheaper fix is to allocate less. A prediction worth
+recording as wrong — that a store with more tables would show a *bigger* `get`
+ratio, since allocations per `get` grew with table count — came out backwards,
+1.46× at fourteen tables and 1.27× at twenty-six. The per-allocation saving
+held; the baseline cost per lookup grew faster than the allocation count, so
+the allocator's share of it shrank.
+
+Two things these numbers are not. macOS's libmalloc is the friendliest
+possible baseline, and glibc's per-thread tcache is far closer to mimalloc's
+fast path, so **expect less on Linux** — which is where Oxia runs, and which
+the Benchmark workflow below is for. And this is one shard on one thread,
+where mimalloc's per-thread heaps have nothing to do; a run with many shards
+is a different measurement.
+
 ## On a Linux runner
 
 macOS cannot give an honest load row with the WAL on: Go's `os.File.Sync` is
