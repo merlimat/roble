@@ -526,3 +526,66 @@ async fn a_sweep_keeps_the_readers_the_version_still_names() {
         "the sweep let go of a reader for a table the version still names"
     );
 }
+
+#[compio::test]
+async fn a_table_a_scan_cannot_reach_is_collected_while_it_is_open() {
+    // The mirror of the test above, and the reason that one is not the whole
+    // story. A scan pins every table it opens, so a scan that opened every
+    // table in the database would hold every table in the database against
+    // the sweep — a handful of keys keeping a shard's worth of files alive
+    // for as long as the cursor is open. It opens what its bounds can reach
+    // and nothing else.
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    // The L0 tables that start above the bounds below, which is what makes
+    // this a test rather than a restatement.
+    let beyond: Vec<u64> = {
+        let versions = db.versions();
+        versions
+            .version
+            .level(0)
+            .iter()
+            .filter(|t| t.smallest_user_key().expect("smallest") >= b"g".as_slice())
+            .map(|t| t.file_num)
+            .collect()
+    };
+    assert!(
+        !beyond.is_empty(),
+        "the fixture should arrive with L0 tables starting above \"g\""
+    );
+
+    // Opened before the compaction, and bounded well below the tables it is
+    // about to retire.
+    let mut scan = db.scan_range(Some(b"a"), Some(b"g")).await.expect("scan");
+    scan.first().await.expect("first");
+
+    db.compact(0, &beyond).await.expect("compact");
+
+    let names = listing(env.sim(), &dir).await;
+    for file_num in &beyond {
+        let name = files::table_filename(*file_num);
+        assert!(
+            !names.contains(&name),
+            "{name} is outside the scan's bounds and was kept alive by it anyway: \
+             {names:?}"
+        );
+    }
+
+    // And the scan reads its range to the end, which is the half that says
+    // nothing it *did* need was collected.
+    let mut seen = Model::new();
+    while scan.is_valid() {
+        seen.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next().await.expect("next");
+    }
+    let expected: Model = contents(&db)
+        .await
+        .into_iter()
+        .filter(|(k, _)| k.as_slice() >= b"a".as_slice() && k.as_slice() < b"g".as_slice())
+        .collect();
+    assert_eq!(
+        seen, expected,
+        "the scan should have read every key inside its bounds"
+    );
+}

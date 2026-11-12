@@ -592,15 +592,28 @@ impl<F: crate::env::Fs> crate::Opened<F> {
         // decide and it costs nothing here: an iterator over a table outside
         // the bounds goes invalid on its first seek.
         //
+        // Only the tables this scan could reach. A table whose keys are all
+        // outside the bounds has nothing to offer: its iterator would go
+        // invalid on its first seek, and holding it open would pin a file
+        // the obsolete sweep is then not allowed to collect (§5,
+        // `crate::obsolete`). A scan over three keys would otherwise retain
+        // every table in the database for as long as it was open.
+        //
         // The file numbers first, so the borrow is released before any
         // waiting: opening a table is I/O, and a `RefCell` held across it
         // would collide with the flush that is allowed to run meanwhile.
-        let file_nums: Vec<u64> = self
-            .versions()
-            .version
-            .levels()
-            .flat_map(|(_, metas)| metas.iter().map(|m| m.file_num))
-            .collect();
+        let file_nums: Vec<u64> = {
+            let versions = self.versions();
+            let mut wanted = Vec::new();
+            for (_, metas) in versions.version.levels() {
+                for meta in metas {
+                    if meta.overlaps_range(lower, upper)? {
+                        wanted.push(meta.file_num);
+                    }
+                }
+            }
+            wanted
+        };
         let mut tables = Vec::new();
         for file_num in file_nums {
             tables.push(self.open_table(file_num).await?);
