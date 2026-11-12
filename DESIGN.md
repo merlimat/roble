@@ -495,11 +495,23 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   memtable — the order that keeps anything readable recoverable (§6). A flush
   that froze in between would build its table from a memtable the write had
   not reached yet, and retire the log holding the record: the write returned
-  `Ok`, and both copies of it are gone. So a store counts the writes that have
-  chosen a memtable, and a freeze does not swap until the count is zero
-  (`crate::change::Writers`). It is a counter and not a permit, because there
-  is nothing wrong with two writes at once — only with freezing underneath
-  one.
+  `Ok`, and both copies of it are gone. So there is **one write at a time**,
+  `crate::change::Writers`, and a freeze does not swap until no write holds
+  it.
+
+  That permit is also what keeps two writes off each other, and that is the
+  same fact rather than a second one. A write reads the sequence number it
+  will stamp and the offset it will append its record at, waits for the disk,
+  and only then applies to the memtable. Two writes overlapping there read
+  the same of each, and both go wrong: the second's record lands on top of
+  the first's, so `write` returned `Ok` for a record the next open has no
+  trace of; and both batches carry the same sequence number, so two entries
+  for one key become one, a snapshot cannot tell the two writes apart, and
+  the MANIFEST's last sequence number is a write short of what the memtable
+  holds. Pebble serializes the same span for the same reason — its WAL append
+  happens under `commitPipeline.mu`, with only the memtable apply left
+  concurrent. roble has one thread, so there is nothing to gain by splitting
+  the two, and a write holds the permit from end to end.
 
   A freeze is the one part of a flush that a failure does not undo: the store
   is writing to the fresh memtable and the fresh log from then on, whatever
@@ -558,7 +570,9 @@ does not, while `DELSIZED` does (`batchrepr.Reader.Next`).
 
 `write()` assigns sequence numbers, appends the repr to the log as one record,
 syncs the log if `sync` is set, and then applies the entries to the memtable — in
-that order, so nothing is ever readable that a replay would not recover. With
+that order, so nothing is ever readable that a replay would not recover. One
+write at a time, because that span is where the sequence number and the log
+offset are both chosen and both committed to (§5). With
 `disable_wal` the log step is skipped and durability is `flush()`'s job alone
 (§4). A `sync` is then **refused** rather than ignored, which is what Pebble
 does (`DB.Apply`: "pebble: WAL disabled") and the correction this document
