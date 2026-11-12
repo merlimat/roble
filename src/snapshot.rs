@@ -200,14 +200,24 @@ impl<D: Disk> Snapshot<D> {
             let mut it = table.iter();
             it.seek_ge(&target).await?;
             while it.is_valid() {
-                let here = it.key().to_vec();
-                let k = InternalKey::decode(&here)?;
-                if k.user_key != user {
+                // The trailer read out of the borrowed key rather than out of
+                // a copy of it, and the value without a second copy of that
+                // key beside it. The copy was here to end the borrow before
+                // the call below; scoping it to the three scalars this needs
+                // ends the borrow just as well, and `value_into` never builds
+                // the key it was going to throw away. Two allocations a
+                // version stepped over, both of them of the same key.
+                let (seq_num, kind, matches) = {
+                    let k = InternalKey::decode(it.key())?;
+                    (k.seq_num, k.kind, k.user_key == user)
+                };
+                if !matches {
                     break;
                 }
-                if k.seq_num <= self.seq && best.as_ref().is_none_or(|(seq, _, _)| k.seq_num > *seq)
-                {
-                    best = Some((k.seq_num, k.kind, it.entry().await?.value));
+                if seq_num <= self.seq && best.as_ref().is_none_or(|(seq, _, _)| seq_num > *seq) {
+                    let mut value = Vec::new();
+                    it.value_into(&mut value).await?;
+                    best = Some((seq_num, kind, value));
                 }
                 it.next().await?;
             }
