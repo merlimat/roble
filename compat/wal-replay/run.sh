@@ -54,7 +54,7 @@ trap 'rm -rf "$out"' EXIT
 # into a table through a MANIFEST edit roble appended. The first tests
 # Pebble replaying roble's log; the second tests Pebble reading roble's
 # table and believing roble's MANIFEST.
-for mode in log flushed rotated compacted settled no-wal swept; do
+for mode in log flushed rotated compacted settled no-wal swept checkpoint; do
   db="$out/$mode"
   # The swept run needs a database Pebble left something obsolete in, which
   # db-simple is not: Pebble closed db-unflushed-wal holding a log it had
@@ -73,9 +73,16 @@ for mode in log flushed rotated compacted settled no-wal swept; do
     settled) cargo run --release --quiet -p wal-replay -- "$db" --settle ;;
     no-wal)  cargo run --release --quiet -p wal-replay -- "$db" --no-wal ;;
     swept)   cargo run --release --quiet -p wal-replay -- "$db" --swept ;;
+    checkpoint) cargo run --release --quiet -p wal-replay -- "$db" --checkpoint ;;
     *)       cargo run --release --quiet -p wal-replay -- "$db" ;;
   esac
   echo
-  (cd ../../harness && go run ./verify-wal "$db" "$mode")
+  # The checkpoint run hands Pebble the directory roble wrote *out* of the
+  # database, not the database.
+  verify="$db"
+  if [ "$mode" = checkpoint ]; then
+    verify="$out/checkpointed"
+  fi
+  (cd ../../harness && go run ./verify-wal "$verify" "$mode")
   echo
 done
