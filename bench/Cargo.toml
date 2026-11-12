@@ -1,0 +1,25 @@
+# Compares roble with Go Pebble on Oxia's shape. See README.md.
+[package]
+name = "roble-bench"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Benchmarks roble against Go Pebble on the workload Oxia runs"
+
+[dependencies]
+compio = { version = "0.19.2", features = ["fs", "macros"] }
+roble = { path = ".." }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+# The benchmark needs two libc calls — `getrusage`, for CPU time and peak
+# memory — so like the engine it denies unsafe and allows it at those call
+# sites, each with a SAFETY comment. Without them the CPU column would be
+# missing, and that column is what makes roble's cooperative compaction
+# comparable with Pebble's background threads.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"

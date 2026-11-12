@@ -1455,9 +1455,18 @@ in both directions.
   CI measures coverage on every pull request (`cargo llvm-cov`), posts the totals
   as a status, and lists the lines and regions no test runs, such as the error
   branch of a `?`. An uncovered failure path needs a test or a written reason.
-- **Benchmarks** against Go Pebble on Oxia's shape: small records, hundreds of
-  shards, batches per write, floor lookups, reverse scans, and a checkpoint under
-  load. Compressed against uncompressed is a first-class comparison (§8), as is
+- **Benchmarks** against Go Pebble on Oxia's shape: small records, a store per
+  shard, batches per write, floor lookups, scans both ways, and a checkpoint.
+  `bench/` is the Rust side and `harness/bench` the Go one, each engine in a
+  process of its own so the CPU time and the memory reported are its alone, and
+  both deriving their keys, values and lookup order from one seed with the same
+  generator. `bench/README.md` says what the phases are and, at more length,
+  the three ways a comparison like this misleads a careless reader: a sync
+  primitive that differs by platform, a block cache the previous phase warmed,
+  and a clock read per step that costs as much as the step. Each of the three
+  was caught producing a wrong answer before it was fixed, which is why they
+  are written down rather than merely avoided.
+  Compressed against uncompressed is a first-class comparison (§8), as is
   cooperative compaction against offloaded (§9), and the WAL on against off (§4).
   **Also against encina**, which is not apples-to-apples and is not meant to be:
   a copy-on-write B+tree with no compaction, no tombstones to step over and a
@@ -1496,23 +1505,44 @@ Stated rather than quietly decided:
 
 - **Uncompressed by default (§8)** needs the measurement before it is a default.
   If Snappy's space saving on Oxia's values is large, the zero-copy read path is
-  worth less than it looks.
+  worth less than it looks. `bench/` can now ask: on incompressible values the
+  two engines hold the same 42 MiB, so the default costs nothing there, and on
+  a single repeated byte Snappy saved 2.5x. Oxia's values are serialized
+  records and sit between those, so what is still missing is a run over
+  something shaped like Oxia's own data rather than either extreme.
 - **Cooperative compaction (§9)** is a bet on small shards. The offload path is
-  designed but unbuilt; the benchmark in M4 decides whether it gets built.
-- **What reverse iteration costs** is unmeasured, and it is not an optional
-  feature: `KeyRangeScanReverse` is on an Oxia serving path, and an LSM pays more
-  for `prev` than for `next`. So it is measured in M2 against Go Pebble over the
-  same database, and the result is a **gate on M2**, not a number reported in
-  M5 — if roble is materially slower there, that is a design problem to fix while
-  the iterator tree is still being built.
+  designed but unbuilt; the benchmark decides whether it gets built, and the
+  `cpu s` column is where to look — a cooperative compaction's cost lands on
+  the thread that owns the store, so it shows up in the phase that drove it
+  rather than in a background total.
+- **What reverse iteration costs** is now measured, and it is not the problem
+  this entry expected. `bench/` runs both engines over the same workload, each
+  scan direction in a process of its own so that neither reads a cache the
+  other warmed. Reverse costs roble **1.26x** what forward does, and Pebble
+  **1.44x** — so roble's `prev` is, relative to its own `next`, cheaper than
+  Pebble's. Reverse iteration is not a design problem.
+
+  What the same run exposed instead is that **roble scans about 7x slower than
+  Pebble in both directions**, and the `levels` line says why: over the same
+  300,000 records roble settles at `L0=1 L1=13` and Pebble at `L6=11`. A scan
+  of the first merges fourteen iterators over a level that may overlap; a scan
+  of the second reads eleven tables of a level that cannot, one after another.
+  That is the picker's doing, not the iterator tree's, which moves the cost to
+  the open question two entries below and makes it a much larger one than
+  "noisy". Measuring it is M5's; fixing it is not scheduled.
 - **A future Oxia that excises.** Virtual sstables are refused (§3) because
   nothing in Oxia creates one today — not the data path, and not the shard
   split, which streams a filtered snapshot. If Oxia adopts `Excise` or
   `IngestAndExcise`, roble needs them on both sides, and that is a release
   rather than a patch. Worth watching rather than deciding now.
 - **How closely the picker should follow Pebble's.** Compatibility does not
-  require it. Diverging risks a shard whose shape Go Pebble then compacts
-  differently, which is legal but makes performance comparisons noisy.
+  require it, and this was filed as a question about noise. The benchmark says
+  it is a question about speed: roble's picker leaves a 42 MiB shard spread
+  across thirteen L1 tables where Pebble's compacts it down to eleven at L6,
+  and scanning the first costs about 7x more because every step merges every
+  table of the level. The shape is legal and Go Pebble reads it, so this is
+  not a compatibility bug — but it is the largest performance gap the
+  benchmark found, and it is the one worth closing first.
 - **Whether roble should recycle log files**, as Pebble does. Not recycling is
   simpler and keeps `ReuseForWrite` out of `Fs` (§10); recycling saves a file
   creation and its directory sync per rotation, which with 4 MiB memtables is

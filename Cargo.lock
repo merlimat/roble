@@ -979,6 +979,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roble-bench"
+version = "0.0.0"
+dependencies = [
+ "compio",
+ "libc",
+ "roble",
+]
+
+[[package]]
 name = "roble-cli"
 version = "0.0.0"
 dependencies = [
