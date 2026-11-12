@@ -39,7 +39,8 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next().map(PathBuf::from) else {
         eprintln!(
-            "usage: wal-replay <database-dir> [--flush|--rotate|--compact|--settle|--no-wal|--swept]"
+            "usage: wal-replay <database-dir> \
+             [--flush|--rotate|--compact|--settle|--no-wal|--swept|--checkpoint]"
         );
         std::process::exit(2);
     };
@@ -48,6 +49,10 @@ async fn main() {
     // other half of the round trip. With `--swept` roble writes nothing and
     // the only change to the directory is what its open deleted.
     let mode = args.next();
+    // Its own flag rather than a seventh place in the tuple below: a
+    // checkpoint is not another way of writing to this database, it is a
+    // second directory written out of it.
+    let checkpoint = mode.as_deref() == Some("--checkpoint");
     let (flush, rotate, compact, settle, no_wal, swept) = match mode.as_deref() {
         None => (false, false, false, false, false, false),
         Some("--flush") => (true, false, false, false, false, false),
@@ -66,6 +71,12 @@ async fn main() {
         // the flush is the only thing that happened.
         Some("--no-wal") => (true, false, false, false, true, false),
         Some("--swept") => (false, false, false, false, false, true),
+        // `--checkpoint` writes a second directory out of this one and
+        // hands Pebble *that*: hard links to the tables, a MANIFEST roble
+        // wrote from nothing, the two markers, and no OPTIONS file at all.
+        // The checkpoint flushes on its way, so everything written here is
+        // in a table by the time Pebble sees it.
+        Some("--checkpoint") => (false, false, false, false, false, false),
         Some(other) => fail(&format!("unknown mode {other}")),
     };
 
@@ -315,13 +326,31 @@ async fn main() {
         println!("roble rotated the MANIFEST to {manifest}, written from nothing");
     }
 
+    // The directory Pebble is going to be handed, which for `--checkpoint`
+    // is not this one.
+    let at = if checkpoint {
+        let at = dir.with_file_name("checkpointed");
+        db.checkpoint(&at)
+            .await
+            .unwrap_or_else(|e| fail(&format!("checkpoint: {e}")));
+        println!(
+            "roble checkpointed {} into {}, which holds {:?}",
+            dir.display(),
+            at.display(),
+            names_in(&at)
+        );
+        at
+    } else {
+        dir.clone()
+    };
+
     // What Pebble should find, in the format its reader prints.
     let mut out = String::new();
     for (k, v) in &wrote {
         out.push_str(&format!("{} {}\n", hex(k), hex(v)));
     }
     out.push_str(&format!("deleted {}\n", hex(b"alpha")));
-    std::fs::write(dir.join("roble-wrote.txt"), out)
+    std::fs::write(at.join("roble-wrote.txt"), out)
         .unwrap_or_else(|e| fail(&format!("write the expectation: {e}")));
 
     println!(
