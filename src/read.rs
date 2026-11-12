@@ -43,7 +43,6 @@ use roble_format::key::{self, Kind};
 use crate::env::Fs;
 use crate::error::Result;
 use crate::open::Opened;
-use crate::version::Table as TableMeta;
 
 /// Which key a read is asking for, relative to the one it is given.
 ///
@@ -115,10 +114,16 @@ impl<F: Fs> Opened<F> {
 
     /// A point lookup.
     async fn equal(&self, user: &[u8]) -> Result<Option<Found>> {
-        let Some(found) = self.newest_for(user).await? else {
+        // The range check both halves need, done once. They narrow it
+        // differently from here — `newest_for` consults each table's filter
+        // and `visible` must not, since a filter is built from point keys and
+        // a range tombstone is not one — but which tables *contain* the key
+        // is one question with one answer.
+        let containing = self.tables_containing(user)?;
+        let Some(found) = self.newest_for(user, &containing).await? else {
             return Ok(None);
         };
-        if !self.visible(user, &found).await? {
+        if !self.visible(user, &found, &containing).await? {
             return Ok(None);
         }
         Ok(Some(Found {
@@ -157,7 +162,7 @@ impl<F: Fs> Opened<F> {
     /// Newest by sequence number, across every level: an entry's level says
     /// nothing a trailer does not already say, and trailers are what the
     /// ordering is defined on.
-    async fn newest_for(&self, user: &[u8]) -> Result<Option<Candidate>> {
+    async fn newest_for(&self, user: &[u8], containing: &[u64]) -> Result<Option<Candidate>> {
         let target = key::search_key(user);
         let mut best: Option<Candidate> = None;
 
@@ -185,11 +190,8 @@ impl<F: Fs> Opened<F> {
             }
         }
 
-        for meta in self.live_tables() {
-            if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
-                continue;
-            }
-            let table = self.open_table(meta.file_num).await?;
+        for &file_num in containing {
+            let table = self.open_table(file_num).await?;
             // The filter is consulted only here: it answers about one key, and
             // the ordered comparisons are asking about a range (§6).
             //
@@ -225,7 +227,7 @@ impl<F: Fs> Opened<F> {
     }
 
     /// Whether `found` is a live value for `user`.
-    async fn visible(&self, user: &[u8], found: &Candidate) -> Result<bool> {
+    async fn visible(&self, user: &[u8], found: &Candidate, containing: &[u64]) -> Result<bool> {
         if crate::table::is_deletion(found.kind) {
             return Ok(false);
         }
@@ -241,12 +243,9 @@ impl<F: Fs> Opened<F> {
         // before it — and it is written that way for that reason, not because
         // a test demanded it.
         let seq = found.trailer >> 8;
-        let mut tables = Vec::new();
-        for meta in self.live_tables() {
-            if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
-                continue;
-            }
-            tables.push(self.open_table(meta.file_num).await?);
+        let mut tables = Vec::with_capacity(containing.len());
+        for &file_num in containing {
+            tables.push(self.open_table(file_num).await?);
         }
         if crate::table::covered_by_tombstone(&tables, user, seq)? {
             return Ok(false);
@@ -263,15 +262,33 @@ impl<F: Fs> Opened<F> {
         Ok(true)
     }
 
-    /// Every table of the version, in no particular order.
+    /// The file number of every table whose key range contains `user`.
     ///
-    /// Order does not matter: every comparison below is by key or by trailer,
-    /// never by position in the tree.
-    fn live_tables(&self) -> Vec<TableMeta> {
-        self.versions()
-            .version
-            .levels()
-            .flat_map(|(_, tables)| tables.iter().cloned())
-            .collect()
+    /// The comparison happens **here**, while the version is still borrowed,
+    /// and only file numbers leave. What it replaced carried a clone of every
+    /// table's metadata out instead, and a table's two bounds are `Vec<u8>`
+    /// fields: a point lookup allocated twice per table in the database, for
+    /// tables whose range cannot hold the key as much as for the one that
+    /// does, and twice over because both halves of the lookup asked. A store
+    /// settling into more tables made every lookup allocate more — 28 per
+    /// `get` at four tables and 122 at twenty-six, measured, growing by about
+    /// four per table added.
+    ///
+    /// The borrow is why the clone was there: the callers `.await` on opening
+    /// a table, and a `Ref` cannot be held across that. A file number can.
+    ///
+    /// Order does not matter: every comparison in the callers is by key or by
+    /// trailer, never by position in the tree.
+    fn tables_containing(&self, user: &[u8]) -> Result<Vec<u64>> {
+        let versions = self.versions();
+        let mut out = Vec::new();
+        for (_, tables) in versions.version.levels() {
+            for meta in tables {
+                if meta.smallest_user_key()? <= user && meta.largest_user_key()? >= user {
+                    out.push(meta.file_num);
+                }
+            }
+        }
+        Ok(out)
     }
 }
