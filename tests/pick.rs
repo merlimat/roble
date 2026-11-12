@@ -72,6 +72,18 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 }
 
 /// Writes `count` keys from `at` and flushes, giving one L0 table.
+/// How deep L0 is, which is what `l0_compaction_threshold` is counted in.
+fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
+    db.versions().version.l0_sublevels().expect("the sublevels") as u64
+}
+
+/// Writes `count` keys from `at` under `prefix` and flushes them, and says
+/// which table that wrote.
+///
+/// Whether two calls share a key range is what decides whether their tables
+/// stack: L0 is measured in the layers its tables form, so two flushes of
+/// the same range are two layers and two flushes of different ranges are one
+/// (§9, `Version::l0_sublevels`).
 async fn flush_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, at: usize, count: usize) -> u64 {
     let mut batch = Batch::new();
     for i in at..at + count {
@@ -98,19 +110,22 @@ async fn a_level_inside_its_allowance_is_left_alone() {
     .expect("open");
     assert_eq!(db.versions().version.level(0).len(), 1);
 
-    assert_eq!(db.pick(), None, "one table in L0 is not worth compacting");
-    for round in 0..2 {
-        flush_keys(&db, "a", round * 10, 4).await;
+    assert_eq!(db.pick(), None, "one layer in L0 is not worth compacting");
+    // The same key range every time, so each flush lands a layer above the
+    // last: four flushes of four different ranges would be one layer and
+    // nothing to compact.
+    for _ in 0..2 {
+        flush_keys(&db, "a", 0, 4).await;
         assert_eq!(
             db.pick(),
             None,
-            "{} tables in L0 is still inside the allowance",
-            db.versions().version.level(0).len()
+            "{} layers in L0 is still inside the allowance",
+            l0_depth(&db)
         );
     }
 
-    flush_keys(&db, "a", 100, 4).await;
-    let pick = db.pick().expect("four tables in L0 is past the allowance");
+    flush_keys(&db, "a", 0, 4).await;
+    let pick = db.pick().expect("four layers in L0 is past the allowance");
     assert_eq!(pick.level, 0);
     assert_eq!(pick.held, 4);
     assert_eq!(pick.allowance, 4);
@@ -127,11 +142,13 @@ async fn l0_is_picked_whole() {
         &dir,
         Options::new()
             .disable_automatic_compactions(true)
-            .l0_compaction_threshold(3),
+            .l0_compaction_threshold(2),
     )
     .await
     .expect("open");
 
+    // Overlapping each other, so they stack; the fixture's own table is
+    // somewhere else entirely and shares the bottom layer with the first.
     flush_keys(&db, "b", 0, 4).await;
     flush_keys(&db, "b", 2, 4).await;
 
@@ -224,10 +241,12 @@ async fn a_tie_goes_to_the_level_nearest_l0() {
             .map(|t| t.file_num)
             .collect();
         db.compact(0, &l0).await.expect("compact");
+        // The same range twice, so L0 is two layers deep rather than two
+        // tables wide: its allowance is counted in layers.
         flush_keys(&db, "f", 0, 4).await;
-        flush_keys(&db, "f", 4, 4).await;
+        flush_keys(&db, "f", 0, 4).await;
 
-        l0_tables = db.versions().version.level(0).len() as u64;
+        l0_tables = l0_depth(&db);
         l1_bytes = db.versions().version.level(1).iter().map(|t| t.size).sum();
     }
 
@@ -565,9 +584,11 @@ async fn l0_at_the_stop_writes_line_is_picked_over_anything_else() {
     assert!(l1_bytes > 64, "L1 should be past its allowance");
 
     // And L0 at the line, which is where it stops being a question of score.
+    // The same key twice, so the two tables stack into the two layers the
+    // line is counted in.
     flush_keys(&db, "d", 0, 1).await;
-    flush_keys(&db, "d", 1, 1).await;
-    assert_eq!(db.versions().version.level(0).len(), 2);
+    flush_keys(&db, "d", 0, 1).await;
+    assert_eq!(l0_depth(&db), 2);
 
     let pick = db.pick().expect("a pick");
     assert_eq!(
@@ -578,5 +599,82 @@ async fn l0_at_the_stop_writes_line_is_picked_over_anything_else() {
         pick.tables.len(),
         2,
         "and the whole of L0 goes into it, as it always does"
+    );
+}
+
+#[compio::test]
+async fn l0_tables_that_do_not_overlap_are_left_alone_however_many() {
+    // The whole of what counting layers is for. Ten tables flushed from ten
+    // different key ranges are one layer and one seek, and merging them
+    // would be work that buys a read nothing — where counting tables would
+    // have called it a backlog of ten against an allowance of two.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(2),
+    )
+    .await
+    .expect("open");
+
+    for round in 0..10 {
+        flush_keys(&db, "z", round * 10, 4).await;
+    }
+
+    assert_eq!(
+        db.versions().version.level(0).len(),
+        11,
+        "the fixture's table and ten more"
+    );
+    assert_eq!(l0_depth(&db), 1, "and every one of them in the one layer");
+    assert_eq!(
+        db.pick(),
+        None,
+        "so there is nothing in L0 worth compacting"
+    );
+    assert_eq!(
+        db.compaction_debt(),
+        0,
+        "and nothing owed for it either: debt is weighed against the same allowance"
+    );
+}
+
+#[compio::test]
+async fn l0s_debt_is_charged_by_the_layer_and_not_by_the_table() {
+    // Two layers against an allowance of one is one layer's worth of bytes
+    // — half of what L0 holds here, not a quarter of it. Charging by the
+    // table would say a quarter, because the layers are two tables each.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(1),
+    )
+    .await
+    .expect("open");
+
+    // Four tables in two layers: two ranges, each flushed twice.
+    flush_keys(&db, "g", 0, 4).await;
+    flush_keys(&db, "g", 0, 4).await;
+    flush_keys(&db, "h", 0, 4).await;
+    flush_keys(&db, "h", 0, 4).await;
+
+    let (tables, bytes) = {
+        let versions = db.versions();
+        let l0 = versions.version.level(0);
+        (l0.len(), l0.iter().map(|t| t.size).sum::<u64>())
+    };
+    assert_eq!(tables, 5, "the fixture's table and four more");
+    assert_eq!(l0_depth(&db), 2, "in two layers");
+
+    assert_eq!(
+        db.compaction_debt(),
+        bytes / 2,
+        "one layer over the allowance, charged at what a layer of {bytes} bytes across \
+         two weighs"
     );
 }

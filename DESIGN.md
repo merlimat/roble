@@ -932,15 +932,17 @@ overlaps, so a read walking down the layers meets the newest version of a key
 first. Two tables that only *touch*, where the first ends at the sentinel a
 range deletion leaves, do not overlap and share a layer (§5).
 
-What this does **not** do yet is change what the thresholds count.
-`l0_compaction_threshold` and `l0_stop_writes_threshold` still count L0's
-tables, where Pebble's count its sublevels — so roble compacts earlier and
-stalls earlier than Pebble would, which is conservative and not the same
-number. Switching them is a change to when compaction happens rather than to
-what anything measures, and it needs the tests that build L0 to build one with
-read amplification in it: flushing a fresh key range each time, which is what
-most of them do, makes ten tables and one sublevel, and every L0 threshold in
-the suite would stop being reached.
+**Everything that measures L0 measures it in layers**, which is what Pebble's
+thresholds are in: `l0_compaction_threshold` and `l0_stop_writes_threshold`
+both, and the compaction debt with them, since a debt weighed against an
+allowance has to be in the allowance's unit. Ten tables flushed from ten
+different key ranges are one layer, so a store that writes in key order is
+left alone where counting tables would have called it a backlog of ten.
+
+A bound that does not decode falls back to the table count, which is the upper
+bound on the layers. It cannot happen to a database that opened — the ordering
+check decodes every bound — and a picker is not where anyone would want to find
+that out.
 
 A compaction is paced in units of work (`crate::work`): every
 `Options::compaction_unit` entries it hands the executor back and resumes, so

@@ -510,14 +510,17 @@ async fn the_debt_is_what_the_levels_hold_above_their_allowances() {
     let value = vec![b'v'; 200];
     let mut batch = Batch::new();
     for i in 0..20 {
+        // Inside the range the fixture's own table covers, so the table this
+        // flushes lands a layer above it: L0's debt is counted in layers,
+        // like the allowance it is weighed against (§9).
         batch
-            .put(format!("d{i:03}").as_bytes(), &value)
+            .put(format!("a{i:03}").as_bytes(), &value)
             .expect("put");
     }
     db.write(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
-    // Two L0 tables against an allowance of one: one table's worth of debt.
+    // Two L0 layers against an allowance of one: one layer's worth of debt.
     let debt = collected(reader(), &tag)["roble.compaction.debt"];
     assert!(debt > 0, "L0 is past its allowance, so there is debt");
 
@@ -1090,16 +1093,19 @@ async fn a_write_that_waited_is_counted_by_what_it_waited_for() {
             i += 2;
         }
 
-        // And on the way out, an L0 deep enough for the second phase.
+        // And on the way out, an L0 deep enough for the second phase. The
+        // same ten keys over and over, so that every flush lands a layer
+        // above the last: L0 is measured in layers, and fifty keys marching
+        // forward would be one of them (§9).
         for j in 0..5 * 10 {
-            put(&db, 200 + j).await.expect("write");
+            put(&db, 300 + j % 10).await.expect("write");
         }
         db.flush().await.expect("flush");
-        db.versions().version.level(0).len() as u64
+        db.versions().version.l0_sublevels().expect("the sublevels") as u64
     };
     assert!(
         deep >= 4,
-        "the first phase should have left L0 deep: {deep}"
+        "the first phase should have left L0 deep: {deep} layers"
     );
 
     // Short of a shallow enough L0: one of the two writes drains it, and the

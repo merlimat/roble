@@ -784,7 +784,10 @@ impl<F: Fs> Opened<F> {
             return Ok(());
         }
         loop {
-            let in_l0 = self.versions().version.level(0).len() as u64;
+            // In layers, which is what the line is counted in: a store
+            // holding twelve tables a read crosses in one seek is not deep
+            // (§9, `crate::pick::l0_depth`).
+            let in_l0 = crate::pick::l0_depth(&self.versions().version);
             if in_l0 < self.l0_stop_writes_threshold {
                 return Ok(());
             }

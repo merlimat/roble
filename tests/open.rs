@@ -1040,14 +1040,16 @@ async fn a_task_of_its_own_can_be_the_one_that_compacts() {
     // deterministically. What this adds is that the shape works against a
     // real runtime and a real disk at all.
     let (tmp, dir) = fixture("db-reads");
-    // Eleven, so the picker wants nothing until the flush below adds its
-    // table: the task has to be waiting *before* there is work, or the flush
-    // would find nobody and do the merge itself.
+    // The fixture arrives four layers deep, so five is the line the flush
+    // below crosses: the task has to be waiting *before* there is work, or
+    // the flush would find nobody and do the merge itself. The key it writes
+    // falls inside a range L0 already holds, so its table lands a layer
+    // above rather than beside (§9).
     let db = std::rc::Rc::new(
         roble::open_with(
             &roble::DefaultEnv,
             &dir,
-            roble::Options::new().l0_compaction_threshold(11),
+            roble::Options::new().l0_compaction_threshold(5),
         )
         .await
         .expect("open"),

@@ -139,6 +139,21 @@ async fn put<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result
     db.write(&mut batch, wal).await
 }
 
+/// Writes one key of a range the writes keep coming back to, so that every
+/// flush covers the same keys and its table lands a layer above the last.
+///
+/// L0 is measured in the layers its tables form (§9), so a test that wants a
+/// deep L0 has to write a deep one. Keys that march forward make tables that
+/// do not overlap, and any number of those is one layer and one seek.
+async fn put_overlapping<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result<()> {
+    put(db, i % ENTRIES as usize, wal).await
+}
+
+/// How deep L0 is, which is what the thresholds are counted in.
+fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
+    db.versions().version.l0_sublevels().expect("the sublevels") as u64
+}
+
 /// Writes until the store is at `budget`, and says how many keys that took.
 ///
 /// Capped, because a store that flushed on every write would never reach the
@@ -278,12 +293,12 @@ async fn l0_never_passes_the_line_a_write_waits_at() {
     let mut model = contents(&db).await;
 
     for i in 0..8 * ENTRIES as usize {
-        put(&db, i, true).await.expect("write");
-        model.insert(key_at(i), VALUE.to_vec());
-        let in_l0 = db.versions().version.level(0).len() as u64;
+        put_overlapping(&db, i, true).await.expect("write");
+        model.insert(key_at(i % ENTRIES as usize), VALUE.to_vec());
+        let in_l0 = l0_depth(&db);
         assert!(
             in_l0 < LINE,
-            "after {} writes L0 holds {in_l0} tables, which is at or past the line of \
+            "after {} writes L0 is {in_l0} layers deep, which is at or past the line of \
              {LINE} a write is supposed to wait at",
             i + 1
         );
@@ -315,13 +330,13 @@ async fn a_write_drains_an_l0_it_opened_onto() {
             .await
             .expect("open");
         for i in 0..5 * ENTRIES as usize {
-            put(&db, i, true).await.expect("write");
+            put_overlapping(&db, i, true).await.expect("write");
         }
         db.flush().await.expect("flush");
-        let n = db.versions().version.level(0).len() as u64;
+        let n = l0_depth(&db);
         assert!(
             n >= 4,
-            "the setup should have left L0 deeper than this: {n}"
+            "the setup should have left L0 deeper than this: {n} layers"
         );
         n
     };
@@ -338,18 +353,19 @@ async fn a_write_drains_an_l0_it_opened_onto() {
     .expect("reopen");
     let mut model = contents(&db).await;
     assert_eq!(
-        db.versions().version.level(0).len() as u64,
+        l0_depth(&db),
         deep,
-        "the reopen should have found L0 as it was left"
+        "the reopen should have found L0 as deep as it was left"
     );
 
     put(&db, 500, true).await.expect("write");
     model.insert(key_at(500), VALUE.to_vec());
 
     assert!(
-        (db.versions().version.level(0).len() as u64) < deep,
-        "the write should have drained L0 before its batch was accepted, and L0 holds {}",
-        db.versions().version.level(0).len()
+        l0_depth(&db) < deep,
+        "the write should have drained L0 before its batch was accepted, and L0 is {} \
+         layers deep",
+        l0_depth(&db)
     );
     assert_eq!(
         contents(&db).await,
@@ -379,14 +395,14 @@ async fn a_store_that_owns_its_compactions_is_not_stopped_by_l0() {
     let mut model = contents(&db).await;
 
     for i in 0..5 * ENTRIES as usize {
-        put(&db, i, true).await.expect("write");
-        model.insert(key_at(i), VALUE.to_vec());
+        put_overlapping(&db, i, true).await.expect("write");
+        model.insert(key_at(i % ENTRIES as usize), VALUE.to_vec());
     }
 
-    let in_l0 = db.versions().version.level(0).len() as u64;
+    let in_l0 = l0_depth(&db);
     assert!(
         in_l0 > LINE,
-        "L0 should have been left to grow past the line, and holds {in_l0}"
+        "L0 should have been left to grow past the line, and is {in_l0} layers deep"
     );
     assert_eq!(contents(&db).await, model, "and still answer every key");
 }
@@ -429,12 +445,13 @@ async fn the_default_line_is_the_one_a_deep_l0_stops_at() {
     let mut deepest = 0;
 
     for i in 0..20 * ENTRIES as usize {
-        put(&db, i, true).await.expect("write");
-        let in_l0 = db.versions().version.level(0).len() as u64;
+        put_overlapping(&db, i, true).await.expect("write");
+        let in_l0 = l0_depth(&db);
         deepest = deepest.max(in_l0);
         assert!(
             in_l0 < line,
-            "after {} writes L0 holds {in_l0} tables, at or past the default line of {line}",
+            "after {} writes L0 is {in_l0} layers deep, at or past the default line of \
+             {line}",
             i + 1
         );
     }
@@ -513,5 +530,91 @@ async fn a_line_no_merge_can_meet_does_not_spin() {
         contents(&db).await,
         model,
         "every write should have gone through"
+    );
+}
+
+#[compio::test]
+async fn a_wide_l0_stops_no_write_however_many_tables_it_holds() {
+    // The other side of `l0_never_passes_the_line_a_write_waits_at`, and the
+    // reason the line is counted in layers: writes that march forward leave
+    // L0 wide rather than deep, and a read crosses the lot in one seek. A
+    // store that stalled on the table count would be stopping its writer for
+    // a backlog that costs a read nothing.
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(budget)
+            .l0_compaction_threshold(100)
+            .l0_stop_writes_threshold(LINE),
+    )
+    .await
+    .expect("open");
+    let mut model = contents(&db).await;
+
+    for i in 0..8 * ENTRIES as usize {
+        put(&db, i, true).await.expect("write");
+        model.insert(key_at(i), VALUE.to_vec());
+    }
+
+    let tables = db.versions().version.level(0).len() as u64;
+    assert!(
+        tables > LINE,
+        "L0 should have grown wider than the line, and holds {tables} tables"
+    );
+    assert_eq!(l0_depth(&db), 1, "all of them in the one layer");
+    assert_eq!(contents(&db).await, model, "and every key still answers");
+}
+
+#[compio::test]
+async fn a_wide_l0_the_picker_wants_is_still_not_something_a_write_waits_for() {
+    // The line a write waits at is counted in layers, and this is where that
+    // shows. L0 here is wide and shallow — more tables than the line, fewer
+    // layers — and the picker does want it compacted. A write that measured
+    // the line in tables would find itself past it, ask the picker, get an
+    // answer, and pay for a merge that no read was waiting on.
+    let (env, dir) = load("db-twin-a").await;
+    let wide = {
+        let db = roble::open_with(&env, &dir, opened(true, u64::MAX))
+            .await
+            .expect("open");
+        for i in 0..6 {
+            let mut batch = Batch::new();
+            batch
+                .put(format!("w{i:02}").as_bytes(), VALUE)
+                .expect("put");
+            db.write(&mut batch, true).await.expect("write");
+            db.flush().await.expect("flush").expect("a table");
+        }
+        db.versions().version.level(0).len() as u64
+    };
+
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(u64::MAX)
+            .l0_compaction_threshold(1)
+            .l0_stop_writes_threshold(5),
+    )
+    .await
+    .expect("reopen");
+    assert_eq!(l0_depth(&db), 1, "wide, and one layer deep");
+    assert!(wide >= 5, "and wider than the line of five: {wide} tables");
+    assert!(
+        db.pick().is_some(),
+        "the picker does want it compacted, so a write that asked would be given a merge"
+    );
+
+    let mut batch = Batch::new();
+    batch.put(b"after", VALUE).expect("put");
+    db.write(&mut batch, true).await.expect("write");
+
+    assert_eq!(
+        db.versions().version.level(0).len() as u64,
+        wide,
+        "the write neither flushed nor waited, so it should have compacted nothing"
     );
 }
