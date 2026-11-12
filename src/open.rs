@@ -23,17 +23,23 @@
 //! 2. List the directory once. Both markers and every refusal are decided from
 //!    that one listing, so the open sees a single state of the directory
 //!    rather than a different one per question.
-//! 3. Read `marker.format-version.*`, and refuse a version above the pin
+//! 3. Write a database, if there is none and the caller asked for one
+//!    (`crate::create`). Under the lock, so two opens racing to create one
+//!    directory cannot both write it, and before the format version is read,
+//!    because a directory with no database has no format version either. The
+//!    listing is taken again afterwards: the creation changed what the
+//!    directory holds, and every step below still answers from one listing.
+//! 4. Read `marker.format-version.*`, and refuse a version above the pin
 //!    **before** trusting any structure inside the files.
-//! 4. Read `marker.manifest.*`, which names the MANIFEST to replay. No marker
+//! 5. Read `marker.manifest.*`, which names the MANIFEST to replay. No marker
 //!    means no database.
-//! 5. Replay that MANIFEST into a version, then check the comparer.
-//! 6. Replay the logs the version leaves unflushed, so every acknowledged
+//! 6. Replay that MANIFEST into a version, then check the comparer.
+//! 7. Replay the logs the version leaves unflushed, so every acknowledged
 //!    write is back in the memtable before anyone can read.
-//! 7. Collect what the MANIFEST no longer refers to, which is where a flush
+//! 8. Collect what the MANIFEST no longer refers to, which is where a flush
 //!    interrupted between its table and its edit is cleaned up.
 //!
-//! Step 3 before step 5 is the part worth keeping: a database written above
+//! Step 4 before step 6 is the part worth keeping: a database written above
 //! the pin must be refused for being above the pin, not for whatever its
 //! MANIFEST happens to trip over first.
 
@@ -48,6 +54,29 @@ use roble_format::record::RecordReader;
 use crate::env::{Access, Disk, Env, Fs, read_all};
 use crate::error::{Error, Result};
 use crate::version::VersionSet;
+
+/// The first sequence number a key may be given, Pebble's `base.SeqNumStart`.
+///
+/// Zero means "no key below this one", which a compaction may stamp onto a
+/// key it has proven to be the last of its kind, and 1 to 9 Pebble reserves
+/// for uses it has not found yet. So the first key written to a database
+/// Pebble made is numbered 10, and Pebble clamps up to it when it loads a
+/// MANIFEST that says less — `version_set.go`:
+///
+/// ```text
+/// if ve.LastSeqNum+1 < base.SeqNumStart {
+///     vs.logSeqNum.Store(base.SeqNumStart)
+/// ```
+///
+/// roble clamps in the same place and for the same reason. Without it a
+/// database with nothing committed yet — one `crate::create` just wrote, or
+/// one Pebble created and never wrote to — would number its first key 1, and
+/// roble would be writing keys into the range Pebble has set aside while
+/// Pebble, handed the same directory, would not. The number is not
+/// importable: `base` is one of Pebble's internal packages, so what pins it
+/// is `harness/db-fixture`, whose `db-created` fixture is a database Pebble
+/// made and wrote one key to.
+const SEQ_NUM_START: u64 = 10;
 
 /// A database directory, open: its lock held and its MANIFEST replayed.
 ///
@@ -190,22 +219,47 @@ pub async fn open_with<E: Env>(
     // ownable by a task of its own (§10).
     let fs = env.fs().clone();
 
+    // The directory itself, when the caller has said it may not be there.
+    // Ahead of the lock because the lock is a file inside it; an open that
+    // was not asked to create anything is left to fail on the lock, which is
+    // what a mistyped path should do.
+    if options.create_if_missing {
+        fs.mkdir_all(dir).await?;
+    }
+
     // 1. The lock comes first, so nothing below races a second owner.
     let lock = fs.lock(&dir.join("LOCK")).await?;
 
     // 2. One listing, and every question answered from it.
     let entries = fs.list(dir).await?;
-    let names: Vec<String> = entries
+    let mut names: Vec<String> = entries
         .iter()
         .map(|e| e.name.to_string_lossy().into_owned())
         .collect();
 
     refuse_unreadable_files(&names)?;
 
-    // 3. The format version, before anything inside a file is trusted.
+    // 3. A database, if the caller asked for one and there is none to find.
+    //    The marker is what says which: it is the same question step 4 asks,
+    //    and asking it here rather than acting on step 4's refusal is what
+    //    keeps "there is no database" apart from the several other reasons a
+    //    directory can be refused.
+    if options.create_if_missing
+        && files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?.is_none()
+    {
+        crate::create::create(&fs, dir, &names).await?;
+        names = fs
+            .list(dir)
+            .await?
+            .iter()
+            .map(|e| e.name.to_string_lossy().into_owned())
+            .collect();
+    }
+
+    // 4. The format version, before anything inside a file is trusted.
     let format_version = read_format_version(&names)?;
 
-    // 4. Which MANIFEST.
+    // 5. Which MANIFEST.
     let manifest_marker = files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?
         .ok_or_else(|| {
             Error::NotFound(format!(
@@ -227,7 +281,7 @@ pub async fn open_with<E: Env>(
         )));
     }
 
-    // 5. Replay it.
+    // 6. Replay it.
     let edits = read_version_edits(&fs, &dir.join(&manifest_filename), parsed.file_num).await?;
     let versions = VersionSet::replay(&edits)?;
 
@@ -252,7 +306,7 @@ pub async fn open_with<E: Env>(
         }
     }
 
-    // 6. Replay the logs the version edits leave unflushed.
+    // 7. Replay the logs the version edits leave unflushed.
     let mut memtable = crate::memtable::Memtable::new(versions.last_seq_num.wrapping_add(1));
     let replayed = replay_logs(
         &fs,
@@ -263,7 +317,7 @@ pub async fn open_with<E: Env>(
     )
     .await?;
 
-    // 7. What the replayed MANIFEST no longer refers to: the logs it has
+    // 8. What the replayed MANIFEST no longer refers to: the logs it has
     //    moved past, and any table a flush wrote whose edit never landed.
     //    This is where an interrupted flush is collected — the table was
     //    written and synced before the edit, so a crash in between leaves a
@@ -285,11 +339,14 @@ pub async fn open_with<E: Env>(
     .unwrap_or_default();
 
     // The next sequence number never goes backwards: a write replay brought
-    // back must not be overwritten by one numbered the same (§6).
+    // back must not be overwritten by one numbered the same (§6). And never
+    // below Pebble's floor, which is the arithmetic below reaching into a
+    // range Pebble has set aside.
     let next_seq = versions
         .last_seq_num
         .max(replayed.highest_seq)
-        .saturating_add(1);
+        .saturating_add(1)
+        .max(SEQ_NUM_START);
 
     // The log the store carries on writing to, opened where the replay
     // stopped. Overwriting a torn tail is the point: those bytes were never

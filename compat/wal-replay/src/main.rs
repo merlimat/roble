@@ -31,6 +31,11 @@
 //! database and writes nothing at all, leaving only the obsolete files roble
 //! collected on the way in. Pebble then has to open a directory roble has
 //! deleted from and still find every key.
+//!
+//! `--created` starts from an empty directory, so every byte Pebble reads —
+//! the MANIFEST, both markers, the log, the tables — was written by roble and
+//! none of it by Pebble. The other modes all begin from a fixture Pebble
+//! built.
 
 use std::path::PathBuf;
 
@@ -53,6 +58,10 @@ async fn main() {
     // checkpoint is not another way of writing to this database, it is a
     // second directory written out of it.
     let checkpoint = mode.as_deref() == Some("--checkpoint");
+    // Also its own flag: it changes where the database comes from rather than
+    // what is done to it, and it is the only mode whose directory starts
+    // empty.
+    let created = mode.as_deref() == Some("--created");
     let (flush, rotate, compact, settle, no_wal, swept) = match mode.as_deref() {
         None => (false, false, false, false, false, false),
         Some("--flush") => (true, false, false, false, false, false),
@@ -77,11 +86,19 @@ async fn main() {
         // The checkpoint flushes on its way, so everything written here is
         // in a table by the time Pebble sees it.
         Some("--checkpoint") => (false, false, false, false, false, false),
+        // Flushed, so that what Pebble reads includes a table roble wrote
+        // into a directory roble made, named by a MANIFEST roble made.
+        Some("--created") => (true, false, false, false, false, false),
         Some(other) => fail(&format!("unknown mode {other}")),
     };
 
-    let before = names_in(&dir);
-    let mut options = roble::Options::new().disable_wal(no_wal);
+    // Only the swept run compares before with after, and it is the one mode
+    // whose directory is certain to exist: `--created` is handed a path that
+    // is not there yet, which is the whole point of it.
+    let before = if swept { names_in(&dir) } else { Vec::new() };
+    let mut options = roble::Options::new()
+        .disable_wal(no_wal)
+        .create_if_missing(created);
     if settle {
         // Allowances a test-sized database can actually cross, so the picker
         // has something to do.
@@ -99,6 +116,30 @@ async fn main() {
     if swept {
         swept_run(&db, &dir, &before).await;
         return;
+    }
+
+    // The fixture modes all start from a database holding `alpha`, which the
+    // delete further down removes. A created one holds nothing, so it is put
+    // there and flushed into a table first — otherwise the delete would be a
+    // tombstone over nothing and Pebble would agree with it for free.
+    if created {
+        let mut batch = db.batch();
+        batch
+            .put(b"alpha", b"from-nothing")
+            .unwrap_or_else(|e| fail(&format!("put: {e}")));
+        batch
+            .commit(true)
+            .await
+            .unwrap_or_else(|e| fail(&format!("commit: {e}")));
+        db.flush()
+            .await
+            .unwrap_or_else(|e| fail(&format!("flush: {e}")))
+            .unwrap_or_else(|| fail("flush wrote nothing"));
+        println!(
+            "roble created a database in {} holding {:?}",
+            dir.display(),
+            names_in(&dir)
+        );
     }
 
     // Several batches, so the log holds more than one record, and one large

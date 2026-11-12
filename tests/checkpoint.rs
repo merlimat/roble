@@ -199,6 +199,15 @@ async fn a_checkpoint_holds_its_tables_a_manifest_and_two_markers() {
         Some(1),
         "{names:?}"
     );
+    // Spelled as Pebble spells it, zero-padded to three digits: the value is
+    // parsed as a number, so `16` was readable and still left a directory
+    // distinguishable from one Pebble wrote.
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "marker.format-version.000001.016"),
+        "the format version should be spelled Pebble's way: {names:?}"
+    );
     assert_eq!(kinds.get("log").copied(), None, "no logs: {names:?}");
     assert_eq!(kinds.get("options").copied(), None, "no OPTIONS: {names:?}");
     assert_eq!(kinds.get("other").copied(), None, "nothing else: {names:?}");

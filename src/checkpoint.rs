@@ -115,7 +115,11 @@ impl<F: Fs> Opened<F> {
             dir,
             MARKER_FORMAT_VERSION,
             1,
-            &self.format_version.to_string(),
+            // Zero-padded to three digits, which is how Pebble spells it:
+            // `FormatMajorVersion.String` is `%03d`, and the value is parsed
+            // as a number either way, so writing `16` here was readable and
+            // still not what Pebble writes.
+            &files::format_version_value(self.format_version),
         )
         .await?;
         self.fs().sync_dir(dir).await?;

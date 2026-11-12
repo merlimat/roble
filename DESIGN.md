@@ -850,14 +850,66 @@ than opening without it**: ignoring one silently discards writes that were
 already acknowledged. With `disable_wal` there is nothing to replay and the
 database opens as of the last flush.
 
-**roble opens a database; it does not create one.** An `open()` of a directory
-with no `marker.format-version.*` is refused, and that is what an empty
-directory is, so every database roble has read so far was written by Pebble or
-by a `checkpoint`. Creating one from nothing is the last thing M5 owes, and the
-files are the ones `checkpoint` already writes: one MANIFEST holding a snapshot
-edit of an empty version, and the two markers. What is left to decide is
-whether an empty directory becomes a `create_if_missing` in `Options` or a call
-of its own.
+### Creating a database
+
+`open_with(.., Options::new().create_if_missing(true))` writes a database where
+there is none, as Pebble's `CreateIfMissing` does. **It is a setting and not a
+`create()` of its own because Oxia's call site cannot tell the two cases
+apart**: `newKVPebble` builds a path from the namespace and shard and hands it
+to `pebble.Open`, whether the shard has been on this node all along or arrived
+a moment ago. A caller that cannot distinguish them should not have to, and
+keeping the decision inside the open also keeps it under one lock, where two
+opens racing to create one directory cannot both write it.
+
+It is off by default, so an `open()` of the wrong path says so rather than
+handing back an empty store, and an open that may not create never makes the
+directory either.
+
+What gets written is the least a database can be: `MANIFEST-000001` holding one
+snapshot edit of an empty version — the same edit a rotation writes, of a
+version set with nothing in it — an empty `000002.log`, and iteration one of
+both markers. Pebble reaches almost the same place from further away, creating
+at `FormatMinSupported` and upgrading, which is why its own directories carry
+`marker.format-version.000003.016`; a marker's iteration says only which of
+several is current, and `compat/wal-replay --checkpoint` has been making that
+claim about a roble-written iteration one since M4.
+
+**The log is there because a store with no log refuses writes.** With the WAL on,
+a `write` that could not be recovered is not acknowledged (§4), and nothing but
+a flush ever opens a log — so a database created without one could not be
+written to until it had been flushed, and could not be flushed until it had
+been written to. Pebble solves this on the other side, creating a log in every
+open that is not read-only; doing it at creation instead leaves the open's log
+handling to the one thing it does today, which is resuming the log a replay
+found, and means the directory is complete when the creation returns rather
+than when something first opens it.
+
+**A directory holding any `marker.` file is refused rather than written into.**
+What is there is either a database this would overwrite or a creation that did
+not finish, and one marker cannot say which, so the operator clears the
+directory. This is deliberately Pebble's answer too — `ErrorIfNotPristine`
+exists to error in exactly the retried-creation case.
+
+Two numbers are worth stating. The MANIFEST takes file number 1 and the log 2,
+as Pebble's do, and the edit says 3 comes next, so the first flush numbers its
+table past the log rather than beside it. And the first key written to a
+created database is numbered **10**: Pebble keeps 0 for a key a compaction has
+proven to be the last of its kind and 1 to 9 for uses it has not found yet, so
+an open clamps the next sequence number up to `base.SeqNumStart` whatever the
+MANIFEST says — and roble clamps in the same place, since without it a database
+with nothing committed, created by roble or by Pebble, would number its first
+key 1. The constant is not importable, so `harness/db-fixture`'s `db-created`
+fixture pins it: a database Pebble made and wrote one key to, whose table reads
+`seq=10..10`.
+
+What a creation does **not** do is make its own directory entry durable. The
+`mkdir_all` and the final `sync_dir` make the database's files durable within
+the directory, but nothing syncs the parent that names it, so a crash just
+after a creation can take the whole thing. `checkpoint` has the same gap and
+Pebble does not (`mkdirAllAndSyncParents`). It is left because the consequence
+is the one Oxia already handles — the shard comes back absent and is created
+again from the replication log — and closing it means syncing a directory roble
+was never handed.
 
 As built, the replay stops at the first record of the **last** log that does
 not read, and the store carries on writing from there — overwriting what was
@@ -1254,6 +1306,9 @@ while scan.is_valid() { /* scan.key(), scan.value() */ scan.next().await?; }
 let other = snap.lookup(b"/sessions/7").await?;   // a key outside those bounds
 
 db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
+
+// A shard arriving on this node, where Oxia cannot tell new from returning.
+let db = roble::open_with(&env, dir, Options::new().create_if_missing(true)).await?;
 ```
 
 The Oxia mapping, so the surface is complete rather than approximately right:
@@ -1269,6 +1324,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `scan_range` and `lookup` on it (§6) |
 | `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
 | `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
+| `pebble.Open` of a shard's path, new or returning | `open_with` with `create_if_missing` (§6) |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
 | `SyncData`, `UseWAL` | `Sync` on commit, and `disable_wal` in `Options` (§4) |
 | Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina ([METRICS.md](METRICS.md)) |
@@ -1337,6 +1393,18 @@ in both directions.
   opens it, scans it, verifies it with the `pebble` tool, checkpoints it; roble opens
   that checkpoint and compares. Then the reverse. **This is the gate: a change
   that breaks it is a broken change**, including a performance change.
+  `compat/wal-replay` runs it in nine modes, and the strongest is `--created`:
+  it is handed a path and nothing else, so when Pebble opens the result every
+  byte in the directory — MANIFEST, both markers, the log, the tables — was
+  written by roble. Every other mode starts from a database Pebble built, which
+  leaves Pebble's own bytes in the parts roble did not touch.
+- **A number Pebble will not export is pinned by a fixture instead.** The first
+  sequence number a key may be given is `base.SeqNumStart`, in one of Pebble's
+  internal packages, so it cannot be asserted against the symbol the way
+  `db-fixture` asserts the format-version pin. The `db-created` fixture is a
+  database Pebble created and wrote one key to, and its dump carries the number
+  Pebble gave that key. A Pebble release that moved it lands on a fixture that
+  no longer matches, rather than in a roble that had quietly diverged.
 - **Format fuzzing.** `roble-format` round-trips blocks, tables, version edits
   and batch reprs under `cargo fuzz`, and decodes arbitrary bytes without
   panicking — the corpus seeded from the golden files.
@@ -1410,8 +1478,9 @@ Ordered so that the compatibility risk is resolved before the engine exists.
 4. **M4, compaction.** Leveled with L0 sublevels, the picker, cooperative
    execution in units of work, write-stall accounting.
 5. **M5, the Oxia surface.** Snapshots, `checkpoint`, the prefix iterator with
-   `Lookup`, batch checksums that match Go, metrics, creating a database where
-   there is none, and the `KV` mapping of §11 complete. A Rust data server can serve a shard.
+   `Lookup`, batch checksums that match Go, metrics, creating and destroying a
+   database, and the `KV` mapping of §11 complete. A Rust data server can serve
+   a shard.
 
 ## 14. Open questions
 

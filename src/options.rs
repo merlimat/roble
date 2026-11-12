@@ -14,9 +14,12 @@
 
 //! What a store is told when it opens (§4, §11).
 //!
-//! Three settings, and only one of them is a policy: `disable_wal` changes
-//! where durability comes from, and so changes what `write` promises. The
-//! other two are budgets.
+//! Most of these are budgets, and say only what a store spends. Two are
+//! policies, which is to say they change what a call means rather than what
+//! it costs: `disable_wal` changes where durability comes from, and so
+//! changes what `write` promises, and `create_if_missing` decides whether an
+//! `open` of a directory with no database in it is an error or a database
+//! (§6, `crate::create`).
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider;
@@ -31,6 +34,8 @@ pub struct Options<F: Fs> {
     pub(crate) caches: Caches<F>,
     /// Whether to skip the log entirely.
     pub(crate) disable_wal: bool,
+    /// Whether an open with no database to find writes one.
+    pub(crate) create_if_missing: bool,
     /// Whether a flush leaves the compaction the picker chose for the
     /// caller to run.
     pub(crate) disable_automatic_compactions: bool,
@@ -61,6 +66,7 @@ impl<F: Fs> Default for Options<F> {
         Options {
             caches: Caches::default(),
             disable_wal: false,
+            create_if_missing: false,
             disable_automatic_compactions: false,
             memtable_size: crate::memtable::MEMTABLE_SIZE,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
@@ -112,6 +118,26 @@ impl<F: Fs> Options<F> {
     /// with, so a newer value or tombstone still wins.
     pub fn disable_wal(mut self, disable: bool) -> Self {
         self.disable_wal = disable;
+        self
+    }
+
+    /// Creates the database when the directory holds none, as Pebble's
+    /// `CreateIfMissing` does (`crate::create`).
+    ///
+    /// Off by default, so that an `open` of the wrong path says so instead
+    /// of quietly handing back an empty store. On, an open makes the
+    /// directory if it is not there, writes the least a database can consist
+    /// of, and then opens that — one call, under one lock, which is why this
+    /// is a setting rather than a `create` of its own: Oxia's own call site
+    /// cannot tell a shard arriving from a shard already here, since
+    /// `newKVPebble` builds a path and opens it either way.
+    ///
+    /// It does not make an open forgiving of anything else. A directory
+    /// holding a `marker.` file is refused rather than written into,
+    /// because what is there is either a database this would overwrite or a
+    /// creation that did not finish, and one marker cannot say which.
+    pub fn create_if_missing(mut self, create: bool) -> Self {
+        self.create_if_missing = create;
         self
     }
 

@@ -40,7 +40,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|compacted|settled|no-wal|swept|checkpoint]")
+		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|compacted|settled|no-wal|swept|checkpoint|created]")
 		os.Exit(2)
 	}
 	dir := os.Args[1]
@@ -129,6 +129,8 @@ func main() {
 		fmt.Println("\nVERDICT: Go Pebble reads a database roble has deleted obsolete files from")
 	case "checkpoint":
 		fmt.Println("\nVERDICT: Go Pebble opens a checkpoint roble wrote, with no OPTIONS file and no logs")
+	case "created":
+		fmt.Println("\nVERDICT: Go Pebble opens a database roble created from an empty directory, every byte of it roble's")
 	default:
 		fmt.Println("\nVERDICT: Go Pebble replays the log roble wrote, key for key")
 	}
