@@ -607,6 +607,49 @@ async fn open_scans_are_counted_until_they_are_dropped() {
 }
 
 #[compio::test]
+async fn disk_usage_is_the_number_the_metric_reports() {
+    // Oxia's `DiskSpaceUsage`, and `roble.disk.size`, are one measurement:
+    // every file in the directory, which Pebble instead reaches by adding up
+    // the sizes it tracks.
+    let (options, tag) = metered("disk-usage");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    let listed: u64 = env
+        .sim()
+        .list(&dir)
+        .await
+        .expect("list")
+        .iter()
+        .map(|e| e.size)
+        .sum();
+    let usage = db.disk_usage().await.expect("disk usage");
+    assert_eq!(
+        usage, listed,
+        "every file in the directory, not only the tables the version names"
+    );
+    assert_eq!(
+        collected(reader(), &tag).get("roble.disk.size").copied(),
+        Some(usage as i64),
+    );
+
+    // A file the store did not write leaves the gauge stale, which is what
+    // makes asking *refresh* it rather than merely agree with it.
+    let disk = env.sim().create(&dir.join("stray")).await.expect("create");
+    let (result, _) = disk.write(WriteBuf::new(vec![0u8; 1024]), 0, ()).await;
+    result.expect("write");
+    disk.close().await.expect("close");
+
+    let grown = db.disk_usage().await.expect("disk usage");
+    assert_eq!(grown, usage + 1024, "the stray file counts too");
+    assert_eq!(
+        collected(reader(), &tag).get("roble.disk.size").copied(),
+        Some(grown as i64),
+        "and the gauge should have moved with it"
+    );
+}
+
+#[compio::test]
 async fn open_snapshots_are_counted_until_they_are_dropped() {
     // Worth saying separately from the scans, because a snapshot holds every
     // table of a version rather than the ones a scan's bounds reach: one

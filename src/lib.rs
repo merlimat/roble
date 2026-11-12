@@ -32,6 +32,7 @@ pub mod cache;
 mod change;
 pub mod checkpoint;
 pub mod compact;
+pub mod destroy;
 pub mod env;
 pub mod flush;
 pub mod memtable;

@@ -806,6 +806,34 @@ Links rather than copies, because a table is immutable once written: the
 checkpoint and the store share the bytes until one of them deletes its name
 (§10, `Fs::link`, which falls back to a copy where a link cannot be made).
 
+### `destroy()` and `disk_usage()`
+
+`destroy()` is Oxia's `KV.Delete`, which it calls when a shard leaves the node:
+every file of the database removed, `LOCK` included. It takes the store by
+value, which does two things. The lock is held until the last name is gone, so
+there is no moment at which the database is half there and unowned — Oxia's
+closes first and removes afterwards, which leaves that window open. And it
+needs no permit, unlike every other change: an outstanding borrow forbids the
+move, and a store shared into a task of its own is behind an `Rc` that has to
+be sole-owned first (§10), so there is no way to ask for a destroy while the
+store is busy. A `Scan` or a `Snapshot` may outlive it, holding readers and no
+borrow; they write nothing, so the removal is none of their business. It does
+not flush on the way out, as
+Oxia's `Close` does: a memtable written into a table that is removed in the
+same call is work for nobody. The table cache's readers go before the names,
+because a filesystem reclaims nothing while a file is open, and a destroy that
+freed the names and not the space would be only half of one. The directory
+itself stays, empty: `Fs` has no way to remove a directory, and a method on it
+is a method every embedder has to write (§10).
+
+`disk_usage()` is Oxia's `DiskSpaceUsage`: the bytes of every file in the
+directory, which is the measurement `roble.disk.size` reports and the call that
+refreshes it. Pebble reaches the number from the other side, adding up the
+sizes it tracks, which is a sum of what it believes rather than of what is
+there. It walks the directory, so it is a call to make when something asks and
+not one to make on a timer — Oxia memoizes Pebble's for five seconds for that
+reason.
+
 ### Opening and recovery
 
 `open()` reads `marker.format-version.*` and `marker.manifest.*`, replays the
@@ -821,6 +849,15 @@ to an older file, is corruption. **roble refuses a log it cannot replay rather
 than opening without it**: ignoring one silently discards writes that were
 already acknowledged. With `disable_wal` there is nothing to replay and the
 database opens as of the last flush.
+
+**roble opens a database; it does not create one.** An `open()` of a directory
+with no `marker.format-version.*` is refused, and that is what an empty
+directory is, so every database roble has read so far was written by Pebble or
+by a `checkpoint`. Creating one from nothing is the last thing M5 owes, and the
+files are the ones `checkpoint` already writes: one MANIFEST holding a snapshot
+edit of an empty version, and the two markers. What is left to decide is
+whether an empty directory becomes a `create_if_missing` in `Options` or a call
+of its own.
 
 As built, the replay stops at the first record of the **last** log that does
 not read, and the store carries on writing from there — overwriting what was
@@ -1373,8 +1410,8 @@ Ordered so that the compatibility risk is resolved before the engine exists.
 4. **M4, compaction.** Leveled with L0 sublevels, the picker, cooperative
    execution in units of work, write-stall accounting.
 5. **M5, the Oxia surface.** Snapshots, `checkpoint`, the prefix iterator with
-   `Lookup`, batch checksums that match Go, metrics, and the `KV` mapping of §11
-   complete. A Rust data server can serve a shard.
+   `Lookup`, batch checksums that match Go, metrics, creating a database where
+   there is none, and the `KV` mapping of §11 complete. A Rust data server can serve a shard.
 
 ## 14. Open questions
 

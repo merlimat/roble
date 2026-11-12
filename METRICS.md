@@ -190,7 +190,8 @@ drawing on it do.
 `roble.disk.size` is measured from the directory, so it counts the MANIFEST, the
 logs, the markers and anything obsolete that the sweep has not collected yet — not
 only the tables the version names. It is remeasured where files appear or
-disappear, which is a flush, a compaction and an open.
+disappear — a flush, a compaction, an open — and whenever `disk_usage()` is
+asked, which is the same measurement under Oxia's name for it (§6).
 
 These are up-down counters rather than gauges so that the stores of a process add
 up to one series per set of attributes. Each store adds what changes and takes its
