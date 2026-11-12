@@ -41,7 +41,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, where the other jobs track stable, because this one does not
+      # just measure: it compares its number against the one a previous run
+      # posted. Coverage instrumentation differs between compiler versions, so
+      # `@stable` means the two sides of that comparison can be measured by
+      # different compilers — which is what happened when Rust 1.100 landed
+      # mid-review. A branch byte-identical to main in `src/`, `format/`,
+      # `cli/`, `tests/` and both manifests scored 275 missed lines under
+      # 1.100.0 against main's 236 under 1.99.1, and the gate failed it for a
+      # drop that was the instrument moving, not the code.
+      #
+      # So the version is explicit and bumping it is deliberate. The run after
+      # a bump posts a new baseline and the one comparing across it may show a
+      # step; that is visible and explicable, which `@stable` silently was not.
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -67,14 +80,6 @@ jobs:
       #
       # cargo-llvm-cov leaves out tests.rs; sim.rs is test code too, the
       # simulated filesystem the failure-path tests drive.
-      # The cache above restores `target/`, and a restored `target/` can carry
-      # profile data from an earlier commit's run. Merged in, it counts lines
-      # that this tree does not have: a run of this branch reported 275 missed
-      # lines against the 236 a clean measurement of the identical `src/` gives,
-      # and failed the gate for it. Cleaning first makes the number depend on
-      # this commit alone, which a gate that fails a pull request has to.
-      - name: Clear any profile data the cache restored
-        run: cargo llvm-cov clean --workspace
       - name: Run the tests under cargo-llvm-cov
         run: >
           cargo llvm-cov --workspace --locked
