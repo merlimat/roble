@@ -576,7 +576,9 @@ impl<F: crate::env::Fs> crate::Opened<F> {
     ///
     /// What an uncommitted batch reads through (`crate::batch`): its index is
     /// a memtable like any other, and its entries win because of the numbers
-    /// they carry rather than because of where they are in this list.
+    /// they carry rather than because of where they are in this list. The
+    /// store's are both of them, so a scan made in the middle of a flush
+    /// reads the memtable being written out as well as the one in front.
     pub(crate) async fn scan_with(
         &self,
         extra: Vec<Rc<RefCell<Memtable>>>,
@@ -604,7 +606,7 @@ impl<F: crate::env::Fs> crate::Opened<F> {
             tables.push(self.open_table(file_num).await?);
         }
         let mut memtables = extra;
-        memtables.push(self.memtable());
+        memtables.extend(self.memtables());
         Ok(Scan::new(
             tables,
             memtables,

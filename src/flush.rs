@@ -17,24 +17,35 @@
 //! The order is what makes a crash during a flush harmless, and it is the
 //! order Pebble uses:
 //!
-//! 1. Write the table and sync it, then sync the directory. A table whose
+//! 1. Create the log the store will write to next and sync the directory,
+//!    then freeze the memtable and point the store at both in one step. From
+//!    here a write goes to a memtable this flush is not writing out and a
+//!    log its edit does not retire, which is what makes a write arriving in
+//!    the middle of a flush safe (§5, `crate::open::Opened::freeze_memtable`).
+//!    With the WAL off there is no log, so only the memtable moves and the
+//!    edit's minimum unflushed log number falls away.
+//! 2. Write the table and sync it, then sync the directory. A table whose
 //!    name never reached the disk is a table the MANIFEST will point at and
 //!    nobody can open.
-//! 2. Create the log the store will write to next, and sync the directory
-//!    again. With the WAL off there is no log, so this step and the edit's
-//!    minimum unflushed log number both fall away.
 //! 3. Append the version edit to the MANIFEST and sync **that**. Until this
 //!    moment the new table is a file nothing refers to, and a crash leaves
-//!    the database exactly as it was, with the old log still holding every
-//!    write. After it, the table is the database's and the old log is no
-//!    longer needed.
-//! 4. Only then swap the memtable and the log in memory, replace the
-//!    MANIFEST if it has outgrown its limit (`crate::rotate`), and collect
-//!    what the edit retired — the log it replaced is now a file the MANIFEST
-//!    has moved past (`crate::obsolete`).
+//!    the database exactly as it was, with both logs still holding every
+//!    write: the one the frozen memtable came from, and the one the writes
+//!    since have gone to. An open replays every log the version leaves
+//!    unflushed, which is both of them. After the edit, the table is the
+//!    database's and the first of the two is no longer needed.
+//! 4. Only then let go of the frozen memtable, replace the MANIFEST if it
+//!    has outgrown its limit (`crate::rotate`), and collect what the edit
+//!    retired — the log the freeze replaced is now a file the MANIFEST has
+//!    moved past (`crate::obsolete`).
 //!
 //! The one-way door is step 3. Everything before it is reversible by doing
 //! nothing; everything after it is bookkeeping that a replay would redo.
+//!
+//! Step 1 is the one thing a failure does not undo: the store goes on
+//! writing to the fresh memtable and the fresh log whatever becomes of the
+//! rest, so a flush that fails leaves a memtable frozen and the next flush
+//! writes *that* one out rather than freezing again.
 
 use roble_format::key::{Kind, SEQ_NUM_MAX};
 use roble_format::manifest::{NewTable, VersionEdit};
@@ -55,6 +66,11 @@ impl<F: Fs> Opened<F> {
     /// Returns the new table's file number, or `None` when there was nothing
     /// to write. With the WAL off this is the only durability point (§7);
     /// with it on, it is what lets a log be retired.
+    ///
+    /// A flush that fails loses nothing: the memtable it froze is still read
+    /// from and still written out, by the next flush. What it does not do is
+    /// put that memtable back in front — the writes that arrived meanwhile
+    /// are in the one that replaced it, and carry higher sequence numbers.
     ///
     /// A flush is also where the store notices it has too many tables, so a
     /// flush that wrote one runs the compaction the picker chose before
@@ -95,29 +111,57 @@ impl<F: Fs> Opened<F> {
     /// The flush proper: the table, the log, the edit, the bookkeeping.
     async fn flush_inner(&self, change: &Change<'_>) -> Result<Option<u64>> {
         let _timer = self.metrics.flush.start();
-        let memtable = self.memtable();
-        if memtable.borrow().is_empty() && memtable.borrow().tombstones().is_empty() {
-            return Ok(None);
-        }
 
-        // File numbers for the table and, when there is a WAL, for the log
-        // that follows it.
-        let (table_num, log_num, next_file_num) = {
-            let versions = self.versions();
-            let table_num = versions.next_file_num;
-            if self.wal_disabled() {
-                (table_num, None, table_num + 1)
-            } else {
-                (table_num, Some(table_num + 1), table_num + 2)
+        // 1. The memtable this flush writes out, frozen so that a write
+        //    arriving from here is none of this flush's business.
+        let memtable = match self.frozen() {
+            // An earlier flush froze one and then failed. It is written out
+            // as it stands rather than frozen over: a second freeze would
+            // leave two memtables owed a table, and a log already rotated
+            // past both — so the edit below would retire a log holding the
+            // records of the one left behind.
+            Some(frozen) => frozen,
+            None => {
+                let current = self.memtable();
+                if current.borrow().is_empty() && current.borrow().tombstones().is_empty() {
+                    return Ok(None);
+                }
+
+                // The log the store writes to next, created before anything
+                // points at it. With the WAL off there is none, and so
+                // nothing to create and nothing for the edit to retire.
+                let log_num = if self.wal_disabled() {
+                    None
+                } else {
+                    let log_num = self.versions().next_file_num;
+                    let log_path = self.dir.join(roble_format::files::log_filename(log_num));
+                    let log_disk = self.fs().create(&log_path).await?;
+                    log_disk.sync(Default::default()).await?;
+                    log_disk.close().await?;
+                    self.fs().sync_dir(&self.dir).await?;
+                    Some(log_num)
+                };
+                self.freeze_memtable(log_num).await?;
+                current
             }
         };
 
+        // The table's number is taken and not yet spent: nothing refers to
+        // it until the edit lands, and a flush that fails leaves it free for
+        // the next one. The log's was spent by the freeze above, which is
+        // why this reads the counter again rather than adding to it.
+        let table_num = self.versions().next_file_num;
+
+        // Nothing is awaited between the freeze above and the walk of the
+        // memtable here, which is what makes the walk see everything the
+        // freeze promised: an await in between would let a write apply to a
+        // memtable this has already read to the end.
         let entries = memtable.borrow().len() as u64;
         let (bytes, new_table) = build_table(&memtable.borrow(), table_num)?;
         self.metrics.flush_size.record(bytes.len() as u64);
         self.metrics.flush_bytes.add(bytes.len() as u64);
 
-        // 1. The table, then the directory, so its name is durable too.
+        // 2. The table, then the directory, so its name is durable too.
         let path = self
             .dir
             .join(roble_format::files::table_filename(table_num));
@@ -135,17 +179,6 @@ impl<F: Fs> Opened<F> {
         disk.close().await?;
         self.fs().sync_dir(&self.dir).await?;
 
-        // 2. The log the store writes to next. It has to exist before the
-        //    MANIFEST points at it. With the WAL off there is none, and so
-        //    nothing to create and nothing for the edit below to retire.
-        if let Some(log_num) = log_num {
-            let log_path = self.dir.join(roble_format::files::log_filename(log_num));
-            let log_disk = self.fs().create(&log_path).await?;
-            log_disk.sync(Default::default()).await?;
-            log_disk.close().await?;
-            self.fs().sync_dir(&self.dir).await?;
-        }
-
         // 3. The edit. Before this the table is a file nothing refers to.
         // With the WAL off the edit says nothing about log numbers, which
         // leaves the MANIFEST's where it was. Pebble writes a zero there,
@@ -156,21 +189,20 @@ impl<F: Fs> Opened<F> {
         // replayed.
         let edit = VersionEdit {
             comparer_name: None,
-            min_unflushed_log_num: log_num,
+            min_unflushed_log_num: self.current_log(),
             obsolete_prev_log_num: None,
-            next_file_num: Some(next_file_num),
+            next_file_num: Some(table_num + 1),
             last_seq_num: Some(self.snapshot()),
             deleted_tables: Vec::new(),
             new_tables: vec![new_table],
         };
         let manifest_bytes = self.append_version_edit(&edit, change).await?;
 
-        // 4. Bookkeeping a replay would redo anyway.
+        // 4. Bookkeeping a replay would redo anyway. The memtable and the
+        //    log were swapped in step 1; all that is left is to stop holding
+        //    the one a table now holds.
         self.versions_mut().apply(&edit)?;
-        self.install_fresh_memtable(Memtable::new(self.snapshot().wrapping_add(1)));
-        if let Some(log_num) = log_num {
-            self.install_log(log_num).await?;
-        }
+        self.thaw();
 
         // 5. A MANIFEST that has outgrown its limit is replaced by one
         //    holding a snapshot of the version, so a reopen replays one

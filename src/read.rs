@@ -161,23 +161,26 @@ impl<F: Fs> Opened<F> {
         let target = key::search_key(user);
         let mut best: Option<Candidate> = None;
 
-        // The memtable first. Anything it holds was written after every table
-        // was, so it usually wins outright — but the comparison below is by
-        // trailer either way, so this is an ordering of convenience, not of
-        // correctness.
-        {
-            let held = self.memtable();
+        // The memtables first — the one writes go to, and the one a flush is
+        // writing out if there is one. Anything either holds was written
+        // after every table was, so one of them usually wins outright, but
+        // the comparison below is by trailer either way: this is an ordering
+        // of convenience, not of correctness.
+        for held in self.memtables() {
             let memtable = held.borrow();
             let mut cursor = memtable.cursor();
             cursor.seek_ge(&memtable, &target)?;
             if cursor.is_valid() {
                 let k = InternalKey::decode(cursor.key(&memtable))?;
                 if k.user_key == user {
-                    best = Some(Candidate {
+                    let candidate = Candidate {
                         trailer: (k.seq_num << 8) | k.kind.to_byte() as u64,
                         kind: k.kind,
                         value: cursor.value(&memtable).to_vec(),
-                    });
+                    };
+                    if best.as_ref().is_none_or(|b| candidate.trailer > b.trailer) {
+                        best = Some(candidate);
+                    }
                 }
             }
         }
@@ -248,11 +251,13 @@ impl<F: Fs> Opened<F> {
         if crate::table::covered_by_tombstone(&tables, user, seq)? {
             return Ok(false);
         }
-        // And the memtable's, which are kept apart from its point keys and so
-        // are in no cursor's way (§4).
-        for t in self.memtable().borrow().tombstones() {
-            if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
-                return Ok(false);
+        // And the memtables', which are kept apart from their point keys and
+        // so are in no cursor's way (§4).
+        for held in self.memtables() {
+            for t in held.borrow().tombstones() {
+                if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
