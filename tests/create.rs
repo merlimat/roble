@@ -394,3 +394,54 @@ async fn a_created_database_survives_a_crash() {
         "as the empty database it was"
     );
 }
+
+#[compio::test]
+async fn a_half_written_creation_never_reads_as_a_database() {
+    // The same claim `tests/checkpoint.rs` makes about a checkpoint, and the
+    // reason both write the manifest marker last: it is the marker that makes
+    // a directory read as a database, so until everything it names is there
+    // it must not be written. An open interrupted anywhere may leave rubbish
+    // behind — the directory was the caller's to ask for and can be asked for
+    // again — but never rubbish that claims to be a database.
+    let total = {
+        let env = SimEnv::new();
+        let before = env.sim().ops();
+        let db = roble::open_with(&env, Path::new("/db"), creating())
+            .await
+            .expect("create");
+        drop(db);
+        env.sim().ops() - before
+    };
+
+    let mut saw_one_marker = 0;
+    for n in 1..=total {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        env.sim().fail_at(n);
+        let _ = roble::open_with(&env, &dir, creating()).await;
+        env.sim().stop_failing();
+
+        let names = listing(env.sim(), &dir).await;
+        let manifest = names.iter().any(|n| n.starts_with("marker.manifest."));
+        let format = names
+            .iter()
+            .any(|n| n.starts_with("marker.format-version."));
+        if format && !manifest {
+            saw_one_marker += 1;
+        }
+        assert!(
+            !manifest || format,
+            "failing at {n} of {total} left a directory claiming to be a database \
+             with no format version: {names:?}"
+        );
+        if manifest {
+            roble::open(&env, &dir)
+                .await
+                .unwrap_or_else(|e| panic!("failing at {n} of {total}, the created database: {e}"));
+        }
+    }
+    assert!(
+        saw_one_marker > 0,
+        "no failure landed between the two markers, so the order is untested"
+    );
+}
