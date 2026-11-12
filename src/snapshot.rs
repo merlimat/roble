@@ -65,14 +65,17 @@ use crate::version::Table;
 /// store does meanwhile, and [`Snapshot::lookup`] answers about any key at
 /// all rather than only the ones a scan's bounds take in.
 pub struct Snapshot<D: Disk> {
-    /// Every table of the version, open, each beside its metadata.
+    /// Every table of the version, open, each beside its metadata and the
+    /// level it was in.
     ///
     /// The open reader is what keeps the sweep off the file; the metadata is
     /// what a bounded scan and a lookup choose among them by, and it is not
     /// derivable from the reader — a table's largest bound can be the
     /// exclusive sentinel a range deletion leaves (§5), which only the
-    /// version records.
-    tables: Vec<(Table, Rc<OpenTable<D>>)>,
+    /// version records. Nor is the level, and a scan needs it to know which
+    /// tables it may read as one ([`crate::scan::Placed`]), so a snapshot
+    /// has to carry it from the version it was made from.
+    tables: Vec<(u32, Table, Rc<OpenTable<D>>)>,
     /// The memtables as they were: the one writes go to, and the one a flush
     /// is writing out if there is one. Both keep being written to, and the
     /// sequence number below is what keeps the later writes out.
@@ -112,9 +115,13 @@ impl<D: Disk> Snapshot<D> {
         // so no test pins it and none should, as with the bloom filter in
         // `crate::read`. It is here for the seek per table per step it saves.
         let mut tables = Vec::new();
-        for (meta, table) in &self.tables {
+        for (level, meta, table) in &self.tables {
             if meta.overlaps_range(lower, upper)? {
-                tables.push(Rc::clone(table));
+                tables.push(crate::scan::Placed {
+                    level: *level,
+                    table: Rc::clone(table),
+                    smallest: meta.smallest_user_key()?.to_vec(),
+                });
             }
         }
         self.metrics.scans.add(1);
@@ -193,7 +200,7 @@ impl<D: Disk> Snapshot<D> {
         // it survives — stated rather than tested (§12), because the
         // alternative is a reader having to prove that invariant before
         // believing the loop.
-        for (_, table) in &self.tables {
+        for (_, _, table) in &self.tables {
             if !table.may_contain(user)? {
                 continue;
             }
@@ -237,7 +244,7 @@ impl<D: Disk> Snapshot<D> {
         // table's bounds take in its range deletions as well as its point
         // keys (`crate::flush`). `crate::read` splits the two the same way.
         let mut bracketing = Vec::new();
-        for (meta, table) in &self.tables {
+        for (_, meta, table) in &self.tables {
             if meta.smallest_user_key()? > user || meta.largest_user_key()? < user {
                 continue;
             }
@@ -281,18 +288,18 @@ impl<F: Fs> Opened<F> {
     pub async fn snapshot(&self) -> Result<Snapshot<F::Disk>> {
         // The metadata first, so the version's borrow is released before any
         // opening: a table is I/O, and a flush is allowed to run meanwhile.
-        let metas: Vec<Table> = {
+        let metas: Vec<(u32, Table)> = {
             let versions = self.versions();
             versions
                 .version
                 .levels()
-                .flat_map(|(_, tables)| tables.iter().cloned())
+                .flat_map(|(level, tables)| tables.iter().cloned().map(move |t| (level, t)))
                 .collect()
         };
         let mut tables = Vec::with_capacity(metas.len());
-        for meta in metas {
+        for (level, meta) in metas {
             let open = self.open_table(meta.file_num).await?;
-            tables.push((meta, open));
+            tables.push((level, meta, open));
         }
         self.metrics.snapshots_open.add(1);
         Ok(Snapshot {
