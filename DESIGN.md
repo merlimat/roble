@@ -435,9 +435,12 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   gives them a skiplist of their own; roble keeps them in a list sorted by
   start key, which serves that reason at a memtable's scale — a 4 MiB arena
   holds few tombstones, and they are searched rather than walked. A second
-  skiplist replaces it the day a workload shows it needs one. A
-  full memtable becomes immutable and queues for flush; the arena is released
-  when its table is written.
+  skiplist replaces it the day a workload shows it needs one. A store that has
+  reached `Options::memtable_size` — 4 MiB, Pebble's `MemTableSize` — writes a
+  memtable out on the next write, before that write's batch is applied, and the
+  arena is released when its table is written. That is **the only thing that
+  bounds a store's memory**: nothing else writes a memtable out unless a caller
+  asks (§6).
 - **Versions are immutable, and what they name is reference counted.** A
   version is the set of files per level, with L0 as sublevels. A flush or a
   compaction produces a version edit, which is appended to the MANIFEST and
@@ -560,8 +563,27 @@ that order, so nothing is ever readable that a replay would not recover. With
 (§4). A `sync` is then **refused** rather than ignored, which is what Pebble
 does (`DB.Apply`: "pebble: WAL disabled") and the correction this document
 needed: a caller that asked for durability and got `Ok` would have none, and
-finding out would mean losing the write. A batch whose entries would exceed the memtable
-rotates it first, which rotates the log with it.
+finding out would mean losing the write.
+
+A write that finds the store **at** `Options::memtable_size` writes a memtable
+out before applying its own batch, which rotates the log with it (§5). Pebble
+asks instead whether the batch *fits*, and so never exceeds the size; roble's
+arena has no capacity to run out of, so the batch that crosses the line is
+applied whole and the bound is the budget plus one batch. The looser rule needs
+no estimate of what a batch will cost the arena, and no second path for a batch
+larger than the whole budget. Every memtable counts toward the budget, one a
+failed flush left frozen included, so the write after such a flush is the one
+that retries it.
+
+Before the batch rather than after, and that is the whole of the ordering: a
+flush that fails fails a write that has not happened, so a caller handed the
+error can write the same batch again. The other way round the batch would be in
+the log and in the memtable and reported as failed, and a caller doing the
+obvious thing would write bytes the store already had. The flush is the
+caller's to pay for, in the write that asked for the room, and its time is in
+`roble.write.duration` because that is what the write cost. It is not a stall —
+nothing is waiting, the work is being done. The stalls of §9 are the writes
+that wait for somebody else's flush, and are still owed.
 
 roble writes recyclable chunks, as Go does at the pin, but **does not recycle log
 files**: a rotation creates a new one. Reading a recycled file is still required,
@@ -842,7 +864,10 @@ required regardless, for files Go wrote (§3).
 
 **Memtables** are arenas of a configured size, 4 MiB to match Oxia. A store's
 memory is its memtables plus its share of the thread's caches plus its
-compaction buffers, and the budget covers all three.
+compaction buffers, and the budget covers all three. The first of the three is
+a bound rather than a hope because a write enforces it: what a store holds
+across every memtable it has is `Options::memtable_size` plus one batch (§4,
+§6).
 
 ## 9. Compaction
 

@@ -102,6 +102,13 @@ pub struct Memtable {
     rng: u64,
 }
 
+/// How many bytes a memtable holds before a write writes it out (§4, §8).
+///
+/// Pebble's `MemTableSize`, and the same 4 MiB, which is also what Oxia runs
+/// with. Small enough that a flush is a short operation and a store that
+/// crashes loses little; large enough that a table is worth writing.
+pub(crate) const MEMTABLE_SIZE: u64 = 4 << 20;
+
 impl Memtable {
     /// An empty memtable whose shape is determined by `seed`.
     pub fn new(seed: u64) -> Self {

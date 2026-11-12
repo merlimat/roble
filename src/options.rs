@@ -34,6 +34,8 @@ pub struct Options<F: Fs> {
     /// Whether a flush leaves the compaction the picker chose for the
     /// caller to run.
     pub(crate) disable_automatic_compactions: bool,
+    /// How many bytes a memtable holds before a write writes it out.
+    pub(crate) memtable_size: u64,
     /// How large the MANIFEST may grow before a flush replaces it.
     pub(crate) max_manifest_bytes: u64,
     /// How many tables L0 may hold before the picker wants it compacted.
@@ -58,6 +60,7 @@ impl<F: Fs> Default for Options<F> {
             caches: Caches::default(),
             disable_wal: false,
             disable_automatic_compactions: false,
+            memtable_size: crate::memtable::MEMTABLE_SIZE,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
@@ -121,6 +124,29 @@ impl<F: Fs> Options<F> {
     /// `roble.compaction.debt`. It simply does nothing about it.
     pub fn disable_automatic_compactions(mut self, disable: bool) -> Self {
         self.disable_automatic_compactions = disable;
+        self
+    }
+
+    /// How many bytes a memtable holds before a write writes it out (§4).
+    ///
+    /// Pebble's `MemTableSize`, and the same default of 4 MiB. A write that
+    /// finds the memtable at or past this flushes it before applying its own
+    /// batch, so **this is the only thing that bounds a store's memory**: a
+    /// caller that never calls `flush` itself still gets one.
+    ///
+    /// It bounds the store rather than fixing the memtable's size. The batch
+    /// that takes it over the line is applied whole, so what a store holds
+    /// across every memtable it has — the one writes go to, and one a flush
+    /// is writing out (§5) — is at most this plus one batch. That holds
+    /// after a flush that failed as well, because the write that follows
+    /// such a flush is the one that retries it.
+    ///
+    /// The flush is the caller's to pay for, in the write that asked for the
+    /// room, and its time is in `roble.write.duration` because that is what
+    /// the write cost. `u64::MAX` turns it off, which is what a caller that
+    /// does its own flushing on its own schedule wants.
+    pub fn memtable_size(mut self, bytes: u64) -> Self {
+        self.memtable_size = bytes;
         self
     }
 
