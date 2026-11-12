@@ -26,7 +26,16 @@ Usage: pivot.py [--metrics rate,p50,cpu,size] < lines
 import sys
 
 # The phases, in the order they run, so the table reads like the run did.
-PHASES = ["load", "settle", "scan-rev", "scan", "get", "floor", "checkpoint"]
+PHASES = [
+    "load",
+    "settle",
+    "scan-rev",
+    "scan",
+    "get",
+    "floor",
+    "get-cold",
+    "checkpoint",
+]
 
 # What each metric is called, which column of the line holds it, and how to
 # spell a value. `rate` first: it is the headline for every phase.

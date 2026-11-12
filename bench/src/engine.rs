@@ -111,6 +111,19 @@ pub trait Store: Sized {
     /// see the `floor` phase.
     async fn floor(&self, probe: &[u8]) -> Option<Vec<u8>>;
 
+    /// Closes every store and opens them again, so the next phase reads
+    /// nothing the last one warmed.
+    ///
+    /// What a cold `get` needs, and the reason it is a trait method rather
+    /// than a second process: every cache an engine holds has to go, and only
+    /// the engine knows what it holds. Each implementation drops its stores —
+    /// which for roble is also what releases the directory lock — and opens
+    /// them as `open` did, with caches of their own.
+    async fn reopen(shards: Vec<Self>, cfg: &Config, dir: &Path) -> Vec<Self> {
+        drop(shards);
+        Self::open(cfg, dir).await
+    }
+
     /// Writes a checkpoint into `at`, or `false` if the engine has none.
     async fn checkpoint(&self, at: &Path) -> bool;
 

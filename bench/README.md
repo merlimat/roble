@@ -50,6 +50,16 @@ They always run in this order, whatever order `--phases` names them in.
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
 - **get** — `--reads` random keys, every one present. Oxia's `Get` with
   `ComparisonEqual`, and the one comparison a bloom filter can answer.
+- **get-cold** — **one** point lookup per shard, on a store closed and opened
+  again. The `get` phase above reports a warm steady state: `--reads` lookups
+  in a row, after the scans have walked every block, with the filters and
+  indexes cached and the tables open. A shard Oxia has just been handed is in
+  none of those states, and the first read of it pays for the footer, the index
+  and the filter of whatever table holds the key. Exactly one lookup, because a
+  second would be warm — so `--shards 8` gives eight samples and `--shards 1`
+  gives one, and the percentile columns collapse onto it. It empties the
+  *engine's* caches, not the operating system's, so the blocks may still be in
+  the page cache: what it measures is the work above the filesystem.
 - **floor** — `--reads` random probes, each one byte past a stored key so that
   **no probe exists**. That is deliberate: Oxia's `getFloor` tries an exact
   `Get` first and only seeks when it misses, so probing keys that exist would
@@ -57,10 +67,11 @@ They always run in this order, whatever order `--phases` names them in.
   filter can help.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
-`run.sh` adds two passes of its own. **Batch against single insert** writes
+`run.sh` adds three passes of its own. **Batch against single insert** writes
 the same total records in batches and then one record per commit, so that the
 per-commit cost can be told from the per-record cost; see the warning about it
-below. **The layout** (`--layout`) prints every table of every level, with its
+below. **Insert with the journal against without it**, which is the WAL's cost per
+engine. **The layout** (`--layout`) prints every table of every level, with its
 size and key range, and flags any level below L0 whose tables overlap — which
 is what a scan number has to be read against.
 
@@ -159,6 +170,16 @@ measurement of the generator, not of Oxia's data. Real Oxia values are
 serialized records, which sit somewhere between the two, so the size column
 here is the incompressible end of the range rather than the answer for any
 particular shard.
+
+**The journal rows are the most platform-dependent numbers here, and on macOS
+they cannot be compared between engines at all.** Each engine's own on-against-
+off ratio is honest about that engine on this machine — it is its own sync both
+times — but the ratios are not comparable with each other, because they are not
+the same syscall. On this laptop Pebble pays **36x** for the journal and roble
+**1.7x**, and almost all of that difference is `F_FULLFSYNC` against `fsync`
+rather than anything about either engine. This is the measurement that most
+needs the Linux runner below; treat the macOS figures as a demonstration that
+the asymmetry is real, not as the WAL's cost.
 
 **The single-insert row is not like for like, and what it shows is expected.**
 With `--no-wal` the three LSMs sync nothing per commit while encina commits

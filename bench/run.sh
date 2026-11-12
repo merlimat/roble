@@ -127,6 +127,29 @@ echo
 echo "-- one record per commit --"
 table single "${args[@]}" --phases load --batches "$total" --records 1
 
+# The same insert, with the journal and without it. Within one engine this is
+# an honest comparison even on macOS, because it is that engine's own sync
+# both times; across engines the WAL-on row is not, since Go syncs with
+# F_FULLFSYNC there and compio and RocksDB with fsync (README.md).
+#
+# `--no-wal` is dropped from the passed-through arguments for the first row,
+# since there is no flag that turns the journal back on. encina appears in
+# both rows with the same number: it commits durably either way and has no
+# flag to give it.
+without_no_wal=()
+for ((i = 0; i < ${#args[@]}; i++)); do
+  [ "${args[$i]}" = "--no-wal" ] || without_no_wal+=("${args[$i]}")
+done
+
+echo
+echo "=== insert with the journal against without it ==="
+echo
+echo "-- journal on: every commit synced --"
+table journal-on "${without_no_wal[@]}" --phases load
+echo
+echo "-- journal off: a flush is the only durability point, as Oxia runs it --"
+table journal-off "${without_no_wal[@]}" --phases load --no-wal
+
 echo
 echo "=== the layout each engine settled into ==="
 for engine in $ENGINES; do

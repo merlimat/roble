@@ -1591,6 +1591,18 @@ Stated rather than quietly decided:
   key space as Pebble's L6 does, and the scan gap survives matching the table
   count, so the shape is not what is costing the reads. It remains a question
   about what Go Pebble will do with a shard roble shaped, not about speed.
+- **What a cold read costs**, which the benchmark asked rather than answered.
+  `bench/`'s `get-cold` phase closes every store, opens it again and does one
+  point lookup, which is the state a shard Oxia has just been handed is in.
+  roble's first read takes about 110 microseconds against Pebble's 28 and
+  RocksDB's 4, where all three answer a warm `get` in about one. Four samples
+  a run, so it is an order of magnitude and not a figure — but the order of
+  magnitude is the point: roble consults a bloom filter per table whose bounds
+  take the key in (§6), and on a shard it settles into fourteen tables that is
+  fourteen footers, indexes and filters to read where Pebble has eleven and
+  RocksDB one. Worth measuring properly before deciding anything, since the
+  first read after a shard moves is a latency Oxia's clients see.
+
 - **Whether roble should recycle log files**, as Pebble does. Not recycling is
   simpler and keeps `ReuseForWrite` out of `Fs` (§10); recycling saves a file
   creation and its directory sync per rotation, which with 4 MiB memtables is

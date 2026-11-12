@@ -59,7 +59,7 @@ Creates the store at DIR/pebble, which must not exist yet.
                   script that puts several engines side by side
   --no-wal        turn the WAL off, as Oxia runs it
   --phases LIST   comma-separated subset of
-                  load,settle,scan-rev,scan,get,floor,checkpoint
+                  load,settle,scan-rev,scan,get,floor,get-cold,checkpoint
                   (always run in that order, whatever order they are named in)`
 
 type config struct {
@@ -112,7 +112,6 @@ func main() {
 	// One block cache for every shard, which is how Oxia runs: hundreds of
 	// shards inside one budget. roble shares its caches the same way (§8).
 	cache := pebble.NewCache(cfg.cacheMB * 1024 * 1024)
-	defer cache.Unref()
 
 	shards := make([]*pebble.DB, cfg.shards)
 	for i := range shards {
@@ -121,8 +120,15 @@ func main() {
 			fail(fmt.Sprintf("open shard %d: %v", i, err))
 		}
 		shards[i] = db
-		defer db.Close()
 	}
+	// Closed at the end rather than deferred per store, because `get-cold`
+	// replaces both the stores and the cache half way through and a deferred
+	// close would then be of the wrong ones.
+	defer func() {
+		for _, db := range shards {
+			_ = db.Close()
+		}
+	}()
 
 	if cfg.wants("load") {
 		load(cfg, shards)
@@ -153,6 +159,12 @@ func main() {
 	}
 	if cfg.wants("floor") {
 		lookups(cfg, shards, true)
+	}
+	// Last of the read phases, because it closes the stores and opens them
+	// again: everything above it wants the caches the one before left.
+	if cfg.wants("get-cold") {
+		shards = reopen(cfg, shards, path, cache)
+		coldGet(cfg, shards)
 	}
 	if cfg.wants("checkpoint") {
 		checkpoint(cfg, shards, path)
@@ -451,6 +463,61 @@ func (r *report) finish(shards []*pebble.DB) {
 // zero-padded so bytewise order is numeric order.
 func keyFor(s, i int) []byte {
 	return []byte(fmt.Sprintf("/shard-%04d/bucket-%02d/key-%010d", s, i%64, i))
+}
+
+// reopen closes every store and opens it again, so the next phase reads
+// nothing the last one warmed.
+//
+// A new block cache with it: Pebble's is passed in at open, so reusing the one
+// above would keep exactly what this is trying to drop.
+func reopen(cfg config, shards []*pebble.DB, path string, old *pebble.Cache) []*pebble.DB {
+	for _, db := range shards {
+		if err := db.Close(); err != nil {
+			fail(err.Error())
+		}
+	}
+	old.Unref()
+	fresh := pebble.NewCache(cfg.cacheMB * 1024 * 1024)
+	out := make([]*pebble.DB, len(shards))
+	for i := range out {
+		db, err := pebble.Open(filepath.Join(path, fmt.Sprintf("shard-%04d", i)), options(cfg, fresh))
+		if err != nil {
+			fail(fmt.Sprintf("reopen shard %d: %v", i, err))
+		}
+		out[i] = db
+	}
+	return out
+}
+
+// coldGet does one point lookup per shard, on a store just reopened.
+//
+// What the get phase cannot say. That one runs --reads lookups in a row after
+// the scans have walked every block, so it reports a warm steady state. A
+// shard Oxia has just been handed is in none of those states, and the first
+// read of it pays for the footer, the index and the filter of whatever table
+// holds the key.
+//
+// Exactly one lookup per shard, which is the point — a second would be warm.
+// It is the engine's caches this empties, not the operating system's.
+func coldGet(cfg config, shards []*pebble.DB) {
+	r := newReport(cfg, "get-cold")
+	total := cfg.batches * cfg.records
+	rng := newRng(cfg.seed ^ 0x51ed270b)
+	for s, db := range shards {
+		key := keyFor(s, int(rng.next()%uint64(total)))
+		at := time.Now()
+		value, closer, err := db.Get(key)
+		r.saw(time.Since(at))
+		if err != nil {
+			fail(fmt.Sprintf("get-cold %q: %v", key, err))
+		}
+		sink(value)
+		if err := closer.Close(); err != nil {
+			fail(err.Error())
+		}
+		r.count++
+	}
+	r.finish(shards)
 }
 
 // printLayout prints every table of every level: which file, how large, and

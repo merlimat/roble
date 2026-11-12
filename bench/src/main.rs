@@ -60,7 +60,7 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --tsv           one tab-separated line per phase instead of a table, for a
                   script that puts several engines side by side
   --phases LIST   comma-separated subset of
-                  load,settle,scan-rev,scan,get,floor,checkpoint
+                  load,settle,scan-rev,scan,get,floor,get-cold,checkpoint
                   (always run in that order, whatever order they are named in)";
 
 fn main() {
@@ -164,6 +164,15 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
     if cfg.wants("floor") {
         lookups(cfg, &shards, true, out).await;
     }
+    // Last of the read phases, because it closes the stores and opens them
+    // again: everything above it wants the caches the one before left.
+    let shards = if cfg.wants("get-cold") {
+        let shards = S::reopen(shards, cfg, path).await;
+        cold_get(cfg, &shards, out).await;
+        shards
+    } else {
+        shards
+    };
     if cfg.wants("checkpoint") {
         checkpoint(&shards, path, out).await;
     }
@@ -266,6 +275,43 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
             fail(&format!(
                 "{name} answered {:?}, not the key below the probe",
                 String::from_utf8_lossy(&answer)
+            ));
+        }
+        report.count += 1;
+    }
+    report.finish(size_of(shards).await);
+}
+
+/// One point lookup per shard, on a store just reopened.
+///
+/// What the `get` phase cannot say. That one runs `--reads` lookups in a row,
+/// after the scans have walked every block, so it reports a warm steady state:
+/// the filters are cached, the indexes are cached, and most of the tables are
+/// open. A shard Oxia has just been handed is in none of those states, and the
+/// first read of it pays for the footer, the index and the filter of whatever
+/// table holds the key.
+///
+/// Exactly one lookup per shard, which is the point — a second would be warm.
+/// So `--shards 8` gives eight samples and `--shards 1` gives one, and the
+/// percentile columns collapse onto it.
+///
+/// It is the engine's caches this empties, not the operating system's: the
+/// blocks may still be in the page cache, so what this measures is the work
+/// above the filesystem and not a seek to a spinning disk.
+async fn cold_get<S: Store>(cfg: &Config, shards: &[S], out: Output) {
+    let mut report = Report::new("get-cold", out);
+    let total = cfg.batches * cfg.records;
+    let mut rng = Rng::new(cfg.seed ^ 0x51ed_270b);
+    for (s, store) in shards.iter().enumerate() {
+        let key = key_for(s, (rng.next() as usize) % total);
+        let at = Instant::now();
+        let found = store.get(&key).await;
+        report.saw(at.elapsed());
+        if found.is_none() {
+            fail(&format!(
+                "get-cold found no answer for {:?}. A store opened without the WAL keeps only \
+                 what a flush wrote, so this phase needs `settle` before it",
+                String::from_utf8_lossy(&key)
             ));
         }
         report.count += 1;
