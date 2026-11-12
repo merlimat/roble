@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, WriteBuf};
+use roble::{Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -62,10 +62,23 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
     out
 }
 
+/// Opens with compaction left to the caller.
+///
+/// A flush runs the compaction the picker chose unless it is told not to.
+/// The tests that use this are about what a flush does on its own — the
+/// table it adds, the log it retires — and a compaction following it would
+/// change the version before the assertion could read it.
+/// `tests/schedule.rs` is where the scheduling is the subject.
+async fn open_unscheduled<'a>(env: &'a SimEnv, dir: &Path) -> roble::Opened<'a, SimFs> {
+    roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
+        .await
+        .expect("open")
+}
+
 #[compio::test]
 async fn a_flush_changes_no_answer() {
     let (env, dir) = load("db-reads").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let db = open_unscheduled(&env, &dir).await;
 
     let mut batch = Batch::new();
     batch.put(b"f1", b"one").expect("put");
@@ -255,7 +268,7 @@ async fn a_manifest_that_outgrows_a_block_still_reads() {
     let flushes;
 
     {
-        let db = roble::open(&env, &dir).await.expect("open");
+        let db = open_unscheduled(&env, &dir).await;
         let path = dir.join(db.manifest_filename());
         let mut rounds = 0;
         loop {

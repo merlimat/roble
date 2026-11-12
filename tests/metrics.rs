@@ -389,7 +389,11 @@ async fn the_bytes_a_write_amplification_needs_are_both_there() {
     // ratio cannot be taken.
     let (options, tag) = metered("amplification");
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, options).await.expect("open");
+    // The compactions here are the test's own, named table by table, so the
+    // flushes are left to do nothing but flush.
+    let db = roble::open_with(&env, &dir, options.disable_automatic_compactions(true))
+        .await
+        .expect("open");
 
     let value = vec![b'v'; 200];
     let mut tables = Vec::new();
@@ -432,7 +436,9 @@ async fn what_oxia_graphs_from_pebble_is_there() {
     // own names; the correspondence is written out in METRICS.md.
     let (options, tag) = metered("oxia");
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, options).await.expect("open");
+    let db = roble::open_with(&env, &dir, options.disable_automatic_compactions(true))
+        .await
+        .expect("open");
 
     let value = vec![b'v'; 200];
     let mut tables = Vec::new();
@@ -490,7 +496,10 @@ async fn the_debt_is_what_the_levels_hold_above_their_allowances() {
     let db = roble::open_with(
         &env,
         &dir,
-        options.l0_compaction_threshold(1).lbase_max_bytes(1),
+        options
+            .l0_compaction_threshold(1)
+            .lbase_max_bytes(1)
+            .disable_automatic_compactions(true),
     )
     .await
     .expect("open");

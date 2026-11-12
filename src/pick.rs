@@ -25,14 +25,21 @@
 //! and spreads its work across a level with a key cursor it carries between
 //! compactions.
 //!
-//! **Two things it does not do**, and both are §9 asking rather than an
-//! oversight. It reads no clock and draws no random number: a picker that did
+//! **One thing it does not do**, and it is §9 asking rather than an
+//! oversight: it reads no clock and draws no random number. A picker that did
 //! either would make a seeded run stop replaying, and replay is how the
-//! failure-path tests work at all (§10, §12). And it does not *schedule*
-//! itself — nothing here runs a compaction behind the caller's back. Wiring
-//! this into a flush waits for the cooperative execution §9 describes,
-//! because a compaction that runs to completion inside a flush is exactly the
-//! latency spike units of work exist to avoid.
+//! failure-path tests work at all (§10, §12). So what it decides is a
+//! function of the version alone, and two stores given the same version pick
+//! the same compaction.
+//!
+//! **What runs it.** A flush, through [`Opened::maybe_compact`]: a flush is
+//! what fills L0, so it is where the store notices it has too much in it.
+//! That waited on the cooperative execution of `crate::work`, because a
+//! compaction that ran to completion while holding the thread was exactly
+//! the latency spike units of work exist to avoid; now it merges a slice at
+//! a time and the thread comes back between them. What still has no trigger
+//! is an *idle* store draining its backlog, which needs a task of its own
+//! and so an ownership change (§9).
 //!
 //! **The score is a fraction, not a float.** Two levels are compared by
 //! cross-multiplying, which is exact; a float would be deterministic in
@@ -189,6 +196,33 @@ impl<F: Fs> Opened<'_, F> {
             return Ok(Vec::new());
         };
         self.compact(pick.level, &pick.tables).await
+    }
+
+    /// Runs one compaction on the store's own account, if there is one worth
+    /// running and the caller did not ask to be left in charge.
+    ///
+    /// **One compaction, not every one the picker could find.** A flush adds
+    /// a single table to L0 and a compaction of L0 takes all of it, so one
+    /// per flush more than keeps up with the level a flush fills; below L0
+    /// the levels trade off, because the picker's next choice is whichever
+    /// is furthest past its allowance. What one per flush deliberately does
+    /// *not* do is drain a store that has already fallen behind: a flush
+    /// that compacted until nothing was pickable would make its caller wait
+    /// out a backlog it did not create. Pebble answers that with its
+    /// stop-writes thresholds — a write waits only once the backlog is
+    /// dangerous — and roble still owes those (§9).
+    ///
+    /// **The failure is swallowed**, for the reason the obsolete sweep's is:
+    /// the flush that called this is already durable, and calling it failed
+    /// because the maintenance behind it did not run would be the larger
+    /// lie. Nor is a compaction that keeps failing silent — the debt it is
+    /// not paying off is `roble.compaction.debt`, which is the number that
+    /// says a store is falling behind.
+    pub(crate) async fn maybe_compact(&self) {
+        if self.automatic_compactions_disabled() {
+            return;
+        }
+        let _ = self.compact_once().await;
     }
 }
 

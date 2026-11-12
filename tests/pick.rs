@@ -17,8 +17,15 @@
 //! The picker is the one component whose whole job is to make the same
 //! decision twice, so most of what follows is about *which* level it chose
 //! and why, rather than about what the compaction then did. The last test is
-//! the one that matters in practice: left to itself, a store that keeps
-//! flushing has to settle rather than pile up.
+//! the one that matters in practice: a store that keeps flushing has to
+//! settle rather than pile up, once something compacts what the picker
+//! names.
+//!
+//! Every store here is opened with automatic compactions off. The picker's
+//! answer is a statement about a version, and these tests build their
+//! versions by flushing: a flush that ran the compaction it chose would
+//! have changed the version before the assertion could read it. What runs
+//! the picker is `tests/schedule.rs`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -85,9 +92,15 @@ async fn flush_keys<F: Fs>(
 async fn a_level_inside_its_allowance_is_left_alone() {
     let (env, dir) = load("db-twin-a").await;
     // The fixture arrives with one table in L0, so three more reach four.
-    let db = roble::open_with(&env, &dir, Options::new().l0_compaction_threshold(4))
-        .await
-        .expect("open");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(4),
+    )
+    .await
+    .expect("open");
     assert_eq!(db.versions().version.level(0).len(), 1);
 
     assert_eq!(db.pick(), None, "one table in L0 is not worth compacting");
@@ -114,9 +127,15 @@ async fn l0_is_picked_whole() {
     // L0's tables overlap, so compacting one means pulling in every one that
     // meets it, and in L0 that usually spreads to the lot.
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, Options::new().l0_compaction_threshold(3))
-        .await
-        .expect("open");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(3),
+    )
+    .await
+    .expect("open");
 
     flush_keys(&db, "b", 0, 4).await;
     flush_keys(&db, "b", 2, 4).await;
@@ -143,6 +162,7 @@ async fn the_worst_level_is_the_one_picked() {
         &env,
         &dir,
         Options::new()
+            .disable_automatic_compactions(true)
             .l0_compaction_threshold(2)
             .lbase_max_bytes(64),
     )
@@ -192,7 +212,10 @@ async fn a_tie_goes_to_the_level_nearest_l0() {
         let db = roble::open_with(
             &env,
             &dir,
-            Options::new().l0_compaction_threshold(1).lbase_max_bytes(1),
+            Options::new()
+                .disable_automatic_compactions(true)
+                .l0_compaction_threshold(1)
+                .lbase_max_bytes(1),
         )
         .await
         .expect("open");
@@ -219,6 +242,7 @@ async fn a_tie_goes_to_the_level_nearest_l0() {
         &env,
         &dir,
         Options::new()
+            .disable_automatic_compactions(true)
             .l0_compaction_threshold(l0_tables)
             .lbase_max_bytes(l1_bytes),
     )
@@ -243,7 +267,10 @@ async fn a_level_below_l0_is_picked_one_table_at_a_time() {
     let db = roble::open_with(
         &env,
         &dir,
-        Options::new().l0_compaction_threshold(1).lbase_max_bytes(1),
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(1)
+            .lbase_max_bytes(1),
     )
     .await
     .expect("open");
@@ -293,7 +320,10 @@ async fn the_last_level_is_never_picked() {
     let db = roble::open_with(
         &env,
         &dir,
-        Options::new().l0_compaction_threshold(1).lbase_max_bytes(1),
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(1)
+            .lbase_max_bytes(1),
     )
     .await
     .expect("open");
@@ -350,7 +380,10 @@ async fn the_allowance_grows_with_depth() {
         let db = roble::open_with(
             &env,
             &dir,
-            Options::new().l0_compaction_threshold(1).lbase_max_bytes(1),
+            Options::new()
+                .disable_automatic_compactions(true)
+                .l0_compaction_threshold(1)
+                .lbase_max_bytes(1),
         )
         .await
         .expect("open");
@@ -380,6 +413,7 @@ async fn the_allowance_grows_with_depth() {
         &env,
         &dir,
         Options::new()
+            .disable_automatic_compactions(true)
             .l0_compaction_threshold(1000)
             .lbase_max_bytes(in_l2 / 2),
     )
@@ -406,6 +440,7 @@ async fn the_same_version_always_picks_the_same_thing() {
         &env,
         &dir,
         Options::new()
+            .disable_automatic_compactions(true)
             .l0_compaction_threshold(2)
             .lbase_max_bytes(64),
     )
@@ -434,6 +469,7 @@ async fn compacting_until_it_settles_changes_no_answer() {
         &env,
         &dir,
         Options::new()
+            .disable_automatic_compactions(true)
             .l0_compaction_threshold(3)
             .lbase_max_bytes(256),
     )

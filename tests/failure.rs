@@ -187,8 +187,18 @@ async fn a_failure_at_any_single_operation_leaves_a_database_that_opens() {
         // through `Fs`, a scenario that stopped touching the disk — every run
         // would succeed and every reopen would trivially work, and the loop
         // would still be green.
+        //
+        // A third rather than a half, because a flush runs the compaction the
+        // picker chose and swallows its failure on purpose: the flush is
+        // durable, and reporting it as failed because the maintenance behind
+        // it did not run would be the larger lie (§9). So a good share of
+        // what this sweeps now happens inside a call meant to absorb it, and
+        // an injection landing there is not a scenario that failed. It is
+        // still a scenario that was *swept* — the reopen below is what this
+        // test is for, and a compaction that failed quietly is held to it
+        // like every other operation.
         assert!(
-            refused * 2 >= total,
+            refused * 3 >= total,
             "wal={wal}: only {refused} of {total} injections made the scenario fail; \
              the engine is barely meeting the failing disk"
         );

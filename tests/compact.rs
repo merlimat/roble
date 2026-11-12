@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, WriteBuf};
+use roble::{Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -62,6 +62,18 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
         scan.next().await.expect("next");
     }
     out
+}
+
+/// Opens with compaction left to the caller.
+///
+/// A flush runs the compaction the picker chose unless it is told not to,
+/// and the tests that use this name the tables to merge themselves: a flush
+/// that compacted for itself would have moved them first.
+/// `tests/schedule.rs` is where the scheduling is the subject.
+async fn open_unscheduled<'a>(env: &'a SimEnv, dir: &Path) -> roble::Opened<'a, SimFs> {
+    roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
+        .await
+        .expect("open")
 }
 
 /// Writes a batch and flushes it, giving one L0 table.
@@ -153,7 +165,7 @@ async fn a_compaction_drops_what_it_may() {
     // the same eight keys over and over: the merge has to keep one version
     // of each and throw away the other twenty-four entries.
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let db = open_unscheduled(&env, &dir).await;
 
     let mut inputs = Vec::new();
     for round in 0..4 {
@@ -307,7 +319,7 @@ async fn overlapping_range_tombstones_are_fragmented() {
     // them builds a range-deletion block the format refuses, so the merge
     // has to cut them into fragments.
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let db = open_unscheduled(&env, &dir).await;
 
     let mut keys = Batch::new();
     for i in 0..12 {
