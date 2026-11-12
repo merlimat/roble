@@ -77,11 +77,21 @@ because nothing is appended: its durability is `flush`'s (§4).
 | `roble.scans` | counter | `{scan}` | Scans created |
 | `roble.scan.entries` | counter | `{entry}` | Keys that scans stepped onto |
 | `roble.scans.open` | up-down counter | `{scan}` | Scans created and not yet dropped |
+| `roble.snapshots.open` | up-down counter | `{snapshot}` | Snapshots created and not yet dropped |
 | `roble.read.bytes` | counter | By | Bytes of the keys and values that lookups and scans returned |
 | `roble.read.errors` | counter | `{error}` | Lookups that failed, by what went wrong |
 
 A `get` under any comparison but `Equal` is a scan, positioned once: it counts one
 scan and one entry. `Equal` is a point lookup and counts neither.
+
+`roble.snapshots.open` is counted apart from `roble.scans.open` because the two
+hold different amounts: a scan holds the tables its bounds reach, and a
+snapshot holds every table of its version, so a snapshot nobody holds keeps a
+whole shard's files from being collected (§5, §6). There is no counter for
+snapshots *created*, because nothing asks for the rate — only for whether any
+are outstanding. A `lookup` on one is a point lookup like `get` with `Equal`:
+it counts in `roble.get.duration` and `roble.read.bytes` and in neither scan
+series.
 
 ## Flushing and compacting
 

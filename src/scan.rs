@@ -587,11 +587,6 @@ impl<F: crate::env::Fs> crate::Opened<F> {
     ) -> Result<Scan<F::Disk>> {
         self.metrics.scans.add(1);
         self.metrics.scans_open.add(1);
-        // Every table of the version. A table whose key range misses the
-        // bounds could be left out, but that is the version's business to
-        // decide and it costs nothing here: an iterator over a table outside
-        // the bounds goes invalid on its first seek.
-        //
         // Only the tables this scan could reach. A table whose keys are all
         // outside the bounds has nothing to offer: its iterator would go
         // invalid on its first seek, and holding it open would pin a file
@@ -623,7 +618,7 @@ impl<F: crate::env::Fs> crate::Opened<F> {
         Ok(Scan::new(
             tables,
             memtables,
-            self.snapshot(),
+            self.last_seq_num(),
             lower.map(|b| b.to_vec()),
             upper.map(|b| b.to_vec()),
             Some(Rc::clone(&self.metrics)),

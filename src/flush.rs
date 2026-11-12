@@ -202,7 +202,7 @@ impl<F: Fs> Opened<F> {
             min_unflushed_log_num: self.current_log(),
             obsolete_prev_log_num: None,
             next_file_num: Some(table_num + 1),
-            last_seq_num: Some(self.snapshot()),
+            last_seq_num: Some(self.last_seq_num()),
             deleted_tables: Vec::new(),
             new_tables: vec![new_table],
         };
