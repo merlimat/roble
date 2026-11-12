@@ -1123,9 +1123,26 @@ impl<F: Fs> Opened<F> {
         if !self.metrics.recording() {
             return;
         }
-        if let Ok(usage) = self.fs.disk_usage(&self.dir).await {
-            self.metrics.disk_size.set(usage.used_bytes as i64);
-        }
+        let _ = self.disk_usage().await;
+    }
+
+    /// Bytes of every file in this store's directory, which is Oxia's
+    /// `DiskSpaceUsage`.
+    ///
+    /// Measured from the directory rather than summed from the version, so it
+    /// takes in the MANIFEST, the logs, the markers and anything obsolete the
+    /// sweep has not collected yet — the number `roble.disk.size` reports, and
+    /// this is what refreshes it. Pebble answers the same question from the
+    /// other side, adding up the sizes it tracks (`Metrics.DiskSpaceUsage`),
+    /// which is a sum of what it believes rather than of what is there.
+    ///
+    /// It walks the directory, so it is a call to make when something asks
+    /// and not one to make on a timer. Oxia memoizes Pebble's for five
+    /// seconds for that reason ([METRICS.md](../METRICS.md)).
+    pub async fn disk_usage(&self) -> Result<u64> {
+        let usage = self.fs.disk_usage(&self.dir).await?;
+        self.metrics.disk_size.set(usage.used_bytes as i64);
+        Ok(usage.used_bytes)
     }
 
     /// The filesystem this store's files live in.
