@@ -26,10 +26,6 @@
 #   2. Each scan direction in a process of its own over a freshly loaded store,
 #      so neither reads a cache the other warmed. This is the comparison
 #      DESIGN.md §14 asks for, and the first pass only approximates it.
-#   2b. The same for the two forms of the point lookup, `get` and `get-buf`,
-#      for the same reason: within one process the second of them reads a
-#      cache the first warmed, which on a small store was worth 1.51x against
-#      the 1.10x two processes report.
 #   3. Batch insert against single insert, at the same total number of
 #      records, so the per-commit cost can be told from the per-record cost.
 #   4. The layout: every table of every level, with its size and key range,
@@ -125,14 +121,6 @@ echo "(so neither direction reads a cache the other warmed)"
 for dir in scan-rev scan; do
   echo
   table "$dir" "${args[@]}" --phases "load,settle,$dir"
-done
-
-echo
-echo "=== the point lookup, each form on its own, over a store of its own ==="
-echo "(so neither form reads a cache the other warmed)"
-for phase in get-buf get; do
-  echo
-  table "$phase" "${args[@]}" --phases "load,settle,$phase"
 done
 
 # The same records, written one batch at a time against one record at a time.

@@ -48,28 +48,26 @@ They always run in this order, whatever order `--phases` names them in.
   up in the CPU column.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
-- **get-buf**, then **get** — `--reads` random keys, every one present. Oxia's
-  `Get` with `ComparisonEqual`, and the one comparison a bloom filter can
-  answer. The two differ in one line of the engine adapter and nothing else:
-  the same keys in the same order, the same allocations in this harness.
-  `get` takes the answer owned; `get-buf` reads into a buffer the caller keeps
-  and hands back, which for roble is `get_into` and a `Lookup`.
+- **get** — `--reads` random keys, every one present. Oxia's `Get` with
+  `ComparisonEqual`, and the one comparison a bloom filter can answer.
 
-  **`get-buf` goes first**, for the reason `scan-rev` does: the phases share a
-  cache, so the second reads one the first warmed, and the bias belongs
-  against the phase making a claim. Running it second reported 1.51× on a
-  90,000-record store where two processes, one phase each, reported 1.10×.
-  The clean comparison is the `get` pass in `run.sh`, which gives each form a
-  process and a store of its own.
+  **Each engine reads it the best way it offers, and reports the value's
+  length rather than the value.** That is not a detail: every one of them can
+  produce a value without handing back an owned copy, and they do it
+  differently. roble reads into a `Lookup` the caller keeps; Pebble's `Get`
+  borrows the value from the block it is in and gives back a closer; RocksDB
+  has `get_pinned`; encina passes the borrowed value to a closure. Asking for
+  an owned value charged some of them for an allocation this row is not about
+  while others borrowed — which is what it used to do, so **roble's `get` row
+  was not like-for-like with Pebble's** until this was fixed. A length still
+  proves the value was read, and the phase checks it against `--value-bytes`
+  so that an engine cannot win by not producing one.
 
-  It is skipped where an engine has no such read, with the reason in the
-  table — and the reasons differ. **Pebble already reads without copying**:
-  `Get` hands back a value borrowed from its block with a closer, and
-  `harness/bench` consumes it in place. So Pebble's `get` row is already its
-  buffered read, which also means **roble's `get` row has never been
-  like-for-like with Pebble's, and its `get-buf` row is**. RocksDB has
-  `get_pinned` for the same purpose, not wired up here. encina returns an
-  owned value.
+  The harness builds its probe keys into a buffer it reuses, on both sides,
+  for the same reason: a `format!` or a `Sprintf` per probe is the harness
+  measuring itself, and leaving it in one language and not the other would
+  quietly favour one engine.
+
 - **get-cold** — **one** point lookup per shard, on a store closed and opened
   again. The `get` phase above reports a warm steady state: `--reads` lookups
   in a row, after the scans have walked every block, with the filters and

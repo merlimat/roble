@@ -120,7 +120,7 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --tsv           one tab-separated line per phase instead of a table, for a
                   script that puts several engines side by side
   --phases LIST   comma-separated subset of
-                  load,settle,scan-rev,scan,get-buf,get,floor,get-cold,checkpoint
+                  load,settle,scan-rev,scan,get,floor,get-cold,checkpoint
                   (always run in that order, whatever order they are named in)";
 
 fn main() {
@@ -227,24 +227,11 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
     if cfg.wants("scan") {
         scan(cfg, &shards, false, out).await;
     }
-    // `get-buf` before `get`, for the reason `scan-rev` goes before `scan`:
-    // the phases share a cache and run in order, so the second reads one the
-    // first warmed, and the bias belongs against the phase under suspicion.
-    // `get-buf` is the one making a claim here, so it pays the cold cache —
-    // a `get-buf` that wins from there is winning from behind. Running it
-    // second reported 1.51x on a 90,000-record store where two processes,
-    // one phase each, reported 1.10x; that gap was the cache, not the code.
-    //
-    // The clean comparison is still one phase per process, which is what the
-    // `get` pass in run.sh does.
-    if cfg.wants("get-buf") {
-        lookups(cfg, &shards, Probe::Buffered, out).await;
-    }
     if cfg.wants("get") {
-        lookups(cfg, &shards, Probe::Get, out).await;
+        lookups(cfg, &shards, false, out).await;
     }
     if cfg.wants("floor") {
-        lookups(cfg, &shards, Probe::Floor, out).await;
+        lookups(cfg, &shards, true, out).await;
     }
     // Last of the read phases, because it closes the stores and opens them
     // again: everything above it wants the caches the one before left.
@@ -332,41 +319,20 @@ async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool, out: Output) 
     report.finish(size_of(shards).await);
 }
 
-/// Which lookup a read phase makes.
-#[derive(Clone, Copy)]
-enum Probe {
-    /// Oxia's `Get` with `ComparisonEqual`, answering with an owned value.
-    Get,
-    /// The same read through a buffer the engine keeps ([`Store::buffered`]).
-    Buffered,
-    /// `getFloor`'s seek, probing a key that is not there.
-    Floor,
-}
-
 /// Looks up random keys, every one of which has an answer.
 ///
 /// `get` is Oxia's `Get` with `ComparisonEqual`, and the one comparison a
-/// bloom filter can answer.
+/// bloom filter can answer. Each engine reads it the best way it offers —
+/// see [`Store::get`] — and reports the value's length, because an owned
+/// return would charge some of them for an allocation the comparison is not
+/// about and leave others borrowing.
 ///
 /// `floor` probes keys that are **not there**, one byte past a stored key:
 /// Oxia's `getFloor` tries an exact `Get` first and only falls through to a
 /// seek when that misses, so probing keys that exist would measure the `get`
 /// phase over again. What this times is the seek, which no filter can help.
-async fn lookups<S: Store>(cfg: &Config, shards: &[S], probe_kind: Probe, out: Output) {
-    let name = match probe_kind {
-        Probe::Get => "get",
-        Probe::Buffered => "get-buf",
-        Probe::Floor => "floor",
-    };
-    let floor = matches!(probe_kind, Probe::Floor);
-    if matches!(probe_kind, Probe::Buffered) && !shards.first().is_some_and(|s| s.buffered()) {
-        Report::skipped(
-            name,
-            "this engine has no read into a buffer the caller keeps",
-            out,
-        );
-        return;
-    }
+async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output) {
+    let name = if floor { "floor" } else { "get" };
     let mut report = Report::new(name, out);
     let total = cfg.batches * cfg.records;
     let mut rng = Rng::new(cfg.seed ^ 0x9e37_79b9);
@@ -386,47 +352,42 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], probe_kind: Probe, out: O
             // sorts above the digits the padding ends in.
             probe.push(b'~');
         }
-        if matches!(probe_kind, Probe::Buffered) {
+        if floor {
             let at = Instant::now();
-            let len = shards[s].get_buffered(&probe).await;
+            let answer = shards[s].floor(&probe).await;
             report.saw(at.elapsed());
-            // The length is checked against the value this record was
-            // written with, not merely for being there: a buffered read that
-            // answered `true` without filling the buffer would otherwise be
-            // the fastest engine in the table.
-            let len = len.unwrap_or_else(|| {
+            let answer = answer.unwrap_or_else(|| {
                 fail(&format!(
                     "{name} found no answer for {:?}",
                     String::from_utf8_lossy(&probe)
                 ))
             });
-            if len != cfg.value_bytes {
+            if answer != key {
                 fail(&format!(
-                    "{name} answered {len} bytes for {:?}, not the {} written",
-                    String::from_utf8_lossy(&probe),
-                    cfg.value_bytes,
+                    "{name} answered {:?}, not the key below the probe",
+                    String::from_utf8_lossy(&answer)
                 ));
             }
             report.count += 1;
             continue;
         }
         let at = Instant::now();
-        let answer = if floor {
-            shards[s].floor(&probe).await
-        } else {
-            shards[s].get(&probe).await
-        };
+        let len = shards[s].get(&probe).await;
         report.saw(at.elapsed());
-        let answer = answer.unwrap_or_else(|| {
+        // Checked against the value this record was written with, not merely
+        // for being there: a read that answered without producing the value
+        // would otherwise be the fastest engine in the table.
+        let len = len.unwrap_or_else(|| {
             fail(&format!(
                 "{name} found no answer for {:?}",
                 String::from_utf8_lossy(&probe)
             ))
         });
-        if floor && answer != key {
+        if len != cfg.value_bytes {
             fail(&format!(
-                "{name} answered {:?}, not the key below the probe",
-                String::from_utf8_lossy(&answer)
+                "{name} answered {len} bytes for {:?}, not the {} written",
+                String::from_utf8_lossy(&probe),
+                cfg.value_bytes,
             ));
         }
         report.count += 1;

@@ -31,7 +31,6 @@ PHASES = [
     "settle",
     "scan-rev",
     "scan",
-    "get-buf",
     "get",
     "floor",
     "get-cold",
