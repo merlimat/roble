@@ -834,7 +834,7 @@ impl<F: Fs> Opened<F> {
     }
 
     /// The highest sequence number any read may see.
-    pub(crate) fn snapshot(&self) -> u64 {
+    pub(crate) fn last_seq_num(&self) -> u64 {
         self.next_seq.get().saturating_sub(1)
     }
 
@@ -1163,7 +1163,7 @@ impl<F: Fs> Opened<F> {
         // in flight on the memtable the next lines take away (§5).
         self.writers.settled().await;
         let fresh = std::rc::Rc::new(std::cell::RefCell::new(crate::memtable::Memtable::new(
-            self.snapshot().wrapping_add(1),
+            self.last_seq_num().wrapping_add(1),
         )));
         let old = std::mem::replace(&mut *self.memtable.borrow_mut(), fresh);
         *self.frozen.borrow_mut() = Some(old);

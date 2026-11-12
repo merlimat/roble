@@ -607,6 +607,49 @@ async fn open_scans_are_counted_until_they_are_dropped() {
 }
 
 #[compio::test]
+async fn open_snapshots_are_counted_until_they_are_dropped() {
+    // Worth saying separately from the scans, because a snapshot holds every
+    // table of a version rather than the ones a scan's bounds reach: one
+    // nobody holds keeps a whole shard's files from being collected.
+    let (options, tag) = metered("open-snapshots");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+
+    let a = db.snapshot().await.expect("snapshot");
+    let b = db.snapshot().await.expect("snapshot");
+    assert_eq!(
+        collected(reader(), &tag)
+            .get("roble.snapshots.open")
+            .copied(),
+        Some(2),
+        "two snapshots are open"
+    );
+    // And a scan made from one is a scan like any other.
+    let scan = a.scan().expect("scan");
+    assert_eq!(
+        collected(reader(), &tag).get("roble.scans.open").copied(),
+        Some(1),
+    );
+    drop(scan);
+    drop(a);
+    assert_eq!(
+        collected(reader(), &tag)
+            .get("roble.snapshots.open")
+            .copied(),
+        Some(1),
+        "one went away"
+    );
+    drop(b);
+    assert_eq!(
+        collected(reader(), &tag)
+            .get("roble.snapshots.open")
+            .copied(),
+        Some(0),
+        "and the version it was holding is released with it"
+    );
+}
+
+#[compio::test]
 async fn every_read_write_and_sync_is_counted() {
     let (options, tag) = metered("disk-io");
     let (env, dir) = load("db-twin-a").await;

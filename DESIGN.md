@@ -707,8 +707,8 @@ number in use when it is made and ignores anything above it, so a write that
 happens while it is open is simply not its business. Nothing is copied and
 nothing is reference counted: sequence numbers only go up, and a table's
 contents are all older than any scan, so the rule has to be applied in exactly
-one place — the memtable. An explicit `snapshot()` handle is the same
-mechanism with the number kept for longer (§4). Reverse iteration over an LSM is more expensive than forward,
+one place — the memtable. An explicit `snapshot()` handle keeps that number
+and holds the version with it, which is below. Reverse iteration over an LSM is more expensive than forward,
 which Oxia's `KeyRangeScanReverse` uses; it is worth measuring early.
 
 There are two reasons it is dearer, and they compound. Within a block,
@@ -717,9 +717,27 @@ the restart point before the current entry. Across blocks, a backward step at
 the start of a block has to load the previous one and walk it to its end,
 where a forward step loads the next and stops at its first entry.
 
-A prefix iterator additionally serves `Lookup` for keys outside its prefix,
-which Oxia uses to read internal keys while scanning: it keeps a second iterator
-over the same snapshot rather than moving the first.
+**A snapshot is the number and the files.** A scan opens only the tables its
+bounds reach (§5), so it cannot answer about a key outside them — which is
+right for a scan, since otherwise three records would pin a shard's files
+against the obsolete sweep for as long as the cursor stayed open. A snapshot is
+what a caller says instead when it means to read the whole store at one
+instant: it opens every table of the version and holds the readers, and holding
+them is what keeps the sweep off those files. The version is pinned by
+references that were going to be held anyway rather than by a count of its own.
+
+That pair — a bounded cursor over one instant, and a lookup for any key at all
+over the same instant — is Oxia's `KeyPrefixIterator` with `Lookup`, which it
+uses to read a value while scanning an index. The lookup is a point lookup and
+not a scan positioned once, so that the bloom filters still rule out the tables
+that cannot hold the key; Oxia arrives at the same place from the other side,
+seeking a cloned iterator with `SeekPrefixGE`. Filters answer about point keys
+only, so a range tombstone is searched for without them.
+
+The prefix itself is not roble's. Oxia's goes through its own key encoder,
+which can map one prefix to several ranges, and a plain byte prefix is the
+range `[p, p+1)`. roble offers the view and the range; the bounds are the
+caller's to compute from its own encoding.
 
 Iterators read ahead, as encina's do, and share a read with another iterator
 that wants the same block (§8).
@@ -761,7 +779,9 @@ marker and letting the old one go, so no crash can land with no marker at all.
 roble does not rotate at open as Pebble does, which keeps opening a database
 something that does not write to it.
 
-`snapshot()` pins a version and a sequence number. `checkpoint(dir)` writes a
+`snapshot()` pins a sequence number and the version with it, by opening every
+table the version names: a table some reader is open for is one the sweep
+leaves alone (§5), so no second structure counts versions. `checkpoint(dir)` writes a
 directory Go Pebble opens: hard links to the live tables, a fresh MANIFEST
 holding one edit that describes the version — the same edit a rotation writes,
 and the same claim — and the two markers. Oxia streams that directory, so it
@@ -1186,9 +1206,11 @@ db.flush().await?;                     // a table; the logs it covers can go
 
 let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
 
-let snap = db.snapshot();
-let mut iter = snap.range(&b"/users/"[..]..&b"/users0"[..]);
-while let Some((k, v)) = iter.next().await? { /* ... */ }
+let snap = db.snapshot().await?;       // one instant, every table held open
+let mut scan = snap.scan_range(Some(b"/users/"), Some(b"/users0"))?;
+scan.first().await?;
+while scan.is_valid() { /* scan.key(), scan.value() */ scan.next().await?; }
+let other = snap.lookup(b"/sessions/7").await?;   // a key outside those bounds
 
 db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
 ```
@@ -1203,7 +1225,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | batch `Count`, `Size`, `Checksum` | over the Pebble batch repr, so checksums match Go |
 | `Get` with `ComparisonType` | `get` with `Comparison` |
 | `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
-| `KeyPrefixIterator` with `Lookup` | `prefix` iterator (§6) |
+| `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `scan_range` and `lookup` on it (§6) |
 | `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
 | `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |

@@ -74,6 +74,9 @@ const READ_ERRORS: CounterDef = CounterDef::new("roble.read.errors")
 const SCANS_OPEN: UpDownCounterDef = UpDownCounterDef::new("roble.scans.open")
     .unit("{scan}")
     .description("Scans that have been created and not dropped");
+const SNAPSHOTS_OPEN: UpDownCounterDef = UpDownCounterDef::new("roble.snapshots.open")
+    .unit("{snapshot}")
+    .description("Snapshots that have been created and not dropped");
 const GET_DURATION: LatencyDef =
     LatencyDef::new("roble.get.duration").description("Time a lookup takes, found or not");
 const SCANS: CounterDef = CounterDef::new("roble.scans")
@@ -286,6 +289,7 @@ pub(crate) struct Metrics {
     pub(crate) read_bytes: Counter,
     pub(crate) read_errors: Errors,
     pub(crate) scans_open: Amount,
+    pub(crate) snapshots_open: Amount,
     pub(crate) get: Latency,
     pub(crate) scans: Counter,
     pub(crate) scan_entries: Counter,
@@ -342,6 +346,7 @@ impl Metrics {
             read_bytes: meter.counter(READ_BYTES, &[]),
             read_errors: Errors::new(meter, READ_ERRORS),
             scans_open: meter.amount(SCANS_OPEN, &[]),
+            snapshots_open: meter.amount(SNAPSHOTS_OPEN, &[]),
             get: meter.latency(GET_DURATION, &[]),
             scans: meter.counter(SCANS, &[]),
             scan_entries: meter.counter(SCAN_ENTRIES, &[]),

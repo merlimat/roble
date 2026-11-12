@@ -247,7 +247,7 @@ impl<F: Fs> Opened<F> {
             obsolete_prev_log_num: None,
             next_file_num: (!new_tables.is_empty())
                 .then(|| first_file_num + new_tables.len() as u64),
-            last_seq_num: Some(self.snapshot()),
+            last_seq_num: Some(self.last_seq_num()),
             deleted_tables: inputs.iter().map(|(l, m)| (*l, m.file_num)).collect(),
             new_tables,
         };

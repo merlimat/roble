@@ -74,7 +74,9 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
             // Seeded from where the store has got to, so two batches on one
             // store get skiplists of different shapes and a run still
             // replays (§9).
-            index: Rc::new(RefCell::new(Memtable::new(db.snapshot().wrapping_add(1)))),
+            index: Rc::new(RefCell::new(Memtable::new(
+                db.last_seq_num().wrapping_add(1),
+            ))),
         }
     }
 
