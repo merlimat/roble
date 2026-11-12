@@ -276,3 +276,72 @@ async fn a_checkpoint_that_failed_leaves_the_store_it_came_from_alone() {
         );
     }
 }
+
+#[compio::test]
+async fn a_half_written_checkpoint_never_reads_as_a_database() {
+    // An unfinished checkpoint is rubbish, and allowed to be — the test above
+    // says the store it came from is what must survive. What it may not be is
+    // a directory that *claims* to be a database, which is what the manifest
+    // marker makes it.
+    //
+    // So the two markers are not interchangeable in order. Written manifest
+    // first, a checkpoint interrupted between them left a directory an open
+    // read as a database whose format version had never been recorded — the
+    // one case Pebble reserves that message for, a database older than
+    // markers themselves. Written format-version first, the only marker that
+    // can be there alone is the one that claims nothing.
+    //
+    // Which is checked here directly rather than through the refusal: a
+    // failure before either marker leaves a directory with no markers at all,
+    // and that is refused for its missing format version whatever this
+    // function does, exactly as an empty directory is (`tests/create.rs`).
+    let total = {
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open(&env, &dir).await.expect("open");
+        write_keys(&db, "c", 10, true).await;
+        let before = env.sim().ops();
+        db.checkpoint(Path::new("/snapshot"))
+            .await
+            .expect("checkpoint");
+        env.sim().ops() - before
+    };
+
+    let mut saw_one_marker = 0;
+    for n in 1..=total {
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open(&env, &dir).await.expect("open");
+        write_keys(&db, "c", 10, true).await;
+
+        let at = Path::new("/snapshot");
+        env.sim().fail_at(n);
+        let _ = db.checkpoint(at).await;
+        env.sim().stop_failing();
+        drop(db);
+
+        let names = listing(env.sim(), at).await;
+        let manifest = names.iter().any(|n| n.starts_with("marker.manifest."));
+        let format = names
+            .iter()
+            .any(|n| n.starts_with("marker.format-version."));
+        if format && !manifest {
+            saw_one_marker += 1;
+        }
+        assert!(
+            !manifest || format,
+            "failing at {n} of {total} left a directory claiming to be a database \
+             with no format version: {names:?}"
+        );
+        // And a directory that does claim it has to mean it: every file the
+        // marker's MANIFEST names is already there, because the marker was
+        // the last thing written.
+        if manifest {
+            roble::open(&env, at)
+                .await
+                .unwrap_or_else(|e| panic!("failing at {n} of {total}, the checkpoint: {e}"));
+        }
+    }
+    assert!(
+        saw_one_marker > 0,
+        "no failure landed between the two markers, so the order is untested"
+    );
+}

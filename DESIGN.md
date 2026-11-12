@@ -884,6 +884,14 @@ handling to the one thing it does today, which is resuming the log a replay
 found, and means the directory is complete when the creation returns rather
 than when something first opens it.
 
+**The manifest marker goes last**, after the format version, because it is the
+marker that makes a directory read as a database: until everything it names is
+in place it must not be written. `checkpoint` does the same, for the same
+reason — written the other way round, a checkpoint interrupted between the two
+left a directory an open read as a database whose format version had never been
+recorded, which is the one case that message is for. Both orders leave an
+unfinished directory refused; only one of them describes what is there.
+
 **A directory holding any `marker.` file is refused rather than written into.**
 What is there is either a database this would overwrite or a creation that did
 not finish, and one marker cannot say which, so the operator clears the

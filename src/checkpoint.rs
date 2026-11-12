@@ -22,7 +22,9 @@
 //! Four things go in, and the list is short because a database is short:
 //! hard links to the live tables, a MANIFEST holding one edit that describes
 //! the version, and the two markers that say which MANIFEST to replay and
-//! which format version it is in.
+//! which format version it is in — in that order, the manifest marker last,
+//! so that the moment the directory reads as a database is the moment
+//! everything it names is already in it.
 //!
 //! **Links rather than copies.** A table is immutable once written, so the
 //! checkpoint and the store can share the bytes until one of them deletes
@@ -109,7 +111,14 @@ impl<F: Fs> Opened<F> {
 
         // Iteration one for both markers: the directory is new, so there is
         // nothing for them to supersede.
-        crate::rotate::move_marker(self.fs(), dir, MARKER_MANIFEST, 1, &filename).await?;
+        //
+        // The format version goes first and the manifest marker last, as
+        // `crate::create`'s do and for the same reason: the manifest marker
+        // is what makes a directory read as a database, so a checkpoint that
+        // stopped between the two is refused for holding no database rather
+        // than for holding one whose format version was never recorded. Both
+        // are refusals — an unfinished checkpoint is rubbish either way — but
+        // only one of them describes what is actually there.
         crate::rotate::move_marker(
             self.fs(),
             dir,
@@ -122,6 +131,7 @@ impl<F: Fs> Opened<F> {
             &files::format_version_value(self.format_version),
         )
         .await?;
+        crate::rotate::move_marker(self.fs(), dir, MARKER_MANIFEST, 1, &filename).await?;
         self.fs().sync_dir(dir).await?;
         Ok(())
     }
