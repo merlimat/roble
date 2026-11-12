@@ -83,7 +83,7 @@ fn tables(names: &[String]) -> Vec<u64> {
         .collect()
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -101,7 +101,7 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
 /// table it adds, the log it retires — and a compaction following it would
 /// change the version before the assertion could read it.
 /// `tests/schedule.rs` is where the scheduling is the subject.
-async fn open_unscheduled<'a>(env: &'a SimEnv, dir: &Path) -> roble::Opened<'a, SimFs> {
+async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Opened<SimFs> {
     roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open")
@@ -409,7 +409,7 @@ async fn an_interrupted_flush_leaves_a_table_the_next_open_collects() {
 }
 
 /// The tables of L0, which the fixtures leave with something to compact.
-fn in_l0<F: Fs>(db: &roble::Opened<'_, F>) -> Vec<u64> {
+fn in_l0<F: Fs>(db: &roble::Opened<F>) -> Vec<u64> {
     let found: Vec<u64> = db
         .versions()
         .version

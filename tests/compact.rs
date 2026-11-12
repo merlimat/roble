@@ -53,7 +53,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -70,14 +70,14 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
 /// and the tests that use this name the tables to merge themselves: a flush
 /// that compacted for itself would have moved them first.
 /// `tests/schedule.rs` is where the scheduling is the subject.
-async fn open_unscheduled<'a>(env: &'a SimEnv, dir: &Path) -> roble::Opened<'a, SimFs> {
+async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Opened<SimFs> {
     roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open")
 }
 
 /// Writes a batch and flushes it, giving one L0 table.
-async fn flush_batch<F: Fs>(db: &roble::Opened<'_, F>, batch: &mut Batch) -> u64 {
+async fn flush_batch<F: Fs>(db: &roble::Opened<F>, batch: &mut Batch) -> u64 {
     db.write(batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table")
 }
@@ -93,7 +93,7 @@ fn one_output(outputs: Vec<u64>) -> u64 {
 }
 
 /// How many bytes every table of the version takes.
-fn table_bytes<F: Fs>(db: &roble::Opened<'_, F>) -> u64 {
+fn table_bytes<F: Fs>(db: &roble::Opened<F>) -> u64 {
     db.versions()
         .version
         .levels()
@@ -628,7 +628,7 @@ async fn a_scan_open_across_a_compaction_keeps_reading() {
 }
 
 /// Opens with a target file size small enough that a test can cross it.
-async fn open_splitting<'a>(env: &'a SimEnv, dir: &Path, target: u64) -> roble::Opened<'a, SimFs> {
+async fn open_splitting(env: &SimEnv, dir: &Path, target: u64) -> roble::Opened<SimFs> {
     roble::open_with(env, dir, roble::Options::new().target_file_size(target))
         .await
         .expect("open")

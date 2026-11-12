@@ -111,7 +111,7 @@ impl Pick {
     }
 }
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// The compaction worth running, if any level is past its allowance.
     ///
     /// Ties go to the level nearest L0, which is where a table being there

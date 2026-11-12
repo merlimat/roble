@@ -60,7 +60,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -72,12 +72,7 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
 }
 
 /// Writes `count` keys from `at` and flushes, giving one L0 table.
-async fn flush_keys<F: Fs>(
-    db: &roble::Opened<'_, F>,
-    prefix: &str,
-    at: usize,
-    count: usize,
-) -> u64 {
+async fn flush_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, at: usize, count: usize) -> u64 {
     let mut batch = Batch::new();
     for i in at..at + count {
         batch

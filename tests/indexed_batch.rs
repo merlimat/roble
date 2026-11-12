@@ -64,7 +64,7 @@ async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
     out
 }
 
-async fn store_contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn store_contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     walk(&mut db.scan().await.expect("scan")).await
 }
 

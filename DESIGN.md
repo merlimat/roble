@@ -903,13 +903,28 @@ is what rules `O_DIRECT` out of the open and puts it under the block cache
 instead (§8). `Db` is `!Send` and `!Sync`, a cheap `Clone` handle shared by one
 thread's tasks. `DefaultEnv` uses compio.
 
+**A store owns its filesystem.** `Clone` is on the trait because a store
+keeps the `Fs` it was opened in rather than borrowing it, which is what makes
+a store a `'static` value: `Env::spawn` takes `'static` futures, and a store
+that borrowed its filesystem could be owned by nothing but the stack frame it
+was opened on — so a compaction could only ever run inside the call that
+started it. Both implementations were already handles, `FileFs` a unit struct
+and `SimFs` one `Rc`, and an implementation holding real state is expected to
+do the same. This is what a compaction running behind the caller's back needs
+and not all of what it needs: a compaction holding the one change permit (§5)
+for the length of its merge makes a flush wait for it whichever way round
+they are, so the permit has to be narrowed to the edit — with per-table marks
+so that two compactions cannot choose the same inputs, as Pebble's
+`compacting` flag does — before moving the work off the caller's stack buys
+anything.
+
 **What has to change, and why.** encina has one file, created once. An LSM
 creates, renames, links and deletes files constantly, and its correctness
 depends on directory syncs. So the env grows a filesystem, which is Pebble's
 `vfs.FS` in Rust terms:
 
 ```rust
-pub trait Fs {
+pub trait Fs: Clone {
     type Disk: Disk;
     /// Held for as long as this process owns the directory.
     type Lock;

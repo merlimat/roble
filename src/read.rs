@@ -93,7 +93,7 @@ struct Candidate {
     value: Vec<u8>,
 }
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// Reads the key `how` says, or `None` if there is none.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
         let _timer = self.metrics.get.start();

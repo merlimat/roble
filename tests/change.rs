@@ -150,7 +150,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -162,7 +162,7 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
 }
 
 /// Writes `n` keys under `prefix`, and says what they were.
-async fn write_keys<F: Fs>(db: &roble::Opened<'_, F>, prefix: &str, n: usize) -> Model {
+async fn write_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, n: usize) -> Model {
     let mut batch = Batch::new();
     let mut written = Model::new();
     for i in 0..n {
@@ -175,11 +175,7 @@ async fn write_keys<F: Fs>(db: &roble::Opened<'_, F>, prefix: &str, n: usize) ->
 }
 
 /// Sets up a store with keys waiting in its memtable, pausing at `n`.
-async fn ready_to_flush<'a>(
-    env: &'a SimEnv,
-    dir: &'a Path,
-    n: u64,
-) -> (roble::Opened<'a, SimFs>, Model) {
+async fn ready_to_flush(env: &SimEnv, dir: &Path, n: u64) -> (roble::Opened<SimFs>, Model) {
     let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open");
@@ -247,11 +243,11 @@ async fn two_flushes_at_once_never_write_the_same_table() {
 
 /// Opens `db-reads` with compaction left to the caller, writes keys, and says
 /// which tables are in L0.
-async fn ready_to_compact<'a>(
-    env: &'a SimEnv,
-    dir: &'a Path,
+async fn ready_to_compact(
+    env: &SimEnv,
+    dir: &Path,
     prefix: &str,
-) -> (roble::Opened<'a, SimFs>, Model, Vec<u64>) {
+) -> (roble::Opened<SimFs>, Model, Vec<u64>) {
     let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open");

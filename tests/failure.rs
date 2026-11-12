@@ -76,7 +76,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();

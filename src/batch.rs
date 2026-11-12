@@ -61,13 +61,13 @@ use crate::scan::Scan;
 /// [`IndexedBatch::scan`], and applied to the store by
 /// [`IndexedBatch::commit`].
 pub struct IndexedBatch<'a, F: Fs> {
-    db: &'a Opened<'a, F>,
+    db: &'a Opened<F>,
     repr: Batch,
     index: Rc<RefCell<Memtable>>,
 }
 
 impl<'a, F: Fs> IndexedBatch<'a, F> {
-    pub(crate) fn new(db: &'a Opened<'a, F>) -> Self {
+    pub(crate) fn new(db: &'a Opened<F>) -> Self {
         IndexedBatch {
             db,
             repr: Batch::new(),
@@ -205,7 +205,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     }
 }
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// A batch that can be read back through itself before it commits.
     pub fn batch(&self) -> IndexedBatch<'_, F> {
         IndexedBatch::new(self)
