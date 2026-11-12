@@ -41,7 +41,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, where the other jobs track stable, because this one does not
+      # just measure: it compares its number against the one a previous run
+      # posted. Coverage instrumentation differs between compiler versions, so
+      # `@stable` means the two sides of that comparison can be measured by
+      # different compilers.
+      #
+      # Which happened when Rust 1.100 landed. A branch byte-identical to main
+      # in `src/`, `format/`, `cli/`, `tests/` and both manifests scored 275
+      # missed lines under 1.100.0 against main's 236 under 1.99.1 — the same
+      # 0.5 points apart on both of its runs, spread over twenty-two files it
+      # never touched, several moving the other way, both runs having executed
+      # the same 38 test binaries and the same 459 tests. The gate failed it
+      # for a drop that was the instrument moving and not the code.
+      #
+      # 1.99.1 and not the newest, because every baseline this gate has posted
+      # so far was measured by it: pinning forward would make the next pull
+      # request fail against a stale number rather than fix anything. A patch
+      # version and not `1.99`, so that a patch release cannot move it either.
+      #
+      # Bumping it is deliberate, and the run after a bump posts a new baseline
+      # while the one comparing across it may show a step. That is visible and
+      # explicable, where `@stable` silently was not.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
