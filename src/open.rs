@@ -118,6 +118,8 @@ pub struct Opened<F: Fs> {
     /// it: a rotation adds one, and the obsolete sweep removes what it
     /// deleted.
     markers: std::cell::RefCell<Vec<String>>,
+    /// How many bytes a memtable holds before a write writes it out (§4).
+    memtable_size: u64,
     /// How large the MANIFEST may grow before a flush replaces it.
     max_manifest_bytes: u64,
     /// How many readers are open for each of this store's tables, which is
@@ -339,6 +341,7 @@ pub async fn open_with<E: Env>(
         table_entries: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         records_in_tables: std::cell::Cell::new(0),
         markers: std::cell::RefCell::new(markers),
+        memtable_size: options.memtable_size,
         max_manifest_bytes: options.max_manifest_bytes,
         readers: std::rc::Rc::new(crate::obsolete::Readers::default()),
         manifest_failed: std::cell::Cell::new(false),
@@ -601,6 +604,24 @@ impl<F: Fs> Opened<F> {
             )));
         }
 
+        // Room for this batch before it is accepted, which is the only thing
+        // that bounds a store's memory: nothing else writes a memtable out
+        // unless a caller asks (§4).
+        //
+        // Before the batch is applied rather than after, and that is the
+        // whole of the ordering. A flush that fails here fails a write that
+        // has not happened, so a caller handed the error has nothing of its
+        // batch in the store and can simply try again. The other way round,
+        // the write would be in the log and in the memtable and reported as
+        // failed, and a caller doing the obvious thing would write bytes the
+        // store already had.
+        //
+        // And before the count below, which is not a matter of taste: the
+        // flush inside here freezes the memtable, and a freeze waits for
+        // every write in flight to finish (§5, `crate::change`). A write
+        // that had counted itself first would be waiting for itself.
+        self.make_room().await?;
+
         // Counted from here to the end of the function, which is the span a
         // freeze may not happen in: the log record and the memtable entry
         // have to land on the same side of one (§5, `crate::change`).
@@ -665,6 +686,34 @@ impl<F: Fs> Opened<F> {
             .memtable_size
             .set(self.unflushed_bytes() as i64);
         self.saw_records();
+        Ok(())
+    }
+
+    /// Writes a memtable out if the store has reached its budget, so that
+    /// the batch about to be applied has somewhere to go
+    /// ([`crate::Options::memtable_size`]).
+    ///
+    /// **Every** memtable counts, the one a failed flush left frozen
+    /// included (§5): the budget is what the store holds, not what one of
+    /// its memtables holds. So the first write after a failed flush pays for
+    /// the retry, which is the tighter bound and the sooner recovery both —
+    /// and a store that cannot shed what it holds refuses writes rather than
+    /// growing past the budget, which is where the write stall belongs (§9).
+    ///
+    /// One flush writes one memtable, and that is enough: what a frozen one
+    /// holds arrived while the store was under the budget, so writing it out
+    /// puts the store back under it.
+    ///
+    /// This is a `flush` and not half of one, so it also runs the compaction
+    /// the picker chose (§9). A store filled only through `write` would
+    /// otherwise pile L0 up for ever, which is the thing a flush was taught
+    /// to prevent; a caller who would rather decide when to merge has
+    /// [`crate::Options::disable_automatic_compactions`] for it.
+    async fn make_room(&self) -> Result<()> {
+        if (self.unflushed_bytes() as u64) < self.memtable_size {
+            return Ok(());
+        }
+        self.flush().await?;
         Ok(())
     }
 
@@ -760,6 +809,12 @@ impl<F: Fs> Opened<F> {
     /// Takes account of an append to the MANIFEST that failed.
     pub(crate) fn saw_manifest_failure(&self) {
         self.manifest_failed.set(true);
+    }
+
+    /// How many bytes a memtable holds before a write writes it out (§4),
+    /// as [`crate::Options`] was asked for.
+    pub fn memtable_size(&self) -> u64 {
+        self.memtable_size
     }
 
     /// How large the MANIFEST may grow before a flush replaces it

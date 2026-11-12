@@ -54,7 +54,7 @@ so the series are there at zero before anything has gone wrong.
 
 | Metric | Instrument | Unit | What it says |
 |---|---|---|---|
-| `roble.write.duration` | latency | s | Time a successful write takes, from the call until its batch is in the memtable |
+| `roble.write.duration` | latency | s | Time a successful write takes, from the call until its batch is in the memtable, the flush it paid for included when it found the store at `memtable_size` |
 | `roble.write.operations` | counter | `{operation}` | Operations in the batches written successfully, by kind |
 | `roble.write.size` | histogram | By | Bytes of the batch representation of each write |
 | `roble.write.bytes` | counter | By | Bytes of the batch representations written successfully |
@@ -224,5 +224,7 @@ to poll and nothing to memoize.
 - **The two write stalls** of §9, and the time spent in them — a write waiting
   for a memtable, and a write waiting for L0 to drain. Nothing stalls yet, and a
   counter for an event that cannot happen says nothing; they arrive with the
-  waiting they count.
+  waiting they count. A write that finds the store at `memtable_size` and
+  writes a memtable out is not stalling: nothing is waiting on anybody, and the
+  time is in `roble.write.duration` where the rest of that write's time is.
 - **L0 sublevels**, which roble does not build yet.
