@@ -1231,3 +1231,43 @@ async fn a_compaction_that_failed_is_counted_and_said_out_loud() {
         "with the store it happened to: {said:?}"
     );
 }
+
+#[compio::test]
+async fn l0s_sublevels_are_counted_and_not_its_tables() {
+    // What a read of L0 costs, which is not how many tables are in it (§9).
+    // The same key range flushed three times stacks three layers deep; the
+    // fixture's own table overlaps none of them and shares the bottom one.
+    let (options, tag) = metered("sublevels");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options.disable_automatic_compactions(true))
+        .await
+        .expect("open");
+
+    for round in 0..3 {
+        let mut batch = Batch::new();
+        for i in 0..4 {
+            batch
+                .put(format!("q{i:03}").as_bytes(), format!("{round}").as_bytes())
+                .expect("put");
+        }
+        db.write(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush").expect("a table");
+    }
+
+    assert_eq!(
+        db.versions().version.level(0).len(),
+        4,
+        "the fixture's table and the three flushed here"
+    );
+    let seen = collected(reader(), &tag);
+    assert_eq!(
+        seen.get("roble.l0.sublevels").copied(),
+        Some(3),
+        "three of the four overlap each other and the fourth overlaps none of them: {seen:?}"
+    );
+    assert_eq!(
+        seen.get("roble.level.tables").copied(),
+        Some(4),
+        "and the table count is still the table count: {seen:?}"
+    );
+}

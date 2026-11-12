@@ -150,3 +150,118 @@ async fn l0_may_overlap_as_much_as_it_likes() {
     ])
     .expect("L0 overlap is not an error");
 }
+
+/// An L0 table spanning `smallest`..`largest`, written at `seq`.
+///
+/// L0's tables are ordered by sequence number rather than by key and are
+/// allowed to overlap, which is what makes their sublevels a question.
+fn in_l0(file_num: u64, smallest: &[u8], largest: &[u8], seq: u64) -> NewTable {
+    NewTable {
+        level: 0,
+        file_num,
+        size: 100,
+        smallest: key::encode(smallest, seq, Kind::Set),
+        largest: key::encode(largest, seq, Kind::Set),
+        smallest_seq_num: seq,
+        largest_seq_num: seq,
+        marked_for_compaction: false,
+        creation_time: 0,
+    }
+}
+
+/// How many layers L0's tables form in the version `tables` replays to.
+fn sublevels(tables: Vec<NewTable>) -> usize {
+    replay(tables)
+        .expect("the version")
+        .version
+        .l0_sublevels()
+        .expect("the sublevels")
+}
+
+#[compio::test]
+async fn an_l0_with_nothing_in_it_is_no_sublevels() {
+    assert_eq!(sublevels(vec![table(1, 1, b"a", b"b", 20, Kind::Set)]), 0);
+}
+
+#[compio::test]
+async fn l0_tables_that_do_not_overlap_are_one_sublevel() {
+    // The shape a store writing in key order produces, and the whole reason
+    // the count of tables is the wrong number: four tables here cost one
+    // seek, not four.
+    assert_eq!(
+        sublevels(vec![
+            in_l0(1, b"a0", b"a9", 10),
+            in_l0(2, b"b0", b"b9", 20),
+            in_l0(3, b"c0", b"c9", 30),
+            in_l0(4, b"d0", b"d9", 40),
+        ]),
+        1
+    );
+}
+
+#[compio::test]
+async fn l0_tables_written_in_descending_key_order_are_still_one_sublevel() {
+    // The same four tables as above, written the other way round: each one
+    // starts *before* every table already placed ends, and ends before any
+    // of them starts. An overlap test that only asked the first of those two
+    // questions would stack all four.
+    assert_eq!(
+        sublevels(vec![
+            in_l0(1, b"d0", b"d9", 10),
+            in_l0(2, b"c0", b"c9", 20),
+            in_l0(3, b"b0", b"b9", 30),
+            in_l0(4, b"a0", b"a9", 40),
+        ]),
+        1
+    );
+}
+
+#[compio::test]
+async fn l0_tables_that_all_overlap_are_a_sublevel_each() {
+    // The other extreme: the same key range written four times over, which
+    // is four seeks and the number the thresholds are really about.
+    assert_eq!(
+        sublevels(vec![
+            in_l0(1, b"a0", b"a9", 10),
+            in_l0(2, b"a0", b"a9", 20),
+            in_l0(3, b"a0", b"a9", 30),
+            in_l0(4, b"a0", b"a9", 40),
+        ]),
+        4
+    );
+}
+
+#[compio::test]
+async fn a_sublevel_fills_up_sideways_before_it_stacks() {
+    // Two that do not overlap each other share a layer, and the one that
+    // overlaps both goes above the pair rather than above each of them.
+    assert_eq!(
+        sublevels(vec![
+            in_l0(1, b"a0", b"a9", 10),
+            in_l0(2, b"c0", b"c9", 20),
+            in_l0(3, b"a5", b"c5", 30),
+        ]),
+        2
+    );
+}
+
+#[compio::test]
+async fn tables_that_only_touch_are_not_stacked() {
+    // §5 lets the tables of a level share a user key at their bounds when
+    // the first ends there *exclusively*, which is what a compaction split
+    // inside a range deletion leaves. Reading that as an overlap would count
+    // a seek that no read makes.
+    let touching = vec![
+        table(0, 1, b"a0", b"b0", SEQ_NUM_MAX, Kind::RangeDelete),
+        in_l0(2, b"b0", b"c0", 30),
+    ];
+    assert_eq!(sublevels(touching), 1);
+
+    // And the same two bounds with an ordinary trailer on the first do
+    // overlap, because then it holds keys at `b0` as well.
+    let overlapping = vec![
+        table(0, 1, b"a0", b"b0", 10, Kind::Set),
+        in_l0(2, b"b0", b"c0", 30),
+    ];
+    assert_eq!(sublevels(overlapping), 2);
+}

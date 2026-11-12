@@ -442,7 +442,7 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   bounds a store's memory**: nothing else writes a memtable out unless a caller
   asks (§6).
 - **Versions are immutable, and what they name is reference counted.** A
-  version is the set of files per level, with L0 as sublevels. A flush or a
+  version is the set of files per level. A flush or a
   compaction produces a version edit, which is appended to the MANIFEST and
   then applied; a reader holding an older version is unaffected, so a
   snapshot costs one reference count, as an encina iterator does. The count
@@ -914,8 +914,33 @@ tombstone costs a reader a comparison and dropping a live one brings a key
 back from the dead. The output is split at `Options::target_file_size` — 2 MiB
 for L0 and twice that for each level below, as Pebble's `TargetFileSizes` —
 and a tombstone straddling a split is clipped at it, so the tables either side
-meet at one user key rather than overlapping across it. L0 sublevels and the
-write-stall counters are still owed.
+meet at one user key rather than overlapping across it.
+
+**L0 sublevels.** L0 is the one level whose tables overlap, so a read may have
+to look in several of them — but not in all of them. Partition L0 into layers
+within which no two tables overlap and a read consults at most one table per
+layer: the number of layers is L0's read amplification, and the number of
+tables is only an upper bound on it. Ten tables flushed from disjoint key
+ranges are one layer and one seek.
+
+`Version::l0_sublevels` computes it by Pebble's rule
+(`internal/manifest/l0_sublevels.go`): take the tables oldest first by the
+largest sequence number each holds, and put each one a layer above the highest
+layer holding a table it overlaps. Two things stay true at once — no two tables
+in a layer overlap, and a newer table is always above any older table it
+overlaps, so a read walking down the layers meets the newest version of a key
+first. Two tables that only *touch*, where the first ends at the sentinel a
+range deletion leaves, do not overlap and share a layer (§5).
+
+What this does **not** do yet is change what the thresholds count.
+`l0_compaction_threshold` and `l0_stop_writes_threshold` still count L0's
+tables, where Pebble's count its sublevels — so roble compacts earlier and
+stalls earlier than Pebble would, which is conservative and not the same
+number. Switching them is a change to when compaction happens rather than to
+what anything measures, and it needs the tests that build L0 to build one with
+read amplification in it: flushing a fresh key range each time, which is what
+most of them do, makes ten tables and one sublevel, and every L0 threshold in
+the suite would stop being reached.
 
 A compaction is paced in units of work (`crate::work`): every
 `Options::compaction_unit` entries it hands the executor back and resumes, so
@@ -946,7 +971,7 @@ which needs a store that can be handed to a task of its own — an ownership
 question rather than a pacing one.
 
 Compaction is the cost encina does not pay, and the only background CPU work in
-roble. Leveled, with L0 as sublevels, and a **picker** — the component that
+roble. Leveled, with L0 counted in sublevels, and a **picker** — the component that
 decides, each time compaction can run, which level and which of its files to
 compact into the level below, by scoring every level's size against the target
 size for that level and taking the worst, as Pebble's does. Compatibility

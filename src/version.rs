@@ -104,6 +104,31 @@ impl Table {
     pub fn largest_user_key(&self) -> Result<&[u8]> {
         Ok(InternalKey::decode(&self.largest)?.user_key)
     }
+
+    /// Whether the two hold keys in the same range.
+    ///
+    /// Bounds are inclusive at both ends unless the larger one is the
+    /// sentinel a range deletion leaves, which excludes its user key — so
+    /// two tables may **touch** at a key without overlapping, which is what
+    /// §5 allows the tables of one level to do
+    /// ([`Table::largest_is_exclusive`]).
+    ///
+    /// `crate::compact`'s own range expansion asks a looser question — it
+    /// takes the bounds as inclusive either way — and is left as it is:
+    /// reading a touching bound as overlapping there pulls one more table
+    /// into a compaction, which is slower and not wrong.
+    pub fn overlaps(&self, other: &Table) -> Result<bool> {
+        // Does `a` start at or before `b` ends?
+        let starts_within = |a: &Table, b: &Table| -> Result<bool> {
+            let (from, to) = (a.smallest_user_key()?, b.largest_user_key()?);
+            Ok(if b.largest_is_exclusive()? {
+                from < to
+            } else {
+                from <= to
+            })
+        };
+        Ok(starts_within(self, other)? && starts_within(other, self)?)
+    }
 }
 
 /// Which tables are in the database, by level.
@@ -131,6 +156,57 @@ impl Version {
             .iter()
             .enumerate()
             .map(|(i, tables)| (i as u32, tables.as_slice()))
+    }
+
+    /// How many **sublevels** L0's tables form, which is what a read of L0
+    /// actually costs (§9).
+    ///
+    /// L0 is the one level whose tables overlap, so a read may have to look
+    /// in several of them — but not in all of them. Partition L0 into layers
+    /// within which no two tables overlap and a read consults at most one
+    /// table per layer: the number of layers is L0's read amplification, and
+    /// the number of tables is only an upper bound on it. Ten tables written
+    /// from disjoint key ranges are one layer and one seek.
+    ///
+    /// Pebble's rule, from `internal/manifest/l0_sublevels.go`: take the
+    /// tables oldest first by the largest sequence number each holds, and
+    /// put each one a layer above the highest layer holding a table it
+    /// overlaps. That keeps two things true at once — no two tables in a
+    /// layer overlap, and a newer table is always above any older table it
+    /// overlaps, so a read walking down the layers meets the newest version
+    /// of a key first.
+    ///
+    /// Untested, with a reason (§12): that the order is oldest **first**.
+    /// The number of layers is the longest chain of overlaps, and reversing
+    /// the direction a chain is walked in does not change its length, so no
+    /// count can tell oldest-first from newest-first. What the order is for
+    /// is the read invariant above, which a count does not expose; it
+    /// becomes testable when the assignment itself does, which is what
+    /// reading L0 by sublevel and compacting part of it would both need.
+    ///
+    /// Quadratic in the number of L0 tables, which is a number a store works
+    /// to keep near four and refuses to let past twelve (§9). Pebble's is
+    /// cleverer because Pebble's L0 can be far deeper.
+    pub fn l0_sublevels(&self) -> Result<usize> {
+        let mut order: Vec<&Table> = self.level(0).iter().collect();
+        // Stable, so tables that somehow shared a sequence number would keep
+        // the order the version holds them in. L0 is filled by flushes and no
+        // two flushes share one, so that is a tie that does not arise.
+        order.sort_by_key(|t| t.largest_seq_num);
+
+        let mut placed: Vec<(usize, &Table)> = Vec::with_capacity(order.len());
+        let mut sublevels = 0;
+        for table in order {
+            let mut at = 0;
+            for (sublevel, under) in &placed {
+                if *sublevel >= at && table.overlaps(under)? {
+                    at = sublevel + 1;
+                }
+            }
+            placed.push((at, table));
+            sublevels = sublevels.max(at + 1);
+        }
+        Ok(sublevels)
     }
 
     /// How many tables the version holds.

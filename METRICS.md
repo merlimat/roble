@@ -115,6 +115,7 @@ Both halves are counters rather than histograms so that the ratio can be taken.
 |---|---|---|---|
 | `roble.level.tables` | up-down counter | `{table}` | Tables in each level of the store's current version |
 | `roble.level.size` | up-down counter | By | Bytes of the tables in each level |
+| `roble.l0.sublevels` | up-down counter | `{sublevel}` | Layers L0's tables form, which is what a read of L0 costs |
 | `roble.disk.size` | up-down counter | By | Bytes of every file in the store's directory |
 | `roble.compaction.debt` | up-down counter | By | Bytes the levels hold above what their allowances let them |
 | `roble.records.estimate` | up-down counter | `{record}` | Records the store holds, counting every version of a key and every tombstone |
@@ -216,7 +217,7 @@ what each becomes here.
 | `pebble_max_cache_size` | `roble.cache.limit{roble.cache="block"}` |
 | `pebble_block_cache_hits` / `_misses` | `roble.cache.lookups`, by `roble.cache.result` |
 | `pebble_read` | `roble.disk.io{disk.io.direction="read"}` |
-| `pebble_l0_sublevels` | *not yet* — roble has no L0 sublevels |
+| `pebble_l0_sublevels` | `roble.l0.sublevels` |
 | `kv_pebble_write_stalls`, `kv_pebble_write_stall_time` | `roble.write.stalls`, `roble.write.stall.duration` |
 
 Pebble's gauges are read from one `db.Metrics()` call that Oxia memoizes for
@@ -230,4 +231,9 @@ to poll and nothing to memoize.
   running would be worth telling apart from one that waits for a merge another
   write is paying for, and today there is no background task to tell apart
   (§9). The attribute gains a value when it does.
-- **L0 sublevels**, which roble does not build yet.
+- **Thresholds measured in sublevels.** `roble.l0.sublevels` says what a read
+  of L0 costs, but `l0_compaction_threshold` and `l0_stop_writes_threshold`
+  still count L0's *tables*, where Pebble's count its sublevels. Counting
+  tables is the upper bound on the sublevels, so roble compacts earlier and
+  stalls earlier than Pebble would — conservative, and not the same number.
+  §9 says what switching them involves.
