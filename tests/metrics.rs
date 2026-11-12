@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use opentelemetry::KeyValue;
@@ -1134,5 +1134,100 @@ async fn a_write_that_waited_is_counted_by_what_it_waited_for() {
         reasons.get("l0").copied(),
         Some(1),
         "and one waited for L0 to be drained: {reasons:?}"
+    );
+}
+
+/// Every `tracing` event the store emitted, as one string each.
+///
+/// A subscriber of its own rather than `tracing-subscriber`, because what is
+/// wanted here is a list of strings and not a formatter. Global, because
+/// `tracing`'s default subscriber is one: the test below is the only thing
+/// that looks at it, and every other test emitting nothing is exactly what is
+/// expected of them.
+static EVENTS: LazyLock<Arc<Mutex<Vec<String>>>> = LazyLock::new(|| {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    tracing::subscriber::set_global_default(Recorder(Arc::clone(&events)))
+        .expect("the global subscriber");
+    events
+});
+
+struct Recorder(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Recorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut Fields(&mut line));
+        self.0.lock().expect("the events").push(line);
+    }
+
+    // Spans, which roble does not open: the trait requires them all the same.
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+    fn enter(&self, _: &tracing::Id) {}
+    fn exit(&self, _: &tracing::Id) {}
+}
+
+/// Writes an event's fields into one string, the message among them.
+struct Fields<'a>(&'a mut String);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+#[compio::test]
+async fn a_compaction_that_failed_is_counted_and_said_out_loud() {
+    // A compaction often has nobody to return an error to: a flush swallows
+    // the one it scheduled, and a task running one in the background was told
+    // to by a flush that has already returned (§9). So it is said twice over,
+    // and both halves are worth pinning — a counter nobody increments and a
+    // line nobody writes are the same kind of silence.
+    let (options, tag) = metered("compaction-errors");
+    let events = LazyLock::force(&EVENTS);
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open_with(&env, &dir, options.disable_automatic_compactions(true))
+        .await
+        .expect("open");
+    assert!(
+        db.pick().is_some(),
+        "the fixture should arrive wanting a compaction"
+    );
+
+    env.sim().fail_at(1);
+    db.compact_once()
+        .await
+        .expect_err("the compaction should have failed");
+    env.sim().stop_failing();
+
+    let seen = collected(reader(), &tag);
+    assert_eq!(
+        seen.get("roble.compaction.errors").copied(),
+        Some(1),
+        "one compaction failed: {seen:?}"
+    );
+    let kinds = by_attr(reader(), &tag, "roble.compaction.errors", "error.type");
+    assert_eq!(
+        kinds.get("io").copied(),
+        Some(1),
+        "and the disk is what went wrong: {kinds:?}"
+    );
+
+    let said = events.lock().expect("the events").clone();
+    assert!(
+        said.iter().any(|e| e.contains("compaction failed")),
+        "and it should have been said out loud: {said:?}"
+    );
+    assert!(
+        said.iter().any(|e| e.contains("/db")),
+        "with the store it happened to: {said:?}"
     );
 }

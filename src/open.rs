@@ -139,6 +139,11 @@ pub struct Opened<F: Fs> {
     /// two compactions off the same ones now that neither holds the permit
     /// across its merge (§9, `crate::change`).
     compacting: crate::change::Compacting,
+    /// Who is waiting to be told there is a compaction worth running (§9).
+    compaction_waiters: crate::change::Waiters,
+    /// Whether the last compaction failed, in which case the picker's answer
+    /// is not worth asking for again until the version changes (§9).
+    compaction_failed: std::cell::Cell<bool>,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -337,6 +342,8 @@ pub async fn open_with<E: Env>(
         frozen: std::cell::RefCell::new(None),
         writers: Default::default(),
         compacting: Default::default(),
+        compaction_waiters: Default::default(),
+        compaction_failed: std::cell::Cell::new(false),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
@@ -903,6 +910,77 @@ impl<F: Fs> Opened<F> {
     /// The tables the compaction underway is reading (§9).
     pub(crate) fn compacting(&self) -> &crate::change::Compacting {
         &self.compacting
+    }
+
+    /// Waits until there is a compaction worth running.
+    ///
+    /// What a background compaction is built out of. **The store runs no
+    /// tasks of its own**: `Env::spawn` takes a `'static` future and these
+    /// methods take `&self`, so a task that compacted would have to hold the
+    /// store — and then dropping the store would not release the directory
+    /// until that task had finished, which `Drop` cannot wait for. So the
+    /// task belongs to the caller, which also owns stopping it:
+    ///
+    /// ```ignore
+    /// let worker = std::rc::Rc::clone(&db);
+    /// env.spawn(async move {
+    ///     loop {
+    ///         worker.compaction_wanted().await;
+    ///         let _ = worker.compact_once().await;
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// A flush that finds somebody waiting here leaves the merge to them and
+    /// returns; a flush that finds nobody runs it where it stands (§9). So a
+    /// store with a task like that one stops paying for merges inside its
+    /// writes, and a store without one behaves exactly as it did.
+    ///
+    /// A task is not told while another compaction is underway, because the
+    /// picker would name the tables that one has claimed and `compact_once`
+    /// would stand down — and then this would say yes again at once, which
+    /// is a spin and not a wait.
+    ///
+    /// Level-triggered, and asked again on every poll, so a task that starts
+    /// after the work appeared is told at once rather than waiting for a
+    /// flush that may not come. The one exception is a compaction that
+    /// **failed**: that is not wanted again until the version changes,
+    /// because the picker would give the same answer against the same
+    /// version and asking for it again at once is a spin rather than a
+    /// retry. The next flush is what makes it a retry.
+    pub async fn compaction_wanted(&self) {
+        std::future::poll_fn(|cx| {
+            // Somebody is already on it. Waiting for them is the only answer
+            // that does not spin: the picker would name the tables they have
+            // claimed, `compact_once` would stand down, and this would say
+            // yes again at once (§9, `crate::change::Compacting`).
+            if self.compacting.underway() {
+                self.compacting.park(cx);
+                return std::task::Poll::Pending;
+            }
+            if self.compaction_failed.get() || self.pick().is_none() {
+                self.compaction_waiters.park(cx);
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(())
+        })
+        .await
+    }
+
+    /// Takes account of the version having changed: a compaction that failed
+    /// is worth trying again, and anybody waiting to be told there is work is
+    /// woken.
+    ///
+    /// Says whether it woke anybody, which is how a flush knows whether the
+    /// merge is somebody else's now (§9).
+    pub(crate) fn version_changed(&self) -> bool {
+        self.compaction_failed.set(false);
+        self.compaction_waiters.wake()
+    }
+
+    /// Takes account of a compaction that failed.
+    pub(crate) fn saw_compaction_failure(&self) {
+        self.compaction_failed.set(true);
     }
 
     /// The permit every operation that changes what the database is made of

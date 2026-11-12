@@ -144,9 +144,34 @@ impl<F: Fs> Opened<F> {
         }))
     }
 
-    /// Carries out `plan`: the merge with no permit held, then the outputs
-    /// and the edit that claims them with it.
+    /// Carries out `plan`, and takes account of it having failed.
+    ///
+    /// A compaction often has nobody to hand an error to: a flush swallows
+    /// the one it scheduled, and a task running one in the background was
+    /// told to by a flush that has already returned (§9). So a failure is
+    /// said twice over — in a counter an operator graphs and a line an
+    /// operator reads — and is then left alone until the version changes,
+    /// because the picker would give the same answer against the same
+    /// version and asking again at once is a spin rather than a retry.
     pub(crate) async fn run(&self, plan: Plan<'_>) -> Result<Vec<u64>> {
+        let result = self
+            .metrics
+            .compaction_errors
+            .saw(self.run_inner(plan).await);
+        if let Err(e) = &result {
+            tracing::warn!(
+                store = %self.dir.display(),
+                error = %e,
+                "compaction failed"
+            );
+            self.saw_compaction_failure();
+        }
+        result
+    }
+
+    /// The compaction proper: the merge with no permit held, then the
+    /// outputs and the edit that claims them with it.
+    async fn run_inner(&self, plan: Plan<'_>) -> Result<Vec<u64>> {
         let _timer = self.metrics.compaction.start();
         let Plan {
             output_level,
@@ -232,6 +257,9 @@ impl<F: Fs> Opened<F> {
         // database's.
         let manifest_bytes = self.append_version_edit(&edit, &change).await?;
         self.versions_mut().apply(&edit)?;
+        // More may be worth compacting now, and whoever asked to be told is
+        // told here rather than waiting for the next flush (§9).
+        let _ = self.version_changed();
         if manifest_bytes >= self.max_manifest_bytes() {
             let _ = self.rotate_inner(&change).await;
         }

@@ -106,7 +106,14 @@ impl<F: Fs> Opened<F> {
         // picker to see: its answer is the one it already gave, which the
         // flush that wrote the last table already ran.
         if flushed.is_some() {
-            self.maybe_compact().await;
+            // Handed to whoever is waiting to be told there is work, and run
+            // here only if nobody is (§9,
+            // `crate::open::Opened::compaction_wanted`). A store whose
+            // caller runs a task for this stops paying for merges in its
+            // writes; a store without one is exactly as it was.
+            if !self.version_changed() {
+                self.maybe_compact().await;
+            }
         }
         Ok(flushed)
     }

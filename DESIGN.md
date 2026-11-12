@@ -1007,15 +1007,46 @@ owns L0's depth as well, and a write that waited for a merge nobody was going to
 run would wait for ever — which is what Pebble does in that configuration, and a
 worse answer than letting the caller have what it asked for.
 
-What is still owed is running the merge **off the write's stack**. A flush
-already triggers the compaction the picker chose, which is a trigger well below
-the stall line, but it runs there and then, so the write that caused the flush
-pays for it. The two things that were in the way are no longer: a store owns
-what it is opened with and so can be handed to a task of its own (§10), and a
-merge holds a claim rather than the permit, so a task running one does not stop
-a flush (§5). What is left is the trigger itself — `Env::spawn`, a handle to
-the store, and deciding what a failed background merge should do, given that
-nobody is waiting to be told.
+**Compacting in a task of its own.** A flush that finds somebody waiting to be
+told there is work tells them and returns; a flush that finds nobody runs the
+merge where it stands. `Opened::compaction_wanted` is the waiting, and the task
+is the **caller's**:
+
+```rust
+let worker = Rc::clone(&db);
+env.spawn(async move {
+    loop {
+        worker.compaction_wanted().await;
+        let _ = worker.compact_once().await;
+    }
+});
+```
+
+The store spawns nothing itself, and that is a decision rather than an
+omission. `Env::spawn` takes a `'static` future and a store's methods take
+`&self`, so a task the store spawned would have to hold the store — and then
+dropping the store would not release the directory until that task had
+finished, which `Drop` cannot wait for. A store that spawned would need a
+`close().await`, and a lifecycle roble does not otherwise have. The caller
+already owns its tasks and owns stopping them, so the division is: roble says
+when, the caller says where. It keeps §12 intact as well, because no operation
+count in a failure sweep then depends on when a runtime chose to poll a
+detached task.
+
+`compaction_wanted` is level-triggered and asked again on every poll, so a task
+that starts after the work appeared is told at once rather than waiting for a
+flush that may not come. The exception is a compaction that **failed**: the
+picker gives the same answer against the same version, so a task told to go
+again at once would spin rather than retry, and the next change to the version
+is what makes it a retry. That is "later" with no clock to say when (§10).
+
+A failure is said twice over, because a compaction often has nobody to return
+an error to — a flush swallows the one it scheduled, and a task running one was
+told to by a flush that has already returned. `roble.compaction.errors` counts
+it by what went wrong, and a `tracing` event at warn carries the store and the
+error. The facade only, and without `attributes`: roble emits events and never
+opens a span, and it stays silent, and reads no clock, unless the application
+installs a subscriber.
 
 ## 10. Concurrency and I/O
 

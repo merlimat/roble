@@ -113,6 +113,9 @@ const WAL_DURATION: LatencyDef = LatencyDef::new("roble.wal.append.duration").de
 const DISK_SIZE: UpDownCounterDef = UpDownCounterDef::new("roble.disk.size")
     .unit("By")
     .description("Bytes of every file in the store's directory");
+const COMPACTION_ERRORS: CounterDef = CounterDef::new("roble.compaction.errors")
+    .unit("{error}")
+    .description("Compactions that failed, by what went wrong");
 const COMPACTION_DURATION: LatencyDef = LatencyDef::new("roble.compaction.duration")
     .description("Time a compaction takes, from the call until its version edit is durable");
 const COMPACTION_TABLES: CounterDef = CounterDef::new("roble.compaction.tables")
@@ -298,6 +301,11 @@ pub(crate) struct Metrics {
     pub(crate) write_stall: [Latency; 2],
     pub(crate) disk_size: Amount,
     pub(crate) compaction: Latency,
+    /// Compactions that failed. Worth its own series because a compaction
+    /// often has nobody to return an error to: a flush swallows the one it
+    /// scheduled, and a task running one in the background was told to by a
+    /// flush that has already gone (§9).
+    pub(crate) compaction_errors: Errors,
     /// Tables read and written, in that order.
     pub(crate) compaction_tables: [Counter; 2],
     /// Bytes read and written, in that order.
@@ -347,6 +355,7 @@ impl Metrics {
             }),
             disk_size: meter.amount(DISK_SIZE, &[]),
             compaction: meter.latency(COMPACTION_DURATION, &[]),
+            compaction_errors: Errors::new(meter, COMPACTION_ERRORS),
             compaction_tables: ["read", "write"].map(|d| meter.counter(COMPACTION_TABLES, &io(d))),
             compaction_io: ["read", "write"].map(|d| meter.counter(COMPACTION_IO, &io(d))),
             read: Io::new(meter, "read"),

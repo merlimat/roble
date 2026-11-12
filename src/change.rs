@@ -130,6 +130,42 @@ impl Changes {
     }
 }
 
+/// Who is waiting to be told there is compaction to do (§9).
+///
+/// The store does not run background work itself: `Env::spawn` takes a
+/// `'static` future and a store's methods take `&self`, so a task that
+/// compacted would have to hold the store — and then dropping the store
+/// would not release the directory until that task finished, which `Drop`
+/// cannot wait for. So the task is the caller's, built around
+/// `Opened::compaction_wanted`, and this is how a flush tells it.
+#[derive(Default)]
+pub(crate) struct Waiters {
+    waiting: RefCell<Vec<Waker>>,
+}
+
+impl Waiters {
+    /// Registers `cx` to be woken when there is something to do.
+    pub(crate) fn park(&self, cx: &std::task::Context<'_>) {
+        self.waiting.borrow_mut().push(cx.waker().clone());
+    }
+
+    /// Wakes everyone waiting, and says whether there was anyone.
+    ///
+    /// What the answer is for: a flush that handed the work to somebody runs
+    /// none of it itself, and a flush that found nobody waiting runs it
+    /// where it stands (§9, `crate::flush`).
+    pub(crate) fn wake(&self) -> bool {
+        // Out of the cell before any of them is woken, for the reasons
+        // written against `Change`'s drop below.
+        let waiting = std::mem::take(&mut *self.waiting.borrow_mut());
+        let anybody = !waiting.is_empty();
+        for waker in waiting {
+            waker.wake();
+        }
+        anybody
+    }
+}
+
 /// The tables the compaction underway is reading.
 ///
 /// What the permit used to do by being held for the whole of a merge, and
@@ -174,6 +210,12 @@ impl Compacting {
     /// Whether a compaction is underway.
     pub(crate) fn underway(&self) -> bool {
         !self.tables.borrow().is_empty()
+    }
+
+    /// Registers `cx` to be woken when the compaction underway lets its
+    /// tables go.
+    pub(crate) fn park(&self, cx: &std::task::Context<'_>) {
+        self.waiting.borrow_mut().push(cx.waker().clone());
     }
 
     /// Waits until no compaction is underway.
