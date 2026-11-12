@@ -917,9 +917,18 @@ impl<F: Fs> Opened<F> {
     pub(crate) fn memtables(
         &self,
     ) -> Vec<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>> {
-        let mut all = vec![self.memtable()];
-        all.extend(self.frozen());
-        all
+        self.memtables_each().collect()
+    }
+
+    /// The same, without a vector to hold them.
+    ///
+    /// A read looks in these twice per lookup and wants neither copy, so the
+    /// set is an iterator and `memtables` is the one caller that still needs
+    /// it collected.
+    pub(crate) fn memtables_each(
+        &self,
+    ) -> impl Iterator<Item = std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>> {
+        std::iter::once(self.memtable()).chain(self.frozen())
     }
 
     /// The log this store is appending to, if it has one.
