@@ -62,10 +62,24 @@
 //!
 //! So freezing waits. Nothing more is added to a frozen memtable, and a
 //! write that has chosen one and not yet applied to it is something still
-//! being added. [`Writers`] counts those, and a freeze does not swap until
-//! the count is zero. It is a counter and not a permit because writes do not
-//! exclude each other — there is nothing wrong with two writes at once, only
-//! with freezing underneath one.
+//! being added. [`Writers`] is that permit, and a freeze does not swap until
+//! no write holds it.
+//!
+//! # A write against a write
+//!
+//! The same permit is what keeps two writes off each other, and that is not
+//! tidiness either. A write reads the sequence number it will stamp and the
+//! offset it will append the record at, waits for the disk, and only then
+//! applies to the memtable. Two writes overlapping there read the same of
+//! each: the second's record lands on top of the first's, and `write`
+//! returned `Ok` for a record the next open has no trace of — and both
+//! batches are stamped with the same sequence number, so two entries for one
+//! key become one.
+//!
+//! Pebble serializes the same span for the same reason: its WAL append
+//! happens under `commitPipeline.mu`, and only the memtable apply is left
+//! concurrent. roble has one thread, so there is nothing to gain by
+//! splitting the two, and a write holds the permit from end to end.
 //!
 //! Waiting rather than refusing, because the second caller asked a
 //! reasonable question: a flush that waits for the one in front of it finds
@@ -104,36 +118,47 @@ impl Changes {
     }
 }
 
-/// The writes that have chosen a memtable and not yet applied to it.
+/// The one write at a time a store takes.
 ///
-/// Read by a freeze, which cannot take a memtable away from a write that is
-/// still adding to it (`crate::open::Opened::freeze_memtable`).
+/// Held from the sequence number a write stamps to the memtable it applies
+/// to, which is the span two writes may not share. Read by a freeze too,
+/// which cannot take a memtable away from a write that is still adding to it
+/// (`crate::open::Opened::freeze_memtable`).
 #[derive(Default)]
 pub(crate) struct Writers {
-    in_flight: Cell<usize>,
+    underway: Cell<bool>,
     waiting: RefCell<Vec<Waker>>,
 }
 
 impl Writers {
-    /// Counts one write as under way, until the [`Writing`] is dropped.
+    /// Waits for the permit, and holds it until the [`Writing`] is dropped.
     ///
     /// Dropped on the way out however the write ends, a failure or a
     /// cancellation included — which is the reason this is a guard and not a
-    /// pair of calls. A write whose future is thrown away between its log
-    /// append and its memtable would otherwise stall every later flush.
-    pub(crate) fn begin(&self) -> Writing<'_> {
-        self.in_flight.set(self.in_flight.get() + 1);
+    /// pair of calls. A write whose future is thrown away part-way through
+    /// would otherwise hold the permit for ever, and every write and every
+    /// freeze after it would wait on a write that is not happening.
+    pub(crate) async fn begin(&self) -> Writing<'_> {
+        poll_fn(|cx| {
+            if self.underway.get() {
+                self.waiting.borrow_mut().push(cx.waker().clone());
+                return Poll::Pending;
+            }
+            self.underway.set(true);
+            Poll::Ready(())
+        })
+        .await;
         Writing { writers: self }
     }
 
-    /// Waits until every write that has chosen a memtable has applied to it.
+    /// Waits until no write is part-way through, without taking the permit.
     ///
     /// Asked again on every poll rather than trusted once: a write that
-    /// started between a wake-up and the poll it woke is as much in flight
+    /// started between a wake-up and the poll it woke is as much under way
     /// as one that was already there, and the caller is about to freeze.
     pub(crate) async fn settled(&self) {
         poll_fn(|cx| {
-            if self.in_flight.get() > 0 {
+            if self.underway.get() {
                 self.waiting.borrow_mut().push(cx.waker().clone());
                 return Poll::Pending;
             }
@@ -143,18 +168,17 @@ impl Writers {
     }
 }
 
-/// A write under way, counted until it is dropped.
+/// The write under way, and the proof that no other one is.
 pub(crate) struct Writing<'a> {
     writers: &'a Writers,
 }
 
 impl Drop for Writing<'_> {
     fn drop(&mut self) {
-        self.writers.in_flight.set(self.writers.in_flight.get() - 1);
-        // Woken whether or not the count reached zero, and every waiter of
-        // them, for the reasons written against `Change`'s drop below: a
-        // waiter re-checks, so an extra poll is the cheap mistake and a
-        // missed wake-up is the expensive one.
+        self.writers.underway.set(false);
+        // Every waiter of them, for the reasons written against `Change`'s
+        // drop below: a waiter re-checks, so an extra poll is the cheap
+        // mistake and a missed wake-up is the expensive one.
         let waiting = std::mem::take(&mut *self.writers.waiting.borrow_mut());
         for waker in waiting {
             waker.wake();
@@ -197,7 +221,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
-    use super::Writers;
+    use super::{Writers, Writing};
 
     /// A waker that only records that it was woken.
     struct Flag(AtomicBool);
@@ -210,21 +234,30 @@ mod tests {
         }
     }
 
+    /// Takes the permit, which on a free one is no wait at all.
+    fn begin(writers: &Writers) -> Writing<'_> {
+        let mut cx = Context::from_waker(Waker::noop());
+        match pin!(writers.begin()).as_mut().poll(&mut cx) {
+            Poll::Ready(writing) => writing,
+            Poll::Pending => panic!("a free permit should not have to be waited for"),
+        }
+    }
+
     /// Here rather than in `tests/freeze.rs`, where the rest of the freeze is
     /// pinned, because no test through the public API can reach this: a write
-    /// stays in flight only across an await, the simulated filesystem never
-    /// blocks, and so a write that is polled twice is a write that has
+    /// stays part-way through only across an await, the simulated filesystem
+    /// never blocks, and so a write that is polled twice is a write that has
     /// finished (§10, §12). What that leaves untested from outside is the
     /// wake-up, and a freeze that waits and is never woken stalls every
     /// flush after it.
     #[test]
-    fn a_freeze_waits_for_a_write_in_flight_and_is_woken_by_it() {
+    fn a_freeze_waits_for_a_write_under_way_and_is_woken_by_it() {
         let writers = Writers::default();
         let flag = Arc::new(Flag(AtomicBool::new(false)));
         let waker = Waker::from(Arc::clone(&flag));
         let mut cx = Context::from_waker(&waker);
 
-        let writing = writers.begin();
+        let writing = begin(&writers);
         let mut settled = pin!(writers.settled());
         assert!(
             matches!(settled.as_mut().poll(&mut cx), Poll::Pending),
@@ -246,28 +279,35 @@ mod tests {
         );
     }
 
+    /// The same wake-up, for the other thing that waits on the permit. Also
+    /// unreachable from outside, and for the same reason.
     #[test]
-    fn a_freeze_waits_for_every_write_and_not_for_one_of_them() {
+    fn a_second_write_waits_for_the_first_and_is_woken_by_it() {
         let writers = Writers::default();
         let flag = Arc::new(Flag(AtomicBool::new(false)));
         let waker = Waker::from(Arc::clone(&flag));
         let mut cx = Context::from_waker(&waker);
 
-        let first = writers.begin();
-        let second = writers.begin();
-        let mut settled = pin!(writers.settled());
-        assert!(matches!(settled.as_mut().poll(&mut cx), Poll::Pending));
+        let first = begin(&writers);
+        let mut second = pin!(writers.begin());
+        assert!(
+            second.as_mut().poll(&mut cx).is_pending(),
+            "two writes must not share the span where each reads the sequence number \
+             it stamps and the offset it appends at"
+        );
+        assert!(
+            !flag.0.load(Ordering::SeqCst),
+            "and the second must not be woken for nothing"
+        );
 
         drop(first);
         assert!(
-            matches!(settled.as_mut().poll(&mut cx), Poll::Pending),
-            "one of two writes finishing is not the memtable settling"
-        );
-        drop(second);
-        assert!(
             flag.0.load(Ordering::SeqCst),
-            "the last write to finish must wake the freeze"
+            "the write that finished must wake the one waiting for it"
         );
-        assert!(matches!(settled.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(
+            second.as_mut().poll(&mut cx).is_ready(),
+            "and the second must then go through"
+        );
     }
 }

@@ -416,3 +416,100 @@ async fn every_waiting_change_gets_its_turn() {
     );
     assert_eq!(contents(&db).await, model);
 }
+
+/// Writes one key, and says what it wrote.
+async fn put<F: Fs>(db: &roble::Opened<F>, key: &[u8], value: &[u8]) -> Model {
+    let mut batch = Batch::new();
+    batch.put(key, value).expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    Model::from([(key.to_vec(), value.to_vec())])
+}
+
+/// How many operations one synced write takes, with nothing failing.
+async fn ops_of_a_write() -> u64 {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let before = env.sim().ops();
+    put(&db, b"count", b"v").await;
+    let total = env.sim().ops() - before;
+    assert!(
+        total >= 2,
+        "a write of {total} operations is too thin to sweep"
+    );
+    total
+}
+
+#[compio::test]
+async fn two_writes_at_once_both_reach_the_log() {
+    // Each reads the offset it will append its record at, waits for the
+    // disk, and only then applies to the memtable. Without the permit both
+    // read the same offset and the second's record lands on top of the
+    // first's — and nothing looks wrong until the store is reopened and the
+    // first write is simply not there, having been acknowledged with a sync.
+    //
+    // Swept rather than aimed at one operation: where the first write
+    // suspends is not this test's business, and a sweep goes on testing the
+    // right thing when the write's I/O changes.
+    let total = ops_of_a_write().await;
+
+    for n in 1..=total {
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open(&env, &dir).await.expect("open");
+        let mut model = contents(&db).await;
+        env.sim().pause_at(n);
+
+        let (first, second) = interleave(put(&db, b"one", b"1"), put(&db, b"two", b"2"));
+        model.extend(first);
+        model.extend(second);
+
+        assert_eq!(contents(&db).await, model, "paused at {n} of {total}");
+
+        drop(db);
+        let reopened = roble::open(&env, &dir)
+            .await
+            .unwrap_or_else(|e| panic!("paused at {n} of {total}, the reopen: {e}"));
+        assert_eq!(
+            contents(&reopened).await,
+            model,
+            "paused at {n} of {total}: both writes were acknowledged with a sync, so both \
+             have to be there"
+        );
+    }
+}
+
+#[compio::test]
+async fn two_writes_at_once_do_not_share_a_sequence_number() {
+    // The other half of the same overlap, and the half a reopen cannot show.
+    // A write reads the sequence number it will stamp before waiting for the
+    // disk, so two of them read the same one. Then two entries for one key
+    // are one entry, a snapshot cannot tell the two writes apart, and the
+    // MANIFEST's last sequence number is behind what the memtable holds —
+    // which is how a write replayed later loses to a tombstone that was
+    // written before it.
+    let total = ops_of_a_write().await;
+
+    for n in 1..=total {
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open_with(
+            &env,
+            &dir,
+            Options::new().disable_automatic_compactions(true),
+        )
+        .await
+        .expect("open");
+        // A flush first, so the baseline is the store's own count and not
+        // whatever the fixture's logs left for the replay to find.
+        db.flush().await.expect("flush");
+        let before = db.versions().last_seq_num;
+        env.sim().pause_at(n);
+
+        interleave(put(&db, b"one", b"1"), put(&db, b"two", b"2"));
+        db.flush().await.expect("flush").expect("a table");
+
+        assert_eq!(
+            db.versions().last_seq_num,
+            before + 2,
+            "paused at {n} of {total}: two writes of one entry each are two sequence numbers"
+        );
+    }
+}

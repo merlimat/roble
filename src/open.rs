@@ -622,10 +622,12 @@ impl<F: Fs> Opened<F> {
         // that had counted itself first would be waiting for itself.
         self.make_room().await?;
 
-        // Counted from here to the end of the function, which is the span a
-        // freeze may not happen in: the log record and the memtable entry
-        // have to land on the same side of one (§5, `crate::change`).
-        let _writing = self.writers.begin();
+        // Held from here to the end of the function, which is the span no
+        // other write may share and no freeze may happen in: the sequence
+        // number stamped below and the offset the record goes to are both
+        // read here and both committed to after the disk has been waited on
+        // (§5, `crate::change`).
+        let _writing = self.writers.begin().await;
 
         let base = self.next_seq.get();
         batch.set_seq_num(base);
