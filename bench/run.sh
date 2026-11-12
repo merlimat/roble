@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs both engines over the same workload and prints them one after the other.
+# Runs every engine over the same workload and prints them one after the other.
 # See README.md.
 #
 # Two passes, because they answer different questions:
@@ -26,33 +26,61 @@
 #      so neither reads a cache the other warmed. This is the comparison
 #      DESIGN.md §14 asks for, and the first pass only approximates it.
 #
+# ENGINES picks which to run; the default is all of them. roble and Pebble
+# need nothing installed. encina is fetched from git. RocksDB needs a C++
+# toolchain and libclang, which is why neither is a default cargo feature:
+#
+#   ENGINES="roble pebble" ./run.sh          # nothing to install
+#   ENGINES="roble encina" ./run.sh          # adds a git fetch
+#
 # Everything else is passed straight through, so
 #   ./run.sh --shards 8 --batches 2000 --records 500
-# works as it does on either engine alone.
+# works as it does on any engine alone.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+ENGINES="${ENGINES:-roble pebble encina rocksdb}"
 
 out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 
 args=("$@")
 
-roble() { cargo run --release --quiet -p roble-bench -- "$@"; }
-# Pebble's own logging goes to stdout; the lines worth reading are the ones
-# the benchmark prints, and the rest is Pebble narrating its compactions.
-pebble() { (cd ../harness && go run ./bench "$@" 2>&1 | grep -v '^[0-9]\{4\}/'); }
+# Pebble's own logging goes to stdout; the lines worth reading are the ones the
+# benchmark prints, and the rest is Pebble narrating its compactions.
+run_engine() {
+  local engine="$1" dir="$2"
+  shift 2
+  case "$engine" in
+    roble)
+      cargo run --release --quiet -p roble-bench -- --dir "$dir" "$@"
+      ;;
+    encina|rocksdb)
+      cargo run --release --quiet -p roble-bench --features "$engine" -- \
+        --engine "$engine" --dir "$dir" "$@"
+      ;;
+    pebble)
+      (cd ../harness && go run ./bench --dir "$dir" "$@" 2>&1 | grep -v '^[0-9]\{4\}/')
+      ;;
+    *)
+      echo "run.sh: unknown engine $engine" >&2
+      exit 2
+      ;;
+  esac
+}
 
-echo "=== both engines, every phase, one process each ==="
-echo
-roble  --dir "$out/all-roble"  "${args[@]}"
-echo
-pebble --dir "$out/all-pebble" "${args[@]}"
+echo "=== every engine, every phase, one process each ==="
+for engine in $ENGINES; do
+  echo
+  run_engine "$engine" "$out/all-$engine" "${args[@]}"
+done
 
 echo
 echo "=== each scan direction on its own, over a store of its own ==="
-echo "(so that neither direction reads a block cache the other warmed)"
+echo "(so that neither direction reads a cache the other warmed)"
 for dir in scan-rev scan; do
-  echo
-  roble  --dir "$out/$dir-roble"  --phases "load,settle,$dir" "${args[@]}"
-  pebble --dir "$out/$dir-pebble" --phases "load,settle,$dir" "${args[@]}"
+  for engine in $ENGINES; do
+    echo
+    run_engine "$engine" "$out/$dir-$engine" --phases "load,settle,$dir" "${args[@]}"
+  done
 done

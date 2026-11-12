@@ -1,12 +1,22 @@
 # roble benchmark
 
-Compares roble with Go Pebble on the workload Oxia runs: small records, a store
-per shard, batches per write, point and ordered lookups, scans in both
-directions, and a checkpoint.
+Compares roble with **Go Pebble**, **RocksDB** and **encina** on the workload
+Oxia runs: small records, a store per shard, batches per write, point and
+ordered lookups, scans in both directions, and a checkpoint.
 
 Each run benchmarks one engine in a process of its own, so the CPU time and the
-peak memory it reports belong to that engine alone. `run.sh` runs both and
-prints them one after the other.
+peak memory it reports belong to that engine alone. `run.sh` runs all of them
+and prints them one after the other.
+
+| engine | what it is here for | how to get it |
+|---|---|---|
+| roble | the subject | always built |
+| Pebble | the compatibility target: the same files, the same format version, Oxia's own settings | `harness/bench`, needs Go |
+| RocksDB | the engine Pebble replaced, and a second LSM to check a ratio against | `--features rocksdb`, needs a C++ toolchain and libclang |
+| encina | a copy-on-write B+tree that owes nobody compatibility — §2 claims Pebble's format is worth its price without naming the price, and this is the price | `--features encina`, fetched from git |
+
+Neither optional engine is a default cargo feature, so an ordinary
+`cargo build --workspace` neither clones encina nor needs a C++ compiler.
 
 ## Why it exists
 
@@ -15,6 +25,13 @@ measurement, and names milestones that have since passed. The sharpest is
 reverse iteration: Oxia's `KeyRangeScanReverse` is on a serving path, an LSM
 pays more for `prev` than for `next`, and the design says so without saying by
 how much. `scan-rev` is that number and `scan` is its control.
+
+Two reference LSMs rather than one, because a ratio from a single pair of
+numbers is not trustworthy enough to decide anything: the first run of the
+reverse comparison had roble at 1.26x and Pebble at 1.44x, which read as roble
+being the better of the two. It is not — the forward rates move by a fifth
+between runs, and with RocksDB alongside, all three sit in one band of about
+1.1x to 1.2x. One comparison says a number; two say whether it means anything.
 
 ## Phases
 
@@ -40,6 +57,13 @@ They always run in this order, whatever order `--phases` names them in.
   filter can help.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
+An engine that cannot do a phase prints a dash and the reason instead of a
+zero, because a zero reads as "it did this and it took no time". encina skips
+`scan-rev`, having only a forward `Iter`, and `checkpoint`, having none —
+which is part of the comparison rather than a gap in it: an engine that
+answers fewer questions can answer them faster, and both of those are Oxia
+requirements roble meets.
+
 A `levels` line is printed before the scans: how many tables sit at each level.
 A scan's cost is mostly how many iterators it has to merge, so without it a
 slow iterator cannot be told from a differently-shaped LSM — and on this
@@ -51,10 +75,19 @@ workload that distinction turns out to be the whole story.
 ./run.sh --shards 1 --batches 1000 --records 300 --reads 50000 --no-wal
 ```
 
+`ENGINES` picks which to run, so the ones needing a toolchain can be left out:
+
+```sh
+ENGINES="roble pebble" ./run.sh --no-wal        # nothing to install
+ENGINES="roble encina" ./run.sh --no-wal        # adds a git fetch
+```
+
 Or one engine at a time:
 
 ```sh
 cargo run --release -p roble-bench -- --dir /path/to/scratch --no-wal
+cargo run --release -p roble-bench --features encina -- --engine encina --dir /path/to/scratch --no-wal
+cargo run --release -p roble-bench --features rocksdb -- --engine rocksdb --dir /path/to/scratch --no-wal
 cd ../harness && go run ./bench --dir /path/to/scratch --no-wal
 ```
 
@@ -69,10 +102,16 @@ the same sequence.
 **`--no-wal` is Oxia's configuration**, and on macOS it is the only one in
 which the load row means anything. Go's `os.File.Sync` is
 `fcntl(F_FULLFSYNC)` there, which flushes the drive's own write cache;
-compio's is `fsync`, which does not. So with the WAL on, roble appears several
-times faster at writing and is really just promising less. On Linux — which is
-what Oxia runs — both are `fsync`. The benchmark prints a note when the
-configuration is the one that cannot be compared.
+compio's and RocksDB's are `fsync`, which does not. So with the WAL on, roble
+appears several times faster at writing than Pebble and is really just
+promising less. On Linux — which is what Oxia runs — they all are `fsync`. The
+benchmark prints a note when the configuration is the one that cannot be
+compared.
+
+**encina's load row is not quite in the same units.** Its `write` is durable
+by itself and takes no sync flag, so `--no-wal` asks roble, Pebble and RocksDB
+for less than it asks encina for. That counts against encina on the load row
+and nowhere else.
 
 **The phases share a block cache and run in order**, so whichever of the two
 scans goes second reads a cache the first one warmed. Reverse runs first
@@ -96,8 +135,16 @@ here is the incompressible end of the range rather than the answer for any
 particular shard.
 
 **`settle` is not comparable row for row**, by construction. roble's does the
-compaction work and Pebble's waits for it. Compare the `cpu s` column and the
-`levels` line, not the rate.
+compaction work on the thread that owns the store; Pebble's and RocksDB's wait
+for background threads; encina has nothing to settle at all. Compare the
+`cpu s` column and the `levels` line, not the rate.
+
+**The `levels` line is where a scan number is explained.** On this workload
+roble settles at `L0=1 L1=13` while Pebble reaches `L6=11` and RocksDB a
+single file. A scan of the first merges fourteen iterators over a level that
+may overlap; the others read a level that cannot, one table after another.
+Most of roble's scan gap is that shape, which belongs to the picker rather
+than to the iterator tree.
 
 ## Columns
 

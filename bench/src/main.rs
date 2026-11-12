@@ -12,39 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Benchmarks roble on the workload Oxia runs, in the phases and the output
-//! format `harness/bench` reports for Go Pebble, so the two can be read side
-//! by side. See README.md.
+//! Benchmarks roble, encina and RocksDB on the workload Oxia runs, in the
+//! phases and the output format `harness/bench` reports for Go Pebble, so all
+//! four can be read side by side. See README.md.
 //!
 //! A run benchmarks one engine in a process of its own, so the CPU time and
 //! the size it reports are that engine's alone.
 //!
-//! **What this exists to answer.** §14 of DESIGN.md leaves four questions
+//! **What this exists to answer.** §14 of DESIGN.md leaves several questions
 //! waiting on a measurement, and the sharpest is reverse iteration: Oxia's
 //! `KeyRangeScanReverse` is on a serving path, an LSM pays more for `prev`
 //! than for `next`, and the design says so without saying by how much. The
 //! `scan-rev` phase is that number, beside the `scan` phase that is its
-//! control.
+//! control. §12 asks for the encina comparison for a different reason: §2
+//! claims the price of Pebble compatibility is worth paying without ever
+//! putting a number on it, and the gap between roble and a B+tree that owes
+//! nobody compatibility is that price.
 
-use std::hint::black_box;
+mod engine;
+mod report;
+
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
 
-use roble::{Comparison, DefaultEnv, Options};
+use engine::Store;
+use report::Report;
 
 const USAGE: &str = "\
-usage: roble-bench --dir DIR [options]
+usage: roble-bench --dir DIR [--engine roble|encina|rocksdb] [options]
 
-Creates the store at DIR/roble, which must not exist yet.
+Creates the store at DIR/<engine>, which must not exist yet.
 
+  --engine NAME   which engine to benchmark (roble). encina and rocksdb have
+                  to be compiled in: --features encina, --features rocksdb
   --shards N      stores to open, as Oxia opens one per shard (1)
   --batches N     batches written to each shard (200)
   --records N     records in each batch (100)
   --value-bytes N bytes in each value (128)
   --reads N       lookups in each get and floor phase (100000)
   --cache-mb N    block cache for every shard together, in MiB (64)
-  --seed N        seed for the keys and the lookup order (1)
+  --seed N        seed for the keys, the values and the lookup order (1)
   --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
                   only durability point, and a commit syncs nothing
   --phases LIST   comma-separated subset of
@@ -53,20 +61,37 @@ Creates the store at DIR/roble, which must not exist yet.
 
 fn main() {
     let cfg = Config::parse();
-    let path = cfg.dir.join("roble");
+    let path = cfg.dir.join(&cfg.engine);
     if path.exists() {
         fail(&format!("{} exists: remove it first", path.display()));
     }
     std::fs::create_dir_all(&path).expect("create the directory");
-    compio::runtime::Runtime::new()
-        .expect("start the runtime")
-        .block_on(run(&cfg, &path));
+    let runtime = compio::runtime::Runtime::new().expect("start the runtime");
+    runtime.block_on(async {
+        match cfg.engine.as_str() {
+            "roble" => run::<engine::Roble>(&cfg, &path).await,
+            #[cfg(feature = "encina")]
+            "encina" => run::<engine::Encina>(&cfg, &path).await,
+            #[cfg(feature = "rocksdb")]
+            "rocksdb" => run::<engine::Rocks>(&cfg, &path).await,
+            // Named but not compiled in, which is a different thing from
+            // misspelled and worth a different message. One arm each, so
+            // that enabling one feature does not make the other's message
+            // unreachable.
+            #[cfg(not(feature = "encina"))]
+            "encina" => fail("encina was not compiled in: rebuild with --features encina"),
+            #[cfg(not(feature = "rocksdb"))]
+            "rocksdb" => fail("rocksdb was not compiled in: rebuild with --features rocksdb"),
+            other => fail(&format!("unknown engine {other}\n\n{USAGE}")),
+        }
+    });
 }
 
-async fn run(cfg: &Config, path: &Path) {
+async fn run<S: Store>(cfg: &Config, path: &Path) {
     println!(
-        "roble: {} shards x {} batches x {} records, {}-byte values, {} MiB cache, \
+        "{}: {} shards x {} batches x {} records, {}-byte values, {} MiB cache, \
          wal={}, seed={}",
+        S::NAME,
         cfg.shards,
         cfg.batches,
         cfg.records,
@@ -77,41 +102,17 @@ async fn run(cfg: &Config, path: &Path) {
     );
     // Said here rather than only in the README, so it travels with the
     // numbers. Go's `os.File.Sync` is `fcntl(F_FULLFSYNC)` on macOS, which
-    // flushes the drive's own write cache; compio's is `fsync`, which does
-    // not. On Linux — which is what Oxia runs — both are `fsync` and the two
-    // are comparable.
-    if cfg.wal && cfg.wants("load") && cfg.cfg_is_macos() {
-        println!(
-            "note: on macOS Pebble's sync is F_FULLFSYNC and roble's is fsync, so the load \n\
-             note: row is not comparable between the two. Run both with --no-wal, which is \n\
-             note: Oxia's own configuration, for a load comparison that is."
-        );
+    // flushes the drive's own write cache; compio's and RocksDB's are
+    // `fsync`, which does not. On Linux — which is what Oxia runs — they all
+    // are, and the load rows are comparable.
+    if cfg.wal && cfg.wants("load") && cfg!(target_os = "macos") {
+        println!("note: on macOS Pebble's sync is F_FULLFSYNC where this engine's is fsync, so");
+        println!("note: the load row is not comparable with Pebble's. Run every engine with");
+        println!("note: --no-wal, which is Oxia's own configuration, for a load row that is.");
     }
     println!("{}", Report::header());
 
-    // One cache handle for every shard, which is the arrangement Oxia runs
-    // and the one §8 is built for: hundreds of shards inside one budget.
-    let caches = roble::Caches::new(
-        roble::cache::DEFAULT_OPEN_TABLES,
-        cfg.cache_mb as usize * 1024 * 1024,
-    );
-    let mut shards = Vec::with_capacity(cfg.shards);
-    for i in 0..cfg.shards {
-        let dir = path.join(format!("shard-{i:04}"));
-        let db = roble::open_with(
-            &DefaultEnv,
-            &dir,
-            Options::new()
-                .create_if_missing(true)
-                .caches(caches.clone())
-                // Oxia's configuration: its replication log is the source of
-                // truth, so the store need only be durable at a flush (§1).
-                .disable_wal(!cfg.wal),
-        )
-        .await
-        .unwrap_or_else(|e| fail(&format!("open {}: {e}", dir.display())));
-        shards.push(db);
-    }
+    let shards = S::open(cfg, path).await;
 
     if cfg.wants("load") {
         load(cfg, &shards).await;
@@ -119,31 +120,30 @@ async fn run(cfg: &Config, path: &Path) {
     if cfg.wants("settle") {
         settle(&shards).await;
     }
-    // Reverse before forward, deliberately. The phases share a block cache
-    // and run in order, so whichever goes second reads a cache the first one
-    // warmed — and the question §14 asks is whether reverse iteration is
-    // *worse*. Putting it first points that bias against it, so a `scan-rev`
-    // that keeps up with `scan` here is keeping up from behind. A cold
-    // comparison of either needs its own process: `--phases load,scan` and
-    // `--phases load,scan-rev`.
     // What shape the load and the settle left, because a scan's cost is
     // mostly how many iterators it has to merge: one table in one level is
     // not the same work as ten in L0, and without this line a reader cannot
-    // tell a slow iterator from a differently-shaped LSM.
+    // tell a slow iterator from a differently-shaped store.
     if cfg.wants("scan") || cfg.wants("scan-rev") {
         println!("levels {}", level_shape(&shards));
     }
+    // Reverse before forward, deliberately. The phases share a cache and run
+    // in order, so whichever goes second reads one the first warmed — and the
+    // question §14 asks is whether reverse iteration is *worse*. Putting it
+    // first points that bias against it, so a `scan-rev` that keeps up here
+    // is keeping up from behind. A cold comparison of either needs its own
+    // process: `--phases load,scan` and `--phases load,scan-rev`.
     if cfg.wants("scan-rev") {
-        scan(cfg, &shards, Direction::Reverse).await;
+        scan(cfg, &shards, true).await;
     }
     if cfg.wants("scan") {
-        scan(cfg, &shards, Direction::Forward).await;
+        scan(cfg, &shards, false).await;
     }
     if cfg.wants("get") {
-        lookups(cfg, &shards, Comparison::Equal, "get").await;
+        lookups(cfg, &shards, false).await;
     }
     if cfg.wants("floor") {
-        lookups(cfg, &shards, Comparison::Floor, "floor").await;
+        lookups(cfg, &shards, true).await;
     }
     if cfg.wants("checkpoint") {
         checkpoint(&shards, path).await;
@@ -153,277 +153,142 @@ async fn run(cfg: &Config, path: &Path) {
 }
 
 /// Writes every batch of every shard, timing each commit.
-///
-/// Through an indexed batch, which is the one Oxia uses — it reads back
-/// through the batch before committing it — so what is measured includes the
-/// index the repr is built under.
-async fn load<F: roble::Fs>(cfg: &Config, shards: &[roble::Opened<F>]) {
+async fn load<S: Store>(cfg: &Config, shards: &[S]) {
     let mut report = Report::new("load");
-    for (s, db) in shards.iter().enumerate() {
+    for (s, store) in shards.iter().enumerate() {
         for b in 0..cfg.batches {
-            let mut batch = db.batch();
-            for r in 0..cfg.records {
-                let i = b * cfg.records + r;
-                let key = key_for(s, i);
-                batch
-                    .put(&key, &value_for(cfg, s, i))
-                    .unwrap_or_else(|e| fail(&format!("put: {e}")));
-            }
             let at = Instant::now();
-            batch
-                // Synced when there is a log to sync: that is what makes
-                // the load phase's latency a durability number rather than a
-                // memtable-insert number.
-                .commit(cfg.wal)
-                .await
-                .unwrap_or_else(|e| fail(&format!("commit: {e}")));
+            store
+                .write_batch(cfg, s, b * cfg.records, cfg.records, cfg.wal)
+                .await;
             report.saw(at.elapsed());
             report.count += cfg.records as u64;
         }
     }
-    report.finish(shards).await;
+    report.finish(size_of(shards).await);
 }
 
-/// Runs every compaction the picker wants, so the phases that follow read a
-/// settled database rather than one in the middle of being shaped.
-///
-/// roble compacts cooperatively on the owning thread (§9), so this is the
-/// caller's to drive and its cost belongs to whoever drives it. Go Pebble's
-/// counterpart waits for its background compactions instead; the CPU column
-/// is what makes the two comparable.
-async fn settle<F: roble::Fs>(shards: &[roble::Opened<F>]) {
+/// Leaves every shard in a shape the read phases can be compared over.
+async fn settle<S: Store>(shards: &[S]) {
     let mut report = Report::new("settle");
-    for db in shards {
-        db.flush()
-            .await
-            .unwrap_or_else(|e| fail(&format!("flush: {e}")));
-        while db.pick().is_some() {
-            let at = Instant::now();
-            let out = db
-                .compact_once()
-                .await
-                .unwrap_or_else(|e| fail(&format!("compact: {e}")));
-            report.saw(at.elapsed());
-            report.count += out.len() as u64;
-            if report.count > 100_000 {
-                fail("the picker never settled");
-            }
-        }
+    for store in shards {
+        let at = Instant::now();
+        let did = store.settle().await;
+        report.saw(at.elapsed());
+        report.count += did;
     }
-    report.finish(shards).await;
+    report.finish(size_of(shards).await);
 }
-
-enum Direction {
-    Forward,
-    Reverse,
-}
-
-/// One step in this many is timed, in the scan phases. See `scan`.
-const STEP_SAMPLE: u64 = 64;
 
 /// Steps every record of every shard, forward or backward.
-///
-/// The latency recorded is one step, not the whole scan: what the reverse
-/// question is about is the cost of `prev` against `next`, and a total hides
-/// a tail.
-async fn scan<F: roble::Fs>(cfg: &Config, shards: &[roble::Opened<F>], dir: Direction) {
-    let mut report = Report::new(match dir {
-        Direction::Forward => "scan",
-        Direction::Reverse => "scan-rev",
-    });
-    for db in shards {
-        let mut cursor = db
-            .scan()
-            .await
-            .unwrap_or_else(|e| fail(&format!("scan: {e}")));
-        match dir {
-            Direction::Forward => cursor.first().await,
-            Direction::Reverse => cursor.last().await,
-        }
-        .unwrap_or_else(|e| fail(&format!("seek: {e}")));
-        while cursor.is_valid() {
-            black_box(cursor.key());
-            black_box(cursor.value());
-            report.count += 1;
-            // Sampled, not every step. A step here costs a few hundred
-            // nanoseconds and a clock reading costs tens, so timing all of
-            // them would charge the faster engine the larger share of a
-            // measurement overhead and make the comparison say the opposite
-            // of what it should. The rate comes from the phase's own wall
-            // clock, which this leaves alone; the percentiles come from one
-            // step in `STEP_SAMPLE`, which is enough for a tail.
-            let sampled = report.count.is_multiple_of(STEP_SAMPLE);
-            let at = sampled.then(Instant::now);
-            match dir {
-                Direction::Forward => cursor.next().await,
-                Direction::Reverse => cursor.prev().await,
-            }
-            .unwrap_or_else(|e| fail(&format!("step: {e}")));
-            if let Some(at) = at {
-                report.saw(at.elapsed());
-            }
-        }
+async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool) {
+    let name = if reverse { "scan-rev" } else { "scan" };
+    if reverse && !shards.first().is_some_and(|s| s.reverse()) {
+        Report::skipped(name, "this engine cannot iterate backwards");
+        return;
+    }
+    let mut report = Report::new(name);
+    for store in shards {
+        let seen = store.scan(reverse, &mut report).await;
+        report.count += seen;
     }
     let expected = (cfg.shards * cfg.batches * cfg.records) as u64;
     if report.count != expected {
         fail(&format!(
-            "the scan saw {} records, not the {expected} that were written",
+            "the {name} saw {} records, not the {expected} that were written",
             report.count
         ));
     }
-    report.finish(shards).await;
+    report.finish(size_of(shards).await);
 }
 
 /// Looks up random keys, every one of which has an answer.
 ///
-/// `Equal` is Oxia's `Get`, and the one comparison a bloom filter can answer.
+/// `get` is Oxia's `Get` with `ComparisonEqual`, and the one comparison a
+/// bloom filter can answer.
 ///
-/// `Floor` is Oxia's too, and its probes are deliberately keys that are **not
-/// there**: Oxia's `getFloor` tries an exact `Get` first and only falls
-/// through to a seek when that misses, so a floor lookup of a key that exists
-/// measures the `get` phase over again. A probe one byte past a stored key
-/// misses the exact lookup and is answered by the key below it, which is the
-/// seek this is here to time — no filter can help it, so it reads the index
-/// of every table whose bounds take the key in (§6).
-async fn lookups<F: roble::Fs>(
-    cfg: &Config,
-    shards: &[roble::Opened<F>],
-    how: Comparison,
-    name: &'static str,
-) {
+/// `floor` probes keys that are **not there**, one byte past a stored key:
+/// Oxia's `getFloor` tries an exact `Get` first and only falls through to a
+/// seek when that misses, so probing keys that exist would measure the `get`
+/// phase over again. What this times is the seek, which no filter can help.
+async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool) {
+    let name = if floor { "floor" } else { "get" };
     let mut report = Report::new(name);
     let total = cfg.batches * cfg.records;
     let mut rng = Rng::new(cfg.seed ^ 0x9e37_79b9);
     for _ in 0..cfg.reads {
         let s = (rng.next() as usize) % cfg.shards;
         let i = (rng.next() as usize) % total;
-        let mut key = key_for(s, i);
-        if how != Comparison::Equal {
+        let key = key_for(s, i);
+        let mut probe = key.clone();
+        if floor {
             // Past `key-%010d` and below the next one, since every byte here
             // sorts above the digits the padding ends in.
-            key.push(b'~');
+            probe.push(b'~');
         }
         let at = Instant::now();
-        let found = shards[s]
-            .get(&key, how)
-            .await
-            .unwrap_or_else(|e| fail(&format!("{name}: {e}")));
+        let answer = if floor {
+            shards[s].floor(&probe).await
+        } else {
+            shards[s].get(&probe).await
+        };
         report.saw(at.elapsed());
-        let answer = found.unwrap_or_else(|| {
+        let answer = answer.unwrap_or_else(|| {
             fail(&format!(
                 "{name} found no answer for {:?}",
-                String::from_utf8_lossy(&key)
+                String::from_utf8_lossy(&probe)
             ))
         });
-        if how != Comparison::Equal && answer.key != key_for(s, i) {
+        if floor && answer != key {
             fail(&format!(
                 "{name} answered {:?}, not the key below the probe",
-                String::from_utf8_lossy(&answer.key)
+                String::from_utf8_lossy(&answer)
             ));
         }
         report.count += 1;
     }
-    report.finish(shards).await;
+    report.finish(size_of(shards).await);
 }
 
 /// Checkpoints every shard, which is how Oxia moves one.
-async fn checkpoint<F: roble::Fs>(shards: &[roble::Opened<F>], path: &Path) {
+async fn checkpoint<S: Store>(shards: &[S], path: &Path) {
     let mut report = Report::new("checkpoint");
-    for (s, db) in shards.iter().enumerate() {
+    for (s, store) in shards.iter().enumerate() {
         let at = path.join(format!("checkpoint-{s:04}"));
         let started = Instant::now();
-        db.checkpoint(&at)
-            .await
-            .unwrap_or_else(|e| fail(&format!("checkpoint: {e}")));
+        if !store.checkpoint(&at).await {
+            Report::skipped("checkpoint", "this engine has none");
+            return;
+        }
         report.saw(started.elapsed());
         report.count += 1;
     }
-    report.finish(shards).await;
+    report.finish(size_of(shards).await);
 }
 
-// ------------------------------------------------------------------ reporting
-
-/// One phase's line: how much it did, how fast, and what it cost.
-struct Report {
-    name: &'static str,
-    count: u64,
-    started: Instant,
-    cpu_at_start: Duration,
-    latencies: Vec<Duration>,
-}
-
-impl Report {
-    fn header() -> String {
-        format!(
-            "{:<11} {:>10} {:>12} {:>9} {:>9} {:>9} {:>8} {:>9}",
-            "phase", "count", "rate/s", "p50 us", "p99 us", "max us", "cpu s", "size MiB"
-        )
+/// What every shard takes on disk, together.
+async fn size_of<S: Store>(shards: &[S]) -> u64 {
+    let mut total = 0;
+    for store in shards {
+        total += store.size().await;
     }
-
-    fn new(name: &'static str) -> Self {
-        Report {
-            name,
-            count: 0,
-            started: Instant::now(),
-            cpu_at_start: cpu_time(),
-            latencies: Vec::new(),
-        }
-    }
-
-    fn saw(&mut self, took: Duration) {
-        self.latencies.push(took);
-    }
-
-    async fn finish<F: roble::Fs>(mut self, shards: &[roble::Opened<F>]) {
-        let wall = self.started.elapsed();
-        let cpu = cpu_time().saturating_sub(self.cpu_at_start);
-        let mut bytes = 0u64;
-        for db in shards {
-            bytes += db.disk_usage().await.unwrap_or(0);
-        }
-        self.latencies.sort_unstable();
-        let us = |q: f64| -> u128 {
-            if self.latencies.is_empty() {
-                return 0;
-            }
-            let i = ((self.latencies.len() - 1) as f64 * q).round() as usize;
-            self.latencies[i].as_micros()
-        };
-        println!(
-            "{:<11} {:>10} {:>12.0} {:>9} {:>9} {:>9} {:>8.2} {:>9.1}",
-            self.name,
-            self.count,
-            self.count as f64 / wall.as_secs_f64().max(f64::MIN_POSITIVE),
-            us(0.50),
-            us(0.99),
-            us(1.0),
-            cpu.as_secs_f64(),
-            bytes as f64 / (1024.0 * 1024.0),
-        );
-    }
-}
-
-// --------------------------------------------------------------------- the key
-
-/// The key of record `i` in shard `s`.
-///
-/// Oxia's shape, with roble's one constraint on it: the keys are raw and
-/// bytewise ordered, because the `oxia-slash-spans` comparer is one roble
-/// refuses (§3), so a shard roble can serve is one using Oxia's *natural*
-/// encoder. The id is zero-padded so that bytewise order is numeric order,
-/// which is what makes the floor lookups land where a reader expects.
-fn key_for(s: usize, i: usize) -> Vec<u8> {
-    let bucket = i % 64;
-    format!("/shard-{s:04}/bucket-{bucket:02}/key-{i:010}").into_bytes()
+    total
 }
 
 /// How many tables sit at each level, summed over the shards.
-fn level_shape<F: roble::Fs>(shards: &[roble::Opened<F>]) -> String {
+fn level_shape<S: Store>(shards: &[S]) -> String {
     let mut counts = [0usize; 7];
-    for db in shards {
-        for (level, tables) in db.versions().version.levels() {
-            counts[level as usize] += tables.len();
+    let mut any = false;
+    for store in shards {
+        if let Some(levels) = store.levels() {
+            any = true;
+            for (level, n) in levels.iter().enumerate() {
+                counts[level] += n;
+            }
         }
+    }
+    if !any {
+        return "— this engine has none".to_string();
     }
     counts
         .iter()
@@ -434,17 +299,31 @@ fn level_shape<F: roble::Fs>(shards: &[roble::Opened<F>]) -> String {
         .join(" ")
 }
 
+// -------------------------------------------------------- the keys and values
+
+/// The key of record `i` in shard `s`.
+///
+/// Oxia's shape, with roble's one constraint on it: the keys are raw and
+/// bytewise ordered, because the `oxia-slash-spans` comparer is one roble
+/// refuses (§3), so a shard roble can serve is one using Oxia's *natural*
+/// encoder. The id is zero-padded so that bytewise order is numeric order,
+/// which is what makes the floor probes land where a reader expects.
+pub fn key_for(s: usize, i: usize) -> Vec<u8> {
+    let bucket = i % 64;
+    format!("/shard-{s:04}/bucket-{bucket:02}/key-{i:010}").into_bytes()
+}
+
 /// The value of record `i` in shard `s`: pseudo-random bytes.
 ///
 /// Random rather than a repeated byte, and this is not a detail. A value of
 /// one byte over and over compresses to nothing, so a run with it would have
 /// the size column say that Snappy is free and the uncompressed default of §8
 /// is costing 2.5x — a measurement of the generator, not of Oxia's data. The
-/// same generator fills them on both sides, so the two stores hold the same
+/// same generator fills them in every engine, so all the stores hold the same
 /// bytes.
-fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
+pub fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
     let mut rng = Rng::new(cfg.seed ^ ((s as u64) << 40) ^ (i as u64));
-    let mut value = Vec::with_capacity(cfg.value_bytes);
+    let mut value = Vec::with_capacity(cfg.value_bytes + 8);
     while value.len() < cfg.value_bytes {
         value.extend_from_slice(&rng.next().to_le_bytes());
     }
@@ -454,8 +333,9 @@ fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
 
 // ------------------------------------------------------------------- the rest
 
-/// xorshift64*, so the lookup order is the same on every run and in both
-/// engines without pulling in a dependency for it.
+/// xorshift64*, so the lookup order is the same on every run and in every
+/// engine without pulling in a dependency for it. `harness/bench` has the
+/// same generator, seeded the same way.
 struct Rng(u64);
 
 impl Rng {
@@ -473,16 +353,24 @@ impl Rng {
     }
 }
 
-struct Config {
+/// What the run was asked for. The fields an engine needs to open itself or
+/// to build a record are public; the rest only the phases read.
+pub struct Config {
     dir: PathBuf,
-    shards: usize,
+    engine: String,
+    /// Stores to open, as Oxia opens one per shard.
+    pub shards: usize,
     batches: usize,
     records: usize,
-    value_bytes: usize,
+    /// Bytes in each value.
+    pub value_bytes: usize,
     reads: usize,
-    cache_mb: u64,
-    seed: u64,
-    wal: bool,
+    /// Cache for every shard together, in MiB.
+    pub cache_mb: u64,
+    /// Seed for the keys, the values and the lookup order.
+    pub seed: u64,
+    /// Whether the WAL is on, which is also whether a commit syncs.
+    pub wal: bool,
     phases: Option<Vec<String>>,
 }
 
@@ -490,6 +378,7 @@ impl Config {
     fn parse() -> Self {
         let mut cfg = Config {
             dir: PathBuf::new(),
+            engine: "roble".to_string(),
             shards: 1,
             batches: 200,
             records: 100,
@@ -517,6 +406,7 @@ impl Config {
                     cfg.dir = PathBuf::from(value(arg));
                     saw_dir = true;
                 }
+                "--engine" => cfg.engine = value(arg).to_string(),
                 "--shards" => cfg.shards = number(value(arg)) as usize,
                 "--batches" => cfg.batches = number(value(arg)) as usize,
                 "--records" => cfg.records = number(value(arg)) as usize,
@@ -553,10 +443,6 @@ impl Config {
         cfg
     }
 
-    fn cfg_is_macos(&self) -> bool {
-        cfg!(target_os = "macos")
-    }
-
     fn wants(&self, phase: &str) -> bool {
         match &self.phases {
             None => true,
@@ -574,7 +460,7 @@ fn number(s: &str) -> u64 {
 ///
 /// One call site for both, because both come out of one `getrusage`. On a
 /// platform without it the columns read zero rather than being left out, so
-/// that one engine's output is the shape of the other's wherever it runs.
+/// that one engine's output is the shape of the others' wherever it runs.
 #[cfg(unix)]
 fn rusage() -> Option<libc::rusage> {
     // SAFETY: `getrusage` writes into the `rusage` it is given and reads
@@ -589,11 +475,11 @@ fn rusage() -> Option<libc::rusage> {
 
 /// This process's CPU time, user and system, its threads included.
 ///
-/// The column that makes the two engines comparable at all: roble compacts on
-/// the thread that owns the store (§9) and Pebble compacts on threads of its
-/// own, so wall-clock time alone would credit Pebble with work it still paid
-/// for.
-fn cpu_time() -> Duration {
+/// The column that makes the engines comparable at all: roble compacts on the
+/// thread that owns the store (§9) while Pebble and RocksDB compact on
+/// threads of their own, so wall-clock time alone would credit them with work
+/// they still paid for.
+pub fn cpu_time() -> Duration {
     #[cfg(unix)]
     {
         let Some(usage) = rusage() else {
@@ -625,7 +511,9 @@ fn peak_rss_mib() -> u64 {
     0
 }
 
-fn fail(message: &str) -> ! {
+/// Says what went wrong and stops. A benchmark that cannot do what it was
+/// asked has no number to report, so there is nothing to carry on with.
+pub fn fail(message: &str) -> ! {
     eprintln!("roble-bench: {message}");
     process::exit(1);
 }

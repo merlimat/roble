@@ -1506,30 +1506,55 @@ Stated rather than quietly decided:
 - **Uncompressed by default (§8)** needs the measurement before it is a default.
   If Snappy's space saving on Oxia's values is large, the zero-copy read path is
   worth less than it looks. `bench/` can now ask: on incompressible values the
-  two engines hold the same 42 MiB, so the default costs nothing there, and on
-  a single repeated byte Snappy saved 2.5x. Oxia's values are serialized
-  records and sit between those, so what is still missing is a run over
-  something shaped like Oxia's own data rather than either extreme.
+  four engines hold within 5% of the same 42 MiB, so the default costs nothing
+  there, and on a single repeated byte Snappy saved 2.5x. Oxia's values are
+  serialized records and sit between those, so what is still missing is a run
+  over something shaped like Oxia's own data rather than either extreme.
 - **Cooperative compaction (§9)** is a bet on small shards. The offload path is
   designed but unbuilt; the benchmark decides whether it gets built, and the
   `cpu s` column is where to look — a cooperative compaction's cost lands on
   the thread that owns the store, so it shows up in the phase that drove it
   rather than in a background total.
 - **What reverse iteration costs** is now measured, and it is not the problem
-  this entry expected. `bench/` runs both engines over the same workload, each
+  this entry expected. `bench/` runs every engine over the same workload, each
   scan direction in a process of its own so that neither reads a cache the
-  other warmed. Reverse costs roble **1.26x** what forward does, and Pebble
-  **1.44x** — so roble's `prev` is, relative to its own `next`, cheaper than
-  Pebble's. Reverse iteration is not a design problem.
+  other warmed. Over 300,000 records, reverse costs roble **1.19x** what
+  forward does, Pebble **1.12x** and RocksDB **1.17x**. Three LSMs in one
+  narrow band, roble inside it: `prev` is not a design problem.
 
-  What the same run exposed instead is that **roble scans about 7x slower than
-  Pebble in both directions**, and the `levels` line says why: over the same
-  300,000 records roble settles at `L0=1 L1=13` and Pebble at `L6=11`. A scan
-  of the first merges fourteen iterators over a level that may overlap; a scan
-  of the second reads eleven tables of a level that cannot, one after another.
-  That is the picker's doing, not the iterator tree's, which moves the cost to
-  the open question two entries below and makes it a much larger one than
-  "noisy". Measuring it is M5's; fixing it is not scheduled.
+  Stated as a band rather than a figure because that is what the runs support.
+  An earlier run of the same comparison gave 1.26x for roble and 1.44x for
+  Pebble, which would have read as roble being the better of the two; the
+  forward rates move by a fifth between runs, so the ratio is good to about a
+  tenth and no finer. Having two reference LSMs rather than one is what makes
+  the band trustworthy where a single pair of numbers was not.
+
+  What the same run exposed instead is that **roble is the slowest of the
+  three on every read path** — scans 4x to 6x, `get` about 3x, `floor` about
+  3.5x — and the `levels` line says most of why: over those records roble
+  settles at `L0=1 L1=13` where Pebble reaches `L6=11` and RocksDB `L0=1`. A
+  scan of the first merges fourteen iterators over a level that may overlap;
+  the others read a level that cannot, one table after another. That is the
+  picker's doing, not the iterator tree's, which moves the cost to the open
+  question two entries below and makes it much larger than "noisy". Measuring
+  it is M5's; fixing it is not scheduled.
+
+- **What Pebble compatibility costs** has a number now, which §2 claimed was
+  worth paying without ever naming it. Against encina on the same workload,
+  roble reads 7x to 19x slower — `scan` 2.0 M/s against 50.8 M/s, `get` 283
+  k/s against 1.92 M/s, `floor` 121 k/s against 2.32 M/s — and holds twice
+  the resident memory, while writing about twice as fast with the WAL off.
+
+  The gap is not all compatibility, and the honest reading is smaller than the
+  headline. encina has no reverse iteration at all, so it cannot serve
+  `KeyRangeScanReverse`, and no checkpoint, so it cannot serve a shard move
+  either; both are Oxia requirements that roble meets and encina does not, and
+  an engine that answers fewer questions can answer them faster. Its load is
+  always durable, so the `--no-wal` row asks it for more than it asks roble
+  for. And a B+tree reads a page where an LSM merges levels, which is the
+  structural difference §2 was weighing, not a cost of Pebble's file format.
+  What the number does establish is the *scale* of what is being traded, which
+  the design had left to the imagination.
 - **A future Oxia that excises.** Virtual sstables are refused (§3) because
   nothing in Oxia creates one today — not the data path, and not the shard
   split, which streams a filtered snapshot. If Oxia adopts `Excise` or
@@ -1538,11 +1563,11 @@ Stated rather than quietly decided:
 - **How closely the picker should follow Pebble's.** Compatibility does not
   require it, and this was filed as a question about noise. The benchmark says
   it is a question about speed: roble's picker leaves a 42 MiB shard spread
-  across thirteen L1 tables where Pebble's compacts it down to eleven at L6,
-  and scanning the first costs about 7x more because every step merges every
-  table of the level. The shape is legal and Go Pebble reads it, so this is
-  not a compatibility bug — but it is the largest performance gap the
-  benchmark found, and it is the one worth closing first.
+  across thirteen L1 tables where Pebble compacts it to eleven at L6 and
+  RocksDB to a single file, and scanning the first costs several times more
+  because every step merges every table of the level. The shape is legal and
+  Go Pebble reads it, so this is not a compatibility bug — but it is the
+  largest gap the benchmark found in roble, and the one worth closing first.
 - **Whether roble should recycle log files**, as Pebble does. Not recycling is
   simpler and keeps `ReuseForWrite` out of `Fs` (§10); recycling saves a file
   creation and its directory sync per rotation, which with 4 MiB memtables is

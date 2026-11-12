@@ -8,9 +8,29 @@ license.workspace = true
 publish.workspace = true
 description = "Benchmarks roble against Go Pebble on the workload Oxia runs"
 
+# Both comparisons are optional, and off by default, so an ordinary
+# `cargo build --workspace` neither clones encina nor needs a C++ toolchain
+# for RocksDB. `bench/run.sh` turns on whichever it was asked for.
+[features]
+default = []
+encina = ["dep:encina"]
+rocksdb = ["dep:rocksdb"]
+
 [dependencies]
 compio = { version = "0.19.2", features = ["fs", "macros"] }
 roble = { path = ".." }
+# Pinned to a tag rather than a path, so the comparison is reproducible on a
+# machine that has no encina checkout. The tag is what its release workflow
+# published, and the lockfile pins the commit behind it.
+encina = { git = "https://github.com/merlimat/encina", tag = "v0.4.1", optional = true }
+# LZ4 and Snappy are the compressions this benchmark can ask for; bindgen at
+# runtime avoids a pre-generated binding going stale against the local
+# libclang.
+rocksdb = { version = "0.25", default-features = false, features = [
+    "snappy",
+    "lz4",
+    "bindgen-runtime",
+], optional = true }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"
