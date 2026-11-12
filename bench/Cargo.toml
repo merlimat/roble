@@ -15,6 +15,10 @@ description = "Benchmarks roble against Go Pebble on the workload Oxia runs"
 default = []
 encina = ["dep:encina"]
 rocksdb = ["dep:rocksdb"]
+# Swaps the process allocator, to answer whether roble is allocator-bound.
+mimalloc = ["dep:mimalloc"]
+# Counts every allocation the process makes, to size the question.
+count-alloc = []
 
 [dependencies]
 compio = { version = "0.19.2", features = ["fs", "macros"] }
@@ -34,6 +38,8 @@ rocksdb = { version = "0.25", default-features = false, features = [
     "lz4",
     "bindgen-runtime",
 ], optional = true }
+
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"

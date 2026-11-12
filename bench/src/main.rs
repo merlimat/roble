@@ -32,6 +32,53 @@
 mod engine;
 mod report;
 
+// Behind a feature, so the default build is measured on the platform's own
+// allocator — which is what a consumer gets unless it chooses otherwise.
+#[cfg(all(feature = "mimalloc", feature = "count-alloc"))]
+compile_error!(
+    "`mimalloc` and `count-alloc` each install a global allocator, so only one \
+     can be on at a time: build twice and compare the two runs"
+);
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "count-alloc")]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Counting;
+
+    // SAFETY: every method forwards to `System` with the layout it was given
+    // and returns what `System` returned, so the allocator contract is
+    // whatever `System`'s is. The counters are the only addition.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(new.saturating_sub(layout.size()) as u64, Relaxed);
+            unsafe { System.realloc(ptr, layout, new) }
+        }
+    }
+}
+
+#[cfg(feature = "count-alloc")]
+#[global_allocator]
+static COUNTING: counting::Counting = counting::Counting;
+
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
@@ -203,6 +250,22 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
         println!("peak rss {} MiB", peak_rss_mib());
     } else {
         println!("{}\tpeak-rss-mib\t{}", out.engine, peak_rss_mib());
+    }
+    #[cfg(feature = "count-alloc")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (allocs, bytes) = (
+            counting::ALLOCS.load(Relaxed),
+            counting::BYTES.load(Relaxed),
+        );
+        if cfg.tsv {
+            println!("{}\tallocs\t{allocs}\t{bytes}", out.engine);
+        } else {
+            println!(
+                "{allocs} allocations, {:.1} MiB asked for",
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
     }
 }
 
