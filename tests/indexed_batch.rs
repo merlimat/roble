@@ -545,3 +545,67 @@ async fn a_batch_hands_out_a_header_whose_sequence_number_is_still_zero() {
     );
     assert_eq!(batch.count(), 2);
 }
+
+/// A `delete_range` and a `put` of a covered key, in both orders.
+///
+/// The one the merge used to settle by itself, and which the `Equal` path has
+/// to settle for itself now it answers without the merge: a batch's entries
+/// stand in at ascending numbers, so whichever of the two was written later
+/// wins. Both orders, because getting one right and the other wrong is the
+/// mistake a single case would miss — and a mutation that drops the
+/// comparison entirely passes everything else in this file.
+#[compio::test]
+async fn a_batch_settles_a_put_against_its_own_range_deletion() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    // A range the fixture's own keys do not reach, so only this batch's
+    // writes are in play and the store cannot answer either way.
+    let (start, key, end) = (&b"zz-a"[..], &b"zz-m"[..], &b"zz-z"[..]);
+    assert!(
+        db.get(key, Comparison::Equal).await.expect("get").is_none(),
+        "the fixture should hold nothing at {}",
+        String::from_utf8_lossy(key)
+    );
+
+    // put, then delete_range over it: the deletion is later, so it wins.
+    let mut batch = db.batch();
+    batch.put(key, b"written-first").expect("put");
+    batch.delete_range(start, end).expect("delete_range");
+    assert_eq!(
+        batch.get(key, Comparison::Equal).await.expect("get"),
+        None,
+        "a delete_range written after a put of a key it covers should win"
+    );
+
+    // delete_range, then put: the put is later, so the key comes back.
+    let mut batch = db.batch();
+    batch.delete_range(start, end).expect("delete_range");
+    batch.put(key, b"written-second").expect("put");
+    assert_eq!(
+        batch
+            .get(key, Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"written-second".to_vec()),
+        "a put written after a delete_range covering it should put the key back"
+    );
+
+    // And the scan, which settles the same question its own way, agrees with
+    // both — the two paths must not drift.
+    for (first_put, want) in [(true, None), (false, Some(b"written-second".to_vec()))] {
+        let mut batch = db.batch();
+        if first_put {
+            batch.put(key, b"written-first").expect("put");
+            batch.delete_range(start, end).expect("delete_range");
+        } else {
+            batch.delete_range(start, end).expect("delete_range");
+            batch.put(key, b"written-second").expect("put");
+        }
+        let mut scan = batch.scan().await.expect("scan");
+        scan.seek_ge(key).await.expect("seek");
+        let seen = (scan.is_valid() && scan.key() == key).then(|| scan.value().to_vec());
+        assert_eq!(seen, want, "the scan should agree with the Equal path");
+    }
+}
