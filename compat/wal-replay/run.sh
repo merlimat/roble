@@ -37,6 +37,10 @@
 # The sixth is Oxia's own configuration: the WAL off, so the table and the
 # MANIFEST edit are the only things that happened and the log is untouched.
 #
+# The eighth starts from an empty directory, so every byte Pebble reads was
+# written by roble: the MANIFEST, both markers, the log and the tables. Every
+# other run begins from a database Pebble built.
+#
 # The fifth makes the opposite claim. roble opens a database and writes
 # nothing, so the only thing that changed is what roble deleted on the way
 # in. Pebble then has to read a directory roble has removed files from.
@@ -54,17 +58,22 @@ trap 'rm -rf "$out"' EXIT
 # into a table through a MANIFEST edit roble appended. The first tests
 # Pebble replaying roble's log; the second tests Pebble reading roble's
 # table and believing roble's MANIFEST.
-for mode in log flushed rotated compacted settled no-wal swept checkpoint; do
+for mode in log flushed rotated compacted settled no-wal swept checkpoint created; do
   db="$out/$mode"
   # The swept run needs a database Pebble left something obsolete in, which
   # db-simple is not: Pebble closed db-unflushed-wal holding a log it had
-  # already flushed past, kept back to recycle.
-  if [ "$mode" = swept ]; then
+  # already flushed past, kept back to recycle. The created run needs no
+  # fixture at all — it is given a path and nothing else, which is the claim.
+  if [ "$mode" = created ]; then
+    :
+  elif [ "$mode" = swept ]; then
     cp -R ../../tests/golden/db-unflushed-wal "$db"
   else
     cp -R ../../tests/golden/db-simple "$db"
   fi
-  chmod -R u+w "$db"
+  if [ -d "$db" ]; then
+    chmod -R u+w "$db"
+  fi
 
   case "$mode" in
     flushed) cargo run --release --quiet -p wal-replay -- "$db" --flush ;;
@@ -74,6 +83,7 @@ for mode in log flushed rotated compacted settled no-wal swept checkpoint; do
     no-wal)  cargo run --release --quiet -p wal-replay -- "$db" --no-wal ;;
     swept)   cargo run --release --quiet -p wal-replay -- "$db" --swept ;;
     checkpoint) cargo run --release --quiet -p wal-replay -- "$db" --checkpoint ;;
+    created) cargo run --release --quiet -p wal-replay -- "$db" --created ;;
     *)       cargo run --release --quiet -p wal-replay -- "$db" ;;
   esac
   echo

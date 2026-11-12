@@ -75,6 +75,7 @@ func main() {
 	}{
 		{"db-simple", buildSimple},
 		{"db-unflushed-wal", buildUnflushedWAL},
+		{"db-created", buildCreated},
 		// A pair built identically, so their tables get the same file
 		// numbers, holding different keys. Two stores on one thread look
 		// like this, and a cache keyed by file number alone would serve one
@@ -129,6 +130,45 @@ func uncompressed(o *pebble.Options) *pebble.Options {
 // Three flushes leave three tables in L0, then one explicit compaction moves a
 // key range down, so the version has more than one level and replaying the
 // MANIFEST in the wrong order would show it.
+// buildCreated is a database Pebble made from an empty directory and wrote
+// exactly one key to.
+//
+// It is here for one number: the sequence number that key gets. Pebble keeps
+// 0 for a key a compaction has proven to be the last of its kind and 1 to 9
+// for uses it has not found yet, so the first key assigned in a fresh
+// database is numbered base.SeqNumStart, which is 10. roble has to start in
+// the same place, and the constant is not importable — base is one of
+// Pebble's internal packages — so the fixture's dump is what pins it.
+//
+// The write goes through a flush so that the number reaches a table, which is
+// where the dump can read it off: an unflushed write lives in a memtable the
+// dump cannot see into.
+func buildCreated(dir string) error {
+	db, err := pebble.Open(dir, uncompressed(&pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+		DisableWAL:                  true,
+	}))
+	if err != nil {
+		return err
+	}
+
+	// One key, in a batch of its own, so the smallest and largest sequence
+	// numbers of the table it lands in are both the first number assigned.
+	b := db.NewBatch()
+	if err := b.Set([]byte("first"), []byte("v"), nil); err != nil {
+		return err
+	}
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+	if err := db.Flush(); err != nil {
+		return err
+	}
+	return db.Close()
+}
+
 func buildSimple(dir string) error {
 	db, err := pebble.Open(dir, uncompressed(&pebble.Options{
 		FS:                          vfs.Default,

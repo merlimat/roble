@@ -1,0 +1,7 @@
+marker marker.format-version.000003.016
+marker marker.manifest.000001.MANIFEST-000001
+format-version 16
+level 0
+  table 000004 size=602 seq=10..10
+    smallest 6669727374 #10 set
+    largest  6669727374 #10 set
