@@ -83,9 +83,27 @@ pub const LEVEL_MULTIPLIER: u64 = 10;
 fn held(version: &Version, level: u32) -> u64 {
     let tables = version.level(level);
     if level == 0 {
-        return tables.len() as u64;
+        return l0_depth(version);
     }
     tables.iter().map(|t| t.size).sum()
+}
+
+/// How deep L0 is: the layers its tables form, which is what a read of it
+/// costs (§9, [`Version::l0_sublevels`]).
+///
+/// Not the number of tables. Ten tables flushed from disjoint key ranges are
+/// one layer and one seek, and compacting them is not urgent; ten flushed
+/// from the same range are ten seeks, and it is. The thresholds are Pebble's
+/// and Pebble counts sublevels.
+///
+/// A bound that does not decode falls back to the number of tables, which is
+/// the upper bound on the layers and the answer this gave before. It cannot
+/// happen to a database that opened — the ordering check decodes every bound
+/// — and a picker is not where one would want to find out.
+pub(crate) fn l0_depth(version: &Version) -> u64 {
+    version
+        .l0_sublevels()
+        .unwrap_or_else(|_| version.level(0).len()) as u64
 }
 
 /// A compaction the picker would run.
@@ -200,12 +218,18 @@ impl<F: Fs> Opened<F> {
         for level in 0..NUM_LEVELS - 1 {
             let tables = versions.version.level(level);
             if level == 0 {
-                let over = (tables.len() as u64).saturating_sub(self.l0_compaction_threshold());
-                let each = if tables.is_empty() {
-                    0
-                } else {
-                    tables.iter().map(|t| t.size).sum::<u64>() / tables.len() as u64
-                };
+                // In layers, like the allowance it is weighed against (§9),
+                // and charged at what a layer weighs. Counting tables here
+                // would report a store as behind for holding ten that a read
+                // crosses in one seek.
+                let depth = l0_depth(&versions.version);
+                let over = depth.saturating_sub(self.l0_compaction_threshold());
+                let each = tables
+                    .iter()
+                    .map(|t| t.size)
+                    .sum::<u64>()
+                    .checked_div(depth)
+                    .unwrap_or(0);
                 debt += over * each;
             } else {
                 let held: u64 = tables.iter().map(|t| t.size).sum();

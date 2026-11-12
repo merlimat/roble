@@ -117,7 +117,7 @@ Both halves are counters rather than histograms so that the ratio can be taken.
 | `roble.level.size` | up-down counter | By | Bytes of the tables in each level |
 | `roble.l0.sublevels` | up-down counter | `{sublevel}` | Layers L0's tables form, which is what a read of L0 costs |
 | `roble.disk.size` | up-down counter | By | Bytes of every file in the store's directory |
-| `roble.compaction.debt` | up-down counter | By | Bytes the levels hold above what their allowances let them |
+| `roble.compaction.debt` | up-down counter | By | Bytes the levels hold above what their allowances let them, L0's counted in layers |
 | `roble.records.estimate` | up-down counter | `{record}` | Records the store holds, counting every version of a key and every tombstone |
 
 `roble.records.estimate` is an estimate for one reason: the count is in each
@@ -231,9 +231,7 @@ to poll and nothing to memoize.
   running would be worth telling apart from one that waits for a merge another
   write is paying for, and today there is no background task to tell apart
   (§9). The attribute gains a value when it does.
-- **Thresholds measured in sublevels.** `roble.l0.sublevels` says what a read
-  of L0 costs, but `l0_compaction_threshold` and `l0_stop_writes_threshold`
-  still count L0's *tables*, where Pebble's count its sublevels. Counting
-  tables is the upper bound on the sublevels, so roble compacts earlier and
-  stalls earlier than Pebble would — conservative, and not the same number.
-  §9 says what switching them involves.
+- **Per-level read and write amplification**, which Pebble reports and Oxia
+  does not graph. `roble.l0.sublevels` is the read amplification of the one
+  level where it is not simply one; the rest would be a ratio of counters
+  that are already here.

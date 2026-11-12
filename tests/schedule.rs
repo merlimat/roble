@@ -73,6 +73,11 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 }
 
 /// How many tables each level holds.
+/// How deep L0 is, which is what its allowance is counted in (§9).
+fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
+    db.versions().version.l0_sublevels().expect("the sublevels") as u64
+}
+
 fn levels<F: Fs>(db: &roble::Opened<F>) -> Vec<usize> {
     let versions = db.versions();
     (0..7).map(|l| versions.version.level(l).len()).collect()
@@ -208,17 +213,23 @@ async fn a_store_that_keeps_flushing_settles_by_itself() {
     for round in 0..20 {
         let mut batch = Batch::new();
         for i in 0..20 {
-            let key = format!("s{round:02}{i:02}").into_bytes();
-            batch.put(&key, b"value").expect("put");
-            model.insert(key, b"value".to_vec());
+            // The same keys every round, with the round in the value. Every
+            // flush then lands a layer above the last, which is what L0's
+            // allowance is counted in — twenty flushes of twenty different
+            // ranges would be one layer and nothing to settle. And the
+            // newest value is what has to come through the merges.
+            let key = format!("s{i:02}").into_bytes();
+            let value = format!("round {round}").into_bytes();
+            batch.put(&key, &value).expect("put");
+            model.insert(key, value);
         }
         db.write(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
 
-        let held = levels(&db)[0];
+        let held = l0_depth(&db);
         assert!(
-            held as u64 <= db.l0_compaction_threshold(),
-            "after round {round} L0 held {held} tables, past its allowance of {}",
+            held <= db.l0_compaction_threshold(),
+            "after round {round} L0 was {held} layers deep, past its allowance of {}",
             db.l0_compaction_threshold()
         );
     }
@@ -286,19 +297,26 @@ async fn a_flush_hands_the_merge_to_whoever_is_waiting_for_one() {
     // which of the two did the merge and not whether a runtime will poll a
     // task. `tests/open.rs` does it with a real one.
     let (env, dir) = load("db-reads").await;
-    // Eleven, so that the picker wants nothing until this flush has added
-    // its table: a store that already wanted a compaction could not show
-    // whose the merge was.
-    let db = roble::open_with(&env, &dir, Options::new().l0_compaction_threshold(11))
+    // The fixture arrives four layers deep, so five is the line this flush
+    // crosses: a store that already wanted a compaction could not show whose
+    // the merge was.
+    let db = roble::open_with(&env, &dir, Options::new().l0_compaction_threshold(5))
         .await
         .expect("open");
     let mut model = contents(&db).await;
-    assert!(db.pick().is_none(), "the fixture should want nothing yet");
+    assert_eq!(
+        l0_depth(&db),
+        4,
+        "the fixture should arrive four layers deep"
+    );
+    assert!(db.pick().is_none(), "and want nothing yet");
 
+    // Inside a range L0 already holds, so the table this flush writes lands
+    // a layer above it rather than beside it (§9).
     let mut batch = Batch::new();
-    batch.put(b"handed", b"over").expect("put");
+    batch.put(b"a1handed", b"over").expect("put");
     db.write(&mut batch, true).await.expect("write");
-    model.insert(b"handed".to_vec(), b"over".to_vec());
+    model.insert(b"a1handed".to_vec(), b"over".to_vec());
 
     let worker = async {
         db.compaction_wanted().await;
