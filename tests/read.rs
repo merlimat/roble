@@ -155,3 +155,132 @@ async fn roble_reads_what_go_pebble_reads() {
         );
     }
 }
+
+/// `get_into` answers what `get` answers, through one `Lookup` reused for
+/// every probe and every comparison.
+///
+/// The reuse is the whole point of the method, and it is also where it can
+/// quietly break. A buffer not cleared would show up as an answer with the
+/// previous probe's bytes still on the front; a miss that left the buffer
+/// filled would show up as the *next* miss looking like a hit. Every call
+/// after the first answer arrives at a buffer that still holds the last one,
+/// and the counts at the end are what says both cases were reached.
+///
+/// Pebble's probe set is the oracle again, and asking `get` and `get_into`
+/// the same question is deliberate: `get` is compared with Pebble line by
+/// line in the test above, so agreeing with `get` is agreeing with Pebble
+/// without a second copy of the expected text to keep current.
+#[compio::test]
+async fn get_into_answers_what_get_answers_through_one_reused_lookup() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-reads.probes");
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}; regenerate with 'cd harness && go run ./read-probes ../tests/golden'",
+            path.display()
+        )
+    });
+    let probes: Vec<Vec<u8>> = expected
+        .lines()
+        .filter_map(|l| l.strip_prefix("probe "))
+        .map(unhex)
+        .collect();
+    assert!(!probes.is_empty(), "no probes in {}", path.display());
+
+    let (_tmp, db_dir) = fixture("db-reads");
+    let db = roble::open(&roble::DefaultEnv, &db_dir)
+        .await
+        .expect("open the database Go wrote");
+
+    let mut buf = roble::Lookup::new();
+    let (mut hits, mut misses, mut after_an_answer) = (0usize, 0usize, 0usize);
+    for probe in &probes {
+        for (name, how) in [
+            ("equal", Comparison::Equal),
+            ("ceiling", Comparison::Ceiling),
+            ("higher", Comparison::Higher),
+            ("floor", Comparison::Floor),
+            ("lower", Comparison::Lower),
+        ] {
+            let owned = db.get(probe, how).await.expect(name);
+            let dirty = !buf.key().is_empty() || !buf.value().is_empty();
+
+            let found = db.get_into(probe, how, &mut buf).await.expect(name);
+
+            if dirty {
+                after_an_answer += 1;
+            }
+            assert_eq!(
+                found,
+                owned.is_some(),
+                "{name} of {}: get_into said {found}, get said {}",
+                hex(probe),
+                owned.is_some()
+            );
+            match &owned {
+                Some(f) => {
+                    assert_eq!(
+                        (buf.key(), buf.value()),
+                        (f.key.as_slice(), f.value.as_slice()),
+                        "{name} of {}: get_into filled {} / {}, get answered {} / {}",
+                        hex(probe),
+                        hex(buf.key()),
+                        hex(buf.value()),
+                        hex(&f.key),
+                        hex(&f.value)
+                    );
+                    hits += 1;
+                }
+                None => {
+                    assert!(
+                        buf.key().is_empty() && buf.value().is_empty(),
+                        "{name} of {}: no answer, but the buffer kept {} / {}",
+                        hex(probe),
+                        hex(buf.key()),
+                        hex(buf.value())
+                    );
+                    misses += 1;
+                }
+            }
+        }
+    }
+    // Without all three, part of the contract above would go untested while
+    // the test still passed, which is the way a test like this rots.
+    assert!(
+        hits > 0 && misses > 0 && after_an_answer > 0,
+        "the fixture should reach answers, absences and a reused buffer: \
+         {hits} hits, {misses} misses, {after_an_answer} calls onto a full buffer"
+    );
+}
+
+/// `take` hands the answer over and leaves the working space empty.
+#[compio::test]
+async fn take_empties_the_lookup() {
+    let (_tmp, db_dir) = fixture("db-reads");
+    let db = roble::open(&roble::DefaultEnv, &db_dir)
+        .await
+        .expect("open the database Go wrote");
+
+    // Whatever the fixture's first key is, reached without assuming one.
+    let mut scan = db.scan().await.expect("scan");
+    scan.seek_ge(b"").await.expect("seek");
+    assert!(scan.is_valid(), "the fixture should hold at least one key");
+    let (key, value) = (scan.key().to_vec(), scan.value().to_vec());
+    drop(scan);
+
+    let mut buf = roble::Lookup::new();
+    assert!(
+        db.get_into(&key, Comparison::Equal, &mut buf)
+            .await
+            .expect("get_into"),
+        "the key a scan just handed back should be readable"
+    );
+    let taken = buf.take();
+    assert_eq!(taken.key, key);
+    assert_eq!(taken.value, value);
+    assert!(
+        buf.key().is_empty() && buf.value().is_empty(),
+        "take should leave the working space empty, kept {} / {}",
+        hex(buf.key()),
+        hex(buf.value())
+    );
+}

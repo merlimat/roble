@@ -166,6 +166,14 @@ func main() {
 	if cfg.wants("scan") {
 		scan(cfg, shards, false)
 	}
+	if cfg.wants("get-buf") {
+		// Pebble's `Get` hands back a value borrowed from the block it is in,
+		// with a closer, and `getWith` consumes it without copying. So its
+		// `get` row below *is* its buffered read, and a second row would be
+		// the same number twice. Which also means roble's `get` row is not
+		// like-for-like with this one and its `get-buf` row is.
+		skipped(cfg, "get-buf", "its get already borrows the value rather than copying it")
+	}
 	if cfg.wants("get") {
 		lookups(cfg, shards, false)
 	}
@@ -467,6 +475,17 @@ func (r *report) finish(shards []*pebble.DB) {
 	fmt.Printf("%-11s %10d %12.0f %9d %9d %9d %8.2f %9.1f\n",
 		r.name, r.count, rate, us(0.50), us(0.99), us(1.0),
 		cpu.Seconds(), sizeMiB)
+}
+
+// skipped says a phase did not happen, and why, in place of its line, in the
+// formats roble-bench's own `Report::skipped` prints — a dash rather than a
+// zero, which would read as "it did this and it took no time".
+func skipped(cfg config, name, why string) {
+	if cfg.tsv {
+		fmt.Printf("pebble\t%s\tskipped\t%s\n", name, why)
+		return
+	}
+	fmt.Printf("%-11s %10s \u2014 %s\n", name, "-", why)
 }
 
 // ------------------------------------------------------------------- the key

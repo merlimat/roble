@@ -45,6 +45,17 @@ use roble_format::{FOOTER_LEN, Footer};
 use crate::env::{Disk, read_exact, read_tail};
 use crate::error::{Error, Result};
 
+/// The refusal both forms of reading an entry give for a blob handle.
+///
+/// Untested, with a reason rather than a test (§12), and the reason is that an
+/// earlier refusal gets there first: blob handles arrive with Pebblev6, and
+/// the footer refuses anything above v4 before a block is read. This stays as
+/// the backstop for the day the pin moves, where it would become reachable in
+/// the same change that raised it.
+fn blob_unsupported() -> Error {
+    Error::Unsupported("a value stored in a blob file, which is above roble's pin".to_string())
+}
+
 /// One entry a seek landed on.
 pub struct Entry {
     /// The encoded internal key.
@@ -277,6 +288,31 @@ impl<D: Disk> OpenTable<D> {
     /// goes through [`TableIter`], which holds its place instead of forgetting
     /// it between calls.
     pub async fn seek_ge(&self, target: &[u8]) -> Result<Option<Entry>> {
+        let mut entry = Entry {
+            key: Vec::new(),
+            value: Vec::new(),
+        };
+        Ok(self
+            .seek_ge_into(target, &mut entry.key, &mut entry.value)
+            .await?
+            .then_some(entry))
+    }
+
+    /// The same, into buffers the caller keeps, answering whether there was
+    /// one. Both are cleared first, and are left empty when there is none.
+    ///
+    /// This is the form the point lookup wants, because it is merging several
+    /// tables' answers: it needs each table's key to compare before it knows
+    /// whether to keep that table's value, so what it wants is a pair of
+    /// buffers it can overwrite per table and swap out of when one wins. An
+    /// owned `Entry` per table was two allocations per table searched, and
+    /// the losers' were thrown away.
+    pub async fn seek_ge_into(
+        &self,
+        target: &[u8],
+        key: &mut Vec<u8>,
+        value: &mut Vec<u8>,
+    ) -> Result<bool> {
         let start = first_block_at_or_after(&self.index, target)?;
         for entry in &self.index[start..] {
             let bytes = self.block(entry.handle, Caching::Keep).await?;
@@ -284,15 +320,30 @@ impl<D: Disk> OpenTable<D> {
             let mut cursor = block.data_cursor(self.footer.format);
             cursor.seek_ge(&block, target)?;
             if cursor.is_valid() {
-                return Ok(Some(self.entry(&block, &cursor).await?));
+                self.entry_into(&block, &cursor, key, value).await?;
+                return Ok(true);
             }
             // The target fell past this block's last key; the answer, if any,
             // is the next block's first entry.
         }
-        Ok(None)
+        // No entry, so the contract's "left empty when there is none" half.
+        // Clearing here rather than on the way in is what makes the clear
+        // inside `entry_into` the only one on the path that finds something,
+        // and so the one a test can tell is missing.
+        key.clear();
+        value.clear();
+        Ok(false)
     }
 
     /// Takes the entry a cursor is on, following a value-block handle.
+    ///
+    /// Not written in terms of [`Self::entry_into`], though it reads as
+    /// though it could be. This is a scan's per-step path — `take_newest_visible`
+    /// calls it for every record it returns — and routing it through the
+    /// buffer form measured 5% slower on a forward scan over fourteen tables
+    /// (0.946, over six paired runs, 0.907 to 0.961). The two bodies are
+    /// parallel because the ownership differs, not by oversight; what they
+    /// share, the refusal below, is shared.
     async fn entry(
         &self,
         block: &Block<'_>,
@@ -304,23 +355,56 @@ impl<D: Disk> OpenTable<D> {
         let value = match decoded.value {
             Value::InPlace(b) => b.to_vec(),
             Value::ValueHandle(h) => self.resolve(h).await?,
-            // Untested, with a reason rather than a test (§12), and the
-            // reason is that an earlier refusal gets there first: blob
-            // handles arrive with Pebblev6, and the footer refuses anything
-            // above v4 before a block is read. This stays as the backstop for
-            // the day the pin moves, where it would become reachable in the
-            // same change that raised it.
-            Value::BlobHandle(_) => {
-                return Err(Error::Unsupported(
-                    "a value stored in a blob file, which is above roble's pin".to_string(),
-                ));
-            }
+            Value::BlobHandle(_) => return Err(blob_unsupported()),
         };
         Ok(Entry { key, value })
     }
 
+    /// The same, into buffers the caller keeps.
+    ///
+    /// Both are cleared first, so a buffer handed back from a previous entry
+    /// does not leave its bytes on the front of this one.
+    async fn entry_into(
+        &self,
+        block: &Block<'_>,
+        cursor: &roble_format::block::restart::DataCursor,
+        key: &mut Vec<u8>,
+        value: &mut Vec<u8>,
+    ) -> Result<()> {
+        let decoded = cursor.entry(block)?;
+        check_kind(decoded.key)?;
+        let raw = cursor.raw_key();
+        key.clear();
+        key.reserve(raw.len());
+        key.extend_from_slice(raw);
+        value.clear();
+        match decoded.value {
+            Value::InPlace(b) => {
+                value.reserve(b.len());
+                value.extend_from_slice(b);
+            }
+            Value::ValueHandle(h) => self.resolve_into(h, value).await?,
+            Value::BlobHandle(_) => return Err(blob_unsupported()),
+        }
+        Ok(())
+    }
+
     /// Follows a value-block handle to the value it names.
+    ///
+    /// The owned form, for [`Self::entry`]. A value block holds one value, so
+    /// there is nothing here for a reused buffer to save that the allocation
+    /// of the returned `Vec` does not cost anyway.
     async fn resolve(&self, handle_bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.resolve_into(handle_bytes, &mut out).await?;
+        Ok(out)
+    }
+
+    /// Follows a value-block handle to the value it names.
+    ///
+    /// Appends to `out`, which the caller has already cleared: a value block
+    /// holds one value and this writes one value.
+    async fn resolve_into(&self, handle_bytes: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let handle = roble_format::value_block::Handle::decode(handle_bytes)?;
         let block_handle = self
             .value_blocks
@@ -340,7 +424,8 @@ impl<D: Disk> OpenTable<D> {
                 ))
             })?;
         let bytes = self.block(*block_handle, Caching::Keep).await?;
-        Ok(roble_format::value_block::value_in_block(&bytes, handle)?.to_vec())
+        out.extend_from_slice(roble_format::value_block::value_in_block(&bytes, handle)?);
+        Ok(())
     }
 }
 

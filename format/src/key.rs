@@ -210,7 +210,27 @@ pub fn encode_with_trailer(user_key: &[u8], trailer: u64) -> Vec<u8> {
 
 /// The internal key a seek to `user_key` targets.
 pub fn search_key(user_key: &[u8]) -> Vec<u8> {
-    encode_with_trailer(user_key, SEARCH_TRAILER)
+    let mut out = Vec::with_capacity(user_key.len() + TRAILER_LEN);
+    search_key_into(user_key, &mut out);
+    out
+}
+
+/// The same, into a buffer the caller keeps rather than a fresh one.
+///
+/// A point lookup builds one of these per call and throws it away, so the
+/// caller of a read in a loop can hand the same buffer back each time. The
+/// encoding stays here rather than being spelled out at the call site: a
+/// search key that disagreed with [`search_key`] would seek to the wrong
+/// place, and the two would have to be kept in step by eye.
+pub fn search_key_into(user_key: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    // Sized once. Two `extend_from_slice` calls onto an empty buffer would
+    // allocate for the key and then grow again for the trailer, which a
+    // counting allocator sees as two — the whole point here is that a warm
+    // buffer costs neither.
+    out.reserve(user_key.len() + TRAILER_LEN);
+    out.extend_from_slice(user_key);
+    out.extend_from_slice(&SEARCH_TRAILER.to_le_bytes());
 }
 
 /// A borrowed internal key: the user key, its sequence number and its kind.

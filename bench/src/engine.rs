@@ -98,6 +98,36 @@ pub trait Store: Sized {
         true
     }
 
+    /// Whether this engine offers a point read into a buffer the caller
+    /// keeps and hands back on the next call.
+    ///
+    /// roble does, through `get_into` and a `Lookup`.
+    ///
+    /// The others reach it differently or not at all, and the difference
+    /// matters more than it looks. **Pebble already reads without copying**:
+    /// `Get` hands back a value borrowed from its block with a closer, and
+    /// `harness/bench` consumes it in place — so Pebble's `get` row is
+    /// already its buffered read, which means roble's `get` row has never
+    /// been like-for-like with it and its `get-buf` row is. RocksDB has
+    /// `get_pinned` for the same purpose, not wired up here. encina returns
+    /// an owned value.
+    ///
+    /// So this phase reports for roble and is skipped elsewhere, with the
+    /// reason in the table. The alternative was leaving the number out of the
+    /// benchmark and quoting it from a patch nobody can run.
+    fn buffered(&self) -> bool {
+        false
+    }
+
+    /// `get` through that buffer, answering the value's length.
+    ///
+    /// A length and not the value, because handing an owned `Vec` back would
+    /// put back the allocation this exists to avoid — and a length still
+    /// proves the value was read, which `Some(())` would not.
+    async fn get_buffered(&self, _key: &[u8]) -> Option<usize> {
+        fail("this engine has no buffered read; the phase should have been skipped")
+    }
+
     /// Steps every record, forward or backward, sampling steps into `report`,
     /// and returns how many it saw.
     async fn scan(&self, reverse: bool, report: &mut Report) -> u64;
@@ -157,6 +187,14 @@ macro_rules! step_loop {
 /// roble, the subject.
 pub struct Roble {
     db: roble::Opened<roble::FileFs>,
+    /// The working space `get-buf` hands back on every call. One per store,
+    /// as Oxia holds one store per shard and reads them from one thread.
+    ///
+    /// A `Cell` and not a `RefCell`: it is moved out for the call and back
+    /// after, so there is no borrow to hold across the await inside. Clippy
+    /// refuses that borrow, and is right to — it is the hazard that decided
+    /// a `Lookup` belongs to the caller in the first place.
+    lookup: std::cell::Cell<roble::Lookup>,
 }
 
 impl Store for Roble {
@@ -185,7 +223,10 @@ impl Store for Roble {
             )
             .await
             .unwrap_or_else(|e| fail(&format!("open {}: {e}", at.display())));
-            shards.push(Roble { db });
+            shards.push(Roble {
+                db,
+                lookup: std::cell::Cell::new(roble::Lookup::new()),
+            });
         }
         shards
     }
@@ -284,6 +325,25 @@ impl Store for Roble {
             .await
             .unwrap_or_else(|e| fail(&format!("get: {e}")))
             .map(|f| f.value)
+    }
+
+    fn buffered(&self) -> bool {
+        true
+    }
+
+    async fn get_buffered(&self, key: &[u8]) -> Option<usize> {
+        // Moved out for the call and put back after. Moving it is a few
+        // pointers either way, and the buffers keep the capacity they
+        // reached, which is the whole point of handing one back.
+        let mut buf = self.lookup.take();
+        let found = self
+            .db
+            .get_into(key, roble::Comparison::Equal, &mut buf)
+            .await
+            .unwrap_or_else(|e| fail(&format!("get_into: {e}")));
+        let len = found.then(|| buf.value().len());
+        self.lookup.set(buf);
+        len
     }
 
     async fn floor(&self, probe: &[u8]) -> Option<Vec<u8>> {

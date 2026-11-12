@@ -72,6 +72,71 @@ pub struct Found {
     pub value: Vec<u8>,
 }
 
+/// A lookup's working space, kept and handed back by the caller.
+///
+/// Not [`crate::ReadBuf`], which is a block of bytes for one file read. This
+/// is everything one `get` needs somewhere to put.
+///
+/// A point lookup needs more scratch than its answer: the internal key it
+/// seeks to, the file numbers of the tables whose range holds the key, and a
+/// pair of buffers to take each table's candidate into before it knows which
+/// one wins. All of it used to be allocated per call and dropped, which made
+/// a lookup's allocation count grow with the number of tables in the store.
+///
+/// It lives here rather than on the store because a lookup `.await`s in the
+/// middle: scratch behind a `RefCell` on a shared handle could not be held
+/// across those awaits once two reads were ever in flight at once, and a
+/// buffer the caller owns needs no pool and no sharing — a caller with two
+/// reads in flight has two buffers.
+///
+/// Hand the same one back on every call and a read in a steady state stops
+/// allocating. [`Opened::get`] makes one per call, which is what a caller
+/// that wants its answer owned is paying for.
+#[derive(Debug, Default)]
+pub struct Lookup {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    /// The encoded internal key a seek targets.
+    target: Vec<u8>,
+    /// The tables whose key range holds the key being read.
+    file_nums: Vec<u64>,
+    /// One table's candidate, before it is known to be the newest.
+    entry_key: Vec<u8>,
+    entry_value: Vec<u8>,
+}
+
+impl Lookup {
+    /// Working space that has not been used yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The key the last read answered with, or empty if it found nothing.
+    ///
+    /// For [`Comparison::Equal`] this is the key that was asked for; for the
+    /// other four it is the key the seek landed on.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Its value, or empty if the last read found nothing.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Takes the answer out as a [`Found`], leaving the buffer empty.
+    ///
+    /// This moves the two buffers rather than copying them, so it gives up
+    /// the capacity they had reached. A caller reading in a loop wants
+    /// [`Self::key`] and [`Self::value`] instead.
+    pub fn take(&mut self) -> Found {
+        Found {
+            key: std::mem::take(&mut self.key),
+            value: std::mem::take(&mut self.value),
+        }
+    }
+}
+
 /// The least user key strictly greater than `user`.
 ///
 /// Appending a zero byte is exactly that: any key greater than `user` either
@@ -80,56 +145,94 @@ pub struct Found {
 /// a user key it has rejected without having to enumerate its versions.
 pub(crate) fn successor(user: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(user.len() + 1);
-    out.extend_from_slice(user);
-    out.push(0);
+    successor_into(user, &mut out);
     out
 }
 
-/// One table's answer: the newest entry it holds for a user key.
+/// The same, into a buffer the caller keeps.
+pub(crate) fn successor_into(user: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    // Sized once, as `successor`'s `with_capacity` does: extending to the
+    // key's length and then pushing the zero byte would grow the buffer a
+    // second time.
+    out.reserve(user.len() + 1);
+    out.extend_from_slice(user);
+    out.push(0);
+}
+
+/// One table's answer for a user key: which entry won, not what it holds.
+///
+/// The value lives in the caller's buffer. Keeping it here meant one
+/// allocation per table that offered a candidate, including every one a later
+/// table's trailer then beat.
 struct Candidate {
     trailer: u64,
     kind: Kind,
-    value: Vec<u8>,
 }
 
 impl<F: Fs> Opened<F> {
     /// Reads the key `how` says, or `None` if there is none.
+    ///
+    /// Allocates the answer and the scratch the read needed to find it.
+    /// [`Self::get_into`] is the same read into a [`Lookup`] the caller
+    /// keeps, which allocates neither once it is warm.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
+        let mut buf = Lookup::new();
+        Ok(self.get_into(key, how, &mut buf).await?.then(|| buf.take()))
+    }
+
+    /// Reads the key `how` says into `buf`, answering whether there was one.
+    ///
+    /// On `true`, [`Lookup::key`] and [`Lookup::value`] hold the answer. On
+    /// `false` both are empty, so the same buffer can be handed back call
+    /// after call without a miss reading as the previous hit. What it holds
+    /// after an `Err` is not defined.
+    ///
+    /// This is the allocation-free read: hand back the same `buf` and, once
+    /// its buffers have reached the sizes the data needs, a lookup in a steady
+    /// state allocates nothing at all.
+    pub async fn get_into(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
         let _timer = self.metrics.get.start();
+        buf.key.clear();
+        buf.value.clear();
         let result = match how {
             // Equal keeps its own path: it is the one comparison a bloom
             // filter can answer, and a scan does not consult filters because
             // it is asking about a range (§6).
-            Comparison::Equal => self.equal(key).await,
-            _ => self.positioned(key, how).await,
+            Comparison::Equal => self.equal(key, buf).await,
+            _ => self.positioned(key, how, buf).await,
         };
         let found = self.metrics.read_errors.saw(result)?;
-        if let Some(found) = &found {
+        if found {
             self.metrics
                 .read_bytes
-                .add((found.key.len() + found.value.len()) as u64);
+                .add((buf.key.len() + buf.value.len()) as u64);
+        } else {
+            // One place for the "empty on false" half of the contract above,
+            // rather than every path that can decide there is no answer.
+            buf.key.clear();
+            buf.value.clear();
         }
         Ok(found)
     }
 
     /// A point lookup.
-    async fn equal(&self, user: &[u8]) -> Result<Option<Found>> {
+    async fn equal(&self, user: &[u8], buf: &mut Lookup) -> Result<bool> {
         // The range check both halves need, done once. They narrow it
         // differently from here — `newest_for` consults each table's filter
         // and `visible` must not, since a filter is built from point keys and
         // a range tombstone is not one — but which tables *contain* the key
         // is one question with one answer.
-        let containing = self.tables_containing(user)?;
-        let Some(found) = self.newest_for(user, &containing).await? else {
-            return Ok(None);
+        self.tables_containing(user, &mut buf.file_nums)?;
+        let Some(found) = self.newest_for(user, buf).await? else {
+            return Ok(false);
         };
-        if !self.visible(user, &found, &containing).await? {
-            return Ok(None);
+        if !self.visible(user, &found, &buf.file_nums).await? {
+            return Ok(false);
         }
-        Ok(Some(Found {
-            key: user.to_vec(),
-            value: found.value,
-        }))
+        // The key an `Equal` found is the key it was asked for.
+        buf.key.extend_from_slice(user);
+        Ok(true)
     }
 
     /// The first visible key a scan positioned `how` lands on.
@@ -140,21 +243,29 @@ impl<F: Fs> Opened<F> {
     /// merge of their own, re-seeking every candidate table once per key they
     /// rejected; a scan steps instead, and skipping deleted keys is its job
     /// rather than this one's.
-    async fn positioned(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
+    async fn positioned(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
         let mut scan = self.scan().await?;
         match how {
             Comparison::Ceiling => scan.seek_ge(key).await?,
-            Comparison::Higher => scan.seek_ge(&successor(key)).await?,
+            Comparison::Higher => {
+                successor_into(key, &mut buf.target);
+                scan.seek_ge(&buf.target).await?
+            }
             // The greatest key at or below `key` is the greatest key strictly
             // below the one after it.
-            Comparison::Floor => scan.seek_lt(&successor(key)).await?,
+            Comparison::Floor => {
+                successor_into(key, &mut buf.target);
+                scan.seek_lt(&buf.target).await?
+            }
             Comparison::Lower => scan.seek_lt(key).await?,
             Comparison::Equal => unreachable!("Equal is a point lookup"),
         }
-        Ok(scan.is_valid().then(|| Found {
-            key: scan.key().to_vec(),
-            value: scan.value().to_vec(),
-        }))
+        if !scan.is_valid() {
+            return Ok(false);
+        }
+        buf.key.extend_from_slice(scan.key());
+        buf.value.extend_from_slice(scan.value());
+        Ok(true)
     }
 
     /// The newest entry any table holds for `user`.
@@ -162,8 +273,19 @@ impl<F: Fs> Opened<F> {
     /// Newest by sequence number, across every level: an entry's level says
     /// nothing a trailer does not already say, and trailers are what the
     /// ordering is defined on.
-    async fn newest_for(&self, user: &[u8], containing: &[u64]) -> Result<Option<Candidate>> {
-        let target = key::search_key(user);
+    async fn newest_for(&self, user: &[u8], buf: &mut Lookup) -> Result<Option<Candidate>> {
+        // Split so the value being filled, the scratch being overwritten and
+        // the list being walked can be held at once; they are disjoint parts
+        // of the caller's one buffer.
+        let Lookup {
+            value,
+            target,
+            file_nums,
+            entry_key,
+            entry_value,
+            ..
+        } = buf;
+        key::search_key_into(user, target);
         let mut best: Option<Candidate> = None;
 
         // The memtables first — the one writes go to, and the one a flush is
@@ -171,26 +293,29 @@ impl<F: Fs> Opened<F> {
         // after every table was, so one of them usually wins outright, but
         // the comparison below is by trailer either way: this is an ordering
         // of convenience, not of correctness.
-        for held in self.memtables() {
+        for held in self.memtables_each() {
             let memtable = held.borrow();
             let mut cursor = memtable.cursor();
-            cursor.seek_ge(&memtable, &target)?;
+            cursor.seek_ge(&memtable, target)?;
             if cursor.is_valid() {
                 let k = InternalKey::decode(cursor.key(&memtable))?;
                 if k.user_key == user {
                     let candidate = Candidate {
                         trailer: (k.seq_num << 8) | k.kind.to_byte() as u64,
                         kind: k.kind,
-                        value: cursor.value(&memtable).to_vec(),
                     };
+                    // Copied only if it wins. A memtable's value is borrowed
+                    // from the memtable, so there is nothing to swap.
                     if best.as_ref().is_none_or(|b| candidate.trailer > b.trailer) {
+                        value.clear();
+                        value.extend_from_slice(cursor.value(&memtable));
                         best = Some(candidate);
                     }
                 }
             }
         }
 
-        for &file_num in containing {
+        for &file_num in file_nums.iter() {
             let table = self.open_table(file_num).await?;
             // The filter is consulted only here: it answers about one key, and
             // the ordered comparisons are asking about a range (§6).
@@ -203,10 +328,10 @@ impl<F: Fs> Opened<F> {
                 continue;
             }
 
-            let Some(entry) = table.seek_ge(&target).await? else {
+            if !table.seek_ge_into(target, entry_key, entry_value).await? {
                 continue;
-            };
-            let k = InternalKey::decode(&entry.key)?;
+            }
+            let k = InternalKey::decode(entry_key)?;
             if k.user_key != user {
                 // The table has no version of this key; the seek landed past
                 // it.
@@ -217,9 +342,12 @@ impl<F: Fs> Opened<F> {
             let candidate = Candidate {
                 trailer: (k.seq_num << 8) | k.kind.to_byte() as u64,
                 kind: k.kind,
-                value: entry.value,
             };
             if best.as_ref().is_none_or(|b| candidate.trailer > b.trailer) {
+                // Swapped, not copied: the winner's bytes are already in a
+                // buffer of the right size, and the one they replace goes
+                // back to being scratch with its capacity intact.
+                std::mem::swap(value, entry_value);
                 best = Some(candidate);
             }
         }
@@ -243,16 +371,18 @@ impl<F: Fs> Opened<F> {
         // before it — and it is written that way for that reason, not because
         // a test demanded it.
         let seq = found.trailer >> 8;
-        let mut tables = Vec::with_capacity(containing.len());
+        // One table at a time, rather than opening all of them and then
+        // asking: any covering tombstone answers the whole question, so the
+        // tables after it need not be opened at all.
         for &file_num in containing {
-            tables.push(self.open_table(file_num).await?);
-        }
-        if crate::table::covered_by_tombstone(&tables, user, seq)? {
-            return Ok(false);
+            let table = self.open_table(file_num).await?;
+            if crate::table::covered_by_tombstone(std::slice::from_ref(&table), user, seq)? {
+                return Ok(false);
+            }
         }
         // And the memtables', which are kept apart from their point keys and
         // so are in no cursor's way (§4).
-        for held in self.memtables() {
+        for held in self.memtables_each() {
             for t in held.borrow().tombstones() {
                 if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
                     return Ok(false);
@@ -279,9 +409,9 @@ impl<F: Fs> Opened<F> {
     ///
     /// Order does not matter: every comparison in the callers is by key or by
     /// trailer, never by position in the tree.
-    fn tables_containing(&self, user: &[u8]) -> Result<Vec<u64>> {
+    fn tables_containing(&self, user: &[u8], out: &mut Vec<u64>) -> Result<()> {
         let versions = self.versions();
-        let mut out = Vec::new();
+        out.clear();
         for (_, tables) in versions.version.levels() {
             for meta in tables {
                 if meta.smallest_user_key()? <= user && meta.largest_user_key()? >= user {
@@ -289,6 +419,6 @@ impl<F: Fs> Opened<F> {
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 }

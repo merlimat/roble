@@ -48,8 +48,28 @@ They always run in this order, whatever order `--phases` names them in.
   up in the CPU column.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
-- **get** — `--reads` random keys, every one present. Oxia's `Get` with
-  `ComparisonEqual`, and the one comparison a bloom filter can answer.
+- **get-buf**, then **get** — `--reads` random keys, every one present. Oxia's
+  `Get` with `ComparisonEqual`, and the one comparison a bloom filter can
+  answer. The two differ in one line of the engine adapter and nothing else:
+  the same keys in the same order, the same allocations in this harness.
+  `get` takes the answer owned; `get-buf` reads into a buffer the caller keeps
+  and hands back, which for roble is `get_into` and a `Lookup`.
+
+  **`get-buf` goes first**, for the reason `scan-rev` does: the phases share a
+  cache, so the second reads one the first warmed, and the bias belongs
+  against the phase making a claim. Running it second reported 1.51× on a
+  90,000-record store where two processes, one phase each, reported 1.10×.
+  The clean comparison is the `get` pass in `run.sh`, which gives each form a
+  process and a store of its own.
+
+  It is skipped where an engine has no such read, with the reason in the
+  table — and the reasons differ. **Pebble already reads without copying**:
+  `Get` hands back a value borrowed from its block with a closer, and
+  `harness/bench` consumes it in place. So Pebble's `get` row is already its
+  buffered read, which also means **roble's `get` row has never been
+  like-for-like with Pebble's, and its `get-buf` row is**. RocksDB has
+  `get_pinned` for the same purpose, not wired up here. encina returns an
+  owned value.
 - **get-cold** — **one** point lookup per shard, on a store closed and opened
   again. The `get` phase above reports a warm steady state: `--reads` lookups
   in a row, after the scans have walked every block, with the filters and
