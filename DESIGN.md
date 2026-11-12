@@ -477,14 +477,34 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   cooperative within their permit, so a write never waits on a compaction's
   merge for more than a slice of work (§9).
 
-  A **write** does not take the permit, and so is not yet safe against a
-  flush: a write that lands after a flush has read the memtable and before it
-  swaps in a fresh one belongs to a memtable the flush is about to drop,
-  whose log its edit retires. Serializing writes against flushes would close
-  it and would be the wrong fix — Pebble's is to make the memtable immutable
-  at the *start* of a flush and send writes to a new one, which is the
-  machinery the memtable write stall needs anyway (§9). Until then, one task
-  per store.
+  A **write** does not take the permit, and must not: a write that waited on
+  it would be waiting on whatever merge happened to be going on. What makes a
+  write safe against a flush instead is that the flush **freezes** the
+  memtable before its first await, which is Pebble's answer and the machinery
+  the memtable write stall will need (§9). Writes from then on go to a fresh
+  memtable and, with a WAL, a fresh log, so the table being built holds
+  neither of them and the log the edit retires holds neither. A read looks in
+  both memtables, and the frozen one stays readable until the edit naming its
+  table has landed.
+
+  Freezing *waits*, which is the part that is easy to miss. A write appends
+  its record to the log, waits for that, and only then applies it to the
+  memtable — the order that keeps anything readable recoverable (§6). A flush
+  that froze in between would build its table from a memtable the write had
+  not reached yet, and retire the log holding the record: the write returned
+  `Ok`, and both copies of it are gone. So a store counts the writes that have
+  chosen a memtable, and a freeze does not swap until the count is zero
+  (`crate::change::Writers`). It is a counter and not a permit, because there
+  is nothing wrong with two writes at once — only with freezing underneath
+  one.
+
+  A freeze is the one part of a flush that a failure does not undo: the store
+  is writing to the fresh memtable and the fresh log from then on, whatever
+  becomes of the rest. So the new log's file number is spent at the swap
+  rather than at the edit, and a flush that fails leaves a memtable frozen for
+  the next flush to write out rather than freeze over. One flush writes one
+  memtable, which is why a flush does not always leave `unflushed_bytes()` at
+  zero.
 - **A level's tables may touch but not overlap.** Two tables of one level may
   share a user key at their bounds when the first ends there *exclusively* —
   its largest key being a range deletion's end at the largest sequence number
@@ -655,9 +675,14 @@ largest key of `#72057594037927935 rangedel`. Folding the sentinel into the
 sequence range produces a table claiming a sequence number above anything the
 MANIFEST ever committed, which is what §6's version check refuses.
 
-`flush()` makes the memtable an immutable one, writes it as a table, appends the
-version edit — carrying the new minimum unflushed log number — and syncs: the
-point at which Oxia's data becomes durable. The logs below that number are then
+`flush()` **freezes** the memtable — nothing more is added to it, and writes go
+to a fresh one and, with a WAL, a fresh log — then writes it as a table, appends
+the version edit carrying the new minimum unflushed log number, and syncs: the
+point at which Oxia's data becomes durable. The freeze comes first, before
+anything is awaited, so that a write arriving in the middle of a flush is
+neither left out of the table nor retired with the log (§5). The minimum the
+edit carries is the log the store is writing to when the edit is appended, which
+is the one the freeze installed. The logs below that number are then
 obsolete, and are deleted like any other obsolete file — including one Pebble
 had kept back to recycle, which roble does not do and so has no use for.
 
@@ -1100,6 +1125,13 @@ in both directions.
   together, exactly as the failure paths sweep an injected error. What must
   hold at every one of them is §5's rule: the database still opens, and it
   holds what was written to it.
+  One await is not everything an overlap test needs. A claim about *being
+  woken* cannot be made through a filesystem that never blocks — a future
+  polled twice there is a future that has finished — so the two places that
+  park a caller, the permit and the count of writes in flight, are driven by
+  hand instead: `tests/change.rs` with an executor that polls only what was
+  woken, and `crate::change`'s own unit tests with a waker that records
+  whether it was called.
   CI measures coverage on every pull request (`cargo llvm-cov`), posts the totals
   as a status, and lists the lines and regions no test runs, such as the error
   branch of a `?`. An uncovered failure path needs a test or a written reason.

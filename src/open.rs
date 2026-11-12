@@ -77,6 +77,20 @@ pub struct Opened<F: Fs> {
     /// swapping the contents instead would empty a snapshot out from under
     /// it. The inner cell is what a write needs.
     memtable: std::cell::RefCell<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>>,
+    /// The memtable a flush is writing out, if there is one.
+    ///
+    /// Filled at the start of a flush and emptied once the edit naming the
+    /// table has landed. What it buys is that a write arriving in the middle
+    /// of a flush goes to a different memtable and a different log, and so
+    /// is neither left out of the table being built nor retired with the log
+    /// that edit replaces (§5, `crate::flush`).
+    ///
+    /// A flush that fails leaves it filled, and the next flush writes *it*
+    /// out rather than freezing again. Everything in it is older than
+    /// everything in the memtable in front, so a table built from it holds a
+    /// prefix of what this store has been told — which is what makes the log
+    /// the edit retires the right one.
+    frozen: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>>>,
     /// The log this store appends to, if it has one.
     log: std::cell::RefCell<Option<Log<F::Disk>>>,
     /// Whether this store was opened with the WAL off, so that `flush` is
@@ -116,6 +130,9 @@ pub struct Opened<F: Fs> {
     /// The one change at a time this store makes to what it is made of
     /// (§5, `crate::change`).
     changes: crate::change::Changes,
+    /// The writes that have chosen a memtable and not yet applied to it,
+    /// which a freeze has to wait for (§5, `crate::change`).
+    writers: crate::change::Writers,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -309,6 +326,8 @@ pub async fn open_with<E: Env>(
         disable_wal: options.disable_wal,
         disable_automatic_compactions: options.disable_automatic_compactions,
         memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
+        frozen: std::cell::RefCell::new(None),
+        writers: Default::default(),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
@@ -582,6 +601,11 @@ impl<F: Fs> Opened<F> {
             )));
         }
 
+        // Counted from here to the end of the function, which is the span a
+        // freeze may not happen in: the log record and the memtable entry
+        // have to land on the same side of one (§5, `crate::change`).
+        let _writing = self.writers.begin();
+
         let base = self.next_seq.get();
         batch.set_seq_num(base);
 
@@ -649,9 +673,31 @@ impl<F: Fs> Opened<F> {
         self.next_seq.get().saturating_sub(1)
     }
 
-    /// The memtable a read should use, which a flush may replace afterwards.
+    /// The memtable a write goes to, which a flush may replace afterwards.
     pub(crate) fn memtable(&self) -> std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>> {
         std::rc::Rc::clone(&self.memtable.borrow())
+    }
+
+    /// The memtable a flush is writing out, if there is one.
+    pub(crate) fn frozen(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>> {
+        self.frozen.borrow().clone()
+    }
+
+    /// Every memtable a read has to look in: the one writes go to, and the
+    /// one a flush is writing out if there is one.
+    ///
+    /// The order is for a reader's convenience and not for correctness.
+    /// Entries win on the sequence numbers they carry, wherever they are
+    /// found (§4) — which is also why a key held by both is not a problem to
+    /// resolve here.
+    pub(crate) fn memtables(
+        &self,
+    ) -> Vec<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>> {
+        let mut all = vec![self.memtable()];
+        all.extend(self.frozen());
+        all
     }
 
     /// The log this store is appending to, if it has one.
@@ -669,7 +715,7 @@ impl<F: Fs> Opened<F> {
     /// What a caller watches to decide when to flush: §8 sizes a memtable at
     /// 4 MiB, to match Oxia.
     pub fn unflushed_bytes(&self) -> usize {
-        self.memtable().borrow().bytes()
+        self.memtables().iter().map(|m| m.borrow().bytes()).sum()
     }
 
     /// The MANIFEST this store is appending to.
@@ -808,10 +854,10 @@ impl<F: Fs> Opened<F> {
         if !self.metrics.recording() {
             return;
         }
-        let in_memory = self.memtable().borrow().len() as u64;
+        let in_memory: usize = self.memtables().iter().map(|m| m.borrow().len()).sum();
         self.metrics
             .records
-            .set((self.records_in_tables.get() + in_memory) as i64);
+            .set((self.records_in_tables.get() + in_memory as u64) as i64);
     }
 
     /// Restates how much of the disk the directory takes.
@@ -839,9 +885,49 @@ impl<F: Fs> Opened<F> {
         self.versions.borrow_mut()
     }
 
-    /// Puts a fresh memtable in front, leaving any open scan on the old one.
-    pub(crate) fn install_fresh_memtable(&self, fresh: crate::memtable::Memtable) {
-        *self.memtable.borrow_mut() = std::rc::Rc::new(std::cell::RefCell::new(fresh));
+    /// Freezes the memtable a flush is about to write out, puts a fresh one
+    /// in front of it, and — with a WAL — points the store at the log
+    /// `log_num` names, which must already exist.
+    ///
+    /// The memtable and the log move **together**, in one step with nothing
+    /// awaited between them. A write that landed in between would be in the
+    /// new memtable and the old log, or the old memtable and the new log,
+    /// and either way the edit this flush is about to append would retire a
+    /// log holding a record no table has.
+    ///
+    /// Any open scan keeps reading the memtable it started with: a flush
+    /// replaces the handle and never the contents (§4).
+    pub(crate) async fn freeze_memtable(&self, log_num: Option<u64>) -> Result<()> {
+        // Opened before anything moves, because this is the only part that
+        // can fail. A store left pointing at a log it could not open is a
+        // store that cannot write, and this is a flush, not a write.
+        let log = match log_num {
+            Some(log_num) => Some(self.open_log(log_num).await?),
+            None => None,
+        };
+        // The last await before the swap, and that is the whole point of
+        // where it is: a write that started after this one returned would be
+        // in flight on the memtable the next lines take away (§5).
+        self.writers.settled().await;
+        let fresh = std::rc::Rc::new(std::cell::RefCell::new(crate::memtable::Memtable::new(
+            self.snapshot().wrapping_add(1),
+        )));
+        let old = std::mem::replace(&mut *self.memtable.borrow_mut(), fresh);
+        *self.frozen.borrow_mut() = Some(old);
+        if let Some(log) = log {
+            // The log's number is spent here rather than taken, because from
+            // here the store is writing to it and nothing can put that back.
+            // `crate::rotate` draws the same line in the other place a file
+            // number outlives the operation that asked for it.
+            self.versions_mut().next_file_num = log.log_num + 1;
+            *self.log.borrow_mut() = Some(log);
+        }
+        Ok(())
+    }
+
+    /// Forgets the frozen memtable, now that a table holds what it held.
+    pub(crate) fn thaw(&self) {
+        *self.frozen.borrow_mut() = None;
     }
 
     /// Whether this store was opened with the WAL off.
@@ -854,16 +940,16 @@ impl<F: Fs> Opened<F> {
         self.disable_automatic_compactions
     }
 
-    /// Points the store at a different log, which must already exist.
-    pub(crate) async fn install_log(&self, log_num: u64) -> Result<()> {
+    /// Opens an existing log for appending, without pointing the store at
+    /// it: that is a step of its own, taken with the memtable.
+    async fn open_log(&self, log_num: u64) -> Result<Log<F::Disk>> {
         let path = self.dir.join(roble_format::files::log_filename(log_num));
         let disk = self.fs.open(&path, Access::ReadWrite).await?;
-        *self.log.borrow_mut() = Some(Log {
+        Ok(Log {
             disk: std::rc::Rc::new(disk),
             log_num,
             at: 0,
-        });
-        Ok(())
+        })
     }
 
     /// What the MANIFEST says, as it stands.
