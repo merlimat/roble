@@ -110,6 +110,9 @@ const WRITE_STALL_DURATION: LatencyDef = LatencyDef::new("roble.write.stall.dura
 const WAL_DURATION: LatencyDef = LatencyDef::new("roble.wal.append.duration").description(
     "Time appending a batch to the log takes, including its sync when one was asked for",
 );
+const L0_SUBLEVELS: UpDownCounterDef = UpDownCounterDef::new("roble.l0.sublevels")
+    .unit("{sublevel}")
+    .description("Layers L0's tables form, which is what a read of L0 costs");
 const DISK_SIZE: UpDownCounterDef = UpDownCounterDef::new("roble.disk.size")
     .unit("By")
     .description("Bytes of every file in the store's directory");
@@ -300,6 +303,8 @@ pub(crate) struct Metrics {
     pub(crate) write_stalls: [Counter; 2],
     pub(crate) write_stall: [Latency; 2],
     pub(crate) disk_size: Amount,
+    /// Layers L0's tables form (§9, `crate::version::Version::l0_sublevels`).
+    pub(crate) l0_sublevels: Amount,
     pub(crate) compaction: Latency,
     /// Compactions that failed. Worth its own series because a compaction
     /// often has nobody to return an error to: a flush swallows the one it
@@ -354,6 +359,7 @@ impl Metrics {
                 meter.latency(WRITE_STALL_DURATION, &[KeyValue::new(STALL_REASON, why)])
             }),
             disk_size: meter.amount(DISK_SIZE, &[]),
+            l0_sublevels: meter.amount(L0_SUBLEVELS, &[]),
             compaction: meter.latency(COMPACTION_DURATION, &[]),
             compaction_errors: Errors::new(meter, COMPACTION_ERRORS),
             compaction_tables: ["read", "write"].map(|d| meter.counter(COMPACTION_TABLES, &io(d))),
@@ -409,6 +415,12 @@ impl Metrics {
         for (level, tables) in version.levels() {
             self.level_tables[level as usize].set(tables.len() as i64);
             self.level_size[level as usize].set(tables.iter().map(|t| t.size as i64).sum());
+        }
+        // Dropped rather than reported if it cannot be worked out: a table
+        // whose bounds do not decode has already broken everything that
+        // reads them, and a metric is not the place to find that out.
+        if let Ok(sublevels) = version.l0_sublevels() {
+            self.l0_sublevels.set(sublevels as i64);
         }
     }
 }
