@@ -58,7 +58,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 /// Every key the database holds.
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -70,14 +70,14 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
 }
 
 /// How many tables each level holds.
-fn levels<F: Fs>(db: &roble::Opened<'_, F>) -> Vec<usize> {
+fn levels<F: Fs>(db: &roble::Opened<F>) -> Vec<usize> {
     let versions = db.versions();
     (0..7).map(|l| versions.version.level(l).len()).collect()
 }
 
 /// Writes one key and flushes it, giving one L0 table — and whatever the
 /// flush then decided to do about it.
-async fn write_and_flush<F: Fs>(db: &roble::Opened<'_, F>, key: &[u8]) {
+async fn write_and_flush<F: Fs>(db: &roble::Opened<F>, key: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, b"value").expect("put");
     db.write(&mut batch, true).await.expect("write");

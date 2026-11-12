@@ -76,11 +76,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 /// Opens with `unit`, and leaves 300 keys in one L0 table to compact.
-async fn ready_to_compact<'a>(
-    env: &'a SimEnv,
-    dir: &Path,
-    unit: u64,
-) -> (roble::Opened<'a, SimFs>, u64) {
+async fn ready_to_compact(env: &SimEnv, dir: &Path, unit: u64) -> (roble::Opened<SimFs>, u64) {
     let db = roble::open_with(env, dir, Options::new().compaction_unit(unit))
         .await
         .expect("open");

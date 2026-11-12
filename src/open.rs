@@ -54,11 +54,16 @@ use crate::version::VersionSet;
 /// This is what `open` has established, not yet a store you can read keys
 /// from: the memtables, caches and iterator tree are built on top of it.
 /// Dropping it releases the directory lock.
-pub struct Opened<'a, F: Fs> {
+pub struct Opened<F: Fs> {
     // Held, not used: dropping it is what releases the directory.
     _lock: F::Lock,
     /// The filesystem the database's files are opened in.
-    fs: &'a F,
+    ///
+    /// Owned rather than borrowed, so that a store is a `'static` value and
+    /// can be put in an `Rc` and handed to a task of its own (§10). An `Fs`
+    /// is a handle — `Clone` is part of the trait — so this costs what
+    /// cloning that handle costs, which for the two here is nothing.
+    fs: F,
     /// The caches this store draws on, shared with every other store on the
     /// thread that was given the same handle (§8).
     pub(crate) caches: crate::cache::Caches<F>,
@@ -141,17 +146,19 @@ pub struct Opened<'a, F: Fs> {
 ///
 /// A store that shares a thread with others, or that wants Oxia's
 /// configuration, is opened with [`open_with`] instead (§8, §11).
-pub async fn open<'a, E: Env>(env: &'a E, dir: &Path) -> Result<Opened<'a, E::Fs>> {
+pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Opened<E::Fs>> {
     open_with(env, dir, crate::options::Options::default()).await
 }
 
 /// Opens the database in `dir` as `options` says.
-pub async fn open_with<'a, E: Env>(
-    env: &'a E,
+pub async fn open_with<E: Env>(
+    env: &E,
     dir: &Path,
     options: crate::options::Options<E::Fs>,
-) -> Result<Opened<'a, E::Fs>> {
-    let fs = env.fs();
+) -> Result<Opened<E::Fs>> {
+    // Cloned, not borrowed: the store outlives this call and is meant to be
+    // ownable by a task of its own (§10).
+    let fs = env.fs().clone();
 
     // 1. The lock comes first, so nothing below races a second owner.
     let lock = fs.lock(&dir.join("LOCK")).await?;
@@ -191,7 +198,7 @@ pub async fn open_with<'a, E: Env>(
     }
 
     // 5. Replay it.
-    let edits = read_version_edits(fs, &dir.join(&manifest_filename), parsed.file_num).await?;
+    let edits = read_version_edits(&fs, &dir.join(&manifest_filename), parsed.file_num).await?;
     let versions = VersionSet::replay(&edits)?;
 
     // Every table the version names has to be in the directory. A checkpoint
@@ -218,7 +225,7 @@ pub async fn open_with<'a, E: Env>(
     // 6. Replay the logs the version edits leave unflushed.
     let mut memtable = crate::memtable::Memtable::new(versions.last_seq_num.wrapping_add(1));
     let replayed = replay_logs(
-        fs,
+        &fs,
         dir,
         &names,
         versions.min_unflushed_log_num,
@@ -238,7 +245,7 @@ pub async fn open_with<'a, E: Env>(
     // No reader can be open yet: the store being opened has made none, and
     // another process holding the directory is what the lock refuses.
     let swept = crate::obsolete::remove_obsolete(
-        fs,
+        &fs,
         dir,
         &names,
         &live,
@@ -530,7 +537,7 @@ async fn replay_logs<F: Fs>(
 
 // Written out rather than derived: the lock has no business in a debug line,
 // and a `Fs::Lock` is not required to be `Debug` at all.
-impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
+impl<F: Fs> std::fmt::Debug for Opened<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Opened")
             .field("dir", &self.dir)
@@ -542,7 +549,7 @@ impl<F: Fs> std::fmt::Debug for Opened<'_, F> {
     }
 }
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// Appends a batch to the log, syncs it if asked, and then applies it to
     /// the memtable.
     ///
@@ -824,7 +831,7 @@ impl<F: Fs> Opened<'_, F> {
 
     /// The filesystem this store's files live in.
     pub(crate) fn fs(&self) -> &F {
-        self.fs
+        &self.fs
     }
 
     /// The version set, for a flush to add to.

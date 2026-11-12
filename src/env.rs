@@ -106,7 +106,17 @@ pub struct DiskUsage {
 /// Every path a store touches goes through here, which is what lets Oxia
 /// inject its own — and what lets roble's tests fail or crash any single
 /// operation (§12).
-pub trait Fs {
+///
+/// **A handle, not a thing.** `Clone` is part of the trait because a store
+/// keeps the filesystem it was opened in rather than borrowing it, and that
+/// is what lets the store be a `'static` value: a compaction handed to
+/// [`Env::spawn`] has to own everything it touches, and a store that
+/// borrowed its filesystem could not be owned by anything but the stack
+/// frame it was opened on (§10). Both implementations here were already
+/// handles — `FileFs` is a unit struct and `SimFs` is one `Rc` — and an
+/// implementation that holds real state is expected to do the same: wrap it
+/// in an `Rc` and clone that.
+pub trait Fs: Clone {
     /// The disk that [`create`](Self::create) and [`open`](Self::open) return.
     type Disk: Disk;
 

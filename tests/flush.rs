@@ -51,7 +51,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -69,7 +69,7 @@ async fn contents<F: Fs>(db: &roble::Opened<'_, F>) -> Model {
 /// table it adds, the log it retires — and a compaction following it would
 /// change the version before the assertion could read it.
 /// `tests/schedule.rs` is where the scheduling is the subject.
-async fn open_unscheduled<'a>(env: &'a SimEnv, dir: &Path) -> roble::Opened<'a, SimFs> {
+async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Opened<SimFs> {
     roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open")

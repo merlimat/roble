@@ -49,7 +49,7 @@ use crate::error::{Error, Result};
 use crate::memtable::Memtable;
 use crate::open::Opened;
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// Writes the memtable out as a table and records it in the MANIFEST.
     ///
     /// Returns the new table's file number, or `None` when there was nothing

@@ -223,7 +223,7 @@ pub(crate) async fn remove_obsolete<F: Fs>(
     Ok(removed)
 }
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// Deletes every file the database no longer refers to, and says which.
     ///
     /// A flush calls this for itself, so a caller writing through the store

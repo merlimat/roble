@@ -959,3 +959,62 @@ async fn a_write_to_a_database_with_no_log_is_refused() {
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }
+
+/// A store can be owned by a task of its own.
+///
+/// Which is what a store keeping its filesystem rather than borrowing it is
+/// for (§10). [`roble::Env::spawn`] takes `'static` futures, and a store that
+/// borrowed its filesystem could be owned by nothing but the stack frame it
+/// was opened on — so a compaction could only ever run inside the call that
+/// started it. The `'static` bound below is the half of this the compiler
+/// checks; the flush is the half that says the store still works when it
+/// belongs to the task rather than to this test.
+#[compio::test]
+async fn a_store_can_be_owned_by_a_task_of_its_own() {
+    fn needs_static<T: 'static>(_: &T) {}
+
+    let (tmp, dir) = fixture("db-twin-a");
+    let db = std::rc::Rc::new(roble::open(&roble::DefaultEnv, &dir).await.expect("open"));
+    needs_static(&db);
+
+    let mut batch = roble_format::batch::Batch::new();
+    batch.put(b"spawned", b"yes").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+
+    let flushed = std::rc::Rc::new(std::cell::Cell::new(None));
+    let (task_db, report) = (std::rc::Rc::clone(&db), std::rc::Rc::clone(&flushed));
+    roble::Env::spawn(&roble::DefaultEnv, async move {
+        report.set(Some(task_db.flush().await.expect("flush")));
+    });
+
+    // A detached task cannot be joined, so the runtime is given real work
+    // until it has had its chance. Bounded, so a task that never runs fails
+    // the test rather than hanging it.
+    let tick = tmp.path().join("tick");
+    for _ in 0..64 {
+        if flushed.get().is_some() {
+            break;
+        }
+        // Real I/O, so that this loop actually reaches the runtime: an
+        // operation that finishes without awaiting anything would spin here
+        // and never give the task its turn.
+        let disk = roble::FileFs.create(&tick).await.expect("create");
+        disk.sync(()).await.expect("sync");
+        disk.close().await.expect("close");
+    }
+
+    assert!(
+        flushed.get().flatten().is_some(),
+        "the spawned task should have flushed a table"
+    );
+    let found = db
+        .get(b"spawned", roble::Comparison::Equal)
+        .await
+        .expect("get")
+        .expect("the key the task flushed");
+    assert_eq!(
+        found.value,
+        b"yes".to_vec(),
+        "and the store it flushed is the store this test is holding"
+    );
+}

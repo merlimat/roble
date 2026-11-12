@@ -338,7 +338,7 @@ async fn main() {
 /// the MANIFEST has moved past, which Pebble had kept to recycle. The
 /// expectation is every key roble can still read, so Pebble reading the same
 /// set is the claim — that collecting those files took nothing with them.
-async fn swept_run<F: roble::Fs>(db: &roble::Opened<'_, F>, dir: &PathBuf, before: &[String]) {
+async fn swept_run<F: roble::Fs>(db: &roble::Opened<F>, dir: &PathBuf, before: &[String]) {
     let after = names_in(dir);
     let gone: Vec<&String> = before.iter().filter(|n| !after.contains(n)).collect();
     if gone.is_empty() {

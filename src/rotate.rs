@@ -72,7 +72,7 @@ use crate::version::VersionSet;
 /// the heuristic can arrive with the compactions that make it matter.
 pub const MAX_MANIFEST_BYTES: u64 = 128 << 20;
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// Starts a fresh MANIFEST holding a snapshot of the current version, and
     /// points the manifest marker at it.
     ///

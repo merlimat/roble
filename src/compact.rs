@@ -75,7 +75,7 @@ use crate::version::Table as TableMeta;
 /// above.
 pub const TARGET_FILE_SIZE: u64 = 2 << 20;
 
-impl<F: Fs> Opened<'_, F> {
+impl<F: Fs> Opened<F> {
     /// Compacts the named tables of `level` into `level + 1`.
     ///
     /// Every table of `level + 1` whose key range meets theirs joins them, or

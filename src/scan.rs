@@ -556,7 +556,7 @@ fn visible_at(seq: u64, snapshot: u64) -> bool {
     seq <= snapshot || seq & key::SEQ_NUM_BATCH != 0
 }
 
-impl<F: crate::env::Fs> crate::Opened<'_, F> {
+impl<F: crate::env::Fs> crate::Opened<F> {
     /// A scan over every key in the database.
     pub async fn scan(&self) -> Result<Scan<F::Disk>> {
         self.scan_range(None, None).await
