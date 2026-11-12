@@ -476,12 +476,33 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   them interleaved at an await produce a database that does not open. Two
   flushes take the same file number and write the same table over each other;
   a sweep that lists the directory between a flush's table and that flush's
-  edit collects the table as an interrupted flush's leftovers. Both are
-  cooperative within their permit, so a write never waits on a compaction's
-  merge for more than a slice of work (§9).
+  edit collects the table as an interrupted flush's leftovers.
 
-  A **write** does not take the permit, and must not: a write that waited on
-  it would be waiting on whatever merge happened to be going on. What makes a
+  A **compaction** holds it to decide what it will read and to record what it
+  wrote, and **not for the merge in between** (§9). A merge is the longest
+  thing a store does, and a permit held across it is one every flush waits
+  out — being cooperative inside it does not help, because what a waiter
+  wants is the permit and not a slice of the thread. What stands in for the
+  permit while a merge runs is a **claim** on the tables it is reading
+  (`crate::change::Compacting`, which is Pebble's `compacting` flag on a
+  file): a second compaction the picker points at the same tables stands
+  down, rather than merging them twice and having its edit delete tables the
+  first edit already deleted. Standing down rather than waiting is the point,
+  because the caller asking is usually a flush.
+
+  Two of a compaction's reads of the version are what the two holds are for.
+  Deciding reads it to choose inputs; numbering the outputs reads it for
+  `next_file_num`, which the edit then spends — so those two and the edit are
+  one hold, and anything that read the same version in between would have
+  read the same numbers. The key ranges of the levels *below* the output are
+  read in the first hold and used in the second, which is sound because a
+  compaction running meanwhile only moves keys downward: the ranges can be
+  read too wide, which keeps a tombstone that could have gone, and never too
+  narrow, which would drop one that was still hiding something.
+
+  A **write** does not take the permit, and must not: a write would be
+  queueing behind every flush, rotation and sweep the store does, and a write
+  is the one operation that never stops. What makes a
   write safe against a flush instead is that the flush **freezes** the
   memtable before its first await, which is Pebble's answer and the machinery
   the memtable write stall will need (§9). Writes from then on go to a fresh
@@ -989,11 +1010,12 @@ worse answer than letting the caller have what it asked for.
 What is still owed is running the merge **off the write's stack**. A flush
 already triggers the compaction the picker chose, which is a trigger well below
 the stall line, but it runs there and then, so the write that caused the flush
-pays for it. Moving that to `Env::spawn` needs the one-change permit narrowed to
-the edit first, with per-table marks so that two compactions cannot choose the
-same inputs: a compaction holding the coarse permit for the length of its merge
-makes the next flush wait for it whichever way round the two are, so ownership
-alone (§10) buys nothing.
+pays for it. The two things that were in the way are no longer: a store owns
+what it is opened with and so can be handed to a task of its own (§10), and a
+merge holds a claim rather than the permit, so a task running one does not stop
+a flush (§5). What is left is the trigger itself — `Env::spawn`, a handle to
+the store, and deciding what a failed background merge should do, given that
+nobody is waiting to be told.
 
 ## 10. Concurrency and I/O
 

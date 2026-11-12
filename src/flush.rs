@@ -94,16 +94,19 @@ impl<F: Fs> Opened<F> {
     /// `tests/metrics.rs` does not collect histograms at all, for the
     /// separate reason written at the top of it.
     pub async fn flush(&self) -> Result<Option<u64>> {
-        // Taken for the flush *and* the compaction it may run: one change at
-        // a time means one, and a compaction scheduled by a flush is part of
-        // the same one (§5, `crate::change`).
-        let change = self.changes().begin().await;
-        let flushed = self.flush_inner(&change).await?;
+        // Taken for the flush and let go of before the compaction, which
+        // takes its own and holds it only to decide and to record (§9): a
+        // flush that kept the permit across a merge is a flush every write
+        // waits behind, and the narrowing is what that was in the way of.
+        let flushed = {
+            let change = self.changes().begin().await;
+            self.flush_inner(&change).await?
+        };
         // Nothing written is nothing changed, and so nothing new for the
         // picker to see: its answer is the one it already gave, which the
         // flush that wrote the last table already ran.
         if flushed.is_some() {
-            self.maybe_compact(&change).await;
+            self.maybe_compact().await;
         }
         Ok(flushed)
     }

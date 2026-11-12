@@ -25,6 +25,7 @@
 //! opens, and it holds what was written to it. The interesting assertions
 //! are the ones in between, about which of the two did the work.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -72,11 +73,8 @@ fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 struct Flag(AtomicBool);
 
 impl Wake for Flag {
+    // `wake_by_ref` is the trait's own default, which clones and calls this.
     fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
         self.0.store(true, Ordering::SeqCst);
     }
 }
@@ -265,9 +263,10 @@ async fn ready_to_compact(
 
 #[compio::test]
 async fn a_flush_and_a_compaction_at_once_never_collide() {
-    // A compaction takes the file numbers for its output when it starts and
-    // writes them when it ends, so a flush that ran in between took the same
-    // one — and the file that is left is whichever of the two wrote last.
+    // A compaction reads the version to decide what to merge and reads it
+    // again to number what it wrote, and a flush changes the version in
+    // between. Both of a compaction's reads are under the permit (§9), so
+    // what this sweeps for is a flush landing in the gap between them.
     let total = {
         let (env, dir) = load("db-reads").await;
         let (db, _, in_l0) = ready_to_compact(&env, &dir, "u").await;
@@ -378,19 +377,16 @@ async fn a_flush_that_compacts_does_not_wait_on_itself() {
 
 #[compio::test]
 async fn every_waiting_change_gets_its_turn() {
-    // The permit wakes every waiter rather than the next one in its list,
-    // and this is why. A task polled more often than it must — which is what
-    // a `select!` does to every branch when any one of them wakes —
-    // registers its waker more than once, so waking "the next waker" can
-    // mean waking a task that was going to run anyway. Then nothing wakes
-    // the others, and a permit that is never taken again is a store that has
-    // stopped flushing.
+    // Three flushes at once, with a merge in the middle of it: one of them
+    // writes the table, the other two find an empty memtable, and the
+    // compaction the first scheduled runs to the end.
     //
-    // Three, because two cannot tell the difference: with one waiter left
-    // there is nobody to leave asleep. And `db-reads` with a unit of one,
-    // because the first flush has to *hold* the permit across many polls for
-    // the other two to queue behind it at all — the compaction it schedules
-    // yields after every entry it merges.
+    // This used to be where the permit's wake-up was pinned, and it cannot
+    // be any more: the first flush held the permit across the many polls of
+    // the merge its compaction ran, and a merge holds a claim and not the
+    // permit now (§9). With nothing holding the permit across a poll, there
+    // is no waiter to leave asleep. That claim moved to `crate::change`'s own
+    // unit tests, where the permit can be held by hand.
     let (env, dir) = load("db-reads").await;
     let db = roble::open_with(&env, &dir, Options::new().compaction_unit(1))
         .await
@@ -512,4 +508,199 @@ async fn two_writes_at_once_do_not_share_a_sequence_number() {
             "paused at {n} of {total}: two writes of one entry each are two sequence numbers"
         );
     }
+}
+
+/// Opens `db-reads` with a merge that hands the thread back every entry, so
+/// that a compaction of it suspends often enough to interleave with.
+async fn ready_to_merge(env: &SimEnv, dir: &Path, prefix: &str) -> (roble::Opened<SimFs>, Model) {
+    let db = roble::open_with(
+        env,
+        dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .compaction_unit(1),
+    )
+    .await
+    .expect("open");
+    let mut model = contents(&db).await;
+    model.extend(write_keys(&db, prefix, 30).await);
+    (db, model)
+}
+
+#[compio::test]
+async fn a_flush_does_not_wait_for_a_compactions_merge() {
+    // What the narrowing is for (§9). A compaction holds the permit to decide
+    // what it will read and to record what it wrote, and not for the merge in
+    // between — so a flush that starts while one is merging finishes first,
+    // rather than waiting out work that is none of its business.
+    let (env, dir) = load("db-reads").await;
+    let (db, mut model) = ready_to_merge(&env, &dir, "u").await;
+    let in_l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    // Something for the flush to write, after the compaction's inputs were
+    // named: the flush must not be the one that produced them.
+    model.extend(write_keys(&db, "v", 5).await);
+
+    let done: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+    let (compacted, flushed) = interleave(
+        async {
+            let result = db.compact(0, &in_l0).await;
+            done.borrow_mut().push("the compaction");
+            result
+        },
+        async {
+            let result = db.flush().await;
+            done.borrow_mut().push("the flush");
+            result
+        },
+    );
+    compacted.expect("the compaction");
+    flushed.expect("the flush").expect("a table");
+
+    assert_eq!(
+        done.borrow().first().copied(),
+        Some("the flush"),
+        "the flush waited for the merge to finish: {:?}",
+        done.borrow()
+    );
+    assert_eq!(
+        contents(&db).await,
+        model,
+        "and one of them changed an answer"
+    );
+}
+
+#[compio::test]
+async fn two_compactions_at_once_never_choose_the_same_tables() {
+    // The permit used to make this impossible by being held across the merge.
+    // The claim is what makes it impossible now that it is not: without it
+    // the second's edit deletes tables the first already deleted, which is
+    // the refusal that ends a store's writing life (§9).
+    let total = {
+        let (env, dir) = load("db-reads").await;
+        let (db, _) = ready_to_merge(&env, &dir, "u").await;
+        let before = env.sim().ops();
+        db.compact_once().await.expect("compact");
+        env.sim().ops() - before
+    };
+    assert!(
+        total >= 4,
+        "a compaction of {total} operations is too thin to sweep"
+    );
+
+    for n in 1..=total {
+        let (env, dir) = load("db-reads").await;
+        let (db, model) = ready_to_merge(&env, &dir, "u").await;
+        env.sim().pause_at(n);
+
+        let (first, second) = interleave(db.compact_once(), db.compact_once());
+        let first = first.unwrap_or_else(|e| panic!("the first, paused at {n}: {e}"));
+        let second = second.unwrap_or_else(|e| panic!("the second, paused at {n}: {e}"));
+
+        // One of them merged and the other stood down. Which is which is the
+        // claim's business, not this test's.
+        let merged = [&first, &second].iter().filter(|o| !o.is_empty()).count();
+        assert_eq!(
+            merged, 1,
+            "paused at {n} of {total}, {merged} compactions wrote tables: \
+             {first:?} and {second:?}"
+        );
+        assert_eq!(contents(&db).await, model, "paused at {n}");
+
+        drop(db);
+        let reopened = roble::open(&env, &dir)
+            .await
+            .unwrap_or_else(|e| panic!("paused at {n} of {total}, the reopen: {e}"));
+        assert_eq!(contents(&reopened).await, model, "paused at {n}, reopened");
+    }
+}
+
+#[compio::test]
+async fn a_compaction_that_failed_leaves_its_tables_free() {
+    // The claim is a guard and not a pair of calls. A merge that failed half
+    // way through, or whose future was thrown away, would otherwise leave its
+    // inputs claimed for ever — and then the picker would go on choosing them
+    // and every compaction after it would stand down.
+    let total = {
+        let (env, dir) = load("db-reads").await;
+        let (db, _) = ready_to_merge(&env, &dir, "u").await;
+        let before = env.sim().ops();
+        db.compact_once().await.expect("compact");
+        env.sim().ops() - before
+    };
+    let mut retried = 0;
+
+    for n in 1..=total {
+        let (env, dir) = load("db-reads").await;
+        let (db, model) = ready_to_merge(&env, &dir, "u").await;
+
+        env.sim().fail_at(n);
+        let first = db.compact_once().await;
+        env.sim().stop_failing();
+        if first.is_ok() {
+            // The injection landed somewhere this compaction did not mind.
+            continue;
+        }
+
+        // Whatever it left behind, the tables it had are the picker's again.
+        if self_picks(&db) {
+            let second = db.compact_once().await;
+            if let Ok(outputs) = &second {
+                assert!(
+                    !outputs.is_empty(),
+                    "failing at {n} of {total}: the picker still wants a compaction and \
+                     the next one stood down, so the tables are claimed by one that is \
+                     not happening"
+                );
+                retried += 1;
+            }
+        }
+        assert_eq!(contents(&db).await, model, "failing at {n} of {total}");
+    }
+
+    assert!(
+        retried > 0,
+        "no failed compaction was followed by one that ran, so nothing here exercised \
+         the claim being given back"
+    );
+}
+
+/// Whether the picker still wants something compacted.
+fn self_picks<F: Fs>(db: &roble::Opened<F>) -> bool {
+    db.pick().is_some()
+}
+
+#[compio::test]
+async fn compacting_tables_a_compaction_already_has_is_refused() {
+    // The explicit call says so rather than standing down. A caller that
+    // named file numbers asked for something definite and has nothing to
+    // fall back on; `compact_once` has a picker to ask again, which is why
+    // that one stands down instead (§9).
+    let (env, dir) = load("db-reads").await;
+    let (db, model) = ready_to_merge(&env, &dir, "u").await;
+    let in_l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+
+    let (merged, refused) = interleave(db.compact_once(), db.compact(0, &in_l0));
+    let merged = merged.expect("the compaction");
+    assert!(
+        !merged.is_empty(),
+        "the first should have written something"
+    );
+    let err = refused.expect_err("the second asked for tables the first had");
+    assert!(
+        format!("{err}").contains("already being compacted"),
+        "and should say why: {err}"
+    );
+    assert_eq!(contents(&db).await, model, "and nothing changed an answer");
 }

@@ -88,6 +88,7 @@
 //! scheduling rather than about its database.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::future::poll_fn;
 use std::task::{Poll, Waker};
 
@@ -126,6 +127,98 @@ impl Changes {
         })
         .await;
         Change { changes: self }
+    }
+}
+
+/// The tables the compaction underway is reading.
+///
+/// What the permit used to do by being held for the whole of a merge, and
+/// what it cannot do now that it is not (§9). Two compactions must not
+/// choose the same tables: the second's edit would delete tables the first
+/// already deleted, which is the refusal that ends a store's writing life
+/// (`crate::flush`). Pebble keeps the same fact as a `compacting` flag on
+/// each file of its version.
+///
+/// A set rather than a flag per table because roble's version holds
+/// `TableMeta` by value and clones it into every edit; a flag in there would
+/// be a flag in the MANIFEST, which is a different thing that already
+/// exists (`marked_for_compaction`).
+#[derive(Default)]
+pub(crate) struct Compacting {
+    tables: RefCell<BTreeSet<u64>>,
+    waiting: RefCell<Vec<Waker>>,
+}
+
+impl Compacting {
+    /// Claims `tables` for a compaction, or nothing if any of them is
+    /// already claimed.
+    ///
+    /// All or nothing. A compaction that took the tables it could and left
+    /// the rest would be a compaction of a different set than the one the
+    /// picker chose, and the picker chose that set for reasons — in L0,
+    /// because its tables overlap each other and compacting one means
+    /// compacting every one that meets it.
+    pub(crate) fn claim(&self, tables: &[u64]) -> Option<Claim<'_>> {
+        let mut held = self.tables.borrow_mut();
+        if tables.iter().any(|t| held.contains(t)) {
+            return None;
+        }
+        held.extend(tables.iter().copied());
+        drop(held);
+        Some(Claim {
+            compacting: self,
+            tables: tables.to_vec(),
+        })
+    }
+
+    /// Whether a compaction is underway.
+    pub(crate) fn underway(&self) -> bool {
+        !self.tables.borrow().is_empty()
+    }
+
+    /// Waits until no compaction is underway.
+    ///
+    /// What a write short of a shallow enough L0 waits on when the merge it
+    /// needs is already running without the permit (§9, `crate::open`).
+    /// Asked again on every poll, for the reason written against
+    /// [`Writers::settled`].
+    pub(crate) async fn settled(&self) {
+        poll_fn(|cx| {
+            if self.underway() {
+                self.waiting.borrow_mut().push(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(())
+        })
+        .await
+    }
+}
+
+/// The tables one compaction has claimed, released when it is dropped.
+///
+/// Dropped on the way out however the compaction ends, which is the reason
+/// this is a guard: a merge that failed half way through, or whose future was
+/// thrown away, would otherwise leave its inputs claimed for ever and the
+/// picker unable to choose them again.
+pub(crate) struct Claim<'a> {
+    compacting: &'a Compacting,
+    tables: Vec<u64>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        {
+            let mut held = self.compacting.tables.borrow_mut();
+            for table in &self.tables {
+                held.remove(table);
+            }
+        }
+        // Every waiter of them, and out of the cell first, for the reasons
+        // written against `Change`'s drop below.
+        let waiting = std::mem::take(&mut *self.compacting.waiting.borrow_mut());
+        for waker in waiting {
+            waker.wake();
+        }
     }
 }
 
@@ -232,7 +325,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
-    use super::{Writers, Writing};
+    use super::{Changes, Writers};
 
     /// A waker that only records that it was woken.
     struct Flag(AtomicBool);
@@ -245,12 +338,63 @@ mod tests {
         }
     }
 
-    /// Takes the permit, which on a free one is no wait at all.
-    fn begin(writers: &Writers) -> Writing<'_> {
+    /// Polls `future` once and expects it to be ready, which is what taking
+    /// a free permit is.
+    fn ready<F: Future>(future: F) -> F::Output {
         let mut cx = Context::from_waker(Waker::noop());
-        match pin!(writers.begin()).as_mut().poll(&mut cx) {
-            Poll::Ready(writing) => writing,
+        match pin!(future).as_mut().poll(&mut cx) {
+            Poll::Ready(value) => value,
             Poll::Pending => panic!("a free permit should not have to be waited for"),
+        }
+    }
+
+    /// Here rather than in `tests/change.rs`, where
+    /// `every_waiting_change_gets_its_turn` used to pin this. That test could
+    /// set it up because a flush held the permit across the merge its
+    /// compaction ran, which was many polls; now that a merge holds a claim
+    /// and not the permit (§9), nothing holds the permit across more than one
+    /// poll on a filesystem that never blocks, so there is no way to make a
+    /// waiter wait from outside (§10, §12).
+    #[test]
+    fn every_waiter_is_woken_and_not_just_one_of_them() {
+        // A task polled more often than it must — which is what a `select!`
+        // does to every branch when any one of them wakes — registers its
+        // waker more than once. So waking "the next waker" can mean waking a
+        // task that was going to run anyway, and then nothing wakes the
+        // others: a permit that is never taken again is a store that has
+        // stopped flushing.
+        //
+        // Three waiters, because two cannot tell the difference: with one
+        // left there is nobody to leave asleep.
+        let changes = Changes::default();
+        let held = ready(changes.begin());
+
+        let flags: Vec<_> = (0..3)
+            .map(|_| Arc::new(Flag(AtomicBool::new(false))))
+            .collect();
+        let mut waiting: Vec<_> = flags.iter().map(|_| Box::pin(changes.begin())).collect();
+        // Twice round, which is what registers each waker more than once.
+        for _ in 0..2 {
+            for (waiter, flag) in waiting.iter_mut().zip(&flags) {
+                let waker = Waker::from(Arc::clone(flag));
+                let mut cx = Context::from_waker(&waker);
+                assert!(
+                    waiter.as_mut().poll(&mut cx).is_pending(),
+                    "the permit is held, so none of them can have it"
+                );
+            }
+        }
+        assert!(
+            flags.iter().all(|f| !f.0.load(Ordering::SeqCst)),
+            "and none of them should have been woken for nothing"
+        );
+
+        drop(held);
+        for (i, flag) in flags.iter().enumerate() {
+            assert!(
+                flag.0.load(Ordering::SeqCst),
+                "waiter {i} was left asleep, so the permit woke some of them and not all"
+            );
         }
     }
 
@@ -268,7 +412,7 @@ mod tests {
         let waker = Waker::from(Arc::clone(&flag));
         let mut cx = Context::from_waker(&waker);
 
-        let writing = begin(&writers);
+        let writing = ready(writers.begin());
         let mut settled = pin!(writers.settled());
         assert!(
             matches!(settled.as_mut().poll(&mut cx), Poll::Pending),
@@ -299,7 +443,7 @@ mod tests {
         let waker = Waker::from(Arc::clone(&flag));
         let mut cx = Context::from_waker(&waker);
 
-        let first = begin(&writers);
+        let first = ready(writers.begin());
         let mut second = pin!(writers.begin());
         assert!(
             second.as_mut().poll(&mut cx).is_pending(),

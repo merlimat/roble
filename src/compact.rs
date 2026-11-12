@@ -61,7 +61,7 @@ use roble_format::sst::{TableWriter, WriterOptions};
 use roble_format::{InternalKey, key};
 
 use crate::buf::WriteBuf;
-use crate::change::Change;
+use crate::change::Claim;
 use crate::env::{Disk, Fs};
 use crate::error::{Error, Result};
 use crate::flush::Bounds;
@@ -75,6 +75,19 @@ use crate::version::Table as TableMeta;
 /// above.
 pub const TARGET_FILE_SIZE: u64 = 2 << 20;
 
+/// What a compaction has decided to read, with those tables claimed.
+///
+/// Made under the permit and carried out without it, which is what lets a
+/// merge run while a flush gets on with its own work (§9). Dropping it
+/// releases the claim, so a compaction that was never run, or that failed
+/// half way, leaves the picker free to choose those tables again.
+pub(crate) struct Plan<'a> {
+    output_level: u32,
+    inputs: Vec<(u32, TableMeta)>,
+    below: Vec<(Vec<u8>, Vec<u8>)>,
+    _claim: Claim<'a>,
+}
+
 impl<F: Fs> Opened<F> {
     /// Compacts the named tables of `level` into `level + 1`.
     ///
@@ -86,17 +99,26 @@ impl<F: Fs> Opened<F> {
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
-        let change = self.changes().begin().await;
-        self.compact_inner(level, file_nums, &change).await
+        let Some(plan) = self.plan(level, file_nums).await? else {
+            return Err(Error::Unsupported(format!(
+                "{file_nums:?} are already being compacted out of L{level}"
+            )));
+        };
+        self.run(plan).await
     }
 
-    /// The compaction proper, for a caller that already holds the permit.
-    pub(crate) async fn compact_inner(
-        &self,
-        level: u32,
-        file_nums: &[u64],
-        change: &Change<'_>,
-    ) -> Result<Vec<u64>> {
+    /// Decides what a compaction of `file_nums` out of L`level` will read,
+    /// claims it, and lets the permit go — `None` if something else has
+    /// claimed one of them already.
+    ///
+    /// The permit is held for this and not for the merge that follows, which
+    /// is the whole of §9's narrowing: deciding reads the version and so has
+    /// to be alone, and merging reads tables nothing else may touch, which a
+    /// claim says just as well and without stopping a flush
+    /// (`crate::change::Compacting`).
+    pub(crate) async fn plan(&self, level: u32, file_nums: &[u64]) -> Result<Option<Plan<'_>>> {
+        let _change = self.changes().begin().await;
+
         let output_level = level + 1;
         if output_level >= NUM_LEVELS {
             return Err(Error::Unsupported(format!(
@@ -109,19 +131,55 @@ impl<F: Fs> Opened<F> {
             ));
         }
 
-        let _timer = self.metrics.compaction.start();
         let (inputs, below) = self.inputs_for(level, output_level, file_nums)?;
+        let wanted: Vec<u64> = inputs.iter().map(|(_, m)| m.file_num).collect();
+        let Some(claim) = self.compacting().claim(&wanted) else {
+            return Ok(None);
+        };
+        Ok(Some(Plan {
+            output_level,
+            inputs,
+            below,
+            _claim: claim,
+        }))
+    }
+
+    /// Carries out `plan`: the merge with no permit held, then the outputs
+    /// and the edit that claims them with it.
+    pub(crate) async fn run(&self, plan: Plan<'_>) -> Result<Vec<u64>> {
+        let _timer = self.metrics.compaction.start();
+        let Plan {
+            output_level,
+            inputs,
+            below,
+            ..
+        } = &plan;
+        let output_level = *output_level;
+
         self.metrics.compaction_tables[0].add(inputs.len() as u64);
         self.metrics.compaction_io[0].add(inputs.iter().map(|(_, m)| m.size).sum());
         let mut tables = Vec::new();
-        for (_, meta) in &inputs {
+        for (_, meta) in inputs {
             tables.push(self.open_table(meta.file_num).await?);
         }
 
-        let first_file_num = self.versions().next_file_num;
+        // The merge, with no permit held: it is the long part of a compaction
+        // and the part a flush must not wait behind (§9). Three things stand
+        // in for the permit here. The claim `plan` took keeps another
+        // compaction off these tables; they are still the version's, so the
+        // sweep does not count them obsolete; and a reader is open for each,
+        // so it could not collect them even if it did (§5,
+        // `crate::obsolete`).
+        //
+        // `below` was read before the merge and is used for the deletion
+        // rule, which is sound because it can only be read too wide: a
+        // compaction that runs meanwhile moves keys down, and the keys any
+        // level below holds are the same ones or fewer. Too wide keeps a
+        // tombstone that could have gone, which costs a little space; too
+        // narrow would drop one that was still hiding something.
         let merged = merge(
             &tables,
-            &below,
+            below,
             self.target_file_size(output_level),
             self.compaction_unit(),
         )
@@ -132,9 +190,17 @@ impl<F: Fs> Opened<F> {
         // `crate::obsolete`).
         drop(tables);
 
+        // The permit again, for all of what is left, because all of what is
+        // left changes what the store is made of. The numbers the outputs
+        // take are read from the version and spent by the edit, so anything
+        // in between that read the same version would read the same numbers
+        // — which is why this is one hold and not two.
+        let change = self.changes().begin().await;
+
         // Every output written and made durable before the edit that claims
         // any of them: a crash in the middle leaves files nothing refers to,
         // which the sweep collects, and the database exactly as it was.
+        let first_file_num = self.versions().next_file_num;
         let mut new_tables = Vec::with_capacity(merged.len());
         let mut written: Vec<(u64, u64)> = Vec::new();
         for (i, (bytes, bounds, entries)) in merged.into_iter().enumerate() {
@@ -164,12 +230,12 @@ impl<F: Fs> Opened<F> {
         // The one-way door, in the same place a flush puts it: before this
         // the output is a file nothing refers to and the inputs are still the
         // database's.
-        let manifest_bytes = self.append_version_edit(&edit, change).await?;
+        let manifest_bytes = self.append_version_edit(&edit, &change).await?;
         self.versions_mut().apply(&edit)?;
         if manifest_bytes >= self.max_manifest_bytes() {
-            let _ = self.rotate_inner(change).await;
+            let _ = self.rotate_inner(&change).await;
         }
-        let _ = self.sweep(change).await;
+        let _ = self.sweep(&change).await;
         self.metrics.saw_version(&self.versions().version);
         self.measure_disk().await;
         self.metrics.compactions.add(1);

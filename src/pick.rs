@@ -37,9 +37,11 @@
 //! That waited on the cooperative execution of `crate::work`, because a
 //! compaction that ran to completion while holding the thread was exactly
 //! the latency spike units of work exist to avoid; now it merges a slice at
-//! a time and the thread comes back between them. What still has no trigger
-//! is an *idle* store draining its backlog, which needs a task of its own
-//! and so an ownership change (§9).
+//! a time and the thread comes back between them, and the permit comes back
+//! with it (§9): a merge holds a claim on its inputs and nothing else, so
+//! the flush that scheduled it does not wait for it to finish. What still
+//! has no trigger is an *idle* store draining its backlog, which needs a
+//! task of its own — and now needs only that.
 //!
 //! **The score is a fraction, not a float.** Two levels are compared by
 //! cross-multiplying, which is exact; a float would be deterministic in
@@ -48,7 +50,6 @@
 
 use roble_format::manifest::NUM_LEVELS;
 
-use crate::change::Change;
 use crate::env::Fs;
 use crate::error::Result;
 use crate::open::Opened;
@@ -227,16 +228,29 @@ impl<F: Fs> Opened<F> {
     /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.
     pub async fn compact_once(&self) -> Result<Vec<u64>> {
-        let change = self.changes().begin().await;
-        self.compact_once_inner(&change).await
-    }
-
-    /// The same, for a caller that already holds the permit.
-    async fn compact_once_inner(&self, change: &Change<'_>) -> Result<Vec<u64>> {
-        let Some(pick) = self.pick() else {
+        let Some(plan) = self.plan_picked().await? else {
             return Ok(Vec::new());
         };
-        self.compact_inner(pick.level, &pick.tables, change).await
+        self.run(plan).await
+    }
+
+    /// Plans the compaction [`Opened::pick`] chose, if there is one and
+    /// nothing else has claimed its tables.
+    ///
+    /// The picker is not told what is claimed, and so can choose tables a
+    /// compaction already has. Standing down rather than waiting is the
+    /// point of the narrowing: the caller asking is often a flush, and a
+    /// flush that waited for a merge is what §9 set out to stop. The next
+    /// flush asks again, against a version that has moved on.
+    async fn plan_picked(&self) -> Result<Option<crate::compact::Plan<'_>>> {
+        let pick = {
+            let _change = self.changes().begin().await;
+            self.pick()
+        };
+        let Some(pick) = pick else {
+            return Ok(None);
+        };
+        self.plan(pick.level, &pick.tables).await
     }
 
     /// Runs one compaction on the store's own account, if there is one worth
@@ -259,11 +273,11 @@ impl<F: Fs> Opened<F> {
     /// lie. Nor is a compaction that keeps failing silent — the debt it is
     /// not paying off is `roble.compaction.debt`, which is the number that
     /// says a store is falling behind.
-    pub(crate) async fn maybe_compact(&self, change: &Change<'_>) {
+    pub(crate) async fn maybe_compact(&self) {
         if self.automatic_compactions_disabled() {
             return;
         }
-        let _ = self.compact_once_inner(change).await;
+        let _ = self.compact_once().await;
     }
 }
 

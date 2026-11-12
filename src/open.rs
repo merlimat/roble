@@ -135,6 +135,10 @@ pub struct Opened<F: Fs> {
     /// The writes that have chosen a memtable and not yet applied to it,
     /// which a freeze has to wait for (§5, `crate::change`).
     writers: crate::change::Writers,
+    /// The tables the compaction underway is reading, which is what keeps
+    /// two compactions off the same ones now that neither holds the permit
+    /// across its merge (§9, `crate::change`).
+    compacting: crate::change::Compacting,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -332,6 +336,7 @@ pub async fn open_with<E: Env>(
         memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
         frozen: std::cell::RefCell::new(None),
         writers: Default::default(),
+        compacting: Default::default(),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
@@ -776,7 +781,11 @@ impl<F: Fs> Opened<F> {
             if in_l0 < self.l0_stop_writes_threshold {
                 return Ok(());
             }
-            if self.changes().underway() {
+            // Both of the things the merge this needs can be behind: the
+            // permit, which a compaction holds to decide and to record, and
+            // the claim it holds for the merge itself with no permit at all
+            // (§9, `crate::change::Compacting`).
+            if self.changes().underway() || self.compacting().underway() {
                 self.stalled(crate::metrics::STALL_L0).await;
                 continue;
             }
@@ -805,7 +814,13 @@ impl<F: Fs> Opened<F> {
     async fn stalled(&self, why: usize) {
         self.metrics.write_stalls[why].add(1);
         let _timer = self.metrics.write_stall[why].start();
-        drop(self.changes().begin().await);
+        if self.changes().underway() {
+            drop(self.changes().begin().await);
+        } else {
+            // A merge, which holds no permit: there is nothing to queue for,
+            // only the claim to wait out (§9).
+            self.compacting().settled().await;
+        }
     }
 
     /// The highest sequence number any read may see.
@@ -883,6 +898,11 @@ impl<F: Fs> Opened<F> {
     /// Lets go of the table cache's reader for one of this store's tables.
     pub(crate) fn forget_reader(&self, file_num: u64) {
         self.caches.forget_table(self.store_id, file_num);
+    }
+
+    /// The tables the compaction underway is reading (§9).
+    pub(crate) fn compacting(&self) -> &crate::change::Compacting {
+        &self.compacting
     }
 
     /// The permit every operation that changes what the database is made of
