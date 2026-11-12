@@ -1531,13 +1531,22 @@ Stated rather than quietly decided:
 
   What the same run exposed instead is that **roble is the slowest of the
   three on every read path** — scans 4x to 6x, `get` about 3x, `floor` about
-  3.5x — and the `levels` line says most of why: over those records roble
-  settles at `L0=1 L1=13` where Pebble reaches `L6=11` and RocksDB `L0=1`. A
-  scan of the first merges fourteen iterators over a level that may overlap;
-  the others read a level that cannot, one table after another. That is the
-  picker's doing, not the iterator tree's, which moves the cost to the open
-  question two entries below and makes it much larger than "noisy". Measuring
-  it is M5's; fixing it is not scheduled.
+  3.5x.
+
+  The first reading of that blamed the picker, from the `levels` line alone:
+  roble settles at `L0=1 L1=13` where Pebble reaches `L6=11` and RocksDB
+  `L0=1`, so it looked like a scan merging fourteen iterators against one
+  reading a level it could walk. `--layout` says otherwise. roble's thirteen
+  L1 tables **partition the key space** — no overlapping pair, the same shape
+  as Pebble's eleven at L6 — and a run small enough to leave two tables in
+  each engine keeps the gap at 4.3x (roble 3.05 M/s, Pebble 13.2 M/s). So it
+  is not the level shape and not the table count: **the cost is per step**.
+
+  Where to look next is the step itself rather than the layout: roble's is an
+  `async fn` polled through the merge for every record, where Pebble's `Next`
+  is a direct call. That is a guess at a cause and the measurement does not
+  confirm it; what the measurement does say is that the layout is not to
+  blame, which is the opposite of what this entry said a day earlier.
 
 - **What Pebble compatibility costs** has a number now, which §2 claimed was
   worth paying without ever naming it. Against encina on the same workload,
@@ -1549,25 +1558,39 @@ Stated rather than quietly decided:
   headline. encina has no reverse iteration at all, so it cannot serve
   `KeyRangeScanReverse`, and no checkpoint, so it cannot serve a shard move
   either; both are Oxia requirements that roble meets and encina does not, and
-  an engine that answers fewer questions can answer them faster. Its load is
-  always durable, so the `--no-wal` row asks it for more than it asks roble
-  for. And a B+tree reads a page where an LSM merges levels, which is the
-  structural difference §2 was weighing, not a cost of Pebble's file format.
-  What the number does establish is the *scale* of what is being traded, which
-  the design had left to the imagination.
+  an engine that answers fewer questions can answer them faster. And a B+tree
+  reads a page where an LSM merges levels, which is the structural difference
+  §2 was weighing, not a cost of Pebble's file format. What the number does
+  establish is the *scale* of what is being traded, which the design had left
+  to the imagination.
+
+  The write side runs the other way, and the benchmark's batch-against-single
+  pass is where it shows. Written 300,000 records one commit at a time rather
+  than in batches of 300, roble holds 0.84x of its batched rate and Pebble
+  0.94x — a memtable absorbs a single insert — while RocksDB drops to 0.24x
+  and encina to 0.006x, 2,237 records a second, with 36 seconds of CPU and a
+  file grown from 44 MiB to 152 MiB. **That is a copy-on-write B+tree
+  committing each record durably**, which is what it is for: a new root per
+  commit and an fsync behind it. It is the expected shape rather than a
+  finding, and it is not a like-for-like row either, since `--no-wal` asks the
+  three LSMs for no sync at all while encina syncs regardless. What the pass
+  is good for is the comparison *within* an engine — how much of its
+  throughput depends on the caller batching — and there roble's answer is the
+  flattest of the four.
 - **A future Oxia that excises.** Virtual sstables are refused (§3) because
   nothing in Oxia creates one today — not the data path, and not the shard
   split, which streams a filtered snapshot. If Oxia adopts `Excise` or
   `IngestAndExcise`, roble needs them on both sides, and that is a release
   rather than a patch. Worth watching rather than deciding now.
 - **How closely the picker should follow Pebble's.** Compatibility does not
-  require it, and this was filed as a question about noise. The benchmark says
-  it is a question about speed: roble's picker leaves a 42 MiB shard spread
-  across thirteen L1 tables where Pebble compacts it to eleven at L6 and
-  RocksDB to a single file, and scanning the first costs several times more
-  because every step merges every table of the level. The shape is legal and
-  Go Pebble reads it, so this is not a compatibility bug — but it is the
-  largest gap the benchmark found in roble, and the one worth closing first.
+  require it, and this was filed as a question about noise. It still is: the
+  three settle into visibly different shapes for the same 300,000 records —
+  roble into one L0 table over thirteen at L1, Pebble into eleven at L6,
+  RocksDB into a single file — and `bench/ --layout` prints all three so the
+  difference can be seen rather than inferred. But roble's L1 partitions the
+  key space as Pebble's L6 does, and the scan gap survives matching the table
+  count, so the shape is not what is costing the reads. It remains a question
+  about what Go Pebble will do with a shard roble shaped, not about speed.
 - **Whether roble should recycle log files**, as Pebble does. Not recycling is
   simpler and keeps `ReuseForWrite` out of `Fs` (§10); recycling saves a file
   creation and its directory sync per rotation, which with 4 MiB memtables is

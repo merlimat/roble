@@ -19,6 +19,9 @@ rocksdb = ["dep:rocksdb"]
 [dependencies]
 compio = { version = "0.19.2", features = ["fs", "macros"] }
 roble = { path = ".." }
+# For the table file names the layout dump prints, so it spells them the way
+# the directory does rather than formatting a number by hand.
+roble-format = { path = "../format" }
 # Pinned to a tag rather than a path, so the comparison is reproducible on a
 # machine that has no encina checkout. The tag is what its release workflow
 # published, and the lockfile pins the commit behind it.

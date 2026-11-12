@@ -31,8 +31,26 @@
 use std::path::Path;
 use std::time::Instant;
 
+use roble_format::files as roble_files;
+
 use crate::report::Report;
 use crate::{Config, fail, key_for, value_for};
+
+/// One table of one level, as an engine describes its own.
+///
+/// The columns are the intersection of what the three LSMs expose, which is
+/// the point: a layout printed from this is diffable between them. RocksDB
+/// also reports an entry count per file and roble would have to open a table
+/// to learn one, so that column is left out rather than filled in for some
+/// engines and dashed for others.
+pub struct TableInfo {
+    pub level: usize,
+    /// What the engine calls the file, as it names it on disk.
+    pub name: String,
+    pub size: u64,
+    pub smallest: Vec<u8>,
+    pub largest: Vec<u8>,
+}
 
 /// One store of one engine — a shard, in Oxia's terms.
 #[allow(async_fn_in_trait)]
@@ -59,6 +77,16 @@ pub trait Store: Sized {
     /// How many tables sit at each level, or `None` for an engine with no
     /// levels to report.
     fn levels(&self) -> Option<[usize; 7]>;
+
+    /// Every table, with its level, size and key range — what `--layout`
+    /// prints. `None` for an engine with no tables.
+    ///
+    /// The counts in [`Store::levels`] say how much merging a scan does; this
+    /// says what it merges, which is what makes two engines' shapes
+    /// comparable rather than just differently-sized.
+    fn layout(&self) -> Option<Vec<TableInfo>> {
+        None
+    }
 
     /// Whether this engine can iterate backwards at all.
     ///
@@ -192,6 +220,23 @@ impl Store for Roble {
             counts[level as usize] = tables.len();
         }
         Some(counts)
+    }
+
+    fn layout(&self) -> Option<Vec<TableInfo>> {
+        let versions = self.db.versions();
+        let mut out = Vec::new();
+        for (level, tables) in versions.version.levels() {
+            for t in tables {
+                out.push(TableInfo {
+                    level: level as usize,
+                    name: roble_files::table_filename(t.file_num),
+                    size: t.size,
+                    smallest: t.smallest_user_key().unwrap_or_default().to_vec(),
+                    largest: t.largest_user_key().unwrap_or_default().to_vec(),
+                });
+            }
+        }
+        Some(out)
     }
 
     async fn scan(&self, reverse: bool, report: &mut Report) -> u64 {
@@ -456,6 +501,25 @@ impl Store for Rocks {
                 .unwrap_or(0) as usize;
         }
         Some(counts)
+    }
+
+    fn layout(&self) -> Option<Vec<TableInfo>> {
+        let files = self
+            .db
+            .live_files()
+            .unwrap_or_else(|e| fail(&format!("live files: {e}")));
+        Some(
+            files
+                .into_iter()
+                .map(|f| TableInfo {
+                    level: f.level.max(0) as usize,
+                    name: f.name.trim_start_matches('/').to_string(),
+                    size: f.size as u64,
+                    smallest: f.start_key.unwrap_or_default(),
+                    largest: f.end_key.unwrap_or_default(),
+                })
+                .collect(),
+        )
     }
 
     async fn scan(&self, reverse: bool, report: &mut Report) -> u64 {

@@ -57,6 +57,13 @@ They always run in this order, whatever order `--phases` names them in.
   filter can help.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
+`run.sh` adds two passes of its own. **Batch against single insert** writes
+the same total records in batches and then one record per commit, so that the
+per-commit cost can be told from the per-record cost; see the warning about it
+below. **The layout** (`--layout`) prints every table of every level, with its
+size and key range, and flags any level below L0 whose tables overlap — which
+is what a scan number has to be read against.
+
 An engine that cannot do a phase prints a dash and the reason instead of a
 zero, because a zero reads as "it did this and it took no time". encina skips
 `scan-rev`, having only a forward `Iter`, and `checkpoint`, having none —
@@ -68,6 +75,25 @@ A `levels` line is printed before the scans: how many tables sit at each level.
 A scan's cost is mostly how many iterators it has to merge, so without it a
 slow iterator cannot be told from a differently-shaped LSM — and on this
 workload that distinction turns out to be the whole story.
+
+## One table, all the engines
+
+`run.sh` collects every engine's `--tsv` lines and pivots them with
+`pivot.py` into one table — a row per operation and metric, a column per
+engine — so the comparison is read across a row rather than by holding four
+blocks in your head:
+
+```
+                           roble      pebble     rocksdb      encina
+scan       rate/s      2,444,142  33,848,584  10,133,423  48,184,380
+           p50 us              0           0           0           0
+           cpu s            0.12        0.01        0.03        0.01
+floor      rate/s        127,139     474,211     488,003   2,392,593
+```
+
+A phase an engine cannot do shows `—` in the table and the reason underneath,
+never a blank that reads as a zero. Run one engine alone and the aligned
+per-run output comes back instead.
 
 ## Running
 
@@ -134,17 +160,36 @@ serialized records, which sit somewhere between the two, so the size column
 here is the incompressible end of the range rather than the answer for any
 particular shard.
 
+**The single-insert row is not like for like, and what it shows is expected.**
+With `--no-wal` the three LSMs sync nothing per commit while encina commits
+each record durably whatever it is asked — so at one record per commit a
+copy-on-write B+tree is writing a new root and an fsync behind it, 300,000
+times. It drops to 0.006x of its batched rate; that is what the structure
+does, not a defect, and it is not a number to set beside three engines that
+were not asked to sync. Run without `--no-wal` for the comparison where all
+four commit durably. The pass is most useful read *within* an engine: how much
+of its throughput depends on the caller batching. roble keeps 0.84x and Pebble
+0.94x, because a memtable absorbs a single insert; RocksDB keeps 0.24x.
+
 **`settle` is not comparable row for row**, by construction. roble's does the
 compaction work on the thread that owns the store; Pebble's and RocksDB's wait
 for background threads; encina has nothing to settle at all. Compare the
 `cpu s` column and the `levels` line, not the rate.
 
-**The `levels` line is where a scan number is explained.** On this workload
-roble settles at `L0=1 L1=13` while Pebble reaches `L6=11` and RocksDB a
-single file. A scan of the first merges fourteen iterators over a level that
-may overlap; the others read a level that cannot, one table after another.
-Most of roble's scan gap is that shape, which belongs to the picker rather
-than to the iterator tree.
+**The `levels` line is not enough to explain a scan number, and `--layout` is
+the reason this is worth saying.** On this workload roble settles at
+`L0=1 L1=13`, Pebble at `L6=11` and RocksDB at a single file, which looks like
+all the explanation a scan gap needs. The layout shows it is not: roble's
+thirteen L1 tables partition the key space with no overlapping pair, exactly
+as Pebble's eleven at L6 do, and a run small enough to leave two tables in
+each engine keeps roble 4.3x behind. The shape is not the cost — the per-step
+path is. Which is why `--layout` prints the ranges and not just the counts:
+the counts invited the wrong answer and were believed for a day.
+
+**`cpu s`, not `rate/s`, is the column to compare** when the engines schedule
+work differently. roble compacts on the thread that owns the store; Pebble and
+RocksDB use their own; a rate credits the background ones with work they still
+paid for.
 
 ## Columns
 
@@ -160,3 +205,17 @@ than to the iterator tree.
 - **size MiB** — what the store occupies on disk at the end of the phase.
 
 The last line is the process's peak resident memory.
+
+## On a Linux runner
+
+macOS cannot give an honest load row with the WAL on: Go's `os.File.Sync` is
+`fcntl(F_FULLFSYNC)` there and compio's is `fsync`, so Pebble flushes the
+drive's write cache and roble does not. On Linux they are all `fsync`, which
+is also what Oxia runs.
+
+The **Benchmark** workflow runs this on `ubuntu-latest` and posts the tables to
+the job summary. It is `workflow_dispatch` only and gates nothing: a shared
+runner's disk, neighbours and CPU budget are outside this repository's control,
+and a benchmark that could fail a pull request for being 8% slower than a
+runner last week would be noise with a veto. Read the ratios between engines
+within one run, not a rate against another run.

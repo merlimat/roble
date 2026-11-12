@@ -1,0 +1,125 @@
+# Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Benchmark
+
+# **Asked for, never automatic.** A shared CI runner is the wrong place to
+# decide anything from a rate: its disk, its neighbours and its CPU budget are
+# all outside this repository's control, and a benchmark that fails a pull
+# request for being 8% slower than a runner last week would be noise with a
+# veto. So this is `workflow_dispatch` only, it posts a table to the job
+# summary, and it gates nothing.
+#
+# What it is for is the one thing a laptop cannot give: **Linux**. Go's
+# `os.File.Sync` is `fcntl(F_FULLFSYNC)` on macOS and compio's is `fsync`, so
+# the load rows of a run with the WAL on are not comparable there at all
+# (bench/README.md). On Linux they are all `fsync`, which is also what Oxia
+# runs on.
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: Stores to open, as Oxia opens one per shard
+        default: "1"
+      batches:
+        description: Batches written to each shard
+        default: "1000"
+      records:
+        description: Records in each batch
+        default: "300"
+      reads:
+        description: Lookups in each get and floor phase
+        default: "50000"
+      engines:
+        description: Which engines to run, space separated
+        default: roble pebble rocksdb encina
+      wal:
+        description: >
+          WAL on, or off as Oxia runs it. Off makes the load rows comparable
+          between the LSMs; on makes them comparable with encina, which
+          commits durably either way.
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Benchmark on Linux
+    runs-on: ubuntu-latest
+    # Four engines over several passes, one of which writes 300,000 records
+    # one commit at a time. The default inputs finish well inside this; a
+    # much larger `--batches` may not.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: harness/go.mod
+          cache-dependency-path: harness/go.sum
+      # Not shared with CI's cache: this builds the two optional engines,
+      # which no other job does, and would otherwise evict what the gate
+      # needs on every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # What librocksdb-sys needs to build its bindings. The other three
+      # engines need nothing installed.
+      - name: Install what RocksDB needs
+        if: contains(github.event.inputs.engines, 'rocksdb')
+        run: sudo apt-get update && sudo apt-get install --yes clang libclang-dev
+      - name: Run the benchmark
+        env:
+          ENGINES: ${{ github.event.inputs.engines }}
+        run: |
+          wal=""
+          if [ "${{ github.event.inputs.wal }}" = "off" ]; then
+            wal="--no-wal"
+          fi
+          ./bench/run.sh \
+            --shards '${{ github.event.inputs.shards }}' \
+            --batches '${{ github.event.inputs.batches }}' \
+            --records '${{ github.event.inputs.records }}' \
+            --reads '${{ github.event.inputs.reads }}' \
+            $wal | tee bench.txt
+      - name: Post it to the job summary
+        if: always()
+        run: |
+          {
+            echo "## Benchmark on \`$(uname -srm)\`"
+            echo
+            echo "Engines: \`${{ github.event.inputs.engines }}\`, WAL ${{ github.event.inputs.wal }},"
+            echo "${{ github.event.inputs.shards }} shards ×"
+            echo "${{ github.event.inputs.batches }} batches ×"
+            echo "${{ github.event.inputs.records }} records."
+            echo
+            echo "A shared runner's disk and neighbours are not this repository's to control,"
+            echo "so read the ratios between engines in one run, not a rate against another run."
+            echo
+            echo '```'
+            cat bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.run_id }}
+          path: bench.txt

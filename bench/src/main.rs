@@ -37,7 +37,7 @@ use std::process;
 use std::time::{Duration, Instant};
 
 use engine::Store;
-use report::Report;
+use report::{Output, Report};
 
 const USAGE: &str = "\
 usage: roble-bench --dir DIR [--engine roble|encina|rocksdb] [options]
@@ -55,6 +55,10 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --seed N        seed for the keys, the values and the lookup order (1)
   --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
                   only durability point, and a commit syncs nothing
+  --layout        print every table of every level, with its size and key
+                  range, after the store has settled
+  --tsv           one tab-separated line per phase instead of a table, for a
+                  script that puts several engines side by side
   --phases LIST   comma-separated subset of
                   load,settle,scan-rev,scan,get,floor,checkpoint
                   (always run in that order, whatever order they are named in)";
@@ -88,6 +92,15 @@ fn main() {
 }
 
 async fn run<S: Store>(cfg: &Config, path: &Path) {
+    let out = Output {
+        tsv: cfg.tsv,
+        engine: S::NAME,
+    };
+    // The header and the notes are for a person reading one run; the table
+    // across engines is assembled from `--tsv` and needs none of them.
+    if cfg.tsv {
+        return run_phases::<S>(cfg, path, out).await;
+    }
     println!(
         "{}: {} shards x {} batches x {} records, {}-byte values, {} MiB cache, \
          wal={}, seed={}",
@@ -111,21 +124,27 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
         println!("note: --no-wal, which is Oxia's own configuration, for a load row that is.");
     }
     println!("{}", Report::header());
+    run_phases::<S>(cfg, path, out).await;
+}
 
+async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
     let shards = S::open(cfg, path).await;
 
     if cfg.wants("load") {
-        load(cfg, &shards).await;
+        load(cfg, &shards, out).await;
     }
     if cfg.wants("settle") {
-        settle(&shards).await;
+        settle(&shards, out).await;
     }
     // What shape the load and the settle left, because a scan's cost is
     // mostly how many iterators it has to merge: one table in one level is
     // not the same work as ten in L0, and without this line a reader cannot
     // tell a slow iterator from a differently-shaped store.
-    if cfg.wants("scan") || cfg.wants("scan-rev") {
+    if (cfg.wants("scan") || cfg.wants("scan-rev") || cfg.layout) && !cfg.tsv {
         println!("levels {}", level_shape(&shards));
+    }
+    if cfg.layout && !cfg.tsv {
+        print_layout(&shards);
     }
     // Reverse before forward, deliberately. The phases share a cache and run
     // in order, so whichever goes second reads one the first warmed — and the
@@ -134,27 +153,31 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
     // is keeping up from behind. A cold comparison of either needs its own
     // process: `--phases load,scan` and `--phases load,scan-rev`.
     if cfg.wants("scan-rev") {
-        scan(cfg, &shards, true).await;
+        scan(cfg, &shards, true, out).await;
     }
     if cfg.wants("scan") {
-        scan(cfg, &shards, false).await;
+        scan(cfg, &shards, false, out).await;
     }
     if cfg.wants("get") {
-        lookups(cfg, &shards, false).await;
+        lookups(cfg, &shards, false, out).await;
     }
     if cfg.wants("floor") {
-        lookups(cfg, &shards, true).await;
+        lookups(cfg, &shards, true, out).await;
     }
     if cfg.wants("checkpoint") {
-        checkpoint(&shards, path).await;
+        checkpoint(&shards, path, out).await;
     }
 
-    println!("peak rss {} MiB", peak_rss_mib());
+    if !cfg.tsv {
+        println!("peak rss {} MiB", peak_rss_mib());
+    } else {
+        println!("{}\tpeak-rss-mib\t{}", out.engine, peak_rss_mib());
+    }
 }
 
 /// Writes every batch of every shard, timing each commit.
-async fn load<S: Store>(cfg: &Config, shards: &[S]) {
-    let mut report = Report::new("load");
+async fn load<S: Store>(cfg: &Config, shards: &[S], out: Output) {
+    let mut report = Report::new("load", out);
     for (s, store) in shards.iter().enumerate() {
         for b in 0..cfg.batches {
             let at = Instant::now();
@@ -169,8 +192,8 @@ async fn load<S: Store>(cfg: &Config, shards: &[S]) {
 }
 
 /// Leaves every shard in a shape the read phases can be compared over.
-async fn settle<S: Store>(shards: &[S]) {
-    let mut report = Report::new("settle");
+async fn settle<S: Store>(shards: &[S], out: Output) {
+    let mut report = Report::new("settle", out);
     for store in shards {
         let at = Instant::now();
         let did = store.settle().await;
@@ -181,13 +204,13 @@ async fn settle<S: Store>(shards: &[S]) {
 }
 
 /// Steps every record of every shard, forward or backward.
-async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool) {
+async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool, out: Output) {
     let name = if reverse { "scan-rev" } else { "scan" };
     if reverse && !shards.first().is_some_and(|s| s.reverse()) {
-        Report::skipped(name, "this engine cannot iterate backwards");
+        Report::skipped(name, "this engine cannot iterate backwards", out);
         return;
     }
-    let mut report = Report::new(name);
+    let mut report = Report::new(name, out);
     for store in shards {
         let seen = store.scan(reverse, &mut report).await;
         report.count += seen;
@@ -211,9 +234,9 @@ async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool) {
 /// Oxia's `getFloor` tries an exact `Get` first and only falls through to a
 /// seek when that misses, so probing keys that exist would measure the `get`
 /// phase over again. What this times is the seek, which no filter can help.
-async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool) {
+async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output) {
     let name = if floor { "floor" } else { "get" };
-    let mut report = Report::new(name);
+    let mut report = Report::new(name, out);
     let total = cfg.batches * cfg.records;
     let mut rng = Rng::new(cfg.seed ^ 0x9e37_79b9);
     for _ in 0..cfg.reads {
@@ -251,13 +274,13 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool) {
 }
 
 /// Checkpoints every shard, which is how Oxia moves one.
-async fn checkpoint<S: Store>(shards: &[S], path: &Path) {
-    let mut report = Report::new("checkpoint");
+async fn checkpoint<S: Store>(shards: &[S], path: &Path, out: Output) {
+    let mut report = Report::new("checkpoint", out);
     for (s, store) in shards.iter().enumerate() {
         let at = path.join(format!("checkpoint-{s:04}"));
         let started = Instant::now();
         if !store.checkpoint(&at).await {
-            Report::skipped("checkpoint", "this engine has none");
+            Report::skipped("checkpoint", "this engine has none", out);
             return;
         }
         report.saw(started.elapsed());
@@ -273,6 +296,55 @@ async fn size_of<S: Store>(shards: &[S]) -> u64 {
         total += store.size().await;
     }
     total
+}
+
+/// Prints every table of every level: which file, how large, and what range
+/// of keys it holds.
+///
+/// The `levels` line says how many iterators a scan merges; this says what it
+/// merges them over, which is the difference between knowing that two engines
+/// settled differently and seeing how. Sorted by level and then by key, not by
+/// file number, because what matters is whether a level's tables partition the
+/// key space or overlap it — the first is a scan that reads one table at a
+/// time, the second is a scan that merges them all.
+fn print_layout<S: Store>(shards: &[S]) {
+    let mut tables: Vec<engine::TableInfo> =
+        shards.iter().filter_map(|s| s.layout()).flatten().collect();
+    if tables.is_empty() {
+        println!("layout — this engine has no tables");
+        return;
+    }
+    tables.sort_by(|a, b| {
+        a.level
+            .cmp(&b.level)
+            .then_with(|| a.smallest.cmp(&b.smallest))
+    });
+    println!("layout {} tables", tables.len());
+    for t in &tables {
+        println!(
+            "  L{} {:<16} {:>8.1} MiB  {} .. {}",
+            t.level,
+            t.name,
+            t.size as f64 / (1024.0 * 1024.0),
+            String::from_utf8_lossy(&t.smallest),
+            String::from_utf8_lossy(&t.largest),
+        );
+    }
+    // Whether each level below L0 really partitions the key space, which is
+    // the property that lets a scan read its tables one after another instead
+    // of merging them. L0 is allowed to overlap by design: it holds whole
+    // flushed memtables.
+    for level in 1..7 {
+        let mut at: Vec<&engine::TableInfo> = tables.iter().filter(|t| t.level == level).collect();
+        at.sort_by(|a, b| a.smallest.cmp(&b.smallest));
+        let overlaps = at
+            .windows(2)
+            .filter(|p| p[1].smallest <= p[0].largest)
+            .count();
+        if overlaps > 0 {
+            println!("  L{level}: {overlaps} overlapping pair(s), which a scan has to merge");
+        }
+    }
 }
 
 /// How many tables sit at each level, summed over the shards.
@@ -371,6 +443,8 @@ pub struct Config {
     pub seed: u64,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
+    layout: bool,
+    tsv: bool,
     phases: Option<Vec<String>>,
 }
 
@@ -387,6 +461,8 @@ impl Config {
             cache_mb: 64,
             seed: 1,
             wal: true,
+            layout: false,
+            tsv: false,
             phases: None,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -424,6 +500,14 @@ impl Config {
                 }
                 "--no-wal" => {
                     cfg.wal = false;
+                    took_value = false;
+                }
+                "--layout" => {
+                    cfg.layout = true;
+                    took_value = false;
+                }
+                "--tsv" => {
+                    cfg.tsv = true;
                     took_value = false;
                 }
                 "-h" | "--help" => {

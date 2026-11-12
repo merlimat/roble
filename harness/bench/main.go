@@ -53,6 +53,10 @@ Creates the store at DIR/pebble, which must not exist yet.
   --reads N       lookups in each get and floor phase (100000)
   --cache-mb N    block cache for every shard together, in MiB (64)
   --seed N        seed for the keys and the lookup order (1)
+  --layout        print every table of every level, with its size and key
+                  range, after the store has settled
+  --tsv           one tab-separated line per phase instead of a table, for a
+                  script that puts several engines side by side
   --no-wal        turn the WAL off, as Oxia runs it
   --phases LIST   comma-separated subset of
                   load,settle,scan-rev,scan,get,floor,checkpoint
@@ -68,6 +72,8 @@ type config struct {
 	cacheMB    int64
 	seed       uint64
 	wal        bool
+	layout     bool
+	tsv        bool
 	phases     map[string]bool
 }
 
@@ -81,23 +87,27 @@ func main() {
 		fail(err.Error())
 	}
 
-	walState := "on"
-	if !cfg.wal {
-		walState = "off"
+	if !cfg.tsv {
+		walState := "on"
+		if !cfg.wal {
+			walState = "off"
+		}
+		fmt.Printf("pebble: %d shards x %d batches x %d records, %d-byte values, %d MiB cache, "+
+			"wal=%s, seed=%d\n",
+			cfg.shards, cfg.batches, cfg.records, cfg.valueBytes, cfg.cacheMB, walState, cfg.seed)
 	}
-	fmt.Printf("pebble: %d shards x %d batches x %d records, %d-byte values, %d MiB cache, "+
-		"wal=%s, seed=%d\n",
-		cfg.shards, cfg.batches, cfg.records, cfg.valueBytes, cfg.cacheMB, walState, cfg.seed)
 	// Said here rather than only in the README, so it travels with the
 	// numbers. Go's os.File.Sync is fcntl(F_FULLFSYNC) on macOS, which
 	// flushes the drive's own write cache; compio's is fsync, which does not.
 	// On Linux — which is what Oxia runs — both are fsync.
-	if cfg.wal && cfg.wants("load") && runtime.GOOS == "darwin" {
+	if cfg.wal && cfg.wants("load") && runtime.GOOS == "darwin" && !cfg.tsv {
 		fmt.Println("note: on macOS Pebble's sync is F_FULLFSYNC and roble's is fsync, so the load")
 		fmt.Println("note: row is not comparable between the two. Run both with --no-wal, which is")
 		fmt.Println("note: Oxia's own configuration, for a load comparison that is.")
 	}
-	fmt.Println(header())
+	if !cfg.tsv {
+		fmt.Println(header())
+	}
 
 	// One block cache for every shard, which is how Oxia runs: hundreds of
 	// shards inside one budget. roble shares its caches the same way (§8).
@@ -126,8 +136,11 @@ func main() {
 	// What shape the load and the settle left: a scan's cost is mostly how
 	// many iterators it merges, so without this a reader cannot tell a slow
 	// iterator from a differently-shaped LSM.
-	if cfg.wants("scan") || cfg.wants("scan-rev") {
+	if (cfg.wants("scan") || cfg.wants("scan-rev") || cfg.layout) && !cfg.tsv {
 		fmt.Printf("levels %s\n", levelShape(shards))
+	}
+	if cfg.layout && !cfg.tsv {
+		printLayout(shards)
 	}
 	if cfg.wants("scan-rev") {
 		scan(cfg, shards, true)
@@ -145,7 +158,11 @@ func main() {
 		checkpoint(cfg, shards, path)
 	}
 
-	fmt.Printf("peak rss %d MiB\n", peakRSSMiB())
+	if cfg.tsv {
+		fmt.Printf("pebble\tpeak-rss-mib\t%d\n", peakRSSMiB())
+	} else {
+		fmt.Printf("peak rss %d MiB\n", peakRSSMiB())
+	}
 }
 
 // options is Oxia's configuration of Pebble, from kv_pebble.go: 16 KiB blocks,
@@ -180,7 +197,7 @@ func options(cfg config, cache *pebble.Cache) *pebble.Options {
 // itself before committing — so what is measured includes the index the repr
 // is built under, as on the Rust side.
 func load(cfg config, shards []*pebble.DB) {
-	r := newReport("load")
+	r := newReport(cfg, "load")
 	write := pebble.NoSync
 	if cfg.wal {
 		write = pebble.Sync
@@ -216,7 +233,7 @@ func load(cfg config, shards []*pebble.DB) {
 // for. The CPU column is what makes the two comparable: Pebble's background
 // threads are counted in it.
 func settle(cfg config, shards []*pebble.DB) {
-	r := newReport("settle")
+	r := newReport(cfg, "settle")
 	for _, db := range shards {
 		at := time.Now()
 		if err := db.Flush(); err != nil {
@@ -246,7 +263,7 @@ func scan(cfg config, shards []*pebble.DB, reverse bool) {
 	if reverse {
 		name = "scan-rev"
 	}
-	r := newReport(name)
+	r := newReport(cfg, name)
 	for _, db := range shards {
 		it, err := db.NewIter(nil)
 		if err != nil {
@@ -300,7 +317,7 @@ func lookups(cfg config, shards []*pebble.DB, floor bool) {
 	if floor {
 		name = "floor"
 	}
-	r := newReport(name)
+	r := newReport(cfg, name)
 	total := cfg.batches * cfg.records
 	rng := newRng(cfg.seed ^ 0x9e3779b9)
 	for n := 0; n < cfg.reads; n++ {
@@ -357,7 +374,7 @@ func getWith(db *pebble.DB, probe []byte, floor bool) ([]byte, error) {
 
 // checkpoint writes a checkpoint of every shard, which is how Oxia moves one.
 func checkpoint(cfg config, shards []*pebble.DB, path string) {
-	r := newReport("checkpoint")
+	r := newReport(cfg, "checkpoint")
 	for s, db := range shards {
 		at := time.Now()
 		if err := db.Checkpoint(filepath.Join(path, fmt.Sprintf("checkpoint-%04d", s))); err != nil {
@@ -374,6 +391,7 @@ func checkpoint(cfg config, shards []*pebble.DB, path string) {
 
 type report struct {
 	name      string
+	cfg       config
 	count     int64
 	started   time.Time
 	cpuAt     time.Duration
@@ -385,8 +403,8 @@ func header() string {
 		"phase", "count", "rate/s", "p50 us", "p99 us", "max us", "cpu s", "size MiB")
 }
 
-func newReport(name string) *report {
-	return &report{name: name, started: time.Now(), cpuAt: cpuTime()}
+func newReport(cfg config, name string) *report {
+	return &report{name: name, cfg: cfg, started: time.Now(), cpuAt: cpuTime()}
 }
 
 func (r *report) saw(took time.Duration) {
@@ -412,9 +430,15 @@ func (r *report) finish(shards []*pebble.DB) {
 	if wall > 0 {
 		rate = float64(r.count) / wall.Seconds()
 	}
+	sizeMiB := float64(size) / (1024 * 1024)
+	if r.cfg.tsv {
+		fmt.Printf("pebble\t%s\t%d\t%.0f\t%d\t%d\t%d\t%.2f\t%.1f\n",
+			r.name, r.count, rate, us(0.50), us(0.99), us(1.0), cpu.Seconds(), sizeMiB)
+		return
+	}
 	fmt.Printf("%-11s %10d %12.0f %9d %9d %9d %8.2f %9.1f\n",
 		r.name, r.count, rate, us(0.50), us(0.99), us(1.0),
-		cpu.Seconds(), float64(size)/(1024*1024))
+		cpu.Seconds(), sizeMiB)
 }
 
 // ------------------------------------------------------------------- the key
@@ -427,6 +451,77 @@ func (r *report) finish(shards []*pebble.DB) {
 // zero-padded so bytewise order is numeric order.
 func keyFor(s, i int) []byte {
 	return []byte(fmt.Sprintf("/shard-%04d/bucket-%02d/key-%010d", s, i%64, i))
+}
+
+// printLayout prints every table of every level: which file, how large, and
+// what range of keys it holds, in the format the Rust side prints so the two
+// can be diffed.
+//
+// Sorted by level and then by key, not by file number, because what matters is
+// whether a level's tables partition the key space or overlap it — the first
+// is a scan that reads one table at a time, the second is a scan that merges
+// them all.
+func printLayout(shards []*pebble.DB) {
+	type table struct {
+		level             int
+		name              string
+		size              uint64
+		smallest, largest []byte
+	}
+	var tables []table
+	for _, db := range shards {
+		levels, err := db.SSTables()
+		if err != nil {
+			fail(err.Error())
+		}
+		for level, at := range levels {
+			for _, t := range at {
+				tables = append(tables, table{
+					level:    level,
+					name:     fmt.Sprintf("%06d.sst", t.FileNum),
+					size:     t.Size,
+					smallest: append([]byte{}, t.Smallest.UserKey...),
+					largest:  append([]byte{}, t.Largest.UserKey...),
+				})
+			}
+		}
+	}
+	if len(tables) == 0 {
+		fmt.Println("layout — this engine has no tables")
+		return
+	}
+	sort.Slice(tables, func(i, j int) bool {
+		if tables[i].level != tables[j].level {
+			return tables[i].level < tables[j].level
+		}
+		return bytes.Compare(tables[i].smallest, tables[j].smallest) < 0
+	})
+	fmt.Printf("layout %d tables\n", len(tables))
+	for _, t := range tables {
+		fmt.Printf("  L%d %-16s %8.1f MiB  %s .. %s\n",
+			t.level, t.name, float64(t.size)/(1024*1024), t.smallest, t.largest)
+	}
+	// Whether each level below L0 really partitions the key space, which is
+	// the property that lets a scan read its tables one after another instead
+	// of merging them. L0 is allowed to overlap by design: it holds whole
+	// flushed memtables.
+	for level := 1; level < 7; level++ {
+		var at []table
+		for _, t := range tables {
+			if t.level == level {
+				at = append(at, t)
+			}
+		}
+		overlaps := 0
+		for i := 1; i < len(at); i++ {
+			if bytes.Compare(at[i].smallest, at[i-1].largest) <= 0 {
+				overlaps++
+			}
+		}
+		if overlaps > 0 {
+			fmt.Printf("  L%d: %d overlapping pair(s), which a scan has to merge\n", level, overlaps)
+		}
+	}
 }
 
 // levelShape is how many tables sit at each level, summed over the shards.
@@ -572,6 +667,12 @@ func parse() config {
 			}
 		case "--no-wal":
 			cfg.wal = false
+			tookValue = false
+		case "--layout":
+			cfg.layout = true
+			tookValue = false
+		case "--tsv":
+			cfg.tsv = true
 			tookValue = false
 		case "-h", "--help":
 			fmt.Println(usage)

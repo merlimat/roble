@@ -14,17 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs every engine over the same workload and prints them one after the other.
+# Runs every engine over the same workload and prints one table of all of them.
 # See README.md.
 #
-# Two passes, because they answer different questions:
+# Four passes, because they answer different questions:
 #
-#   1. The whole phase list in one process per engine. Cheap, and the phases
-#      share a warm cache in the order they run — which is why `scan-rev` goes
-#      before `scan`, so the bias runs against the direction under suspicion.
+#   1. Every phase, every engine, in one table. The phases share a cache and
+#      run in order, so whichever of the two scans goes second reads one the
+#      first warmed — which is why `scan-rev` goes first, pointing the bias
+#      against the direction under suspicion.
 #   2. Each scan direction in a process of its own over a freshly loaded store,
 #      so neither reads a cache the other warmed. This is the comparison
 #      DESIGN.md §14 asks for, and the first pass only approximates it.
+#   3. Batch insert against single insert, at the same total number of
+#      records, so the per-commit cost can be told from the per-record cost.
+#   4. The layout: every table of every level, with its size and key range,
+#      which is what a scan number has to be read against.
 #
 # ENGINES picks which to run; the default is all of them. roble and Pebble
 # need nothing installed. encina is fetched from git. RocksDB needs a C++
@@ -39,7 +44,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ENGINES="${ENGINES:-roble pebble encina rocksdb}"
+ENGINES="${ENGINES:-roble pebble rocksdb encina}"
 
 out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
@@ -69,18 +74,63 @@ run_engine() {
   esac
 }
 
-echo "=== every engine, every phase, one process each ==="
-for engine in $ENGINES; do
-  echo
-  run_engine "$engine" "$out/all-$engine" "${args[@]}"
-done
+# Collects every engine's `--tsv` lines and pivots them into one table.
+table() {
+  local tag="$1"
+  shift
+  local lines="$out/$tag.tsv"
+  : > "$lines"
+  for engine in $ENGINES; do
+    # Only the tab-separated lines: a build wrapper or a toolchain can put
+    # its own chatter on stdout, and the pivot should see measurements only.
+    run_engine "$engine" "$out/$tag-$engine" --tsv "$@" \
+      | awk -F'\t' 'NF >= 3' >> "$lines"
+  done
+  python3 pivot.py --metrics rate,p50,cpu,size < "$lines"
+}
+
+echo "=== every engine, every phase ==="
+echo
+table all "${args[@]}"
 
 echo
 echo "=== each scan direction on its own, over a store of its own ==="
-echo "(so that neither direction reads a cache the other warmed)"
+echo "(so neither direction reads a cache the other warmed)"
 for dir in scan-rev scan; do
-  for engine in $ENGINES; do
-    echo
-    run_engine "$engine" "$out/$dir-$engine" --phases "load,settle,$dir" "${args[@]}"
-  done
+  echo
+  table "$dir" "${args[@]}" --phases "load,settle,$dir"
+done
+
+# The same records, written one batch at a time against one record at a time.
+# `--records 1` makes every commit its own record, so the load row's rate — it
+# is records per second either way — is directly comparable, and the p50 is a
+# batch commit in one and a single insert in the other.
+#
+# The totals are matched by moving the records into the batch count, which
+# needs the two numbers this was asked for; without them it is the defaults.
+batches=200
+records=100
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --batches) batches="${args[$((i + 1))]}" ;;
+    --records) records="${args[$((i + 1))]}" ;;
+  esac
+done
+total=$((batches * records))
+
+echo
+echo "=== batch insert against single insert, $total records either way ==="
+echo
+echo "-- batches of $records --"
+table batch "${args[@]}" --phases load --batches "$batches" --records "$records"
+echo
+echo "-- one record per commit --"
+table single "${args[@]}" --phases load --batches "$total" --records 1
+
+echo
+echo "=== the layout each engine settled into ==="
+for engine in $ENGINES; do
+  echo
+  run_engine "$engine" "$out/layout-$engine" "${args[@]}" \
+    --phases load,settle --layout
 done
