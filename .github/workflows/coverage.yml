@@ -50,22 +50,29 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      # Everything under compat/ is a harness that compat/*/run.sh drives
-      # against Go, not a crate with tests of its own: counted here it would
-      # only report its own binary as unrun. The two `--exclude`s keep them
-      # from being built at all; the path in the regex is what catches the
-      # next one, because a harness added later would otherwise arrive at 0%
-      # and, now that a drop fails this job, fail it for the one change that
-      # could not have caused it.
+      # compat/ and bench/ hold harnesses that a run.sh drives against Go,
+      # not crates with tests of their own: counted here they would only
+      # report their own binaries as unrun. The `--exclude`s keep them from
+      # being built at all; the paths in the regex are what catch the next
+      # one, because a harness added later would otherwise arrive at 0% and,
+      # now that a drop fails this job, fail it for the one change that could
+      # not have caused it. bench/ is exactly that case — the comment above
+      # predicted it before `roble-bench` existed, and the prediction cost
+      # this job one red run to collect.
+      #
+      # What makes a crate belong on this list is that running it *is* the
+      # test: `compat/*/run.sh` passes or fails, and `bench/run.sh` prints
+      # numbers a person reads. Neither has anything a `cargo test` could
+      # assert, so neither has coverage to report.
       #
       # cargo-llvm-cov leaves out tests.rs; sim.rs is test code too, the
       # simulated filesystem the failure-path tests drive.
       - name: Run the tests under cargo-llvm-cov
         run: >
           cargo llvm-cov --workspace --locked
-          --exclude minlz-compat --exclude sst-roundtrip
+          --exclude minlz-compat --exclude sst-roundtrip --exclude roble-bench
           --json --output-path target/coverage.json
-          --ignore-filename-regex '(^|/)compat/|(^|/)src/sim\.rs$'
+          --ignore-filename-regex '(^|/)compat/|(^|/)bench/|(^|/)src/sim\.rs$'
       - name: Summarize
         id: summary
         run: python3 .github/scripts/coverage-summary.py target/coverage.json

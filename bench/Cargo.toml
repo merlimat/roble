@@ -1,0 +1,48 @@
+# Compares roble with Go Pebble on Oxia's shape. See README.md.
+[package]
+name = "roble-bench"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Benchmarks roble against Go Pebble on the workload Oxia runs"
+
+# Both comparisons are optional, and off by default, so an ordinary
+# `cargo build --workspace` neither clones encina nor needs a C++ toolchain
+# for RocksDB. `bench/run.sh` turns on whichever it was asked for.
+[features]
+default = []
+encina = ["dep:encina"]
+rocksdb = ["dep:rocksdb"]
+
+[dependencies]
+compio = { version = "0.19.2", features = ["fs", "macros"] }
+roble = { path = ".." }
+# For the table file names the layout dump prints, so it spells them the way
+# the directory does rather than formatting a number by hand.
+roble-format = { path = "../format" }
+# Pinned to a tag rather than a path, so the comparison is reproducible on a
+# machine that has no encina checkout. The tag is what its release workflow
+# published, and the lockfile pins the commit behind it.
+encina = { git = "https://github.com/merlimat/encina", tag = "v0.4.1", optional = true }
+# LZ4 and Snappy are the compressions this benchmark can ask for; bindgen at
+# runtime avoids a pre-generated binding going stale against the local
+# libclang.
+rocksdb = { version = "0.25", default-features = false, features = [
+    "snappy",
+    "lz4",
+    "bindgen-runtime",
+], optional = true }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
+# The benchmark needs two libc calls — `getrusage`, for CPU time and peak
+# memory — so like the engine it denies unsafe and allows it at those call
+# sites, each with a SAFETY comment. Without them the CPU column would be
+# missing, and that column is what makes roble's cooperative compaction
+# comparable with Pebble's background threads.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
