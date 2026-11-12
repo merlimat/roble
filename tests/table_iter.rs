@@ -296,3 +296,40 @@ async fn a_table_written_with_another_comparer_is_refused() {
         "expected Unsupported, got {err:?}"
     );
 }
+
+/// One cursor, handed to tables of **different formats**, reads both right.
+///
+/// `seek_ge_into` takes the caller's cursor so that a point lookup does not
+/// build one per table it searches, and keeps beside it the format it was
+/// built for. That is not bookkeeping: the format decides whether a `SET`
+/// value carries a prefix byte — Pebblev3 added it — so a cursor built for
+/// one format and reused on a table in another would read every value
+/// shifted by a byte. A database Pebble upgraded over time holds tables at
+/// more than one format, so this is reachable and not hypothetical.
+///
+/// Pebblev2 and Pebblev3 are that pair, and the loop goes round twice: the
+/// second pass hands each table a cursor built for the *other* format, which
+/// is the only arrangement that reaches the check. One pass would not.
+#[compio::test]
+async fn one_cursor_serves_tables_of_different_formats() {
+    let mut cursor = None;
+    for pass in 0..2 {
+        for name in ["pebblev2", "pebblev3"] {
+            let bytes = std::fs::read(sst_path(name)).expect("read fixture");
+            let (want_key, want_value) = expected(&bytes).first().expect("a first entry").clone();
+
+            let (_env, table) = open(name).await;
+            let (mut key, mut value) = (Vec::new(), Vec::new());
+            let target = roble_format::key::search_key(b"");
+            assert!(
+                table
+                    .seek_ge_into(&target, &mut cursor, &mut key, &mut value)
+                    .await
+                    .expect("seek"),
+                "{name} should hold an entry at or after the empty key"
+            );
+            assert_eq!(key, want_key, "pass {pass}, {name}: the key it read");
+            assert_eq!(value, want_value, "pass {pass}, {name}: the value it read");
+        }
+    }
+}

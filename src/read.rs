@@ -103,6 +103,15 @@ pub struct Lookup {
     /// One table's candidate, before it is known to be the newest.
     entry_key: Vec<u8>,
     entry_value: Vec<u8>,
+    /// A block cursor, with the table format it was built for.
+    ///
+    /// A cursor assembles the prefix-compressed key it is on into a `Vec`, so
+    /// one built per table searched was an allocation per table — the last
+    /// one a warm lookup made ([`crate::table::OpenTable::seek_ge_into`]).
+    cursor: Option<(
+        roble_format::TableFormat,
+        roble_format::block::restart::DataCursor,
+    )>,
 }
 
 impl Lookup {
@@ -283,6 +292,7 @@ impl<F: Fs> Opened<F> {
             file_nums,
             entry_key,
             entry_value,
+            cursor,
             ..
         } = buf;
         key::search_key_into(user, target);
@@ -328,7 +338,10 @@ impl<F: Fs> Opened<F> {
                 continue;
             }
 
-            if !table.seek_ge_into(target, entry_key, entry_value).await? {
+            if !table
+                .seek_ge_into(target, cursor, entry_key, entry_value)
+                .await?
+            {
                 continue;
             }
             let k = InternalKey::decode(entry_key)?;

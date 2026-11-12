@@ -42,6 +42,8 @@ use roble_format::sst::{
 };
 use roble_format::{FOOTER_LEN, Footer};
 
+use roble_format::block::restart::DataCursor;
+
 use crate::env::{Disk, read_exact, read_tail};
 use crate::error::{Error, Result};
 
@@ -292,8 +294,9 @@ impl<D: Disk> OpenTable<D> {
             key: Vec::new(),
             value: Vec::new(),
         };
+        let mut cursor = None;
         Ok(self
-            .seek_ge_into(target, &mut entry.key, &mut entry.value)
+            .seek_ge_into(target, &mut cursor, &mut entry.key, &mut entry.value)
             .await?
             .then_some(entry))
     }
@@ -307,9 +310,21 @@ impl<D: Disk> OpenTable<D> {
     /// buffers it can overwrite per table and swap out of when one wins. An
     /// owned `Entry` per table was two allocations per table searched, and
     /// the losers' were thrown away.
+    /// `cursor` is the caller's: a block cursor assembles the prefix-compressed
+    /// key it is on into a `Vec`, so building one per table searched was an
+    /// allocation per table, and the only one a warm lookup had left. It is
+    /// reused untouched rather than reset, because `seek_ge` places itself
+    /// from the restart array and overwrites every field — a cursor last used
+    /// on another block, or another table, carries nothing into this one.
+    ///
+    /// The format it was built for is kept beside it. A cursor cannot be
+    /// asked, and the format decides whether a `SET` value carries a prefix
+    /// byte, so one built for a different format is replaced rather than
+    /// reused.
     pub async fn seek_ge_into(
         &self,
         target: &[u8],
+        cursor: &mut Option<(roble_format::TableFormat, DataCursor)>,
         key: &mut Vec<u8>,
         value: &mut Vec<u8>,
     ) -> Result<bool> {
@@ -317,10 +332,13 @@ impl<D: Disk> OpenTable<D> {
         for entry in &self.index[start..] {
             let bytes = self.block(entry.handle, Caching::Keep).await?;
             let block = Block::new(&bytes)?;
-            let mut cursor = block.data_cursor(self.footer.format);
+            if !matches!(cursor, Some((format, _)) if *format == self.footer.format) {
+                *cursor = Some((self.footer.format, block.data_cursor(self.footer.format)));
+            }
+            let (_, cursor) = cursor.as_mut().expect("set just above");
             cursor.seek_ge(&block, target)?;
             if cursor.is_valid() {
-                self.entry_into(&block, &cursor, key, value).await?;
+                self.entry_into(&block, cursor, key, value).await?;
                 return Ok(true);
             }
             // The target fell past this block's last key; the answer, if any,
