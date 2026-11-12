@@ -753,9 +753,24 @@ something that does not write to it.
 
 `snapshot()` pins a version and a sequence number. `checkpoint(dir)` writes a
 directory Go Pebble opens: hard links to the live tables, a fresh MANIFEST
-holding one edit that describes the version, the markers, and an `OPTIONS-*`.
-Oxia streams that directory, so it is the single most important interop test
-(§12).
+holding one edit that describes the version — the same edit a rotation writes,
+and the same claim — and the two markers. Oxia streams that directory, so it
+is the single most important interop test (§12), and `compat/wal-replay` hands
+Pebble one to open read-only.
+
+**No `OPTIONS-*`,** which this document used to say there would be. roble
+writes none and reads nothing from one, and Pebble does not need one: it
+writes its own when it opens a directory read-write, and checks a previous one
+only if it finds one. **And no logs.** A checkpoint **flushes first**, so
+there is nothing for a log to carry — which is what makes it right with the
+WAL off, where a log would not be there to carry it anyway. The minimum
+unflushed log number the edit records then names a log the checkpoint does not
+hold, which is the same thing as a log holding nothing to roble's replay and
+to Pebble's.
+
+Links rather than copies, because a table is immutable once written: the
+checkpoint and the store share the bytes until one of them deletes its name
+(§10, `Fs::link`, which falls back to a copy where a link cannot be made).
 
 ### Opening and recovery
 

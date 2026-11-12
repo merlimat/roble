@@ -129,7 +129,7 @@ impl<F: Fs> Opened<F> {
 /// It has to replay, on its own, to the version set it was built from: that
 /// is the whole claim rotation makes, and `tests/rotate.rs` checks it by
 /// replaying the file before trusting it.
-fn snapshot_edit(versions: &VersionSet, next_file_num: u64) -> VersionEdit {
+pub(crate) fn snapshot_edit(versions: &VersionSet, next_file_num: u64) -> VersionEdit {
     let mut new_tables = Vec::new();
     for (level, tables) in versions.version.levels() {
         for t in tables {
