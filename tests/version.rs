@@ -265,3 +265,62 @@ async fn tables_that_only_touch_are_not_stacked() {
     ];
     assert_eq!(sublevels(overlapping), 2);
 }
+
+/// One table, to ask about its bounds.
+fn bounded(smallest: &[u8], largest: &[u8], largest_seq: u64, largest_kind: Kind) -> VersionSet {
+    replay(vec![table(
+        0,
+        1,
+        smallest,
+        largest,
+        largest_seq,
+        largest_kind,
+    )])
+    .expect("the version")
+}
+
+#[compio::test]
+async fn a_table_meets_a_scans_bounds_as_the_bounds_are_written() {
+    // A scan's bounds are half-open as Pebble's are — lower included, upper
+    // excluded — and a table's own largest bound is excluded too when it is
+    // the sentinel a range deletion leaves (§5). Every assertion here is one
+    // of those three exclusions, because every one of them is an off-by-one
+    // that loses keys or holds files.
+    let plain = bounded(b"b", b"d", 20, Kind::Set);
+    let plain = &plain.version.level(0)[0];
+    let sentinel = bounded(b"b", b"d", SEQ_NUM_MAX, Kind::RangeDelete);
+    let sentinel = &sentinel.version.level(0)[0];
+
+    assert!(
+        plain.overlaps_range(Some(b"d"), None).expect("overlaps"),
+        "the scan's lower bound is included, and this table holds a key at it"
+    );
+    assert!(
+        !sentinel.overlaps_range(Some(b"d"), None).expect("overlaps"),
+        "but a table ending at the sentinel holds nothing at that key"
+    );
+    assert!(
+        !plain.overlaps_range(Some(b"e"), None).expect("overlaps"),
+        "and a table that ends before the scan starts holds nothing it can see"
+    );
+
+    assert!(
+        !plain.overlaps_range(None, Some(b"b")).expect("overlaps"),
+        "the scan's upper bound is excluded, so a table starting at it is out of reach"
+    );
+    assert!(
+        plain.overlaps_range(None, Some(b"c")).expect("overlaps"),
+        "and one starting below it is not"
+    );
+
+    assert!(
+        plain.overlaps_range(None, None).expect("overlaps"),
+        "a scan with no bounds reaches everything"
+    );
+    assert!(
+        plain
+            .overlaps_range(Some(b"c"), Some(b"c0"))
+            .expect("overlaps"),
+        "and a scan inside the table's range reaches it"
+    );
+}

@@ -105,6 +105,34 @@ impl Table {
         Ok(InternalKey::decode(&self.largest)?.user_key)
     }
 
+    /// Whether it holds any key a scan bounded by `lower` and `upper` could
+    /// reach, either bound open for unbounded.
+    ///
+    /// The bounds are a scan's, so they are half-open as Pebble's are:
+    /// `lower` included, `upper` excluded. The table's own largest bound is
+    /// excluded too when it is the sentinel a range deletion leaves, so a
+    /// table ending that way at a scan's lower bound holds nothing the scan
+    /// can see ([`Table::largest_is_exclusive`]).
+    ///
+    /// A table's bounds take in its range deletions as well as its point
+    /// keys (`crate::flush`), which is what makes this safe to filter a scan
+    /// by: a tombstone that covers anything inside the bounds belongs to a
+    /// table whose bounds reach inside them too.
+    pub fn overlaps_range(&self, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<bool> {
+        if let Some(upper) = upper
+            && self.smallest_user_key()? >= upper
+        {
+            return Ok(false);
+        }
+        if let Some(lower) = lower {
+            let largest = self.largest_user_key()?;
+            if largest < lower || (largest == lower && self.largest_is_exclusive()?) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Whether the two hold keys in the same range.
     ///
     /// Bounds are inclusive at both ends unless the larger one is the

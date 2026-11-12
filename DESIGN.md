@@ -466,6 +466,16 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   the sequence number of the snapshot deciding what is visible.
   This is the part with no encina counterpart and the most room to be slow;
   §6 says what it must not do.
+
+  A scan opens **only the tables its bounds can reach**, and that is not only
+  about the work of building iterators nobody seeks. A scan holds an open
+  reader for every table it opened, and the obsolete sweep may not collect a
+  table a reader is open for (`crate::obsolete`) — so a scan over a handful of
+  keys that opened every table would hold a shard's worth of files against the
+  sweep for as long as the cursor stayed open. A table's bounds take in its
+  range deletions as well as its point keys, which is what makes the test
+  safe: a tombstone reaching inside the bounds belongs to a table whose bounds
+  reach inside them too.
 - **One change at a time to what a store is made of**, and it is enforced
   rather than hoped for (`crate::change`). A flush, a compaction, a MANIFEST
   rotation and the obsolete sweep each take a permit first, and
