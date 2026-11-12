@@ -57,6 +57,7 @@ use roble_format::files::{self, MARKER_MANIFEST};
 use roble_format::manifest::{NewTable, VersionEdit};
 
 use crate::buf::WriteBuf;
+use crate::change::Change;
 use crate::env::{Disk, Fs};
 use crate::error::Result;
 use crate::open::Opened;
@@ -78,6 +79,12 @@ impl<F: Fs> Opened<'_, F> {
     /// Returns the new MANIFEST's name. A flush does this for itself once the
     /// file it is appending to has grown past [`Opened::max_manifest_bytes`].
     pub async fn rotate_manifest(&self) -> Result<String> {
+        let change = self.changes().begin().await;
+        self.rotate_inner(&change).await
+    }
+
+    /// The rotation proper, for a caller that already holds the permit.
+    pub(crate) async fn rotate_inner(&self, _change: &Change<'_>) -> Result<String> {
         // The number is taken but not spent: nothing in memory moves until
         // the marker has. A crash before that leaves this MANIFEST an orphan
         // and the number free again, and the sweep collects the file.

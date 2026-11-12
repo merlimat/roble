@@ -61,6 +61,7 @@ use roble_format::sst::{TableWriter, WriterOptions};
 use roble_format::{InternalKey, key};
 
 use crate::buf::WriteBuf;
+use crate::change::Change;
 use crate::env::{Disk, Fs};
 use crate::error::{Error, Result};
 use crate::flush::Bounds;
@@ -85,6 +86,17 @@ impl<F: Fs> Opened<'_, F> {
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
+        let change = self.changes().begin().await;
+        self.compact_inner(level, file_nums, &change).await
+    }
+
+    /// The compaction proper, for a caller that already holds the permit.
+    pub(crate) async fn compact_inner(
+        &self,
+        level: u32,
+        file_nums: &[u64],
+        change: &Change<'_>,
+    ) -> Result<Vec<u64>> {
         let output_level = level + 1;
         if output_level >= NUM_LEVELS {
             return Err(Error::Unsupported(format!(
@@ -152,12 +164,12 @@ impl<F: Fs> Opened<'_, F> {
         // The one-way door, in the same place a flush puts it: before this
         // the output is a file nothing refers to and the inputs are still the
         // database's.
-        let manifest_bytes = self.append_version_edit(&edit).await?;
+        let manifest_bytes = self.append_version_edit(&edit, change).await?;
         self.versions_mut().apply(&edit)?;
         if manifest_bytes >= self.max_manifest_bytes() {
-            let _ = self.rotate_manifest().await;
+            let _ = self.rotate_inner(change).await;
         }
-        let _ = self.remove_obsolete_files().await;
+        let _ = self.sweep(change).await;
         self.metrics.saw_version(&self.versions().version);
         self.measure_disk().await;
         self.metrics.compactions.add(1);

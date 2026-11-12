@@ -73,7 +73,7 @@ impl Pacer {
 /// A ready task behind this one gets its turn before this one resumes, which
 /// is the whole of "cooperative". Written out rather than taken from a
 /// runtime crate because compio has none and the whole of it is four lines.
-async fn yield_now() {
+pub(crate) async fn yield_now() {
     let mut yielded = false;
     poll_fn(|cx| {
         if yielded {
