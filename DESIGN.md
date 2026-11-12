@@ -1608,6 +1608,16 @@ Stated rather than quietly decided:
   split, which streams a filtered snapshot. If Oxia adopts `Excise` or
   `IngestAndExcise`, roble needs them on both sides, and that is a release
   rather than a patch. Worth watching rather than deciding now.
+- **Whether a table count explains a read cost: twice now, no.** `bench/`
+  sets every LSM knob from roble's own constants, because RocksDB's defaults
+  differ enough to decide a result — its 64 MiB target file size settled a
+  34 MiB store into one table where roble leaves eleven. That looked like the
+  reason its lookups led. Aligned to 2 MiB it has sixteen tables and its point
+  reads move by under 1%: the filters absorb them. The scan gap went the same
+  way, surviving a run with the table counts matched. So a shape that *should*
+  cost more does not, twice, and the thing left both times is roble's cost per
+  operation rather than the structure it operates over.
+
 - **How closely the picker should follow Pebble's.** Compatibility does not
   require it, and this was filed as a question about noise. It still is: the
   three settle into visibly different shapes for the same 300,000 records —

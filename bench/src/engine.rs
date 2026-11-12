@@ -465,12 +465,28 @@ impl Store for Rocks {
             table.set_bloom_filter(10.0, false);
             let mut options = rocksdb::Options::default();
             options.create_if_missing(true);
-            // RocksDB's own default is 64 MiB against roble's and Pebble's 4,
-            // so left alone it buffered this whole workload and flushed
-            // nothing during the load while the other two wrote 30 MiB of
-            // tables. Its two-buffer default already matches what roble holds
-            // (one live, one frozen) and Pebble's stop-writes threshold.
+            // Every knob roble and Pebble agree on — roble took Pebble's
+            // defaults (§4, §9) — set on RocksDB too, because its own are
+            // different enough to decide the result rather than inform it.
+            //
+            // The memtable was the first: RocksDB's default is 64 MiB against
+            // their 4, so left alone it buffered this whole workload and
+            // flushed nothing during the load while the other two wrote
+            // 30 MiB of tables.
+            //
+            // The target file size matters more. RocksDB's default is 64 MiB
+            // against their 2, so it settled this store into a *single* table
+            // where roble leaves eleven and Pebble nine — and a point lookup
+            // searching one table instead of three is most of why RocksDB
+            // looked quickest at it. That is a setting, not an engine.
             options.set_write_buffer_size(cfg.memtable_mb as usize * 1024 * 1024);
+            options.set_target_file_size_base(roble::compact::TARGET_FILE_SIZE);
+            options.set_max_bytes_for_level_base(roble::pick::LBASE_MAX_BYTES);
+            options.set_level_zero_file_num_compaction_trigger(
+                roble::pick::L0_COMPACTION_THRESHOLD as i32,
+            );
+            options
+                .set_level_zero_stop_writes_trigger(roble::pick::L0_STOP_WRITES_THRESHOLD as i32);
             options.set_block_based_table_factory(&table);
             options.set_compression_type(rocksdb::DBCompressionType::Snappy);
             let db = rocksdb::DB::open(&options, &at)

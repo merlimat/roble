@@ -63,6 +63,11 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --seed N        seed for the keys, the values and the lookup order (1)
   --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
                   only durability point, and a commit syncs nothing
+  --reuse         open the store that is already at DIR/<engine> instead of
+                  refusing it, so that a load and the reads over it can be two
+                  processes with something done in between — dropping the
+                  page cache, which needs root and so cannot be done from
+                  here. Without it a run insists on a directory of its own.
   --layout        print every table of every level, with its size and key
                   range, after the store has settled
   --tsv           one tab-separated line per phase instead of a table, for a
@@ -74,8 +79,17 @@ Creates the store at DIR/<engine>, which must not exist yet.
 fn main() {
     let cfg = Config::parse();
     let path = cfg.dir.join(&cfg.engine);
-    if path.exists() {
-        fail(&format!("{} exists: remove it first", path.display()));
+    if path.exists() && !cfg.reuse {
+        fail(&format!(
+            "{} exists: remove it first, or pass --reuse to read the store already there",
+            path.display()
+        ));
+    }
+    if cfg.reuse && !path.exists() {
+        fail(&format!(
+            "--reuse was given but {} does not exist: load it first",
+            path.display()
+        ));
     }
     std::fs::create_dir_all(&path).expect("create the directory");
     let runtime = compio::runtime::Runtime::new().expect("start the runtime");
@@ -519,6 +533,7 @@ pub struct Config {
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
     layout: bool,
+    reuse: bool,
     tsv: bool,
     phases: Option<Vec<String>>,
 }
@@ -539,6 +554,7 @@ impl Config {
             seed: 1,
             wal: true,
             layout: false,
+            reuse: false,
             tsv: false,
             phases: None,
         };
@@ -583,6 +599,10 @@ impl Config {
                 }
                 "--layout" => {
                     cfg.layout = true;
+                    took_value = false;
+                }
+                "--reuse" => {
+                    cfg.reuse = true;
                     took_value = false;
                 }
                 "--tsv" => {

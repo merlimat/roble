@@ -56,6 +56,8 @@ Creates the store at DIR/pebble, which must not exist yet.
                   fill it (default: the whole value, so incompressible)
   --memtable-mb N bytes a memtable holds before a flush, in MiB (4)
   --seed N        seed for the keys and the lookup order (1)
+  --reuse         open the store already at DIR/<engine> instead of refusing
+                  it, so a load and the reads over it can be two processes
   --layout        print every table of every level, with its size and key
                   range, after the store has settled
   --tsv           one tab-separated line per phase instead of a table, for a
@@ -78,6 +80,7 @@ type config struct {
 	seed       uint64
 	wal        bool
 	layout     bool
+	reuse      bool
 	tsv        bool
 	phases     map[string]bool
 }
@@ -85,8 +88,12 @@ type config struct {
 func main() {
 	cfg := parse()
 	path := filepath.Join(cfg.dir, "pebble")
-	if _, err := os.Stat(path); err == nil {
-		fail(fmt.Sprintf("%s exists: remove it first", path))
+	_, statErr := os.Stat(path)
+	if statErr == nil && !cfg.reuse {
+		fail(fmt.Sprintf("%s exists: remove it first, or pass --reuse to read the store already there", path))
+	}
+	if cfg.reuse && statErr != nil {
+		fail(fmt.Sprintf("--reuse was given but %s does not exist: load it first", path))
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		fail(err.Error())
@@ -767,6 +774,9 @@ func parse() config {
 			tookValue = false
 		case "--layout":
 			cfg.layout = true
+			tookValue = false
+		case "--reuse":
+			cfg.reuse = true
 			tookValue = false
 		case "--tsv":
 			cfg.tsv = true

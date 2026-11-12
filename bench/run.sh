@@ -192,6 +192,44 @@ echo
 echo "-- 4 MiB cache: an eighth of one shard fits --"
 table cache-out "${args[@]}" --phases load,settle,scan-rev,scan,get,floor,get-cold --cache-mb 4
 
+# The one pass that reaches a disk. Everything above it keeps the store in the
+# page cache, so a small block cache only measures the miss path in RAM — as
+# the encina row in the pass above shows, where bypassing the page cache by
+# design cost it two hundred times rather than the few times a cache miss
+# should.
+#
+# So: load in one process, drop the page cache, read in another. Dropping it
+# needs root, which the benchmark does not have and should not ask for, hence
+# the split and the `--reuse` flag. Without a working `drop_caches` the pass
+# says so and is skipped rather than reporting numbers that look like disk
+# reads and are not.
+drop_caches() {
+  [ "$(uname -s)" = Linux ] || return 1
+  sync
+  sudo --non-interactive sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null
+}
+
+echo
+if drop_caches; then
+  echo "=== the reads from a disk: page cache dropped after the load ==="
+  echo
+  lines="$out/cold-disk.tsv"
+  : > "$lines"
+  for engine in $ENGINES; do
+    run_engine "$engine" "$out/disk-$engine" "${args[@]}" \
+      --phases load,settle --cache-mb 4 > /dev/null
+    drop_caches || true
+    run_engine "$engine" "$out/disk-$engine" "${args[@]}" --reuse --tsv \
+      --phases scan,get,floor --cache-mb 4 \
+      | awk -F'\t' 'NF >= 3' >> "$lines"
+  done
+  python3 pivot.py --metrics rate,p50,cpu < "$lines"
+else
+  echo "=== the reads from a disk: skipped ==="
+  echo "(needs Linux and a sudo that can write /proc/sys/vm/drop_caches;"
+  echo " without it a small cache only measures the miss path in RAM)"
+fi
+
 echo
 echo "=== the layout each engine settled into ==="
 for engine in $ENGINES; do

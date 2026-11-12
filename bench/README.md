@@ -168,11 +168,22 @@ overhead — enough, on the forward scan, to reverse which engine looks quicker.
 The rate comes from the phase's own wall clock, which the sampling leaves
 alone.
 
-**Three knobs are set the same on every engine that has them, because their
-own defaults are not comparable.** `--memtable-mb` is one: roble and Pebble
-both flush at 4 MiB and RocksDB's own default is 64, so left alone RocksDB
-buffered this whole workload and flushed nothing during the load while the
-other two wrote 30 MiB of tables. `--no-wal` is another: it takes
+**Every LSM knob is set the same on all three, because their own defaults are
+not comparable.** roble took Pebble's defaults (§4, §9), so those two agree
+already; RocksDB's differ enough to decide a result rather than inform it, and
+the benchmark now sets them from roble's own constants — the memtable, the
+target file size, the L0 compaction and stop-writes thresholds, and the base
+level's budget. `--memtable-mb` is the one of them exposed as a flag, at 4 MiB:
+RocksDB's own default is 64, so left alone it buffered this whole workload and
+flushed nothing during the load while the other two wrote 30 MiB of tables.
+
+The target file size was the one that looked decisive and was not. RocksDB's
+default is 64 MiB against their 2, which settled a 34 MiB store into a *single*
+table where roble leaves eleven and Pebble nine — so a lookup searched one
+table instead of three. Setting it to 2 MiB gives RocksDB sixteen tables and
+changes its point reads by under 1% on the same machine, because its filters
+absorb them. Worth aligning anyway, and worth recording that the layout did
+not explain the gap it looked certain to explain. `--no-wal` is another: it takes
 `disable_wal` on roble, `DisableWAL` on Pebble and `disable_WAL` on RocksDB's
 write options, and setting only the sync flag on the last of those left it
 writing a journal the others were not — worth 5 MiB of directory and half its
