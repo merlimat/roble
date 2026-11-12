@@ -253,3 +253,265 @@ async fn a_write_with_room_to_spare_never_waits_for_anybody() {
         assert_eq!(contents(&db).await, model, "wal={wal}");
     }
 }
+
+/// Where L0's depth stops a write in the tests below.
+const LINE: u64 = 3;
+
+#[compio::test]
+async fn l0_never_passes_the_line_a_write_waits_at() {
+    // Writes that keep flushing, with the picker told to *want* L0 compacted
+    // only long after a write would wait for it — so the line is the only
+    // thing that can bring L0 down, and whether it does is the whole
+    // question.
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(budget)
+            .l0_compaction_threshold(100)
+            .l0_stop_writes_threshold(LINE),
+    )
+    .await
+    .expect("open");
+    let mut model = contents(&db).await;
+
+    for i in 0..8 * ENTRIES as usize {
+        put(&db, i, true).await.expect("write");
+        model.insert(key_at(i), VALUE.to_vec());
+        let in_l0 = db.versions().version.level(0).len() as u64;
+        assert!(
+            in_l0 < LINE,
+            "after {} writes L0 holds {in_l0} tables, which is at or past the line of \
+             {LINE} a write is supposed to wait at",
+            i + 1
+        );
+    }
+
+    let below = {
+        let versions = db.versions();
+        versions
+            .version
+            .levels()
+            .any(|(level, tables)| level > 0 && !tables.is_empty())
+    };
+    assert!(below, "nothing was ever merged out of L0");
+    assert_eq!(contents(&db).await, model, "and a merge changed an answer");
+}
+
+#[compio::test]
+async fn a_write_drains_an_l0_it_opened_onto() {
+    // A store can be handed a deep L0 rather than build one: a directory
+    // another store filled with its compactions turned off, or one Pebble
+    // left that way. Nothing runs on open, so the first write is what finds
+    // it — which is the backstop the line is there to be, and the one path
+    // to it that a flush's own compaction has not already taken.
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+
+    let deep = {
+        let db = roble::open_with(&env, &dir, opened(true, budget))
+            .await
+            .expect("open");
+        for i in 0..5 * ENTRIES as usize {
+            put(&db, i, true).await.expect("write");
+        }
+        db.flush().await.expect("flush");
+        let n = db.versions().version.level(0).len() as u64;
+        assert!(
+            n >= 4,
+            "the setup should have left L0 deeper than this: {n}"
+        );
+        n
+    };
+
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(budget)
+            .l0_compaction_threshold(100)
+            .l0_stop_writes_threshold(deep),
+    )
+    .await
+    .expect("reopen");
+    let mut model = contents(&db).await;
+    assert_eq!(
+        db.versions().version.level(0).len() as u64,
+        deep,
+        "the reopen should have found L0 as it was left"
+    );
+
+    put(&db, 500, true).await.expect("write");
+    model.insert(key_at(500), VALUE.to_vec());
+
+    assert!(
+        (db.versions().version.level(0).len() as u64) < deep,
+        "the write should have drained L0 before its batch was accepted, and L0 holds {}",
+        db.versions().version.level(0).len()
+    );
+    assert_eq!(
+        contents(&db).await,
+        model,
+        "and the drain changed an answer"
+    );
+}
+
+#[compio::test]
+async fn a_store_that_owns_its_compactions_is_not_stopped_by_l0() {
+    // A caller that turned compaction off owns L0's depth as well. A write
+    // that waited here would be waiting for a merge nobody was going to run,
+    // which is what Pebble does in this configuration and is a worse answer
+    // than letting the caller have what it asked for.
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(budget)
+            .disable_automatic_compactions(true)
+            .l0_stop_writes_threshold(LINE),
+    )
+    .await
+    .expect("open");
+    let mut model = contents(&db).await;
+
+    for i in 0..5 * ENTRIES as usize {
+        put(&db, i, true).await.expect("write");
+        model.insert(key_at(i), VALUE.to_vec());
+    }
+
+    let in_l0 = db.versions().version.level(0).len() as u64;
+    assert!(
+        in_l0 > LINE,
+        "L0 should have been left to grow past the line, and holds {in_l0}"
+    );
+    assert_eq!(contents(&db).await, model, "and still answer every key");
+}
+
+#[compio::test]
+async fn the_default_line_is_the_one_a_deep_l0_stops_at() {
+    // The default carrying its weight, which is why it is a default and not
+    // only a knob. The picker is told to want L0 compacted only long after a
+    // write would wait for it, so L0 grows with every flush and the line is
+    // the only thing that can turn the picker round — and what this pins is
+    // where that line is.
+    {
+        // The two lines in the right order, on a store that overrode
+        // neither. A line below the one the picker starts wanting L0
+        // compacted at would make every flush an L0 merge and nothing else
+        // would ever be compacted at all.
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open(&env, &dir).await.expect("open");
+        assert!(
+            db.l0_stop_writes_threshold() > db.l0_compaction_threshold(),
+            "the line a write waits at, {}, has to sit above the one the picker starts \
+             wanting L0 compacted at, {}",
+            db.l0_stop_writes_threshold(),
+            db.l0_compaction_threshold()
+        );
+    }
+
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(budget)
+            .l0_compaction_threshold(100),
+    )
+    .await
+    .expect("open");
+    let line = db.l0_stop_writes_threshold();
+    let mut deepest = 0;
+
+    for i in 0..20 * ENTRIES as usize {
+        put(&db, i, true).await.expect("write");
+        let in_l0 = db.versions().version.level(0).len() as u64;
+        deepest = deepest.max(in_l0);
+        assert!(
+            in_l0 < line,
+            "after {} writes L0 holds {in_l0} tables, at or past the default line of {line}",
+            i + 1
+        );
+    }
+    assert!(
+        deepest + 2 >= line,
+        "L0 never came near the default line of {line}, reaching {deepest}, so nothing \
+         here was stopped by it"
+    );
+}
+
+#[compio::test]
+async fn a_budget_no_flush_can_meet_does_not_spin() {
+    // Zero is a budget nothing can meet: the memtable is already empty, so a
+    // flush would write no table and there is no room to be made. Saying so
+    // is what keeps the loop from asking for ever.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, opened(true, 0))
+        .await
+        .expect("open");
+    // Whatever the fixture's logs left, written out, so the memtable really
+    // is empty when the write below asks for room.
+    db.flush().await.expect("flush");
+    let mut model = contents(&db).await;
+
+    for i in 0..3 {
+        put(&db, i, true).await.expect("write");
+        model.insert(key_at(i), VALUE.to_vec());
+    }
+    assert_eq!(
+        contents(&db).await,
+        model,
+        "every write should have gone through"
+    );
+}
+
+#[compio::test]
+async fn a_line_no_merge_can_meet_does_not_spin() {
+    // The same for L0: a line of zero is one an empty L0 is already at, and
+    // there is no merge that would bring it lower. The picker says there is
+    // nothing to pick, and a write that did not take that for an answer
+    // would ask for ever.
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .memtable_size(u64::MAX)
+            .l0_compaction_threshold(100)
+            .l0_stop_writes_threshold(0),
+    )
+    .await
+    .expect("open");
+
+    // L0 emptied, so that the line of zero is met and nothing is pickable.
+    let l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    if !l0.is_empty() {
+        db.compact(0, &l0).await.expect("compact");
+    }
+    assert!(
+        db.versions().version.level(0).is_empty(),
+        "L0 should be empty for this"
+    );
+    let mut model = contents(&db).await;
+
+    for i in 0..3 {
+        put(&db, i, true).await.expect("write");
+        model.insert(key_at(i), VALUE.to_vec());
+    }
+    assert_eq!(
+        contents(&db).await,
+        model,
+        "every write should have gone through"
+    );
+}

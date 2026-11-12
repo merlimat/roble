@@ -54,6 +54,14 @@ use crate::error::Result;
 use crate::open::Opened;
 use crate::version::Version;
 
+/// How many tables L0 may hold before a write waits for it to drain.
+///
+/// Pebble's `L0StopWritesThreshold`, and the same twelve. Pebble counts
+/// sublevels where roble counts tables, which roble has no sublevels to tell
+/// apart yet; until it has, every L0 table is a sublevel of its own and the
+/// two numbers are the same number.
+pub const L0_STOP_WRITES_THRESHOLD: u64 = 12;
+
 /// How many tables L0 may hold before it is worth compacting.
 ///
 /// Pebble's `L0CompactionThreshold`. L0 is counted rather than measured
@@ -127,6 +135,32 @@ impl<F: Fs> Opened<F> {
                     .saturating_mul(LEVEL_MULTIPLIER.saturating_pow(level - 1))
             }
         };
+
+        // L0 at the stop-writes line is not a score to weigh against the
+        // others. A write is about to wait for L0 to drain, and no other
+        // level this could compact instead would let that write through, so
+        // L0 wins outright however far past its allowance anything else is
+        // (§9, `crate::open::Opened::make_room`).
+        //
+        // Pebble arrives at the same place from the other direction: a deep
+        // L0 buys it *extra concurrent* compactions
+        // (`compaction_picker.go`'s `l0ReadAmpCompactions`), so the L0 merge
+        // runs alongside whatever was already going rather than instead of
+        // it. A store that runs one compaction at a time has no second one
+        // to add, so what it can do is make the one it has the L0 one.
+        let in_l0 = held(&versions.version, 0);
+        if in_l0 >= self.l0_stop_writes_threshold() {
+            let tables = inputs_at(&versions.version, 0);
+            if !tables.is_empty() {
+                return Some(Pick {
+                    level: 0,
+                    tables,
+                    held: in_l0,
+                    allowance: allowance(0),
+                });
+            }
+        }
+
         let mut best: Option<Pick> = None;
         // The last level is not scored: there is nowhere below it to compact
         // into, so saying it is over its allowance would be saying something

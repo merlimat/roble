@@ -40,6 +40,8 @@ pub struct Options<F: Fs> {
     pub(crate) max_manifest_bytes: u64,
     /// How many tables L0 may hold before the picker wants it compacted.
     pub(crate) l0_compaction_threshold: u64,
+    /// How many tables L0 may hold before a write waits for it to drain.
+    pub(crate) l0_stop_writes_threshold: u64,
     /// How many bytes L1 may hold; each level below it ten times more.
     pub(crate) lbase_max_bytes: u64,
     /// How many entries a compaction merges before it offers the thread
@@ -63,6 +65,7 @@ impl<F: Fs> Default for Options<F> {
             memtable_size: crate::memtable::MEMTABLE_SIZE,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
+            l0_stop_writes_threshold: crate::pick::L0_STOP_WRITES_THRESHOLD,
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
             compaction_unit: crate::work::COMPACTION_UNIT,
             target_file_size: crate::compact::TARGET_FILE_SIZE,
@@ -161,6 +164,27 @@ impl<F: Fs> Options<F> {
     /// (`crate::pick`).
     pub fn l0_compaction_threshold(mut self, tables: u64) -> Self {
         self.l0_compaction_threshold = tables;
+        self
+    }
+
+    /// How many tables L0 may hold before a write waits for it to drain
+    /// (§9, `crate::pick`).
+    ///
+    /// Pebble's `L0StopWritesThreshold`, and the same default of twelve.
+    /// Reaching it means a write pays for the L0 merge, or waits for the one
+    /// already running, before its batch is accepted: every read consults
+    /// all of L0, so a store that let it grow without limit would be trading
+    /// write latency it does not have for read latency it cannot bound.
+    ///
+    /// Above [`Self::l0_compaction_threshold`], which is where the picker
+    /// starts *wanting* L0 compacted. Between the two a flush runs the merge
+    /// and nothing waits; at this one a write does.
+    ///
+    /// A store with [`Self::disable_automatic_compactions`] set ignores this
+    /// entirely, because it owns L0's depth too: a write that waited for a
+    /// merge nobody was going to run would wait for ever.
+    pub fn l0_stop_writes_threshold(mut self, tables: u64) -> Self {
+        self.l0_stop_writes_threshold = tables;
         self
     }
 

@@ -46,6 +46,7 @@ the caller's choosing.
 | `disk.io.direction` | `roble.disk.*` | `read`, `write` |
 | `roble.cache` | `roble.cache.*` | `block`, `table` |
 | `roble.cache.result` | `roble.cache.lookups` | `hit`, `miss` |
+| `roble.stall.reason` | `roble.write.stall*` | `memtable`, `l0` |
 
 A handle exists for every value of `error.type` from the moment a store opens,
 so the series are there at zero before anything has gone wrong.
@@ -61,6 +62,8 @@ so the series are there at zero before anything has gone wrong.
 | `roble.write.entries` | histogram | `{entry}` | Operations in each batch written successfully |
 | `roble.write.errors` | counter | `{error}` | Writes that failed, by what went wrong |
 | `roble.wal.append.duration` | latency | s | Time appending a batch to the log takes, including its sync when one was asked for |
+| `roble.write.stalls` | counter | {stall} | Writes that waited for room instead of making it themselves, by `roble.stall.reason` |
+| `roble.write.stall.duration` | latency | s | Time such a write spent waiting, by `roble.stall.reason` |
 | `roble.memtable.size` | up-down counter | By | Bytes of writes that no table holds yet |
 
 A store opened with `disable_wal` records no `roble.wal.append.duration` at all,
@@ -213,7 +216,7 @@ what each becomes here.
 | `pebble_block_cache_hits` / `_misses` | `roble.cache.lookups`, by `roble.cache.result` |
 | `pebble_read` | `roble.disk.io{disk.io.direction="read"}` |
 | `pebble_l0_sublevels` | *not yet* — roble has no L0 sublevels |
-| `kv_pebble_write_stalls`, `kv_pebble_write_stall_time` | *not yet* — below |
+| `kv_pebble_write_stalls`, `kv_pebble_write_stall_time` | `roble.write.stalls`, `roble.write.stall.duration` |
 
 Pebble's gauges are read from one `db.Metrics()` call that Oxia memoizes for
 five seconds; roble's are recorded where the thing happens, so there is nothing
@@ -221,10 +224,9 @@ to poll and nothing to memoize.
 
 ## Not here yet
 
-- **The two write stalls** of §9, and the time spent in them — a write waiting
-  for a memtable, and a write waiting for L0 to drain. Nothing stalls yet, and a
-  counter for an event that cannot happen says nothing; they arrive with the
-  waiting they count. A write that finds the store at `memtable_size` and
-  writes a memtable out is not stalling: nothing is waiting on anybody, and the
-  time is in `roble.write.duration` where the rest of that write's time is.
+- **A stall of roble's own making**, which is the one thing the two stall
+  series do not separate. A write that waits for a merge a *background* task is
+  running would be worth telling apart from one that waits for a merge another
+  write is paying for, and today there is no background task to tell apart
+  (§9). The attribute gains a value when it does.
 - **L0 sublevels**, which roble does not build yet.

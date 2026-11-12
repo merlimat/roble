@@ -163,8 +163,6 @@ const DIRECTION: &str = "disk.io.direction";
 const CACHE: &str = "roble.cache";
 const CACHE_RESULT: &str = "roble.cache.result";
 const STALL_REASON: &str = "roble.stall.reason";
-/// The one [`STALL_REASON`] a write can have so far.
-const MEMTABLE: &str = "memtable";
 const ERROR_TYPE: &str = "error.type";
 
 /// The value of `error.type` for each way an operation can fail.
@@ -293,14 +291,11 @@ pub(crate) struct Metrics {
     pub(crate) flush_size: Histogram,
     pub(crate) flush_bytes: Counter,
     pub(crate) wal: Latency,
-    /// Writes that waited for a change already underway to finish instead of
-    /// making room themselves, and the time they spent waiting (§9).
-    ///
-    /// One reason so far. The other one §9 names — a write waiting for L0 to
-    /// drain — arrives with the waiting it counts, because a counter for an
-    /// event that cannot happen says nothing (METRICS.md).
-    pub(crate) memtable_stalls: Counter,
-    pub(crate) memtable_stall: Latency,
+    /// Writes that waited for a change already underway instead of making
+    /// room themselves, and the time they spent waiting — by which of the
+    /// two things they were short of (§9).
+    pub(crate) write_stalls: [Counter; 2],
+    pub(crate) write_stall: [Latency; 2],
     pub(crate) disk_size: Amount,
     pub(crate) compaction: Latency,
     /// Tables read and written, in that order.
@@ -345,11 +340,11 @@ impl Metrics {
             flush_size: meter.histogram(FLUSH_SIZE),
             flush_bytes: meter.counter(FLUSH_BYTES, &[]),
             wal: meter.latency(WAL_DURATION, &[]),
-            memtable_stalls: meter.counter(WRITE_STALLS, &[KeyValue::new(STALL_REASON, MEMTABLE)]),
-            memtable_stall: meter.latency(
-                WRITE_STALL_DURATION,
-                &[KeyValue::new(STALL_REASON, MEMTABLE)],
-            ),
+            write_stalls: ["memtable", "l0"]
+                .map(|why| meter.counter(WRITE_STALLS, &[KeyValue::new(STALL_REASON, why)])),
+            write_stall: ["memtable", "l0"].map(|why| {
+                meter.latency(WRITE_STALL_DURATION, &[KeyValue::new(STALL_REASON, why)])
+            }),
             disk_size: meter.amount(DISK_SIZE, &[]),
             compaction: meter.latency(COMPACTION_DURATION, &[]),
             compaction_tables: ["read", "write"].map(|d| meter.counter(COMPACTION_TABLES, &io(d))),
@@ -412,6 +407,11 @@ impl Metrics {
 /// Which of the two caches a handle describes.
 pub(crate) const BLOCK_CACHE: usize = 0;
 pub(crate) const TABLE_CACHE: usize = 1;
+
+/// Which of [`Metrics::write_stalls`] a wait was: a write short of room in a
+/// memtable, and a write short of a shallow enough L0 (§9).
+pub(crate) const STALL_MEMTABLE: usize = 0;
+pub(crate) const STALL_L0: usize = 1;
 
 /// Which of [`Metrics::cache_lookups`] a lookup was.
 pub(crate) const BLOCK_HIT: usize = 0;
