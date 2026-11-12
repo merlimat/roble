@@ -370,11 +370,17 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], probe_kind: Probe, out: O
     let mut report = Report::new(name, out);
     let total = cfg.batches * cfg.records;
     let mut rng = Rng::new(cfg.seed ^ 0x9e37_79b9);
+    // Reused across every probe, so what the phase reports is the engine's
+    // allocations and not the harness's.
+    let mut key = Vec::new();
+    let mut probe = Vec::new();
     for _ in 0..cfg.reads {
         let s = (rng.next() as usize) % cfg.shards;
         let i = (rng.next() as usize) % total;
-        let key = key_for(s, i);
-        let mut probe = key.clone();
+        key_into(s, i, &mut key);
+        probe.clear();
+        probe.reserve(key.len() + 1);
+        probe.extend_from_slice(&key);
         if floor {
             // Past `key-%010d` and below the next one, since every byte here
             // sorts above the digits the padding ends in.
@@ -573,8 +579,25 @@ fn level_shape<S: Store>(shards: &[S]) -> String {
 /// encoder. The id is zero-padded so that bytewise order is numeric order,
 /// which is what makes the floor probes land where a reader expects.
 pub fn key_for(s: usize, i: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    key_into(s, i, &mut out);
+    out
+}
+
+/// The same, into a buffer the caller keeps.
+///
+/// The read phases probe tens of thousands of keys in a loop, and a `format!`
+/// per probe put two allocations of the harness's own into every measurement
+/// of an engine's lookup. At three and a half allocations for a buffered
+/// `get`, that was most of the number.
+pub fn key_into(s: usize, i: usize, out: &mut Vec<u8>) {
+    use std::io::Write;
     let bucket = i % 64;
-    format!("/shard-{s:04}/bucket-{bucket:02}/key-{i:010}").into_bytes()
+    out.clear();
+    // Enough for the whole key and the `~` a floor probe appends, so neither
+    // the write nor the push grows the buffer.
+    out.reserve(48);
+    write!(out, "/shard-{s:04}/bucket-{bucket:02}/key-{i:010}").expect("writing to a Vec");
 }
 
 /// The value of record `i` in shard `s`: pseudo-random bytes.
