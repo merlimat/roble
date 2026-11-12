@@ -32,8 +32,11 @@
 //! nothing — and tell their series apart by an attribute of their own.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll, Waker};
 
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
@@ -1000,5 +1003,136 @@ async fn the_store_names_itself_and_the_caller_may_rename_it() {
     assert!(
         collected(reader(), &renamed).contains_key("roble.write.operations"),
         "the caller's own name for the store should be the one exported"
+    );
+}
+
+/// Polls two futures turn and turn about until both are done.
+///
+/// The one place in this file that needs two tasks: a stall is a write
+/// waiting for somebody else, so there has to be a somebody else.
+/// `tests/stall.rs` is where what they do is the subject.
+fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut a = pin!(a);
+    let mut b = pin!(b);
+    let (mut first, mut second) = (None, None);
+    let mut polls = 0;
+    loop {
+        if first.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(&mut cx)
+        {
+            first = Some(v);
+        }
+        if second.is_none()
+            && let Poll::Ready(v) = b.as_mut().poll(&mut cx)
+        {
+            second = Some(v);
+        }
+        (first, second) = match (first, second) {
+            (Some(a), Some(b)) => return (a, b),
+            pair => pair,
+        };
+        polls += 1;
+        assert!(polls < 100_000, "one of these two is not making progress");
+    }
+}
+
+/// Writes one key of a known arena cost.
+async fn put<F: Fs>(db: &roble::Opened<F>, i: usize) -> roble::Result<()> {
+    let mut batch = Batch::new();
+    batch
+        .put(format!("s{i:04}").as_bytes(), &[b'v'; 32])
+        .expect("put");
+    db.write(&mut batch, true).await
+}
+
+#[compio::test]
+async fn a_write_that_waited_is_counted_by_what_it_waited_for() {
+    // Two reasons, two phases, because the two are reached from different
+    // states: one write short of room in a memtable, one short of a shallow
+    // enough L0. What the attribute is for is telling an operator which,
+    // and a count that put them in one bucket would answer neither question.
+    //
+    // The durations are not checked, for the reason at the top of this file:
+    // they are histograms, and nanometer exports those through a `Producer`
+    // these tests do not register.
+    let budget = 10 * (5 + 8 + 32) as u64;
+    let (env, dir) = load("db-twin-a").await;
+
+    // Short of room in a memtable: one of the two writes flushes, and the
+    // other finds the change already underway.
+    let deep = {
+        let (options, _) = metered("stalls");
+        let db = roble::open_with(
+            &env,
+            &dir,
+            options
+                .memtable_size(budget)
+                .l0_compaction_threshold(100)
+                .l0_stop_writes_threshold(100),
+        )
+        .await
+        .expect("open");
+        let mut i = 0;
+        // Twice over, so that the two reasons below cannot come out equal
+        // and be told apart by luck: a count that put them in each other's
+        // bucket would read exactly the same.
+        for round in 0..2 {
+            while (db.unflushed_bytes() as u64) < budget {
+                put(&db, i).await.expect("write");
+                i += 1;
+                assert!(i < 200, "the budget should have filled by now");
+            }
+            env.sim().pause_at(3);
+            let (a, b) = interleave(put(&db, i), put(&db, i + 1));
+            a.unwrap_or_else(|e| panic!("round {round}, the write that made the room: {e}"));
+            b.unwrap_or_else(|e| panic!("round {round}, the write that waited: {e}"));
+            i += 2;
+        }
+
+        // And on the way out, an L0 deep enough for the second phase.
+        for j in 0..5 * 10 {
+            put(&db, 200 + j).await.expect("write");
+        }
+        db.flush().await.expect("flush");
+        db.versions().version.level(0).len() as u64
+    };
+    assert!(
+        deep >= 4,
+        "the first phase should have left L0 deep: {deep}"
+    );
+
+    // Short of a shallow enough L0: one of the two writes drains it, and the
+    // other finds that change underway. A budget nothing reaches, so that
+    // the only thing either of them can be waiting for is L0.
+    {
+        let (options, _) = metered("stalls");
+        let db = roble::open_with(
+            &env,
+            &dir,
+            options
+                .memtable_size(u64::MAX)
+                .l0_compaction_threshold(100)
+                .l0_stop_writes_threshold(deep),
+        )
+        .await
+        .expect("reopen");
+        env.sim().pause_at(3);
+        let (a, b) = interleave(put(&db, 900), put(&db, 901));
+        a.expect("the write that drained L0");
+        b.expect("the write that waited for it");
+    }
+
+    let tag = KeyValue::new("case", "stalls");
+    let reasons = by_attr(reader(), &tag, "roble.write.stalls", "roble.stall.reason");
+    assert_eq!(
+        reasons.get("memtable").copied(),
+        Some(2),
+        "two writes waited for a memtable to be written out: {reasons:?}"
+    );
+    assert_eq!(
+        reasons.get("l0").copied(),
+        Some(1),
+        "and one waited for L0 to be drained: {reasons:?}"
     );
 }

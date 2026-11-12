@@ -154,6 +154,8 @@ pub struct Opened<F: Fs> {
     records_in_tables: std::cell::Cell<u64>,
     /// What the picker allows L0 and L1 to hold (`crate::pick`).
     l0_compaction_threshold: u64,
+    /// How many tables L0 may hold before a write waits for it to drain.
+    l0_stop_writes_threshold: u64,
     lbase_max_bytes: u64,
     target_file_size: u64,
     compaction_unit: u64,
@@ -347,6 +349,7 @@ pub async fn open_with<E: Env>(
         manifest_failed: std::cell::Cell::new(false),
         changes: crate::change::Changes::default(),
         l0_compaction_threshold: options.l0_compaction_threshold,
+        l0_stop_writes_threshold: options.l0_stop_writes_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
         compaction_unit: options.compaction_unit,
         target_file_size: options.target_file_size,
@@ -621,6 +624,7 @@ impl<F: Fs> Opened<F> {
         // every write in flight to finish (§5, `crate::change`). A write
         // that had counted itself first would be waiting for itself.
         self.make_room().await?;
+        self.drain_l0().await?;
 
         // Held from here to the end of the function, which is the span no
         // other write may share and no freeze may happen in: the sequence
@@ -706,17 +710,102 @@ impl<F: Fs> Opened<F> {
     /// holds arrived while the store was under the budget, so writing it out
     /// puts the store back under it.
     ///
+    /// A loop, and not because one flush might not be enough. It is Pebble's
+    /// `maybeInduceWriteStall`: a change already underway may be the very
+    /// flush this write needs, so the thing to do is wait for it and then
+    /// ask again rather than queue up to repeat it. The second look is the
+    /// whole point — without it a write would take the permit the moment it
+    /// was free and flush a memtable somebody else had just emptied.
+    ///
     /// This is a `flush` and not half of one, so it also runs the compaction
     /// the picker chose (§9). A store filled only through `write` would
     /// otherwise pile L0 up for ever, which is the thing a flush was taught
     /// to prevent; a caller who would rather decide when to merge has
     /// [`crate::Options::disable_automatic_compactions`] for it.
     async fn make_room(&self) -> Result<()> {
-        if (self.unflushed_bytes() as u64) < self.memtable_size {
+        loop {
+            if (self.unflushed_bytes() as u64) < self.memtable_size {
+                return Ok(());
+            }
+
+            // Somebody else is already changing what the store is made of,
+            // and it may be the very flush this write needs (§5). Waiting
+            // for them and then looking again is Pebble's loop in
+            // `maybeInduceWriteStall`, and it is the difference between a
+            // write that waited and a write that waited and then did work
+            // nobody needed: without the second look, this would queue for
+            // the permit and flush a memtable the other task had just
+            // emptied.
+            //
+            // **This** is the stall §9 names, and the flush below is not: a
+            // write doing the work is a write getting on with it, and a
+            // write waiting for somebody else's is a write that has stopped.
+            if self.changes().underway() {
+                self.stalled(crate::metrics::STALL_MEMTABLE).await;
+                continue;
+            }
+
+            // Nothing to write is nothing this can do about the budget, and
+            // saying so rather than trying again is what keeps a store whose
+            // budget is smaller than an empty memtable from spinning here.
+            if self.flush().await?.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Waits until L0 is shallow enough to accept another table, draining it
+    /// if nobody else is ([`crate::Options::l0_stop_writes_threshold`]).
+    ///
+    /// The other thing a write can be short of room for, and the reason it
+    /// is worth waiting over: every read consults the whole of L0, so a
+    /// store that let it grow without limit would be trading write latency
+    /// it does not have for read latency it cannot bound (§9).
+    ///
+    /// Nothing happens here for a store told to leave compaction to its
+    /// caller. It owns L0's depth as well, and a write that waited for a
+    /// merge nobody was going to run would wait for ever — which is what
+    /// Pebble does in that configuration, and is a worse answer than letting
+    /// the caller have what it asked for.
+    async fn drain_l0(&self) -> Result<()> {
+        if self.automatic_compactions_disabled() {
             return Ok(());
         }
-        self.flush().await?;
-        Ok(())
+        loop {
+            let in_l0 = self.versions().version.level(0).len() as u64;
+            if in_l0 < self.l0_stop_writes_threshold {
+                return Ok(());
+            }
+            if self.changes().underway() {
+                self.stalled(crate::metrics::STALL_L0).await;
+                continue;
+            }
+            // The picker prefers L0 at this depth, so the compaction it
+            // chooses is the L0 one (`crate::pick`). Nothing to pick is
+            // nothing this can do about the depth, and the alternative to
+            // saying so is spinning on a version that will not change.
+            if self.pick().is_none() {
+                return Ok(());
+            }
+            // One merge and no more: an L0 compaction takes the whole of L0,
+            // because its tables overlap each other, so there is nothing
+            // left to look at again. The loop above is for the other branch,
+            // where somebody else's merge is what this is waiting on.
+            return self.compact_once().await.map(|_| ());
+        }
+    }
+
+    /// Waits for the change already underway, and records that a write
+    /// stopped for it (§9).
+    ///
+    /// Queued for the permit and then let go of again, because what a write
+    /// wants here is not the permit but the state whoever holds it leaves
+    /// behind. By the time it is handed over, the change that was underway
+    /// has finished and the question is worth asking again.
+    async fn stalled(&self, why: usize) {
+        self.metrics.write_stalls[why].add(1);
+        let _timer = self.metrics.write_stall[why].start();
+        drop(self.changes().begin().await);
     }
 
     /// The highest sequence number any read may see.
@@ -828,6 +917,12 @@ impl<F: Fs> Opened<F> {
     /// How many tables L0 may hold before the picker wants it compacted.
     pub fn l0_compaction_threshold(&self) -> u64 {
         self.l0_compaction_threshold
+    }
+
+    /// How many tables L0 may hold before a write waits for it to drain
+    /// (§9).
+    pub fn l0_stop_writes_threshold(&self) -> u64 {
+        self.l0_stop_writes_threshold
     }
 
     /// How many bytes L1 may hold, each level below it ten times more.

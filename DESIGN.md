@@ -952,11 +952,48 @@ buffers (not the thread's frames, which are `Rc`), and gets back an edit to
 apply. The default executor runs the job cooperatively on the calling thread.
 Start there; add the pool when a benchmark asks for it.
 
-**Write stalls.** A write that cannot find room in a memtable waits for a flush,
-and too many L0 files make a write wait for a compaction. Neither depends on the
-WAL: a log append is not what a write waits on. Oxia watches Pebble's
-`WriteStallBegin` events and counts
-them, so roble exports the same two: memtable stalls and L0 stalls.
+**Write stalls.** Both of them, and both are a write waiting for work somebody
+else is already doing rather than queueing up to repeat it. Pebble's
+`maybeInduceWriteStall` is the shape: look, wait for the change underway, look
+again.
+
+A write short of room in a memtable makes the room itself — a flush, before its
+batch is accepted (§4) — unless a change is already underway, in which case it
+waits for that one and asks again, and often finds the room already made. A
+write short of a shallow enough L0 does the same with a merge:
+`Options::l0_stop_writes_threshold`, Pebble's and the same twelve, which sits
+above the `l0_compaction_threshold` at which the picker merely starts *wanting*
+L0 compacted. Between the two a flush runs the merge and nothing waits; at the
+upper one a write does.
+
+Reaching that upper line also changes what the picker answers: L0 wins
+outright, however much further past its allowance another level is. Pebble
+arrives at the same place from the other direction — a deep L0 buys it extra
+*concurrent* compactions (`compaction_picker.go`'s `l0ReadAmpCompactions`), so
+the L0 merge runs alongside whatever was already going. A store that runs one
+compaction at a time has no second one to add, so what it can do is make the
+one it has the L0 one.
+
+Neither stall depends on the WAL: a log append is not what a write waits on.
+Oxia watches Pebble's `WriteStallBegin` events and counts them, so roble
+exports the same two, as `roble.write.stalls` and `roble.write.stall.duration`
+split by `roble.stall.reason`. **A write doing the work itself is not stalling**
+and is not counted: nothing is waiting on anybody, and its time is in
+`roble.write.duration` where the rest of that write's time is.
+
+A store with `disable_automatic_compactions` is not stalled by L0 at all. It
+owns L0's depth as well, and a write that waited for a merge nobody was going to
+run would wait for ever — which is what Pebble does in that configuration, and a
+worse answer than letting the caller have what it asked for.
+
+What is still owed is running the merge **off the write's stack**. A flush
+already triggers the compaction the picker chose, which is a trigger well below
+the stall line, but it runs there and then, so the write that caused the flush
+pays for it. Moving that to `Env::spawn` needs the one-change permit narrowed to
+the edit first, with per-table marks so that two compactions cannot choose the
+same inputs: a compaction holding the coarse permit for the length of its merge
+makes the next flush wait for it whichever way round the two are, so ownership
+alone (§10) buys nothing.
 
 ## 10. Concurrency and I/O
 

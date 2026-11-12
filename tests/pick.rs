@@ -531,3 +531,52 @@ async fn compacting_until_it_settles_changes_no_answer() {
         model.get(b"k0005".as_slice()).cloned(),
     );
 }
+
+#[compio::test]
+async fn l0_at_the_stop_writes_line_is_picked_over_anything_else() {
+    // The mirror of `the_worst_level_is_the_one_picked`, and the one place
+    // the score is not what decides. Past the line a write waits at, no
+    // other level's merge would let that write through, however much further
+    // past its own allowance it is (§9).
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .l0_compaction_threshold(2)
+            .l0_stop_writes_threshold(2)
+            .lbase_max_bytes(64),
+    )
+    .await
+    .expect("open");
+
+    // L1 far past a 64-byte allowance, exactly as that test sets it up.
+    flush_keys(&db, "c", 0, 40).await;
+    let l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    db.compact(0, &l0).await.expect("compact");
+    let l1_bytes: u64 = db.versions().version.level(1).iter().map(|t| t.size).sum();
+    assert!(l1_bytes > 64, "L1 should be past its allowance");
+
+    // And L0 at the line, which is where it stops being a question of score.
+    flush_keys(&db, "d", 0, 1).await;
+    flush_keys(&db, "d", 1, 1).await;
+    assert_eq!(db.versions().version.level(0).len(), 2);
+
+    let pick = db.pick().expect("a pick");
+    assert_eq!(
+        pick.level, 0,
+        "L0 is at the line a write waits at, so it is picked over L1 at {l1_bytes}/64"
+    );
+    assert_eq!(
+        pick.tables.len(),
+        2,
+        "and the whole of L0 goes into it, as it always does"
+    );
+}
