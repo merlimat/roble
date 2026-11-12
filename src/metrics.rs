@@ -102,6 +102,11 @@ const FLUSH_BYTES: CounterDef = CounterDef::new("roble.flush.bytes").unit("By").
     "Bytes that flushes wrote. The denominator of write amplification: \
          (roble.flush.bytes + roble.compaction.io{write}) / roble.flush.bytes",
 );
+const WRITE_STALLS: CounterDef = CounterDef::new("roble.write.stalls")
+    .unit("{stall}")
+    .description("Writes that waited for room instead of making it themselves");
+const WRITE_STALL_DURATION: LatencyDef = LatencyDef::new("roble.write.stall.duration")
+    .description("Time a write spent waiting for room it did not make itself");
 const WAL_DURATION: LatencyDef = LatencyDef::new("roble.wal.append.duration").description(
     "Time appending a batch to the log takes, including its sync when one was asked for",
 );
@@ -157,6 +162,9 @@ const LEVEL: &str = "roble.level";
 const DIRECTION: &str = "disk.io.direction";
 const CACHE: &str = "roble.cache";
 const CACHE_RESULT: &str = "roble.cache.result";
+const STALL_REASON: &str = "roble.stall.reason";
+/// The one [`STALL_REASON`] a write can have so far.
+const MEMTABLE: &str = "memtable";
 const ERROR_TYPE: &str = "error.type";
 
 /// The value of `error.type` for each way an operation can fail.
@@ -248,11 +256,11 @@ impl Meter {
         )
     }
 
-    fn latency(&self, def: LatencyDef) -> Latency {
+    fn latency(&self, def: LatencyDef, extra: &[KeyValue]) -> Latency {
         Latency(
             self.meter
                 .as_ref()
-                .map(|m| m.latency(def, &self.attributes)),
+                .map(|m| m.latency(def, &self.attributes(extra))),
         )
     }
 
@@ -285,6 +293,14 @@ pub(crate) struct Metrics {
     pub(crate) flush_size: Histogram,
     pub(crate) flush_bytes: Counter,
     pub(crate) wal: Latency,
+    /// Writes that waited for a change already underway to finish instead of
+    /// making room themselves, and the time they spent waiting (§9).
+    ///
+    /// One reason so far. The other one §9 names — a write waiting for L0 to
+    /// drain — arrives with the waiting it counts, because a counter for an
+    /// event that cannot happen says nothing (METRICS.md).
+    pub(crate) memtable_stalls: Counter,
+    pub(crate) memtable_stall: Latency,
     pub(crate) disk_size: Amount,
     pub(crate) compaction: Latency,
     /// Tables read and written, in that order.
@@ -307,7 +323,7 @@ impl Metrics {
     pub(crate) fn new(meter: &Meter) -> Metrics {
         let io = |direction| [KeyValue::new(DIRECTION, direction)];
         Metrics {
-            write: meter.latency(WRITE_DURATION),
+            write: meter.latency(WRITE_DURATION, &[]),
             write_operations: ["put", "delete", "delete_range"].map(|kind| {
                 meter.counter(WRITE_OPERATIONS, &[KeyValue::new(OPERATION_TYPE, kind)])
             }),
@@ -318,25 +334,30 @@ impl Metrics {
             read_bytes: meter.counter(READ_BYTES, &[]),
             read_errors: Errors::new(meter, READ_ERRORS),
             scans_open: meter.amount(SCANS_OPEN, &[]),
-            get: meter.latency(GET_DURATION),
+            get: meter.latency(GET_DURATION, &[]),
             scans: meter.counter(SCANS, &[]),
             scan_entries: meter.counter(SCAN_ENTRIES, &[]),
             memtable_size: meter.amount(MEMTABLE_SIZE, &[]),
             flushes: meter.counter(FLUSHES, &[]),
             compactions: meter.counter(COMPACTIONS, &[]),
             compaction_debt: meter.amount(COMPACTION_DEBT, &[]),
-            flush: meter.latency(FLUSH_DURATION),
+            flush: meter.latency(FLUSH_DURATION, &[]),
             flush_size: meter.histogram(FLUSH_SIZE),
             flush_bytes: meter.counter(FLUSH_BYTES, &[]),
-            wal: meter.latency(WAL_DURATION),
+            wal: meter.latency(WAL_DURATION, &[]),
+            memtable_stalls: meter.counter(WRITE_STALLS, &[KeyValue::new(STALL_REASON, MEMTABLE)]),
+            memtable_stall: meter.latency(
+                WRITE_STALL_DURATION,
+                &[KeyValue::new(STALL_REASON, MEMTABLE)],
+            ),
             disk_size: meter.amount(DISK_SIZE, &[]),
-            compaction: meter.latency(COMPACTION_DURATION),
+            compaction: meter.latency(COMPACTION_DURATION, &[]),
             compaction_tables: ["read", "write"].map(|d| meter.counter(COMPACTION_TABLES, &io(d))),
             compaction_io: ["read", "write"].map(|d| meter.counter(COMPACTION_IO, &io(d))),
             read: Io::new(meter, "read"),
             written: Io::new(meter, "write"),
-            read_duration: meter.latency(DISK_READ_DURATION),
-            sync_duration: meter.latency(DISK_SYNC_DURATION),
+            read_duration: meter.latency(DISK_READ_DURATION, &[]),
+            sync_duration: meter.latency(DISK_SYNC_DURATION, &[]),
             cache_lookups: [
                 ("block", "hit"),
                 ("block", "miss"),

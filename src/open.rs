@@ -706,17 +706,54 @@ impl<F: Fs> Opened<F> {
     /// holds arrived while the store was under the budget, so writing it out
     /// puts the store back under it.
     ///
+    /// A loop, and not because one flush might not be enough. It is Pebble's
+    /// `maybeInduceWriteStall`: a change already underway may be the very
+    /// flush this write needs, so the thing to do is wait for it and then
+    /// ask again rather than queue up to repeat it. The second look is the
+    /// whole point — without it a write would take the permit the moment it
+    /// was free and flush a memtable somebody else had just emptied.
+    ///
     /// This is a `flush` and not half of one, so it also runs the compaction
     /// the picker chose (§9). A store filled only through `write` would
     /// otherwise pile L0 up for ever, which is the thing a flush was taught
     /// to prevent; a caller who would rather decide when to merge has
     /// [`crate::Options::disable_automatic_compactions`] for it.
     async fn make_room(&self) -> Result<()> {
-        if (self.unflushed_bytes() as u64) < self.memtable_size {
-            return Ok(());
+        loop {
+            if (self.unflushed_bytes() as u64) < self.memtable_size {
+                return Ok(());
+            }
+
+            // Somebody else is already changing what the store is made of,
+            // and it may be the very flush this write needs (§5). Waiting
+            // for them and then looking again is Pebble's loop in
+            // `maybeInduceWriteStall`, and it is the difference between a
+            // write that waited and a write that waited and then did work
+            // nobody needed: without the second look, this would queue for
+            // the permit and flush a memtable the other task had just
+            // emptied.
+            //
+            // **This** is the stall §9 names, and the flush below is not: a
+            // write doing the work is a write getting on with it, and a
+            // write waiting for somebody else's is a write that has stopped.
+            if self.changes().underway() {
+                self.metrics.memtable_stalls.add(1);
+                let _timer = self.metrics.memtable_stall.start();
+                // Queued for the permit and then let go of again, because
+                // what this wants is not the permit but the state whoever
+                // holds it leaves behind. By the time it is handed over, the
+                // change that was underway has finished.
+                drop(self.changes().begin().await);
+                continue;
+            }
+
+            // Nothing to write is nothing this can do about the budget, and
+            // saying so rather than trying again is what keeps a store whose
+            // budget is smaller than an empty memtable from spinning here.
+            if self.flush().await?.is_none() {
+                return Ok(());
+            }
         }
-        self.flush().await?;
-        Ok(())
     }
 
     /// The highest sequence number any read may see.

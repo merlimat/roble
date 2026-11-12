@@ -103,6 +103,17 @@ pub(crate) struct Changes {
 }
 
 impl Changes {
+    /// Whether a change is underway, which is to say whether asking for the
+    /// permit would mean waiting for it.
+    ///
+    /// What a write asks before deciding whether it is about to make room or
+    /// about to wait for somebody else to (`crate::open`, §9). Nothing can
+    /// run between the answer and what the caller does with it — there is no
+    /// await in between — so the answer cannot go stale underneath them.
+    pub(crate) fn underway(&self) -> bool {
+        self.underway.get()
+    }
+
     /// Waits for the permit, and holds it until the [`Change`] is dropped.
     pub(crate) async fn begin(&self) -> Change<'_> {
         poll_fn(|cx| {
