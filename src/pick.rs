@@ -48,6 +48,7 @@
 
 use roble_format::manifest::NUM_LEVELS;
 
+use crate::change::Change;
 use crate::env::Fs;
 use crate::error::Result;
 use crate::open::Opened;
@@ -192,10 +193,16 @@ impl<F: Fs> Opened<'_, F> {
     /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.
     pub async fn compact_once(&self) -> Result<Vec<u64>> {
+        let change = self.changes().begin().await;
+        self.compact_once_inner(&change).await
+    }
+
+    /// The same, for a caller that already holds the permit.
+    async fn compact_once_inner(&self, change: &Change<'_>) -> Result<Vec<u64>> {
         let Some(pick) = self.pick() else {
             return Ok(Vec::new());
         };
-        self.compact(pick.level, &pick.tables).await
+        self.compact_inner(pick.level, &pick.tables, change).await
     }
 
     /// Runs one compaction on the store's own account, if there is one worth
@@ -218,11 +225,11 @@ impl<F: Fs> Opened<'_, F> {
     /// lie. Nor is a compaction that keeps failing silent — the debt it is
     /// not paying off is `roble.compaction.debt`, which is the number that
     /// says a store is falling behind.
-    pub(crate) async fn maybe_compact(&self) {
+    pub(crate) async fn maybe_compact(&self, change: &Change<'_>) {
         if self.automatic_compactions_disabled() {
             return;
         }
-        let _ = self.compact_once().await;
+        let _ = self.compact_once_inner(change).await;
     }
 }
 

@@ -108,6 +108,9 @@ pub struct Opened<'a, F: Fs> {
     /// Whether an append to the MANIFEST has failed, after which this store
     /// records nothing more (`crate::flush`).
     manifest_failed: std::cell::Cell<bool>,
+    /// The one change at a time this store makes to what it is made of
+    /// (§5, `crate::change`).
+    changes: crate::change::Changes,
     /// What this store records, if anything (`crate::metrics`).
     ///
     /// Shared rather than owned outright because a scan outlives the call
@@ -313,6 +316,7 @@ pub async fn open_with<'a, E: Env>(
         max_manifest_bytes: options.max_manifest_bytes,
         readers: std::rc::Rc::new(crate::obsolete::Readers::default()),
         manifest_failed: std::cell::Cell::new(false),
+        changes: crate::change::Changes::default(),
         l0_compaction_threshold: options.l0_compaction_threshold,
         lbase_max_bytes: options.lbase_max_bytes,
         compaction_unit: options.compaction_unit,
@@ -686,6 +690,12 @@ impl<F: Fs> Opened<'_, F> {
     /// Lets go of the table cache's reader for one of this store's tables.
     pub(crate) fn forget_reader(&self, file_num: u64) {
         self.caches.forget_table(self.store_id, file_num);
+    }
+
+    /// The permit every operation that changes what the database is made of
+    /// takes first (§5, `crate::change`).
+    pub(crate) fn changes(&self) -> &crate::change::Changes {
+        &self.changes
     }
 
     /// Whether an append to the MANIFEST has failed, which is the end of

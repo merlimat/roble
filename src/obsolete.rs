@@ -68,6 +68,7 @@ use std::path::Path;
 
 use roble_format::files::{self, FileType, MARKER_MANIFEST};
 
+use crate::change::Change;
 use crate::env::Fs;
 use crate::error::Result;
 use crate::open::Opened;
@@ -232,6 +233,17 @@ impl<F: Fs> Opened<'_, F> {
     /// A table a reader is still open for is left for a later sweep, and the
     /// table cache's own reader is let go of first (§5).
     pub async fn remove_obsolete_files(&self) -> Result<Vec<String>> {
+        let change = self.changes().begin().await;
+        self.sweep(&change).await
+    }
+
+    /// The sweep proper, for a caller that already holds the permit.
+    ///
+    /// The permit is what makes the answer it computes still true by the time
+    /// it acts on it: without one, a flush installing a table between the
+    /// `Live` below and the deletions above it would have installed a table
+    /// this does not know about, and this would delete it.
+    pub(crate) async fn sweep(&self, _change: &Change<'_>) -> Result<Vec<String>> {
         let names: Vec<String> = self
             .fs()
             .list(&self.dir)

@@ -463,8 +463,28 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   the sequence number of the snapshot deciding what is visible.
   This is the part with no encina counterpart and the most room to be slow;
   §6 says what it must not do.
-- **One flush and one compaction at a time per store**, both cooperative, so a
-  write never waits on a compaction's merge for more than a slice of work (§9).
+- **One change at a time to what a store is made of**, and it is enforced
+  rather than hoped for (`crate::change`). A flush, a compaction, a MANIFEST
+  rotation and the obsolete sweep each take a permit first, and
+  `append_version_edit` will not take an edit without one — so a path added
+  later cannot forget to ask. The rule is stronger than "one flush and one
+  compaction", which is what §5 used to say: each of these reads the version,
+  does I/O, and then writes an answer derived from what it read, and two of
+  them interleaved at an await produce a database that does not open. Two
+  flushes take the same file number and write the same table over each other;
+  a sweep that lists the directory between a flush's table and that flush's
+  edit collects the table as an interrupted flush's leftovers. Both are
+  cooperative within their permit, so a write never waits on a compaction's
+  merge for more than a slice of work (§9).
+
+  A **write** does not take the permit, and so is not yet safe against a
+  flush: a write that lands after a flush has read the memtable and before it
+  swaps in a fresh one belongs to a memtable the flush is about to drop,
+  whose log its edit retires. Serializing writes against flushes would close
+  it and would be the wrong fix — Pebble's is to make the memtable immutable
+  at the *start* of a flush and send writes to a new one, which is the
+  machinery the memtable write stall needs anyway (§9). Until then, one task
+  per store.
 - **A level's tables may touch but not overlap.** Two tables of one level may
   share a user key at their bounds when the first ends there *exclusively* —
   its largest key being a range deletion's end at the largest sequence number
@@ -1056,6 +1076,15 @@ in both directions.
   the last `flush()` with `disable_wal`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or
   a half-rotated marker must leave the database openable.
+- **Overlap paths**, by the same method. Nothing the simulated filesystem does
+  blocks — every operation finishes in the call that starts it, which is what
+  makes a replay a replay — so two of a store's operations can never interleave
+  there by accident, and the one thing a real disk guarantees is that they
+  will. `SimFs::pause_at(n)` is one await, put where a test asks for it, and a
+  scenario sweeps it over every operation of the first of two operations run
+  together, exactly as the failure paths sweep an injected error. What must
+  hold at every one of them is §5's rule: the database still opens, and it
+  holds what was written to it.
   CI measures coverage on every pull request (`cargo llvm-cov`), posts the totals
   as a status, and lists the lines and regions no test runs, such as the error
   branch of a `?`. An uncovered failure path needs a test or a written reason.

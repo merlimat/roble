@@ -43,6 +43,7 @@ use roble_format::sst::{TableWriter, WriterOptions};
 use roble_format::{InternalKey, key};
 
 use crate::buf::WriteBuf;
+use crate::change::Change;
 use crate::env::{Access, Disk, Fs};
 use crate::error::{Error, Result};
 use crate::memtable::Memtable;
@@ -77,18 +78,22 @@ impl<F: Fs> Opened<'_, F> {
     /// `tests/metrics.rs` does not collect histograms at all, for the
     /// separate reason written at the top of it.
     pub async fn flush(&self) -> Result<Option<u64>> {
-        let flushed = self.flush_inner().await?;
+        // Taken for the flush *and* the compaction it may run: one change at
+        // a time means one, and a compaction scheduled by a flush is part of
+        // the same one (§5, `crate::change`).
+        let change = self.changes().begin().await;
+        let flushed = self.flush_inner(&change).await?;
         // Nothing written is nothing changed, and so nothing new for the
         // picker to see: its answer is the one it already gave, which the
         // flush that wrote the last table already ran.
         if flushed.is_some() {
-            self.maybe_compact().await;
+            self.maybe_compact(&change).await;
         }
         Ok(flushed)
     }
 
     /// The flush proper: the table, the log, the edit, the bookkeeping.
-    async fn flush_inner(&self) -> Result<Option<u64>> {
+    async fn flush_inner(&self, change: &Change<'_>) -> Result<Option<u64>> {
         let _timer = self.metrics.flush.start();
         let memtable = self.memtable();
         if memtable.borrow().is_empty() && memtable.borrow().tombstones().is_empty() {
@@ -158,7 +163,7 @@ impl<F: Fs> Opened<'_, F> {
             deleted_tables: Vec::new(),
             new_tables: vec![new_table],
         };
-        let manifest_bytes = self.append_version_edit(&edit).await?;
+        let manifest_bytes = self.append_version_edit(&edit, change).await?;
 
         // 4. Bookkeeping a replay would redo anyway.
         self.versions_mut().apply(&edit)?;
@@ -174,7 +179,7 @@ impl<F: Fs> Opened<'_, F> {
         //    rotation that did not happen is one the next flush attempts
         //    again.
         if manifest_bytes >= self.max_manifest_bytes() {
-            let _ = self.rotate_manifest().await;
+            let _ = self.rotate_inner(change).await;
         }
 
         // 6. What the edit retired: the log this flush replaced, and any
@@ -183,7 +188,7 @@ impl<F: Fs> Opened<'_, F> {
         //    file that would not delete is one nothing refers to, which the
         //    next flush will find again (§6). Reporting a flush that worked
         //    as one that did not would be the larger lie.
-        let _ = self.remove_obsolete_files().await;
+        let _ = self.sweep(change).await;
         self.metrics.saw_version(&self.versions().version);
         self.metrics
             .memtable_size
@@ -224,7 +229,11 @@ impl<F: Fs> Opened<'_, F> {
     /// the log and the memtable and says nothing to the MANIFEST, so it can
     /// still be exactly as durable as it promises — and refusing it would
     /// throw away records the log would otherwise have kept.
-    pub(crate) async fn append_version_edit(&self, edit: &VersionEdit) -> Result<u64> {
+    pub(crate) async fn append_version_edit(
+        &self,
+        edit: &VersionEdit,
+        _change: &Change<'_>,
+    ) -> Result<u64> {
         if self.manifest_failed() {
             return Err(Error::Corrupt(
                 "an earlier version edit failed to append, so this store records no more; \

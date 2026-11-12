@@ -416,3 +416,43 @@ async fn any_single_operation_can_be_made_to_fail() {
         }
     }
 }
+
+/// An operation a test asked to pause hands control back exactly once.
+///
+/// Nothing the simulated filesystem does blocks — every operation finishes in
+/// the call that starts it — which is what makes a replay a replay and also
+/// what makes two of a store's operations impossible to overlap in a test.
+/// `pause_at` is the one await, put where a test asks for it; this is the
+/// proof that it is one, and that the operation still happens.
+#[compio::test]
+async fn a_paused_operation_hands_control_back_once() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let env = SimEnv::new();
+    let fs: &SimFs = env.sim();
+    fs.mkdir_all(Path::new("/d")).await.expect("mkdir");
+
+    // The next operation is the one that pauses.
+    fs.pause_at(1);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut creating = pin!(fs.create(Path::new("/d/paused")));
+
+    assert!(
+        creating.as_mut().poll(&mut cx).is_pending(),
+        "the operation asked to pause should hand control back"
+    );
+    let disk = match creating.as_mut().poll(&mut cx) {
+        Poll::Ready(disk) => disk.expect("create"),
+        Poll::Pending => panic!("one yield, not a block: the second poll should finish it"),
+    };
+    disk.close().await.expect("close");
+
+    // And it is one-shot: the operation after it is not paused too.
+    let mut again = pin!(fs.create(Path::new("/d/after")));
+    assert!(
+        again.as_mut().poll(&mut cx).is_ready(),
+        "only the operation a test named should pause"
+    );
+}

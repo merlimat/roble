@@ -99,6 +99,16 @@ struct State {
     ops: u64,
     /// The operation number that should fail, if any.
     fail_at: Option<u64>,
+    /// The operation number that should suspend once before it runs, if any.
+    ///
+    /// Nothing the simulated filesystem does blocks: every operation
+    /// finishes in the call that starts it. That is what makes a replay a
+    /// replay, and it is also why a test cannot otherwise catch two of a
+    /// store's operations overlapping — polled once, a flush runs from its
+    /// first byte to its last without ever handing control back, so the
+    /// interleaving a real disk produces at every await never happens. This
+    /// is one await, put where a test asks for it.
+    pause_at: Option<u64>,
     /// The operation number that should withhold its buffer, if any.
     withhold_at: Option<u64>,
     /// The buffers withheld so far, kept so that the memory behind them is
@@ -164,6 +174,40 @@ impl SimFs {
     pub fn fail_at(&self, n: u64) {
         let mut state = self.state.borrow_mut();
         state.fail_at = Some(state.ops + n);
+    }
+
+    /// Makes the operation `n` from now suspend once before it runs.
+    ///
+    /// One yield, not a block: whatever else is ready runs, and then this
+    /// operation carries on. It is the suspension a real disk would have
+    /// given, at a place a test chose — which is how a test gets two of a
+    /// store's own operations to overlap (§5, §12).
+    pub fn pause_at(&self, n: u64) {
+        let mut state = self.state.borrow_mut();
+        state.pause_at = Some(state.ops + n);
+    }
+
+    /// Suspends once if the operation about to be counted is the one a test
+    /// asked to pause at.
+    ///
+    /// Taken before the operation runs rather than after, so that it needs
+    /// no borrow held across the await: the number it compares against is
+    /// the one `step` is about to hand out.
+    ///
+    /// One yield and no more, without anything here having to remember: the
+    /// poll that resumes comes back *inside* the yield rather than at the top
+    /// of this, and the counter only goes up, so an operation that has run is
+    /// an operation whose number can never come round again. Two tasks both
+    /// reaching for the same number both yield once, which is more
+    /// interleaving to choose from and not less.
+    async fn pause_if_next(&self) {
+        let due = {
+            let state = self.state.borrow();
+            state.pause_at == Some(state.ops + 1)
+        };
+        if due {
+            crate::work::yield_now().await;
+        }
     }
 
     /// Stops failing.
@@ -232,6 +276,7 @@ impl Fs for SimFs {
     type Lock = SimLock;
 
     async fn create(&self, path: &Path) -> Result<SimDisk> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Create)?;
         state.files.insert(path.to_path_buf(), SimFile::default());
@@ -244,6 +289,7 @@ impl Fs for SimFs {
     }
 
     async fn open(&self, path: &Path, access: Access) -> Result<SimDisk> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Open)?;
         if !state.files.contains_key(path) {
@@ -261,6 +307,7 @@ impl Fs for SimFs {
     }
 
     async fn remove(&self, path: &Path) -> Result<()> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Remove)?;
         if state.files.remove(path).is_none() {
@@ -273,6 +320,7 @@ impl Fs for SimFs {
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Rename)?;
         let Some(file) = state.files.remove(from) else {
@@ -294,6 +342,7 @@ impl Fs for SimFs {
     }
 
     async fn link(&self, from: &Path, to: &Path) -> Result<()> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Link)?;
         let Some(file) = state.files.get(from).cloned() else {
@@ -313,6 +362,7 @@ impl Fs for SimFs {
     }
 
     async fn list(&self, dir: &Path) -> Result<Vec<DirEntry>> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::List)?;
         let mut out = Vec::new();
@@ -330,6 +380,7 @@ impl Fs for SimFs {
     }
 
     async fn mkdir_all(&self, dir: &Path) -> Result<()> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Mkdir)?;
         state.dirs.insert(dir.to_path_buf(), true);
@@ -337,6 +388,7 @@ impl Fs for SimFs {
     }
 
     async fn sync_dir(&self, dir: &Path) -> Result<()> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::SyncDir)?;
         let dir = dir.to_path_buf();
@@ -349,6 +401,7 @@ impl Fs for SimFs {
     }
 
     async fn disk_usage(&self, dir: &Path) -> Result<DiskUsage> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::DiskUsage)?;
         let used_bytes = state
@@ -361,6 +414,7 @@ impl Fs for SimFs {
     }
 
     async fn lock(&self, path: &Path) -> Result<SimLock> {
+        self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Lock)?;
         if state.locked.get(path).copied().unwrap_or(false) {
@@ -416,6 +470,7 @@ impl Disk for SimDisk {
     }
 
     async fn read(&self, mut buf: ReadBuf, offset: u64, _class: ()) -> (Result<()>, ReadBuf) {
+        self.fs.pause_if_next().await;
         let mut state = self.fs.state.borrow_mut();
         if let Err(e) = state.step(Op::Read) {
             return (Err(e), buf);
@@ -462,6 +517,7 @@ impl Disk for SimDisk {
     }
 
     async fn write(&self, buf: WriteBuf, offset: u64, _class: ()) -> (Result<()>, WriteBuf) {
+        self.fs.pause_if_next().await;
         let mut state = self.fs.state.borrow_mut();
         if let Err(e) = state.step(Op::Write) {
             return (Err(e), buf);
@@ -504,6 +560,7 @@ impl Disk for SimDisk {
     }
 
     async fn sync(&self, _class: ()) -> Result<()> {
+        self.fs.pause_if_next().await;
         let mut state = self.fs.state.borrow_mut();
         state.step(Op::Sync)?;
         let path = self.path.clone();
