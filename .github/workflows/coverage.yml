@@ -67,6 +67,14 @@ jobs:
       #
       # cargo-llvm-cov leaves out tests.rs; sim.rs is test code too, the
       # simulated filesystem the failure-path tests drive.
+      # The cache above restores `target/`, and a restored `target/` can carry
+      # profile data from an earlier commit's run. Merged in, it counts lines
+      # that this tree does not have: a run of this branch reported 275 missed
+      # lines against the 236 a clean measurement of the identical `src/` gives,
+      # and failed the gate for it. Cleaning first makes the number depend on
+      # this commit alone, which a gate that fails a pull request has to.
+      - name: Clear any profile data the cache restored
+        run: cargo llvm-cov clean --workspace
       - name: Run the tests under cargo-llvm-cov
         run: >
           cargo llvm-cov --workspace --locked
