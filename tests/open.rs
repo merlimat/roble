@@ -1018,3 +1018,104 @@ async fn a_store_can_be_owned_by_a_task_of_its_own() {
         "and the store it flushed is the store this test is holding"
     );
 }
+
+/// Real I/O, so that a loop waiting on a detached task actually reaches the
+/// runtime: an operation that finishes without awaiting anything would spin
+/// here and never give the task its turn.
+async fn give_the_runtime_a_turn(at: &Path) {
+    let disk = roble::FileFs.create(at).await.expect("create");
+    disk.sync(()).await.expect("sync");
+    disk.close().await.expect("close");
+}
+
+#[compio::test]
+async fn a_task_of_its_own_can_be_the_one_that_compacts() {
+    // The pattern `Opened::compaction_wanted` documents, run for real. The
+    // caller owns the task and owns stopping it; the store only says when
+    // there is something to do. A flush that finds the task waiting leaves
+    // the merge to it, so the write that caused the flush pays for none of
+    // it — which is what §9 has been working towards since #72.
+    //
+    // `tests/schedule.rs` pins which of the two does the merge, by hand and
+    // deterministically. What this adds is that the shape works against a
+    // real runtime and a real disk at all.
+    let (tmp, dir) = fixture("db-reads");
+    // Eleven, so the picker wants nothing until the flush below adds its
+    // table: the task has to be waiting *before* there is work, or the flush
+    // would find nobody and do the merge itself.
+    let db = std::rc::Rc::new(
+        roble::open_with(
+            &roble::DefaultEnv,
+            &dir,
+            roble::Options::new().l0_compaction_threshold(11),
+        )
+        .await
+        .expect("open"),
+    );
+
+    let started = std::rc::Rc::new(std::cell::Cell::new(false));
+    let merged = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let (task_db, began, count) = (
+        std::rc::Rc::clone(&db),
+        std::rc::Rc::clone(&started),
+        std::rc::Rc::clone(&merged),
+    );
+    roble::Env::spawn(&roble::DefaultEnv, async move {
+        began.set(true);
+        loop {
+            task_db.compaction_wanted().await;
+            let outputs = task_db
+                .compact_once()
+                .await
+                .expect("the task's own compaction");
+            count.set(count.get() + outputs.len());
+        }
+    });
+
+    // Until the task has had its first turn, which is the turn it parks on.
+    // Bounded, so a task that never runs fails the test rather than hanging
+    // it.
+    let tick = tmp.path().join("tick");
+    for _ in 0..64 {
+        if started.get() {
+            break;
+        }
+        give_the_runtime_a_turn(&tick).await;
+    }
+    assert!(
+        started.get(),
+        "the task should have been polled, and so be waiting to be told"
+    );
+    assert_eq!(merged.get(), 0, "and should have had nothing to do yet");
+
+    let mut batch = roble_format::batch::Batch::new();
+    batch.put(b"background", b"yes").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+
+    for _ in 0..64 {
+        if merged.get() > 0 {
+            break;
+        }
+        give_the_runtime_a_turn(&tick).await;
+    }
+
+    assert!(
+        merged.get() > 0,
+        "the flush had somebody waiting, so the merge was the task's to do"
+    );
+    assert_eq!(
+        db.versions().version.level(0).len(),
+        0,
+        "and the merge it ran should have taken all of L0"
+    );
+    let found = db
+        .get(b"background", roble::Comparison::Equal)
+        .await
+        .expect("get");
+    assert_eq!(
+        found.map(|f| f.value),
+        Some(b"yes".to_vec()),
+        "and the store the task compacted is the store this test is holding"
+    );
+}

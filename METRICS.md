@@ -89,6 +89,7 @@ scan and one entry. `Equal` is a point lookup and counts neither.
 |---|---|---|---|
 | `roble.flushes` | counter | `{flush}` | Flushes that wrote a table |
 | `roble.compactions` | counter | `{compaction}` | Compactions run |
+| `roble.compaction.errors` | counter | `{error}` | Compactions that failed, by what went wrong |
 | `roble.flush.duration` | latency | s | Time a flush takes, from the call until its version edit is durable |
 | `roble.flush.size` | histogram | By | Bytes of the table each flush wrote |
 | `roble.flush.bytes` | counter | By | Bytes that flushes wrote |

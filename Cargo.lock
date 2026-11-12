@@ -975,6 +975,7 @@ dependencies = [
  "opentelemetry_sdk",
  "roble-format",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

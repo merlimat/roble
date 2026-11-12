@@ -9,6 +9,12 @@ description = "Embedded ordered key-value store whose on-disk files are Pebble's
 
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }
+# The facade only, and without `attributes`: a library that logs says so and
+# leaves choosing a subscriber to the application. roble emits events and
+# never opens a span, so the `#[instrument]` macro — and the proc-macro
+# crates behind it — are not wanted. Silent, and reading no clock, unless a
+# subscriber is installed (§10).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 nanometer = "0.1"
 # The version nanometer pins.
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }

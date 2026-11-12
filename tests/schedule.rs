@@ -25,7 +25,10 @@
 //! picker has an answer before this file has done anything.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
 use roble::{Disk, Fs, Options, WriteBuf};
@@ -233,5 +236,192 @@ async fn a_store_that_keeps_flushing_settles_by_itself() {
         contents(&reopened).await,
         model,
         "and should still hold it after a reopen"
+    );
+}
+
+/// Polls two futures turn and turn about until both are done.
+fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut a = pin!(a);
+    let mut b = pin!(b);
+    let (mut first, mut second) = (None, None);
+    let mut polls = 0;
+    loop {
+        if first.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(&mut cx)
+        {
+            first = Some(v);
+        }
+        if second.is_none()
+            && let Poll::Ready(v) = b.as_mut().poll(&mut cx)
+        {
+            second = Some(v);
+        }
+        (first, second) = match (first, second) {
+            (Some(a), Some(b)) => return (a, b),
+            pair => pair,
+        };
+        polls += 1;
+        assert!(polls < 100_000, "one of these two is not making progress");
+    }
+}
+
+/// Whether a task waiting to be told there is a compaction would be told now.
+fn wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
+    let mut cx = Context::from_waker(Waker::noop());
+    pin!(db.compaction_wanted())
+        .as_mut()
+        .poll(&mut cx)
+        .is_ready()
+}
+
+#[compio::test]
+async fn a_flush_hands_the_merge_to_whoever_is_waiting_for_one() {
+    // Background compaction, from the store's side of it (§9). A flush that
+    // finds somebody waiting to be told there is work tells them and
+    // returns, instead of merging where it stands — which is what takes the
+    // merge out of the write that caused the flush.
+    //
+    // Driven by hand rather than spawned, because what is in question is
+    // which of the two did the merge and not whether a runtime will poll a
+    // task. `tests/open.rs` does it with a real one.
+    let (env, dir) = load("db-reads").await;
+    // Eleven, so that the picker wants nothing until this flush has added
+    // its table: a store that already wanted a compaction could not show
+    // whose the merge was.
+    let db = roble::open_with(&env, &dir, Options::new().l0_compaction_threshold(11))
+        .await
+        .expect("open");
+    let mut model = contents(&db).await;
+    assert!(db.pick().is_none(), "the fixture should want nothing yet");
+
+    let mut batch = Batch::new();
+    batch.put(b"handed", b"over").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    model.insert(b"handed".to_vec(), b"over".to_vec());
+
+    let worker = async {
+        db.compaction_wanted().await;
+        db.compact_once().await
+    };
+    let (merged, flushed) = interleave(worker, db.flush());
+    let merged = merged.expect("the waiting task's compaction");
+    flushed.expect("the flush").expect("a table");
+
+    assert!(
+        !merged.is_empty(),
+        "a task was waiting to be told, so the merge was its to do and the flush should \
+         not have done it first"
+    );
+    assert_eq!(
+        db.versions().version.level(0).len(),
+        0,
+        "and the merge it did should have taken all of L0"
+    );
+    assert_eq!(contents(&db).await, model, "and changed no answer");
+}
+
+#[compio::test]
+async fn a_compaction_that_failed_is_not_asked_for_again_until_the_version_moves() {
+    // "Later" with no clock to say when (§10). The picker gives the same
+    // answer against the same version, so a task told to go again at once
+    // would spin rather than retry — the next flush is what makes it a
+    // retry.
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new().disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+    assert!(
+        db.pick().is_some(),
+        "the fixture arrives wanting a compaction"
+    );
+    assert!(wanted_now(&db), "so a task should be told at once");
+
+    env.sim().fail_at(1);
+    db.compact_once()
+        .await
+        .expect_err("the compaction should have failed");
+    env.sim().stop_failing();
+
+    assert!(
+        db.pick().is_some(),
+        "the picker still wants the very same compaction"
+    );
+    assert!(
+        !wanted_now(&db),
+        "but a task should not be told to run it again against the same version"
+    );
+
+    // A flush is what moves the version on, and so what makes it a retry.
+    let mut batch = Batch::new();
+    batch.put(b"moved", b"on").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+
+    assert!(
+        wanted_now(&db),
+        "and a version that has moved on is worth asking the picker about again"
+    );
+}
+
+#[compio::test]
+async fn a_task_waits_for_a_merge_already_running_rather_than_standing_down() {
+    // The picker is not told what another compaction has claimed, so it goes
+    // on naming those tables and `compact_once` goes on standing down (§9).
+    // A task told there was work each time would take that answer, do
+    // nothing with it, and be told again at once — a spin, not a wait. So it
+    // is not told while somebody else is on it.
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .compaction_unit(1),
+    )
+    .await
+    .expect("open");
+    assert!(
+        db.pick().is_some(),
+        "the fixture arrives wanting a compaction"
+    );
+    assert!(wanted_now(&db), "and nobody is on it yet");
+
+    // One compaction, driven by hand as far as its first suspension, which
+    // is past the point where it claims what it is reading.
+    let mut cx = Context::from_waker(Waker::noop());
+    env.sim().pause_at(1);
+    let mut running = pin!(db.compact_once());
+    assert!(
+        running.as_mut().poll(&mut cx).is_pending(),
+        "the compaction should have suspended with its tables claimed"
+    );
+
+    assert!(
+        db.pick().is_some(),
+        "the picker still names the tables it has claimed"
+    );
+    assert!(
+        !wanted_now(&db),
+        "but a task should wait for that merge rather than be told to run one"
+    );
+
+    // And once it is done, the answer is whatever the picker says again.
+    let mut polls = 0;
+    let merged = loop {
+        if let Poll::Ready(result) = running.as_mut().poll(&mut cx) {
+            break result.expect("the compaction");
+        }
+        polls += 1;
+        assert!(polls < 100_000, "the compaction is not making progress");
+    };
+    assert!(!merged.is_empty(), "it should have written something");
+    assert!(
+        !wanted_now(&db),
+        "and it took all of L0, so there is nothing left to want"
     );
 }
