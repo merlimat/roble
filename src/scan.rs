@@ -195,6 +195,7 @@ enum Dir {
 }
 
 /// Where the scan is.
+#[derive(Default)]
 struct Current {
     user: Vec<u8>,
     value: Vec<u8>,
@@ -206,6 +207,15 @@ struct Current {
 /// Pebble's are: `lower` is included and `upper` is not.
 pub struct Scan<D: Disk> {
     iters: Vec<Source<D>>,
+    /// The buffers of the key this scan has moved off, kept to be filled
+    /// again.
+    ///
+    /// A step has to copy the user key out of a source before it can touch
+    /// that source mutably, and the copy is what `key()` then hands out — so
+    /// it cannot borrow and it cannot be skipped. What it can do is reuse the
+    /// `Vec` the previous key was in, which is free the moment this scan
+    /// steps off it (`advance`).
+    spare: Option<Current>,
     tables: Vec<Rc<OpenTable<D>>>,
     /// Kept for their range tombstones, which are not in any source.
     ///
@@ -255,6 +265,7 @@ impl<D: Disk> Scan<D> {
         }
         Scan {
             iters,
+            spare: None,
             tables,
             memtables,
             snapshot,
@@ -388,22 +399,32 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             };
-            let user = InternalKey::decode(self.iters[w].key())?.user_key.to_vec();
-            let chosen = self.take_newest_visible(&user, Dir::Forward).await?;
+            // Into the buffer the last key vacated, which is owned locally
+            // for the rest of this turn of the loop and so conflicts with no
+            // borrow of `self`.
+            let mut next = self.spare.take().unwrap_or_default();
+            next.user.clear();
+            next.user
+                .extend_from_slice(InternalKey::decode(self.iters[w].key())?.user_key);
+            let chosen = self.take_newest_visible(&next.user, Dir::Forward).await?;
 
             if let Some(upper) = &self.upper
-                && user >= *upper
+                && next.user >= *upper
             {
                 self.current = None;
                 return Ok(());
             }
             if let Some((seq, kind, value)) = chosen
-                && self.visible(&user, seq, kind)?
+                && self.visible(&next.user, seq, kind)?
             {
-                self.current = Some(Current { user, value });
+                next.value = value;
+                self.spare = self.current.replace(next);
                 self.stepped_onto();
                 return Ok(());
             }
+            // A deletion, so round again — and the buffers go back rather
+            // than being dropped.
+            self.spare = Some(next);
         }
     }
 
@@ -414,22 +435,32 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             };
-            let user = InternalKey::decode(self.iters[w].key())?.user_key.to_vec();
-            let chosen = self.take_newest_visible(&user, Dir::Reverse).await?;
+            // Into the buffer the last key vacated, which is owned locally
+            // for the rest of this turn of the loop and so conflicts with no
+            // borrow of `self`.
+            let mut next = self.spare.take().unwrap_or_default();
+            next.user.clear();
+            next.user
+                .extend_from_slice(InternalKey::decode(self.iters[w].key())?.user_key);
+            let chosen = self.take_newest_visible(&next.user, Dir::Reverse).await?;
 
             if let Some(lower) = &self.lower
-                && user < *lower
+                && next.user < *lower
             {
                 self.current = None;
                 return Ok(());
             }
             if let Some((seq, kind, value)) = chosen
-                && self.visible(&user, seq, kind)?
+                && self.visible(&next.user, seq, kind)?
             {
-                self.current = Some(Current { user, value });
+                next.value = value;
+                self.spare = self.current.replace(next);
                 self.stepped_onto();
                 return Ok(());
             }
+            // A deletion, so round again — and the buffers go back rather
+            // than being dropped.
+            self.spare = Some(next);
         }
     }
 
@@ -456,17 +487,26 @@ impl<D: Disk> Scan<D> {
                 if !self.iters[i].is_valid() {
                     break;
                 }
-                let here = self.iters[i].key().to_vec();
-                let k = InternalKey::decode(&here)?;
-                if k.user_key != user {
+                // The trailer, read out of the borrowed key rather than out of
+                // a copy of it. Copying was how this ended the borrow before
+                // the `entry().await` below, which needs the source mutably —
+                // and it cost one allocation per source per step, so a scan
+                // over a store settled into fourteen tables made fourteen of
+                // them for every record it returned. Scoping the borrow to
+                // the three scalars this actually needs costs none.
+                let (seq_num, kind, matches) = {
+                    let k = InternalKey::decode(self.iters[i].key())?;
+                    (k.seq_num, k.kind, k.user_key == user)
+                };
+                if !matches {
                     break;
                 }
                 // A version written after this scan began is not its business.
-                if visible_at(k.seq_num, self.snapshot)
-                    && chosen.as_ref().is_none_or(|(seq, _, _)| k.seq_num > *seq)
+                if visible_at(seq_num, self.snapshot)
+                    && chosen.as_ref().is_none_or(|(seq, _, _)| seq_num > *seq)
                 {
                     let entry = self.iters[i].entry().await?;
-                    chosen = Some((k.seq_num, k.kind, entry.value));
+                    chosen = Some((seq_num, kind, entry.value));
                 }
                 match dir {
                     Dir::Forward => self.iters[i].next().await?,
