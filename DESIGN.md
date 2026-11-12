@@ -1503,13 +1503,27 @@ Ordered so that the compatibility risk is resolved before the engine exists.
 
 Stated rather than quietly decided:
 
-- **Uncompressed by default (§8)** needs the measurement before it is a default.
-  If Snappy's space saving on Oxia's values is large, the zero-copy read path is
-  worth less than it looks. `bench/` can now ask: on incompressible values the
-  four engines hold within 5% of the same 42 MiB, so the default costs nothing
-  there, and on a single repeated byte Snappy saved 2.5x. Oxia's values are
-  serialized records and sit between those, so what is still missing is a run
-  over something shaped like Oxia's own data rather than either extreme.
+- **Uncompressed (§8) is measured now, and it is not a default — it is the only
+  setting.** `roble-format`'s writer puts `NoCompression` in every table's
+  properties and takes no option; the format crate decompresses Snappy and Zstd
+  on the way in, so roble reads a compressed table and can never write one.
+  That is a larger claim than "uncompressed by default" and §8 should say it.
+
+  `bench/`'s `--value-chunk` dials how compressible a value is — one random
+  chunk repeated to fill it — and over 240,000 records the answer is one-sided:
+
+  | each value is | roble | Pebble | RocksDB |
+  |---|---|---|---|
+  | 128 random bytes | 33.9 MiB | 33.8 | 33.6 |
+  | a 32-byte chunk, 4x | **33.9 MiB** | 11.0 | 11.3 |
+  | an 8-byte chunk, 16x | **33.9 MiB** | 7.5 | 5.8 |
+
+  roble holds three to four and a half times the disk of either, and gains
+  nothing measurable for it: its scan rate moves by 2% across that range, so
+  the decompression Pebble pays for does not show against a warm cache. Oxia's
+  values are serialized records, which sit inside that range rather than at
+  either end, so the cost is real for the workload roble exists to serve.
+  Writing Snappy is the obvious answer and it is not scheduled.
 - **Cooperative compaction (§9)** is a bet on small shards. The offload path is
   designed but unbuilt; the benchmark decides whether it gets built, and the
   `cpu s` column is where to look — a cooperative compaction's cost lands on
@@ -1594,6 +1608,16 @@ Stated rather than quietly decided:
   split, which streams a filtered snapshot. If Oxia adopts `Excise` or
   `IngestAndExcise`, roble needs them on both sides, and that is a release
   rather than a patch. Worth watching rather than deciding now.
+- **Whether a table count explains a read cost: twice now, no.** `bench/`
+  sets every LSM knob from roble's own constants, because RocksDB's defaults
+  differ enough to decide a result — its 64 MiB target file size settled a
+  34 MiB store into one table where roble leaves eleven. That looked like the
+  reason its lookups led. Aligned to 2 MiB it has sixteen tables and its point
+  reads move by under 1%: the filters absorb them. The scan gap went the same
+  way, surviving a run with the table counts matched. So a shape that *should*
+  cost more does not, twice, and the thing left both times is roble's cost per
+  operation rather than the structure it operates over.
+
 - **How closely the picker should follow Pebble's.** Compatibility does not
   require it, and this was filed as a question about noise. It still is: the
   three settle into visibly different shapes for the same 300,000 records —

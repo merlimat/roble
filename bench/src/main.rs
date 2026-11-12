@@ -52,9 +52,22 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --value-bytes N bytes in each value (128)
   --reads N       lookups in each get and floor phase (100000)
   --cache-mb N    block cache for every shard together, in MiB (64)
+  --value-chunk N bytes of random data each value is built from, repeated to
+                  fill it (default: the whole value, so incompressible). 16
+                  makes a 128-byte value eight copies of one chunk, which
+                  Snappy halves — the dial between the two extremes §8 needs
+  --memtable-mb N bytes a memtable holds before a flush, in MiB (4). Set on
+                  every engine that has one, because their own defaults differ
+                  by sixteen times and the load phase then measures different
+                  amounts of work
   --seed N        seed for the keys, the values and the lookup order (1)
   --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
                   only durability point, and a commit syncs nothing
+  --reuse         open the store that is already at DIR/<engine> instead of
+                  refusing it, so that a load and the reads over it can be two
+                  processes with something done in between — dropping the
+                  page cache, which needs root and so cannot be done from
+                  here. Without it a run insists on a directory of its own.
   --layout        print every table of every level, with its size and key
                   range, after the store has settled
   --tsv           one tab-separated line per phase instead of a table, for a
@@ -66,8 +79,17 @@ Creates the store at DIR/<engine>, which must not exist yet.
 fn main() {
     let cfg = Config::parse();
     let path = cfg.dir.join(&cfg.engine);
-    if path.exists() {
-        fail(&format!("{} exists: remove it first", path.display()));
+    if path.exists() && !cfg.reuse {
+        fail(&format!(
+            "{} exists: remove it first, or pass --reuse to read the store already there",
+            path.display()
+        ));
+    }
+    if cfg.reuse && !path.exists() {
+        fail(&format!(
+            "--reuse was given but {} does not exist: load it first",
+            path.display()
+        ));
     }
     std::fs::create_dir_all(&path).expect("create the directory");
     let runtime = compio::runtime::Runtime::new().expect("start the runtime");
@@ -441,11 +463,28 @@ pub fn key_for(s: usize, i: usize) -> Vec<u8> {
 /// bytes.
 pub fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
     let mut rng = Rng::new(cfg.seed ^ ((s as u64) << 40) ^ (i as u64));
-    let mut value = Vec::with_capacity(cfg.value_bytes + 8);
-    while value.len() < cfg.value_bytes {
-        value.extend_from_slice(&rng.next().to_le_bytes());
+    // `--value-chunk` is the dial between incompressible and compressible: a
+    // value is one random chunk repeated to fill it, so a chunk the size of
+    // the value gives Snappy nothing to find, and a smaller one gives it an
+    // exact repeat every `chunk` bytes. Real serialized records sit between
+    // the two, sharing field tags and common strings without repeating
+    // wholesale, which is why §8's question needs a dial rather than a
+    // choice of two.
+    let chunk = if cfg.value_chunk == 0 {
+        cfg.value_bytes
+    } else {
+        cfg.value_chunk.min(cfg.value_bytes)
+    };
+    let mut pattern = Vec::with_capacity(chunk + 8);
+    while pattern.len() < chunk {
+        pattern.extend_from_slice(&rng.next().to_le_bytes());
     }
-    value.truncate(cfg.value_bytes);
+    pattern.truncate(chunk);
+    let mut value = Vec::with_capacity(cfg.value_bytes);
+    while value.len() < cfg.value_bytes {
+        let take = chunk.min(cfg.value_bytes - value.len());
+        value.extend_from_slice(&pattern[..take]);
+    }
     value
 }
 
@@ -482,14 +521,19 @@ pub struct Config {
     records: usize,
     /// Bytes in each value.
     pub value_bytes: usize,
+    /// Bytes of random data each value is built from, repeated to fill it.
+    pub value_chunk: usize,
     reads: usize,
     /// Cache for every shard together, in MiB.
     pub cache_mb: u64,
+    /// Bytes a memtable holds before a flush, in MiB.
+    pub memtable_mb: u64,
     /// Seed for the keys, the values and the lookup order.
     pub seed: u64,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
     layout: bool,
+    reuse: bool,
     tsv: bool,
     phases: Option<Vec<String>>,
 }
@@ -503,11 +547,14 @@ impl Config {
             batches: 200,
             records: 100,
             value_bytes: 128,
+            value_chunk: 0,
             reads: 100_000,
             cache_mb: 64,
+            memtable_mb: 4,
             seed: 1,
             wal: true,
             layout: false,
+            reuse: false,
             tsv: false,
             phases: None,
         };
@@ -533,8 +580,10 @@ impl Config {
                 "--batches" => cfg.batches = number(value(arg)) as usize,
                 "--records" => cfg.records = number(value(arg)) as usize,
                 "--value-bytes" => cfg.value_bytes = number(value(arg)) as usize,
+                "--value-chunk" => cfg.value_chunk = number(value(arg)) as usize,
                 "--reads" => cfg.reads = number(value(arg)) as usize,
                 "--cache-mb" => cfg.cache_mb = number(value(arg)),
+                "--memtable-mb" => cfg.memtable_mb = number(value(arg)),
                 "--seed" => cfg.seed = number(value(arg)),
                 "--phases" => {
                     cfg.phases = Some(
@@ -550,6 +599,10 @@ impl Config {
                 }
                 "--layout" => {
                     cfg.layout = true;
+                    took_value = false;
+                }
+                "--reuse" => {
+                    cfg.reuse = true;
                     took_value = false;
                 }
                 "--tsv" => {
