@@ -454,3 +454,94 @@ async fn an_empty_batch_reads_like_the_store() {
         store_contents(&db).await,
     );
 }
+
+/// The bytes a caller checksums must be the bytes the format crate builds.
+///
+/// `format/tests/batch_repr.rs` holds that crate's `Batch` to Go Pebble's
+/// bytes against a golden fixture; this holds the batch Oxia actually uses to
+/// the same `Batch`. What sits in between is the index, which orders itself
+/// by stand-in sequence numbers, and the one thing that would make two
+/// replicas disagree is one of those numbers — or anything else the index
+/// does — reaching the repr.
+///
+/// The two programs are written out twice on purpose: a helper driving both
+/// sides would be the place a divergence could hide.
+#[compio::test]
+async fn the_bytes_a_batch_hands_out_are_the_ones_the_format_crate_builds() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let long = vec![b'v'; 300];
+    let mut batch = db.batch();
+    batch.put(b"/users/alice", b"a").expect("put");
+    batch.delete(b"/users/bob").expect("delete");
+    batch.put(b"/users/carol", &long).expect("put");
+    batch.put(b"/empty", b"").expect("put");
+    batch.put(b"", b"x").expect("put");
+    batch
+        .put(b"\xff\xfe\x00\x80", b"\x00\xff\x7f\x80")
+        .expect("put");
+    // A key and a value either side of the one-byte varint boundary.
+    batch.put(&[b'k'; 127], &[b'v'; 128]).expect("put");
+    batch.put(&[b'K'; 128], &[b'V'; 127]).expect("put");
+    batch
+        .put_with(b"marshalled", 5, |buf| buf.copy_from_slice(b"value"))
+        .expect("put_with");
+    batch
+        .delete_range(b"/sessions/", b"/sessions0")
+        .expect("delete_range");
+
+    let mut repr = Batch::new();
+    repr.put(b"/users/alice", b"a").expect("put");
+    repr.delete(b"/users/bob").expect("delete");
+    repr.put(b"/users/carol", &long).expect("put");
+    repr.put(b"/empty", b"").expect("put");
+    repr.put(b"", b"x").expect("put");
+    repr.put(b"\xff\xfe\x00\x80", b"\x00\xff\x7f\x80")
+        .expect("put");
+    repr.put(&[b'k'; 127], &[b'v'; 128]).expect("put");
+    repr.put(&[b'K'; 128], &[b'V'; 127]).expect("put");
+    repr.put_with(b"marshalled", 5, |buf| buf.copy_from_slice(b"value"))
+        .expect("put_with");
+    repr.delete_range(b"/sessions/", b"/sessions0")
+        .expect("delete_range");
+
+    assert_eq!(batch.count(), repr.count(), "entries");
+    assert_eq!(batch.len(), repr.len(), "bytes");
+    assert_eq!(
+        batch.as_bytes(),
+        repr.as_bytes(),
+        "the index must leave the repr alone"
+    );
+}
+
+/// Oxia takes the checksum before committing, so the eight bytes that will
+/// hold the sequence number are zero in every repr it can get hold of — and
+/// because a commit takes the batch, there is no other repr to get.
+#[compio::test]
+async fn a_batch_hands_out_a_header_whose_sequence_number_is_still_zero() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    assert_eq!(
+        db.batch().as_bytes(),
+        &[0u8; 12][..],
+        "Go Pebble's repr for an empty batch is twelve zero bytes"
+    );
+
+    let mut batch = db.batch();
+    batch.put(b"/a", b"1").expect("put");
+    batch.delete(b"/b").expect("delete");
+    let repr = batch.as_bytes();
+    assert_eq!(
+        &repr[..8],
+        &[0u8; 8][..],
+        "a sequence number is stamped at commit, not before"
+    );
+    assert_eq!(
+        u32::from_le_bytes(repr[8..12].try_into().expect("four count bytes")),
+        2,
+        "while the count is in the header from the first entry"
+    );
+    assert_eq!(batch.count(), 2);
+}

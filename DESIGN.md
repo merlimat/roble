@@ -588,7 +588,11 @@ must be the same bytes.
 
 That encoding pays twice over, because **the WAL record is the batch repr**: the
 bytes Oxia checksums are the bytes appended to the log, with no re-encoding
-between the batch and the file.
+between the batch and the file. A batch hands those bytes back through
+`as_bytes()` rather than a checksum of its own: Oxia's `Checksum` is a
+*running* CRC-32 Castagnoli that chains one batch onto the next and is masked
+only when it is finally read (`oxiad/common/crc`), and that convention belongs
+to the replication protocol rather than to a store.
 
 Two details of that contract are measured rather than assumed. Oxia checksums
 the **whole** repr, header included (`db.go`: `batch.Checksum(previousChecksum)`),
@@ -1200,7 +1204,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `NewWriteBatch`, `Put`, `Delete`, `DeleteRange`, `Commit` | `db.batch()`, `put`, `delete`, `delete_range`, `commit` |
 | `PutMarshalable` | `put_with(key, len, \|buf\| …)` |
 | batch `Get`, `FindLower`, `KeyRangeScan`, `RangeScan` | indexed batch iterators (§6) |
-| batch `Count`, `Size`, `Checksum` | over the Pebble batch repr, so checksums match Go |
+| batch `Count`, `Size`, `Checksum` | `count`, `len`, `as_bytes` — the Pebble repr, so a checksum over it matches Go |
 | `Get` with `ComparisonType` | `get` with `Comparison` |
 | `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
 | `KeyPrefixIterator` with `Lookup` | `prefix` iterator (§6) |

@@ -148,6 +148,23 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
         self.repr.len()
     }
 
+    /// Its representation: the bytes a commit appends to the log.
+    ///
+    /// These are the bytes Oxia checksums and compares across replicas, so
+    /// they are byte-identical to the ones Go Pebble builds for the same
+    /// operations — a claim the golden fixture of `format/tests/batch_repr.rs`
+    /// holds the format crate to, and which this batch inherits by encoding
+    /// through it and nothing else.
+    ///
+    /// The eight header bytes that hold the sequence number are still zero.
+    /// That is what a checksum here covers, and it is what Oxia relies on,
+    /// taking the checksum before committing; since [`commit`](Self::commit)
+    /// takes the batch, these are the only bytes it can ever hand out. The
+    /// stand-in numbers its index orders itself by never reach them.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.repr.as_bytes()
+    }
+
     /// Reads the key `how` says, through the batch and the store together.
     ///
     /// Every comparison goes through a scan, including `Equal`. The point
