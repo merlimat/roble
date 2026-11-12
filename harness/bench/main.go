@@ -166,14 +166,6 @@ func main() {
 	if cfg.wants("scan") {
 		scan(cfg, shards, false)
 	}
-	if cfg.wants("get-buf") {
-		// Pebble's `Get` hands back a value borrowed from the block it is in,
-		// with a closer, and `getWith` consumes it without copying. So its
-		// `get` row below *is* its buffered read, and a second row would be
-		// the same number twice. Which also means roble's `get` row is not
-		// like-for-like with this one and its `get-buf` row is.
-		skipped(cfg, "get-buf", "its get already borrows the value rather than copying it")
-	}
 	if cfg.wants("get") {
 		lookups(cfg, shards, false)
 	}
@@ -356,33 +348,80 @@ func lookups(cfg config, shards []*pebble.DB, floor bool) {
 	r := newReport(cfg, name)
 	total := cfg.batches * cfg.records
 	rng := newRng(cfg.seed ^ 0x9e3779b9)
+	// Reused across every probe, so what the phase reports is Pebble's work
+	// and not this harness's.
+	var key, probe []byte
 	for n := 0; n < cfg.reads; n++ {
 		s := int(rng.next() % uint64(cfg.shards))
 		i := int(rng.next() % uint64(total))
-		key := keyFor(s, i)
-		probe := key
+		key = keyInto(key, s, i)
+		probe = append(probe[:0], key...)
 		if floor {
-			probe = append(append([]byte{}, key...), '~')
+			// Past `key-%010d` and below the next one, since every byte here
+			// sorts above the digits the padding ends in.
+			probe = append(probe, '~')
 		}
+
+		if floor {
+			at := time.Now()
+			answer, err := floorOf(shards[s], probe)
+			r.saw(time.Since(at))
+			if err != nil {
+				fail(fmt.Sprintf("%s: %v", name, err))
+			}
+			if answer == nil {
+				fail(fmt.Sprintf("%s found no answer for %q", name, probe))
+			}
+			if !bytes.Equal(answer, key) {
+				fail(fmt.Sprintf("%s answered %q, not the key below the probe", name, answer))
+			}
+			r.count++
+			continue
+		}
+
 		at := time.Now()
-		answer, err := getWith(shards[s], probe, floor)
+		length, err := getLen(shards[s], probe)
 		r.saw(time.Since(at))
 		if err != nil {
 			fail(fmt.Sprintf("%s: %v", name, err))
 		}
-		if answer == nil {
+		if length < 0 {
 			fail(fmt.Sprintf("%s found no answer for %q", name, probe))
 		}
-		if floor && !bytes.Equal(answer, key) {
-			fail(fmt.Sprintf("%s answered %q, not the key below the probe", name, answer))
+		// Checked against the value this record was written with, as every
+		// engine's `get` is: a read that answered without producing the value
+		// would otherwise be the fastest engine in the table.
+		if length != cfg.valueBytes {
+			fail(fmt.Sprintf("%s answered %d bytes for %q, not the %d written",
+				name, length, probe, cfg.valueBytes))
 		}
 		r.count++
 	}
 	r.finish(shards)
 }
 
-// getWith returns the key the lookup landed on, Oxia's two steps for a floor.
-func getWith(db *pebble.DB, probe []byte, floor bool) ([]byte, error) {
+// getLen is the length of the value for probe, or -1 if it is not there.
+//
+// A length and not the value, as every engine's `get` reports: Pebble hands
+// back a value borrowed from the block it is in, so reading its length copies
+// nothing, and an owned return would charge it for an allocation the
+// comparison is not about.
+func getLen(db *pebble.DB, probe []byte) (int, error) {
+	value, closer, err := db.Get(probe)
+	switch {
+	case err == nil:
+		n := len(value)
+		sink(value)
+		return n, closer.Close()
+	case errors.Is(err, pebble.ErrNotFound):
+		return -1, nil
+	default:
+		return -1, err
+	}
+}
+
+// floorOf returns the key the floor lookup landed on, Oxia's two steps.
+func floorOf(db *pebble.DB, probe []byte) ([]byte, error) {
 	value, closer, err := db.Get(probe)
 	switch {
 	case err == nil:
@@ -390,8 +429,6 @@ func getWith(db *pebble.DB, probe []byte, floor bool) ([]byte, error) {
 		return probe, closer.Close()
 	case !errors.Is(err, pebble.ErrNotFound):
 		return nil, err
-	case !floor:
-		return nil, nil
 	}
 	// The exact lookup missed, so seek below the probe, as Oxia's getLower
 	// does: an iterator bounded above by the probe, positioned at its last
@@ -477,17 +514,6 @@ func (r *report) finish(shards []*pebble.DB) {
 		cpu.Seconds(), sizeMiB)
 }
 
-// skipped says a phase did not happen, and why, in place of its line, in the
-// formats roble-bench's own `Report::skipped` prints — a dash rather than a
-// zero, which would read as "it did this and it took no time".
-func skipped(cfg config, name, why string) {
-	if cfg.tsv {
-		fmt.Printf("pebble\t%s\tskipped\t%s\n", name, why)
-		return
-	}
-	fmt.Printf("%-11s %10s \u2014 %s\n", name, "-", why)
-}
-
 // ------------------------------------------------------------------- the key
 
 // keyFor is the key of record i in shard s, byte for byte the Rust side's.
@@ -497,7 +523,38 @@ func skipped(cfg config, name, why string) {
 // so a shard roble can serve is one using Oxia's natural encoder. The id is
 // zero-padded so bytewise order is numeric order.
 func keyFor(s, i int) []byte {
-	return []byte(fmt.Sprintf("/shard-%04d/bucket-%02d/key-%010d", s, i%64, i))
+	return keyInto(nil, s, i)
+}
+
+// keyInto writes the key of record i in shard s into dst, reusing its array,
+// and gives back the result.
+//
+// The read phases probe tens of thousands of keys in a loop, and `keyFor`'s
+// `Sprintf` put a format and two allocations of the harness's own into every
+// one of Pebble's measured lookups. roble's side of the benchmark stopped
+// doing that, so leaving it here would charge Pebble for work the comparison
+// is not about — and the whole point of one table is that every engine is
+// asked the same question the same way.
+func keyInto(dst []byte, s, i int) []byte {
+	dst = append(dst[:0], "/shard-"...)
+	dst = appendFixed(dst, s, 4)
+	dst = append(dst, "/bucket-"...)
+	dst = appendFixed(dst, i%64, 2)
+	dst = append(dst, "/key-"...)
+	return appendFixed(dst, i, 10)
+}
+
+// appendFixed writes v in decimal, zero-padded to at least width digits, as
+// `%0*d` does — including going wider when the number needs it.
+func appendFixed(dst []byte, v, width int) []byte {
+	var buf [20]byte
+	p := len(buf)
+	for n := 0; n < width || v > 0; n++ {
+		p--
+		buf[p] = byte('0' + v%10)
+		v /= 10
+	}
+	return append(dst, buf[p:]...)
 }
 
 // reopen closes every store and opens it again, so the next phase reads
