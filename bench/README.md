@@ -67,11 +67,15 @@ They always run in this order, whatever order `--phases` names them in.
   filter can help.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
-`run.sh` adds three passes of its own. **Batch against single insert** writes
+`run.sh` adds four passes of its own. **Batch against single insert** writes
 the same total records in batches and then one record per commit, so that the
 per-commit cost can be told from the per-record cost; see the warning about it
 below. **Insert with the journal against without it**, which is the WAL's cost per
-engine. **The layout** (`--layout`) prints every table of every level, with its
+engine. **The reads in cache and out of it**, at 64 MiB and 4 MiB against 34 MiB
+of data — which measures the block-cache *miss* path and not a disk, since all
+three LSMs read through the operating system's page cache (§8: direct I/O is
+the goal and not the state). A genuinely disk-bound comparison needs a working
+set larger than RAM and is a much longer run. **The layout** (`--layout`) prints every table of every level, with its
 size and key range, and flags any level below L0 whose tables overlap — which
 is what a scan number has to be read against.
 
@@ -164,7 +168,26 @@ overhead — enough, on the forward scan, to reverse which engine looks quicker.
 The rate comes from the phase's own wall clock, which the sampling leaves
 alone.
 
-**Values are pseudo-random.** A value made of one repeated byte compresses to
+**Three knobs are set the same on every engine that has them, because their
+own defaults are not comparable.** `--memtable-mb` is one: roble and Pebble
+both flush at 4 MiB and RocksDB's own default is 64, so left alone RocksDB
+buffered this whole workload and flushed nothing during the load while the
+other two wrote 30 MiB of tables. `--no-wal` is another: it takes
+`disable_wal` on roble, `DisableWAL` on Pebble and `disable_WAL` on RocksDB's
+write options, and setting only the sync flag on the last of those left it
+writing a journal the others were not — worth 5 MiB of directory and half its
+load rate. `--cache-mb` is the third, divided per store for encina, whose
+cache is its own.
+
+**`--value-chunk` dials how compressible a value is**, since the default
+values are random and give Snappy nothing to find — so without it every
+engine's compression setting is inert and the size column says nothing. A
+value is one random chunk repeated to fill it: 128 is incompressible, 8 is a
+sixteenfold repeat. roble's size does not move across that range, because its
+writer only ever writes `NoCompression`; Pebble's and RocksDB's fall by three
+to four and a half times.
+
+**Values are pseudo-random by default.** A value made of one repeated byte compresses to
 nothing, and with one the size column reported Snappy saving 2.5× — a
 measurement of the generator, not of Oxia's data. Real Oxia values are
 serialized records, which sit somewhere between the two, so the size column

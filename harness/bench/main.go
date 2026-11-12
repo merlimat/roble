@@ -52,6 +52,9 @@ Creates the store at DIR/pebble, which must not exist yet.
   --value-bytes N bytes in each value (128)
   --reads N       lookups in each get and floor phase (100000)
   --cache-mb N    block cache for every shard together, in MiB (64)
+  --value-chunk N bytes of random data each value is built from, repeated to
+                  fill it (default: the whole value, so incompressible)
+  --memtable-mb N bytes a memtable holds before a flush, in MiB (4)
   --seed N        seed for the keys and the lookup order (1)
   --layout        print every table of every level, with its size and key
                   range, after the store has settled
@@ -68,8 +71,10 @@ type config struct {
 	batches    int
 	records    int
 	valueBytes int
+	valueChunk int
 	reads      int
 	cacheMB    int64
+	memtableMB int64
 	seed       uint64
 	wal        bool
 	layout     bool
@@ -200,6 +205,10 @@ func options(cfg config, cache *pebble.Cache) *pebble.Options {
 		FormatMajorVersion: pebble.FormatVirtualSSTables,
 		Levels:             levels,
 		DisableWAL:         !cfg.wal,
+		// Pebble's own default is this already; set explicitly so that all
+		// three engines flush at the same point and the load phase compares
+		// the same amount of work.
+		MemTableSize: uint64(cfg.memtableMB) * 1024 * 1024,
 	}
 }
 
@@ -618,16 +627,32 @@ func levelShape(shards []*pebble.DB) string {
 // the generator rather than what Snappy does to Oxia's data.
 func valueFor(cfg config, s, i int) []byte {
 	r := newRng(cfg.seed ^ (uint64(s) << 40) ^ uint64(i))
-	value := make([]byte, 0, cfg.valueBytes+8)
-	for len(value) < cfg.valueBytes {
+	// --value-chunk is the dial between incompressible and compressible: one
+	// random chunk repeated to fill the value, so a chunk the size of the
+	// value gives Snappy nothing and a smaller one gives it an exact repeat.
+	chunk := cfg.valueChunk
+	if chunk <= 0 || chunk > cfg.valueBytes {
+		chunk = cfg.valueBytes
+	}
+	pattern := make([]byte, 0, chunk+8)
+	for len(pattern) < chunk {
 		var word [8]byte
 		n := r.next()
 		for b := 0; b < 8; b++ {
 			word[b] = byte(n >> (8 * b))
 		}
-		value = append(value, word[:]...)
+		pattern = append(pattern, word[:]...)
 	}
-	return value[:cfg.valueBytes]
+	pattern = pattern[:chunk]
+	value := make([]byte, 0, cfg.valueBytes)
+	for len(value) < cfg.valueBytes {
+		take := chunk
+		if left := cfg.valueBytes - len(value); take > left {
+			take = left
+		}
+		value = append(value, pattern[:take]...)
+	}
+	return value
 }
 
 // ------------------------------------------------------------------ the rest
@@ -696,6 +721,7 @@ func parse() config {
 		valueBytes: 128,
 		reads:      100000,
 		cacheMB:    64,
+		memtableMB: 4,
 		seed:       1,
 		wal:        true,
 	}
@@ -721,10 +747,14 @@ func parse() config {
 			cfg.records = int(number(value()))
 		case "--value-bytes":
 			cfg.valueBytes = int(number(value()))
+		case "--value-chunk":
+			cfg.valueChunk = int(number(value()))
 		case "--reads":
 			cfg.reads = int(number(value()))
 		case "--cache-mb":
 			cfg.cacheMB = int64(number(value()))
+		case "--memtable-mb":
+			cfg.memtableMB = int64(number(value()))
 		case "--seed":
 			cfg.seed = number(value())
 		case "--phases":

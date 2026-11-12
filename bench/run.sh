@@ -43,6 +43,9 @@
 # looking at what a run actually wrote:
 #
 #   KEEP=1 BENCH_DIR=/tmp/bench ./run.sh --phases load,settle
+#
+# --cache-mb is passed through, so a single engine can be swept across cache
+# sizes directly; run.sh runs the reads at two of them (see below).
 #   cargo run -p roble-cli -- manifest dump /tmp/bench/all-roble/roble/shard-0000
 #
 # Everything else is passed straight through, so
@@ -168,6 +171,26 @@ table journal-on "${without_no_wal[@]}" --phases load
 echo
 echo "-- journal off: a flush is the only durability point, as Oxia runs it --"
 table journal-off "${without_no_wal[@]}" --phases load --no-wal
+
+# The same reads with the data inside the cache and far outside it, which is
+# how encina's own benchmark frames it. The sizes are picked from the data:
+# the store is about 8.4 MiB a shard at the defaults, so 64 MiB holds every
+# shard and 4 MiB holds an eighth of one.
+#
+# What this does and does not reach: roble, Pebble and RocksDB all read
+# through the operating system's page cache (§8 — direct I/O is the goal and
+# not the state), so the small-cache rows measure the block-cache *miss* path
+# — finding, parsing and copying a block again — and not a trip to a disk. A
+# genuinely disk-bound comparison needs a working set larger than RAM, which
+# is a different run and a much longer one.
+echo
+echo "=== the reads with the data in cache, and with it out ==="
+echo
+echo "-- 64 MiB cache: every shard fits --"
+table cache-in "${args[@]}" --phases load,settle,scan-rev,scan,get,floor,get-cold --cache-mb 64
+echo
+echo "-- 4 MiB cache: an eighth of one shard fits --"
+table cache-out "${args[@]}" --phases load,settle,scan-rev,scan,get,floor,get-cold --cache-mb 4
 
 echo
 echo "=== the layout each engine settled into ==="
