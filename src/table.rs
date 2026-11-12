@@ -360,6 +360,40 @@ impl<D: Disk> OpenTable<D> {
         Ok(Entry { key, value })
     }
 
+    /// The value alone, into a buffer the caller keeps, with no key built.
+    ///
+    /// Two callers want an entry's value and already have its key: a snapshot
+    /// lookup decoded it to get here, and a compaction is writing the encoded
+    /// key it already holds. Both were building a second copy of it, on every
+    /// record, to drop it unread.
+    ///
+    /// The scan's merge is a third such caller and is deliberately **not**
+    /// converted. Removing its key copy measured worth nothing on the scan
+    /// itself (1.0032 over twenty paired runs) and cost `floor` 2.3% (0.977,
+    /// ahead in only 4 of 20) — `floor` positions a fresh merge per lookup,
+    /// so it feels changes to that loop that a long scan amortises away. The
+    /// allocation is real and wasted there; taking it out is not free, which
+    /// is not what either of us would have guessed.
+    async fn value_into(
+        &self,
+        block: &Block<'_>,
+        cursor: &roble_format::block::restart::DataCursor,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let decoded = cursor.entry(block)?;
+        check_kind(decoded.key)?;
+        out.clear();
+        match decoded.value {
+            Value::InPlace(b) => {
+                out.reserve(b.len());
+                out.extend_from_slice(b);
+            }
+            Value::ValueHandle(h) => self.resolve_into(h, out).await?,
+            Value::BlobHandle(_) => return Err(blob_unsupported()),
+        }
+        Ok(())
+    }
+
     /// The same, into buffers the caller keeps.
     ///
     /// Both are cleared first, so a buffer handed back from a previous entry
@@ -515,6 +549,13 @@ impl<D: Disk> TableIter<D> {
         let bytes = self.bytes.as_ref().expect("positioned").clone();
         let block = Block::new(&bytes)?;
         self.table.entry(&block, &self.cursor).await
+    }
+
+    /// The value the cursor is on, into a buffer the caller keeps.
+    pub async fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        let bytes = self.bytes.as_ref().expect("positioned").clone();
+        let block = Block::new(&bytes)?;
+        self.table.value_into(&block, &self.cursor, out).await
     }
 
     /// Loads block `at`, leaving the cursor unpositioned within it.

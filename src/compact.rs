@@ -399,6 +399,11 @@ async fn merge<D: Disk>(
 
     let mut outputs = Vec::new();
     let mut open = Output::new(None)?;
+    // Reused for every entry that survives the merge. A compaction reads
+    // millions of them and already holds the encoded key it is writing, so
+    // taking an owned entry per survivor meant allocating that key again,
+    // and the value again, for each one.
+    let mut value = Vec::new();
     let mut seen: Option<Vec<u8>> = None;
 
     while let Some(w) = least(&iters)? {
@@ -422,8 +427,8 @@ async fn merge<D: Disk>(
                 let finished = std::mem::replace(&mut open, Output::new(Some(user.clone()))?);
                 outputs.push(finished.finish(&tombstones, Some(&user))?);
             }
-            let entry = iters[w].entry().await?;
-            open.add(k, &encoded, &entry.value)?;
+            iters[w].value_into(&mut value).await?;
+            open.add(k, &encoded, &value)?;
         }
         iters[w].next().await?;
         pacer.did(1).await;
