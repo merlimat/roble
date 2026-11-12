@@ -1542,11 +1542,23 @@ Stated rather than quietly decided:
   each engine keeps the gap at 4.3x (roble 3.05 M/s, Pebble 13.2 M/s). So it
   is not the level shape and not the table count: **the cost is per step**.
 
-  Where to look next is the step itself rather than the layout: roble's is an
-  `async fn` polled through the merge for every record, where Pebble's `Next`
-  is a direct call. That is a guess at a cause and the measurement does not
-  confirm it; what the measurement does say is that the layout is not to
-  blame, which is the opposite of what this entry said a day earlier.
+  The step itself was where to look, and two of its costs are now gone. A
+  step copied the user key out of **every** source before it could touch that
+  source mutably — one allocation per source per step, so a store settled
+  into fourteen tables made fourteen of them for every record returned — and
+  it allocated the key it was about to hand out. Scoping the first borrow to
+  the trailer's scalars costs nothing, and the second reuses the buffer the
+  previous key vacated. Over 300,000 records: forward 1.94 to 3.11 M/s,
+  reverse 1.61 to 2.27 M/s, CPU down a third. Against Pebble the gap goes
+  from 6.3x to 3.9x forward.
+
+  What is left is structural rather than wasteful. **The merge is O(sources)
+  per step**: `least` compares every source's key to find the smallest, and
+  `take_newest_visible` then walks every source again to step it past the
+  key, so fourteen tables mean about forty trailer decodes and comparisons
+  per record where a heap would mean a handful. That is the next thing to fix
+  and it is a redesign of the merge, not a tidy-up — worth doing with the
+  benchmark already in place to judge it.
 
 - **What Pebble compatibility costs** has a number now, which §2 claimed was
   worth paying without ever naming it. Against encina on the same workload,

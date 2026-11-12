@@ -38,6 +38,13 @@
 #   ENGINES="roble pebble" ./run.sh          # nothing to install
 #   ENGINES="roble encina" ./run.sh          # adds a git fetch
 #
+# KEEP=1 leaves the stores on disk instead of removing them, and BENCH_DIR
+# puts them somewhere chosen rather than in a temporary directory — for
+# looking at what a run actually wrote:
+#
+#   KEEP=1 BENCH_DIR=/tmp/bench ./run.sh --phases load,settle
+#   cargo run -p roble-cli -- manifest dump /tmp/bench/all-roble/roble/shard-0000
+#
 # Everything else is passed straight through, so
 #   ./run.sh --shards 8 --batches 2000 --records 500
 # works as it does on any engine alone.
@@ -46,8 +53,20 @@ cd "$(dirname "$0")"
 
 ENGINES="${ENGINES:-roble pebble rocksdb encina}"
 
-out="$(mktemp -d)"
-trap 'rm -rf "$out"' EXIT
+# Where every store of every pass is written. Printed rather than hidden,
+# because the thing a run leaves behind is often what you wanted to look at:
+# `KEEP=1` leaves it for `ls`, `roble sst dump` and `roble manifest dump`.
+#
+# One directory per pass per engine under it, named `<pass>-<engine>/<engine>`,
+# since each engine makes its store under the `--dir` it is given.
+out="${BENCH_DIR:-$(mktemp -d)}"
+mkdir -p "$out"
+if [ -n "${KEEP:-}" ]; then
+  trap 'echo; echo "the stores are under $out"' EXIT
+else
+  trap 'rm -rf "$out"' EXIT
+fi
+echo "writing the stores under $out${KEEP:+ (kept)}"
 
 args=("$@")
 
