@@ -145,6 +145,34 @@ async fn an_iterator_walks_a_whole_table_both_ways() {
     }
 }
 
+/// A reverse walk with nothing in the cache, which is where a backward
+/// read-ahead window is built.
+///
+/// `an_iterator_walks_a_whole_table_both_ways` walks forward before it turns
+/// round, so by then every block is cached and a window is never needed. A
+/// window built for a walk going backwards holds the block asked for at its
+/// *end* rather than its start, and handing back the wrong one of them is
+/// invisible to every other test here — it reads correctly forwards.
+#[compio::test]
+async fn a_reverse_walk_on_a_cold_cache_reads_its_window_the_right_way_round() {
+    for name in FIXTURES {
+        let bytes = std::fs::read(sst_path(name)).expect("read fixture");
+        let want = expected(&bytes);
+        let (_env, table) = open(name).await;
+
+        let mut backward = Vec::new();
+        let mut it = table.iter();
+        it.last().await.expect("last");
+        while it.is_valid() {
+            let e = it.entry().await.expect("entry");
+            backward.push((e.key, e.value));
+            it.prev().await.expect("prev");
+        }
+        backward.reverse();
+        assert_eq!(backward, want, "{name}: reverse, cache cold");
+    }
+}
+
 #[compio::test]
 async fn every_entry_can_be_sought_and_stepped_away_from() {
     // Exhaustive rather than sampled: for each entry, seek to it, step
