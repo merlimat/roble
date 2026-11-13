@@ -36,6 +36,7 @@ pub struct Report {
     started: Instant,
     cpu_at_start: Duration,
     latencies: Vec<Duration>,
+    only_max: bool,
 }
 
 impl Report {
@@ -63,7 +64,27 @@ impl Report {
             started: Instant::now(),
             cpu_at_start: crate::cpu_time(),
             latencies: Vec::new(),
+            only_max: false,
         }
+    }
+
+    /// Reports `max` alone, for a phase whose p50 and p99 describe the
+    /// caller rather than the engine.
+    ///
+    /// `load`'s latency is **per commit** where its count and its rate are
+    /// per record, so at `--records 10000` a p50 of six milliseconds is six
+    /// milliseconds of batch size and nothing else — halve the batch and it
+    /// halves. Two columns that move with a flag the reader chose are worse
+    /// than no columns, because they look like measurements.
+    ///
+    /// `max` stays, and is the reason this is not simply dropped: a flush or
+    /// a compaction landing inside a write shows up there and nowhere else.
+    /// It is what made roble's write stall visible at all — 129 ms at a
+    /// 4 MiB memtable, 738 ms at 64 MiB — before any phase wrote while it
+    /// read.
+    pub fn max_only(mut self) -> Self {
+        self.only_max = true;
+        self
     }
 
     /// Whether step `n` is one of the sampled ones.
@@ -98,6 +119,16 @@ impl Report {
             let i = ((self.latencies.len() - 1) as f64 * q).round() as usize;
             self.latencies[i].as_micros()
         };
+        // A dash rather than a number the reader would take for one, and
+        // the same dash the aligned output and the TSV both carry so that
+        // `pivot.py` sees one thing.
+        let quantile = |q: f64| -> String {
+            if self.only_max && q < 1.0 {
+                "—".to_string()
+            } else {
+                us(q).to_string()
+            }
+        };
         let rate = self.count as f64 / wall.as_secs_f64().max(f64::MIN_POSITIVE);
         let size_mib = size_bytes as f64 / (1024.0 * 1024.0);
         if self.out.tsv {
@@ -107,9 +138,9 @@ impl Report {
                 self.name,
                 self.count,
                 rate,
-                us(0.50),
-                us(0.99),
-                us(1.0),
+                quantile(0.50),
+                quantile(0.99),
+                quantile(1.0),
                 cpu.as_secs_f64(),
                 size_mib,
             );
@@ -120,9 +151,9 @@ impl Report {
             self.name,
             self.count,
             rate,
-            us(0.50),
-            us(0.99),
-            us(1.0),
+            quantile(0.50),
+            quantile(0.99),
+            quantile(1.0),
             cpu.as_secs_f64(),
             size_mib,
         );
