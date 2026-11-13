@@ -99,6 +99,14 @@ run_engine() {
 }
 
 # Collects every engine's `--tsv` lines and pivots them into one table.
+#
+# The stores go as soon as the table is printed, because otherwise this
+# script's disk footprint is every pass at once rather than one pass: nine
+# tables times three engines is twenty-seven stores held to the exit trap for
+# no reason, and at the dataset size the README asks for -- upwards of half a
+# million records a shard, so the load row is not measuring a skiplist -- that
+# is tens of gigabytes and the run dies partway with ENOSPC. `KEEP=1` still
+# keeps everything; it is the flag that says the stores are the point.
 table() {
   local tag="$1"
   shift
@@ -111,6 +119,11 @@ table() {
       | awk -F'\t' 'NF >= 3' >> "$lines"
   done
   python3 pivot.py --metrics rate,p50,cpu,size < "$lines"
+  if [ -z "${KEEP:-}" ]; then
+    for engine in $ENGINES; do
+      rm -rf "$out/$tag-$engine"
+    done
+  fi
 }
 
 echo "=== every engine, every phase ==="
