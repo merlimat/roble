@@ -52,13 +52,20 @@ use std::cell::RefCell;
 use crate::memtable::{Memtable, MemtableCursor};
 use crate::table::{OpenTable, TableIter, covered_by_tombstone, is_deletion};
 
-/// One source of entries in a merge: a run of tables, or the memtable.
+/// One source of entries in a merge: a table, a run of them, or the memtable.
 ///
-/// The two differ in more than where their bytes are. A table's contents are
-/// fixed, so everything in it is older than any scan; the memtable is still
-/// being written to, so a scan has to ignore what arrived after it began.
-/// That is what `snapshot` is for, and it is the only place it is needed.
+/// A table and the memtable differ in more than where their bytes are. A
+/// table's contents are fixed, so everything in it is older than any scan;
+/// the memtable is still being written to, so a scan has to ignore what
+/// arrived after it began. That is what `snapshot` is for, and it is the only
+/// place it is needed.
+///
+/// A table is its own source when nothing can be read with it: L0's, whose
+/// ranges overlap, and the only table of a level. That is not merely the
+/// degenerate run, it is the cheaper one — a run of one carries a bound it
+/// never consults and a `Vec` to hold a single table in.
 enum Source<D: Disk> {
+    Table(TableIter<D>),
     Run(Run<D>),
     Mem(MemSource),
 }
@@ -73,7 +80,15 @@ enum Source<D: Disk> {
 pub(crate) struct Placed<D: Disk> {
     pub level: u32,
     pub table: Rc<OpenTable<D>>,
-    pub smallest: Vec<u8>,
+    /// Its bound, or `None` when no run will consult it: a table of L0,
+    /// which are never read as one, or the only table of its level.
+    ///
+    /// The bound is there to choose between the tables of a level, and a
+    /// caller looking at the level knows there is nothing to choose before it
+    /// has copied a key — which is the point, since copying one is what this
+    /// avoids. Passing `Some` anyway is not wrong, only a run of one and the
+    /// key it took to build.
+    pub smallest: Option<Vec<u8>>,
 }
 
 /// A level's tables, read in order as one source.
@@ -255,6 +270,7 @@ impl MemSource {
 impl<D: Disk> Source<D> {
     fn is_valid(&self) -> bool {
         match self {
+            Source::Table(it) => it.is_valid(),
             Source::Run(run) => run.is_valid(),
             Source::Mem(m) => m.valid,
         }
@@ -262,6 +278,7 @@ impl<D: Disk> Source<D> {
 
     fn key(&self) -> &[u8] {
         match self {
+            Source::Table(it) => it.key(),
             Source::Run(run) => run.key(),
             Source::Mem(m) => &m.key,
         }
@@ -269,6 +286,7 @@ impl<D: Disk> Source<D> {
 
     async fn entry(&self) -> Result<crate::table::Entry> {
         match self {
+            Source::Table(it) => it.entry().await,
             Source::Run(run) => run.entry().await,
             Source::Mem(m) => {
                 let table = m.table.borrow();
@@ -282,6 +300,7 @@ impl<D: Disk> Source<D> {
 
     async fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
         match self {
+            Source::Table(it) => it.seek_ge(target).await,
             Source::Run(run) => run.seek_ge(target).await,
             Source::Mem(m) => {
                 m.cursor.seek_ge(&m.table.borrow(), target)?;
@@ -293,6 +312,7 @@ impl<D: Disk> Source<D> {
 
     async fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         match self {
+            Source::Table(it) => it.seek_lt(target).await,
             Source::Run(run) => run.seek_lt(target).await,
             Source::Mem(m) => {
                 m.cursor.seek_lt(&m.table.borrow(), target)?;
@@ -304,6 +324,7 @@ impl<D: Disk> Source<D> {
 
     async fn last(&mut self) -> Result<()> {
         match self {
+            Source::Table(it) => it.last().await,
             Source::Run(run) => run.last().await,
             Source::Mem(m) => {
                 m.cursor.last(&m.table.borrow());
@@ -315,6 +336,7 @@ impl<D: Disk> Source<D> {
 
     async fn next(&mut self) -> Result<()> {
         match self {
+            Source::Table(it) => it.next().await,
             Source::Run(run) => run.next().await,
             Source::Mem(m) => {
                 m.cursor.next(&m.table.borrow());
@@ -326,6 +348,7 @@ impl<D: Disk> Source<D> {
 
     async fn prev(&mut self) -> Result<()> {
         match self {
+            Source::Table(it) => it.prev().await,
             Source::Run(run) => run.prev().await,
             Source::Mem(m) => {
                 m.cursor.prev(&m.table.borrow());
@@ -422,15 +445,26 @@ impl<D: Disk> Scan<D> {
     ) -> Self {
         placed.sort_by(|a, b| (a.level, &a.smallest).cmp(&(b.level, &b.smallest)));
         let tables: Vec<Rc<OpenTable<D>>> = placed.iter().map(|p| Rc::clone(&p.table)).collect();
-        let mut iters: Vec<Source<D>> = Vec::new();
+        let mut iters: Vec<Source<D>> = Vec::with_capacity(placed.len() + memtables.len());
         // The level the run being built is still taking tables for, and
         // `None` at L0, where the tables overlap and so each has to stay a
         // source of its own.
+        //
+        // Both callers already withhold a bound from L0's tables, so the test
+        // for it here fires for nothing and mutating it away changes no
+        // answer. It stays because this is the only place that decides what
+        // may share a source, and that is where the rule belongs — stated
+        // rather than tested (§12), as in `Snapshot::lookup`.
         let mut joining: Option<u32> = None;
         for p in placed {
+            let Some(smallest) = p.smallest else {
+                iters.push(Source::Table(p.table.iter()));
+                joining = None;
+                continue;
+            };
             let table = RunTable {
                 iter: p.table.iter(),
-                smallest: p.smallest,
+                smallest,
             };
             match iters.last_mut() {
                 Some(Source::Run(run)) if joining == Some(p.level) => run.tables.push(table),
@@ -829,13 +863,21 @@ impl<F: crate::env::Fs> crate::Opened<F> {
         // Each with where the version puts it, which is what groups them
         // into runs ([`Scan::new`]) and is only knowable while it is
         // borrowed.
-        let wanted: Vec<(u32, u64, Vec<u8>)> = {
+        let wanted: Vec<(u32, u64, Option<Vec<u8>>)> = {
             let versions = self.versions();
             let mut wanted = Vec::new();
             for (level, metas) in versions.version.levels() {
+                // A bound is only there to choose between the tables of a
+                // level. L0's are never read as one, and a level holding a
+                // single table has nothing to choose between, so neither
+                // copies a key no run would consult.
+                let several = level > 0 && metas.len() > 1;
                 for meta in metas {
                     if meta.overlaps_range(lower, upper)? {
-                        wanted.push((level, meta.file_num, meta.smallest_user_key()?.to_vec()));
+                        let smallest = several
+                            .then(|| meta.smallest_user_key().map(<[u8]>::to_vec))
+                            .transpose()?;
+                        wanted.push((level, meta.file_num, smallest));
                     }
                 }
             }

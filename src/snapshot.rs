@@ -115,13 +115,24 @@ impl<D: Disk> Snapshot<D> {
         // so no test pins it and none should, as with the bloom filter in
         // `crate::read`. It is here for the seek per table per step it saves.
         let mut tables = Vec::new();
-        for (level, meta, table) in &self.tables {
-            if meta.overlaps_range(lower, upper)? {
-                tables.push(crate::scan::Placed {
-                    level: *level,
-                    table: Rc::clone(table),
-                    smallest: meta.smallest_user_key()?.to_vec(),
-                });
+        // By level, because that is what decides whether a bound is needed at
+        // all, and `self.tables` is in the version's own order — every table
+        // of a level together, L0 first — so a chunk is a level.
+        for of_level in self.tables.chunk_by(|a, b| a.0 == b.0) {
+            // `Opened::scan_with`'s rule: L0's tables are never read as one,
+            // and a level holding a single table has nothing to choose
+            // between, so neither copies a key no run would consult.
+            let several = of_level[0].0 > 0 && of_level.len() > 1;
+            for (level, meta, table) in of_level {
+                if meta.overlaps_range(lower, upper)? {
+                    tables.push(crate::scan::Placed {
+                        level: *level,
+                        table: Rc::clone(table),
+                        smallest: several
+                            .then(|| meta.smallest_user_key().map(<[u8]>::to_vec))
+                            .transpose()?,
+                    });
+                }
             }
         }
         self.metrics.scans.add(1);

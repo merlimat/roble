@@ -849,3 +849,102 @@ async fn a_compaction_refuses_what_it_cannot_do() {
         "there is nowhere below the last level"
     );
 }
+
+/// Two levels of several tables each, their ranges interleaved, read every
+/// way.
+///
+/// The shape a deep store settles into, and the one nothing else here builds:
+/// L1 and L2 both holding several tables whose keys alternate, so a read has
+/// to merge two levels that each need a seek of their own. A scan reads a
+/// level as one source (`crate::scan`), which is sound because the tables of
+/// a level cannot reach the same key — and a source that reached past its own
+/// level would be reading tables in no key order at all. Nothing catches that
+/// until two levels hold several tables at once, which until this test
+/// nothing did.
+#[compio::test]
+async fn two_levels_of_several_tables_each_answer_what_a_btreemap_would() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .target_file_size(4096)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    // The even keys pushed down to L2 and the odd ones left in L1, so the two
+    // levels interleave rather than sitting one after the other: a read that
+    // mistook them for one run would be answering out of order at once.
+    let value = vec![b'v'; 200];
+    let mut model = contents(&db).await;
+    for parity in [0u64, 1] {
+        let mut batch = Batch::new();
+        for i in (parity..400).step_by(2) {
+            let key = format!("p{i:04}");
+            batch.put(key.as_bytes(), &value).expect("put");
+            model.insert(key.into_bytes(), value.clone());
+        }
+        let table = flush_batch(&db, &mut batch).await;
+        let into_l1 = db.compact(0, &[table]).await.expect("compact into L1");
+        if parity == 0 {
+            db.compact(1, &into_l1).await.expect("compact into L2");
+        }
+    }
+    for level in [1, 2] {
+        let held = db.versions().version.level(level).len();
+        assert!(
+            held > 1,
+            "L{level} has to hold several tables for this to be testing anything, holds {held}"
+        );
+    }
+
+    assert_eq!(contents(&db).await, model, "a forward scan lost its way");
+
+    let mut backward = Model::new();
+    let mut scan = db.scan().await.expect("scan");
+    scan.last().await.expect("last");
+    while scan.is_valid() {
+        backward.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.prev().await.expect("prev");
+    }
+    assert_eq!(backward, model, "a reverse scan lost its way");
+
+    // Every comparison, at the ends of the range and at keys either side of a
+    // table boundary — which is wherever one level's key sits next to the
+    // other's, since they alternate.
+    for probe in [
+        "o", "p0000", "p0001", "p0002", "p0199", "p0200", "p0399", "q",
+    ] {
+        for how in [
+            Comparison::Equal,
+            Comparison::Floor,
+            Comparison::Ceiling,
+            Comparison::Lower,
+            Comparison::Higher,
+        ] {
+            let p = probe.as_bytes().to_vec();
+            let pair = |(k, v): (&Vec<u8>, &Vec<u8>)| (k.clone(), v.clone());
+            let want = match how {
+                Comparison::Equal => model.get(&p).map(|v| (p.clone(), v.clone())),
+                Comparison::Floor => model.range(..=p.clone()).next_back().map(pair),
+                Comparison::Ceiling => model.range(p.clone()..).next().map(pair),
+                Comparison::Lower => model.range(..p.clone()).next_back().map(pair),
+                Comparison::Higher => model
+                    .range((
+                        std::ops::Bound::Excluded(p.clone()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .map(pair),
+            };
+            let found = db
+                .get(&p, how)
+                .await
+                .expect("get")
+                .map(|f| (f.key, f.value));
+            assert_eq!(found, want, "{how:?} of {probe}");
+        }
+    }
+}
