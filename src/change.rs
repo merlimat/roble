@@ -115,6 +115,19 @@ impl Changes {
         self.underway.get()
     }
 
+    /// Registers `cx` to be woken when the change underway lets the permit
+    /// go.
+    ///
+    /// For a waiter that does not want the permit at all, only the state
+    /// whoever holds it leaves behind: a task asking whether there is a
+    /// memtable to write out would otherwise have to take the permit to
+    /// find out, and then the answer would be yes because it had just
+    /// stopped the flush that was making it no
+    /// (`crate::open::Opened::flush_wanted`).
+    pub(crate) fn park(&self, cx: &std::task::Context<'_>) {
+        self.waiting.borrow_mut().push(cx.waker().clone());
+    }
+
     /// Waits for the permit, and holds it until the [`Change`] is dropped.
     pub(crate) async fn begin(&self) -> Change<'_> {
         poll_fn(|cx| {
@@ -130,14 +143,20 @@ impl Changes {
     }
 }
 
-/// Who is waiting to be told there is compaction to do (§9).
+/// Who is waiting to be told there is work to do (§9).
+///
+/// One of these per kind of work a store hands over: a memtable to write out
+/// and a compaction to run, which are two because they have to be able to
+/// happen at once — a flush that queued behind a merge would be a write
+/// queueing behind it one memtable later.
 ///
 /// The store does not run background work itself: `Env::spawn` takes a
 /// `'static` future and a store's methods take `&self`, so a task that
 /// compacted would have to hold the store — and then dropping the store
 /// would not release the directory until that task finished, which `Drop`
 /// cannot wait for. So the task is the caller's, built around
-/// `Opened::compaction_wanted`, and this is how a flush tells it.
+/// `Opened::flush_wanted` and `Opened::compaction_wanted`, and this is how a
+/// write and a flush tell it.
 #[derive(Default)]
 pub(crate) struct Waiters {
     waiting: RefCell<Vec<Waker>>,

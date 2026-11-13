@@ -239,6 +239,265 @@ async fn two_writes_at_once_make_room_once_between_them() {
     }
 }
 
+/// Whether a task waiting to be told there is a memtable to write out would
+/// be told now (§5).
+fn flush_wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
+    let mut cx = Context::from_waker(Waker::noop());
+    pin!(db.flush_wanted()).as_mut().poll(&mut cx).is_ready()
+}
+
+/// Writes until the store is at `budget`, and says how many keys that took —
+/// without letting the line below the budget write anything out.
+///
+/// The same as [`fill_to`] for a store nobody is waiting on, which is what
+/// every caller of it here is.
+async fn fill_past_the_line<F: Fs>(db: &roble::Opened<F>, wal: bool) -> usize {
+    assert!(
+        !flush_wanted_now(db),
+        "an empty store should have nothing to write out"
+    );
+    let mut i = 0;
+    while (db.unflushed_bytes() as u64) < db.flush_line() {
+        put(db, i, wal).await.expect("write");
+        i += 1;
+        assert!(
+            i <= 4 * ENTRIES as usize,
+            "{i} writes have not reached the line"
+        );
+    }
+    i
+}
+
+#[compio::test]
+async fn a_write_says_there_is_a_memtable_to_write_out_before_the_budget() {
+    // The line, which is what takes a flush off the write that would
+    // otherwise have had to make the room (§5). An eighth of the budget
+    // before it fills, a write says so — and says it without writing
+    // anything out itself, because the whole point is that somebody else
+    // does that while the writes carry on into what is left.
+    for wal in [true, false] {
+        let budget = ENTRIES * entry_cost();
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open_with(&env, &dir, opened(wal, budget))
+            .await
+            .expect("open");
+
+        let filled = fill_past_the_line(&db, wal).await;
+        let tables = db.versions().version.table_count();
+        let held = db.unflushed_bytes() as u64;
+
+        assert!(
+            flush_wanted_now(&db),
+            "wal={wal}: {held} bytes is at the line of {}, so a task waiting to be told \
+             there is a memtable to write out should have been",
+            db.flush_line()
+        );
+        assert!(
+            held < budget,
+            "wal={wal}: and should have been told at {held} bytes, before the budget of \
+             {budget} a write stalls at"
+        );
+        assert_eq!(
+            db.versions().version.table_count(),
+            tables,
+            "wal={wal}: while the writes that said so wrote no table themselves"
+        );
+        assert!(
+            filled > 0,
+            "wal={wal}: the line should take more than no writes to reach"
+        );
+    }
+}
+
+#[compio::test]
+async fn a_write_hands_the_flush_to_whoever_is_waiting_for_one() {
+    // The handoff itself. A task parked on `flush_wanted` writes the
+    // memtable out while the write that told it about it carries on, so the
+    // store never reaches the budget and no write ever waits.
+    //
+    // Driven by hand rather than spawned, because what is in question is
+    // which of the two wrote the table and not whether a runtime will poll
+    // a task.
+    for wal in [true, false] {
+        let budget = ENTRIES * entry_cost();
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open_with(&env, &dir, opened(wal, budget))
+            .await
+            .expect("open");
+        let mut model = contents(&db).await;
+        let filled = fill_past_the_line(&db, wal).await;
+        for j in 0..filled {
+            model.insert(key_at(j), VALUE.to_vec());
+        }
+        let tables = db.versions().version.table_count();
+        assert!(
+            (db.unflushed_bytes() as u64) < budget,
+            "wal={wal}: the line has to come before the budget, or the write below would \
+             be making its own room rather than being handed room"
+        );
+
+        let worker = async {
+            db.flush_wanted().await;
+            db.flush().await
+        };
+        let (flushed, written) = interleave(worker, put(&db, filled, wal));
+        written.unwrap_or_else(|e| panic!("wal={wal}: the write: {e}"));
+        flushed
+            .unwrap_or_else(|e| panic!("wal={wal}: the waiting task's flush: {e}"))
+            .unwrap_or_else(|| panic!("wal={wal}: the task should have written a table"));
+        model.insert(key_at(filled), VALUE.to_vec());
+
+        assert_eq!(
+            db.versions().version.table_count(),
+            tables + 1,
+            "wal={wal}: one table between them, and it was the task's"
+        );
+        assert!(
+            (db.unflushed_bytes() as u64) < budget,
+            "wal={wal}: and the store never reached the budget of {budget}"
+        );
+        assert_eq!(
+            contents(&db).await,
+            model,
+            "wal={wal}: and no answer changed"
+        );
+    }
+}
+
+#[compio::test]
+async fn a_store_with_nobody_waiting_keeps_the_whole_budget_for_one_memtable() {
+    // The line is room kept back for a flush running *beside* the writes,
+    // so a store with nowhere to put that flush should not keep it back at
+    // all: it fills the budget as it always did, and the write that finds it
+    // full writes the memtable out. Keeping an eighth back here would be a
+    // store writing tables an eighth smaller for nothing, which costs it
+    // compactions it did not need (`crate::memtable::FLUSH_RESERVE`).
+    for wal in [true, false] {
+        let budget = ENTRIES * entry_cost();
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open_with(&env, &dir, opened(wal, budget))
+            .await
+            .expect("open");
+        let tables = db.versions().version.table_count();
+
+        // Every write up to the budget, with nobody parked on the line.
+        let filled = fill_to(&db, budget, wal).await;
+        assert_eq!(
+            db.versions().version.table_count(),
+            tables,
+            "wal={wal}: nothing should have been written out below the budget"
+        );
+        assert_eq!(
+            db.unflushed_bytes() as u64 / entry_cost(),
+            ENTRIES,
+            "wal={wal}: and the memtable should hold the whole budget, not an eighth less"
+        );
+
+        put(&db, filled, wal)
+            .await
+            .expect("the write that made room");
+        assert_eq!(
+            db.versions().version.table_count(),
+            tables + 1,
+            "wal={wal}: and the write that found it full should have written it out"
+        );
+    }
+}
+
+#[compio::test]
+async fn the_budget_stops_a_store_whose_flushes_nobody_takes() {
+    // The backstop, which is the half of this that is not negotiable (§9).
+    // A task is parked on the line and then never polled again — a worker
+    // that has stopped, or one whose runtime is busy elsewhere — so every
+    // write after the line is a write nobody is making room for. The store
+    // has to refuse to grow past its budget rather than pile memtables up,
+    // which means the write that finds it full writes one out itself, as it
+    // did before there was anywhere else for a flush to go.
+    for wal in [true, false] {
+        let budget = ENTRIES * entry_cost();
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open_with(&env, &dir, opened(wal, budget))
+            .await
+            .expect("open");
+        let mut model = contents(&db).await;
+
+        // Parked once and abandoned: the waker is a no-op, so nothing that
+        // follows can wake it and nothing polls it again.
+        let mut parked = pin!(db.flush_wanted());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            parked.as_mut().poll(&mut cx).is_pending(),
+            "wal={wal}: an empty store has no memtable to write out"
+        );
+
+        let mut tables = db.versions().version.table_count();
+        let mut wrote = 0;
+        for i in 0..4 * ENTRIES as usize {
+            put(&db, i, wal).await.expect("write");
+            model.insert(key_at(i), VALUE.to_vec());
+            let held = db.unflushed_bytes() as u64;
+            assert!(
+                held <= budget,
+                "wal={wal}: after {} writes the store holds {held} bytes, past the budget \
+                 of {budget} — a swap nobody takes is still a swap that has to stop",
+                i + 1
+            );
+            let now = db.versions().version.table_count();
+            wrote += usize::from(now > tables);
+            tables = now;
+        }
+
+        assert!(
+            wrote >= 2,
+            "wal={wal}: the writes should have written their own memtables out, and {wrote} \
+             tables is not a store keeping itself inside a budget"
+        );
+        assert_eq!(
+            contents(&db).await,
+            model,
+            "wal={wal}: and every key answers"
+        );
+    }
+}
+
+#[compio::test]
+async fn a_flush_that_failed_is_not_asked_for_again_until_a_write() {
+    // The same rule a compaction that failed lives by (§9), for the same
+    // reason: the picker — here, the line — gives the same answer against
+    // the same state, so a task told to go again at once would spin rather
+    // than retry. A write is the only thing that changes what a flush would
+    // write, which is what makes the next one a retry and not a repeat, and
+    // it is "later" with no clock to say when (§10).
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, opened(false, budget))
+        .await
+        .expect("open");
+    let filled = fill_past_the_line(&db, false).await;
+    assert!(flush_wanted_now(&db), "the line was reached");
+
+    // The first thing the flush touches is the table it creates.
+    env.sim().fail_at(1);
+    db.flush().await.expect_err("the flush should have failed");
+    env.sim().stop_failing();
+
+    assert!(
+        (db.unflushed_bytes() as u64) >= db.flush_line(),
+        "the failed flush should have left the memtable it froze behind, so the store is \
+         still at the line and would say yes again on that alone"
+    );
+    assert!(
+        !flush_wanted_now(&db),
+        "and asking for the same flush again against the same store would be a spin"
+    );
+
+    put(&db, filled, false).await.expect("write");
+    assert!(
+        flush_wanted_now(&db),
+        "a write is what makes it a retry, and the store has taken one"
+    );
+}
+
 #[compio::test]
 async fn a_write_with_room_to_spare_never_waits_for_anybody() {
     // The other half. A store under its budget makes no room and so has

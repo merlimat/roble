@@ -170,6 +170,15 @@ impl<F: Fs> Options<F> {
     /// after a flush that failed as well, because the write that follows
     /// such a flush is the one that retries it.
     ///
+    /// **This line is the backstop.** A store with a task waiting on
+    /// [`crate::Opened::flush_wanted`] is told there is a memtable to write
+    /// out at seven eighths of it ([`crate::Opened::flush_line`]), and that
+    /// task writes it out while the writes carry on into the last eighth —
+    /// so the only writes that come down here are the ones a store whose
+    /// flushes have stopped keeping up, or one with nobody to hand them to,
+    /// has nowhere else to put. The bound above is the same either way: the
+    /// reserve is inside the budget, not beside it.
+    ///
     /// The flush is the caller's to pay for, in the write that asked for the
     /// room, and its time is in `roble.write.duration` because that is what
     /// the write cost. `u64::MAX` turns it off, which is what a caller that
@@ -221,12 +230,17 @@ impl<F: Fs> Options<F> {
         self
     }
 
-    /// How many entries a compaction merges before it hands the thread back
-    /// to whatever else is ready (§9, `crate::work`).
+    /// How many entries one of a store's long jobs gets through before it
+    /// hands the thread back to whatever else is ready (§9, `crate::work`).
     ///
-    /// Zero merges straight through, which is what a caller wants when
+    /// Two of them, and the same unit: the merge a compaction runs, and the
+    /// walk of the memtable a flush writes out. Both are work rather than
+    /// waiting, and both run beside the writes rather than inside one, which
+    /// is what makes the pacing load-bearing.
+    ///
+    /// Zero goes straight through, which is what a caller wants when
     /// nothing else shares the thread — a bulk load, a repair tool — and what
-    /// nothing else should want: a compaction that does not yield stops every
+    /// nothing else should want: a job that does not yield stops every
     /// read and write on its core until it finishes.
     pub fn compaction_unit(mut self, entries: u64) -> Self {
         self.compaction_unit = entries;

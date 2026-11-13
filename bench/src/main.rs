@@ -559,10 +559,12 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
     // against. Left out of `--tsv`, which is one line per phase by contract.
     //
     // It carries p99.9 and max as well as p50 and p99, because on this phase
-    // those are four orders apart: roble compacts on the thread that owns the
-    // store (§9), a write-triggered flush runs the compaction the picker
-    // chose, and the write that pays for it waits. p99 is 11us and the worst
-    // case is 127ms, so a column that stops at p99 reports none of it.
+    // those are orders apart and the distance between them is what the
+    // scheduling costs: roble does its flushes and merges on the thread that
+    // owns the store (§9), paced in slices, so the tail is where a slice
+    // landing on an operation shows up. It used to be four orders, when the
+    // write that found the memtable full paid for the whole merge; a column
+    // that stops at p99 reported none of that and would report none of this.
     if !cfg.tsv {
         let mut parts = Vec::new();
         for i in 0..counts.len() {
@@ -584,12 +586,13 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
         println!("  {}", parts.join(",  "));
         // What the writes left behind, which is the evidence that the
         // compaction kept up. roble compacts cooperatively on the thread
-        // that owns the store (§9), and a write that has to make room runs
-        // the compaction the picker chose along with the flush — so a mix
-        // that writes drives compaction by writing, and does not need the
-        // phase to yield to it. L0 stays at one through 800,000 operations.
-        // Printed anyway, because the day that stops being true is the day
-        // this number is the first to say so.
+        // that owns the store (§9), in the tasks this driver spawns beside
+        // each shard — so a mix that writes drives flushing and compaction
+        // by writing, and does not need the phase to yield to either. L0
+        // stays inside its allowance of four through 800,000 operations,
+        // ending at one or two depending on where the phase stops in a
+        // flush cycle. Printed anyway, because the day that stops being
+        // true is the day this number is the first to say so.
         println!("  levels {}", level_shape(shards));
         if !w.pebble_agrees {
             println!(

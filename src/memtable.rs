@@ -109,6 +109,30 @@ pub struct Memtable {
 /// crashes loses little; large enough that a table is worth writing.
 pub(crate) const MEMTABLE_SIZE: u64 = 4 << 20;
 
+/// What share of the budget a store keeps back for the writes that arrive
+/// while a memtable is being written out (§5).
+///
+/// The budget is what a store holds across **every** memtable it has, so the
+/// one in front and the one a flush is writing out share it. They do not
+/// share it evenly: the one being written out is the one that filled, and
+/// the one in front needs only the room the writes arriving during that
+/// flush ask for. Dividing the budget in two would halve the tables a flush
+/// writes, and halving them doubles how often L0 reaches the depth the
+/// picker compacts it at — which is paying a third of a store's write
+/// throughput for room nothing uses (measured, `bench/`).
+///
+/// So the reserve is an eighth, which at the 4 MiB default is 512 KiB and at
+/// the 64 MiB one is 8 MiB. roble cannot do better than a fraction here: how
+/// long a flush takes is a question about the clock, and §10 does not let a
+/// store ask it. What the fraction has to cover is the writes of one flush,
+/// and the two are not independent — a bigger budget means a longer flush
+/// *and* a larger eighth.
+///
+/// A store with nobody to hand the flush to never reaches this line for any
+/// purpose: the reserve is room for a flush running beside the writes, and
+/// without one there is nothing to make room for.
+pub(crate) const FLUSH_RESERVE: u64 = 8;
+
 impl Memtable {
     /// An empty memtable whose shape is determined by `seed`.
     pub fn new(seed: u64) -> Self {

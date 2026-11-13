@@ -1121,3 +1121,111 @@ async fn a_task_of_its_own_can_be_the_one_that_compacts() {
         "and the store the task compacted is the store this test is holding"
     );
 }
+
+#[compio::test]
+async fn a_task_of_its_own_can_be_the_one_that_flushes() {
+    // The other half of the pattern, and the half that needs the write path
+    // to cooperate (§5, §9). A store opened with the WAL off awaits nothing
+    // that is ever pending on a write — no log append, no disk — so a
+    // writer in a loop polls to completion every time. If the write path did
+    // not hand the thread back, the task below would never be polled after
+    // it parked, every flush would land back inside the write that found the
+    // budget full, and this test would see a task that flushed nothing.
+    //
+    // `tests/stall.rs` pins which of the two writes the table, by hand and
+    // deterministically. What this adds is that it happens at all against a
+    // real runtime, a real disk, and a loop that never waits for either.
+    let (tmp, dir) = fixture("db-reads");
+    // Small enough that a few hundred writes cross the line many times over,
+    // and merges left to the caller so that what the task is doing is the
+    // flush and nothing else.
+    let db = std::rc::Rc::new(
+        roble::open_with(
+            &roble::DefaultEnv,
+            &dir,
+            roble::Options::new()
+                .disable_wal(true)
+                .disable_automatic_compactions(true)
+                .memtable_size(16 << 10),
+        )
+        .await
+        .expect("open"),
+    );
+
+    let started = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flushed = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let (task_db, began, count) = (
+        std::rc::Rc::clone(&db),
+        std::rc::Rc::clone(&started),
+        std::rc::Rc::clone(&flushed),
+    );
+    roble::Env::spawn(&roble::DefaultEnv, async move {
+        began.set(true);
+        while task_db.running() {
+            task_db.flush_wanted().await;
+            if let Ok(Some(_)) = task_db.flush().await {
+                count.set(count.get() + 1);
+            }
+        }
+    });
+
+    // Until the task has had its first turn, which is the turn it parks on.
+    // Real I/O, because nothing else here reaches the runtime; after this
+    // the writes are on their own.
+    let tick = tmp.path().join("tick");
+    for _ in 0..64 {
+        if started.get() {
+            break;
+        }
+        give_the_runtime_a_turn(&tick).await;
+    }
+    assert!(
+        started.get(),
+        "the task should have been polled, and so be waiting to be told"
+    );
+    assert_eq!(flushed.get(), 0, "and should have had nothing to do yet");
+
+    let value = vec![b'v'; 256];
+    // What one of these writes adds to an arena: the user key, the eight-byte
+    // trailer, and the value. The budget is a bound on what the store holds
+    // *before* a batch is applied, so the batch that crosses it is the one
+    // thing allowed past — `Options::memtable_size` says so.
+    let entry = (b"b000000".len() + 8 + value.len()) as u64;
+    let budget = db.memtable_size() + entry;
+    for i in 0..2000usize {
+        let mut batch = roble_format::batch::Batch::new();
+        batch
+            .put(format!("b{i:06}").as_bytes(), &value)
+            .expect("put");
+        db.write(&mut batch, false).await.expect("write");
+        assert!(
+            db.unflushed_bytes() as u64 <= budget,
+            "after {} writes the store holds {} bytes, past the {budget} its budget and \
+             one batch allow — a memtable swapped out and not written is still memory",
+            i + 1,
+            db.unflushed_bytes()
+        );
+    }
+
+    assert!(
+        flushed.get() > 0,
+        "the writes never handed the thread over, so the task was never polled and \
+         every flush went back into a write"
+    );
+
+    // And the caller can get its store back. The task holds it while it
+    // waits, so until it is told there is nothing more coming there is
+    // nothing to drop (§9).
+    db.stop();
+    for _ in 0..64 {
+        if std::rc::Rc::strong_count(&db) == 1 {
+            break;
+        }
+        give_the_runtime_a_turn(&tick).await;
+    }
+    assert_eq!(
+        std::rc::Rc::strong_count(&db),
+        1,
+        "a store that said it was finished should have been let go of"
+    );
+}

@@ -443,3 +443,56 @@ async fn a_task_waits_for_a_merge_already_running_rather_than_standing_down() {
         "and it took all of L0, so there is nothing left to want"
     );
 }
+
+/// Whether a task waiting to be told there is a memtable to write out would
+/// be told now (§5).
+fn flush_wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
+    let mut cx = Context::from_waker(Waker::noop());
+    pin!(db.flush_wanted()).as_mut().poll(&mut cx).is_ready()
+}
+
+#[compio::test]
+async fn a_store_that_says_it_is_finished_stops_making_its_tasks_wait() {
+    // The half of "the caller owns stopping them" that the caller cannot
+    // write for itself (§9). A parked task is woken by whatever it is parked
+    // on and by nothing else, and both of these park on the store — so a
+    // store with no way to say "nothing more is coming" is a store its own
+    // tasks hold for ever, and a directory nothing unlocks.
+    let (env, dir) = load("db-reads").await;
+    // The fixture arrives wanting a compaction, and this one is about the
+    // waits rather than the work, so neither of them is going to be run.
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new().disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    assert!(db.running(), "a store nobody has stopped is running");
+    assert!(
+        wanted_now(&db),
+        "the fixture arrives over its allowance, so this one is told on its merits"
+    );
+    assert!(
+        !flush_wanted_now(&db),
+        "and has nothing to write out, so this one waits"
+    );
+
+    db.stop();
+
+    assert!(!db.running(), "a store that was stopped is not running");
+    assert!(
+        flush_wanted_now(&db),
+        "and the wait that would otherwise park for ever is over"
+    );
+    assert!(
+        wanted_now(&db),
+        "both of them, since both are tasks holding the store"
+    );
+    assert!(
+        db.pick().is_some(),
+        "the work itself is untouched — a stopped store is one nobody is listening to, \
+         not one that has forgotten what it owes"
+    );
+}
