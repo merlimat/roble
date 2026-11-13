@@ -159,6 +159,9 @@ Creates the store at DIR/<engine>, which must not exist yet.
 fn main() {
     let cfg = Config::parse();
     let path = cfg.dir.join(&cfg.engine);
+    // Before anything is written, because what this catches makes every row
+    // below it meaningless.
+    warn_if_in_memory(&cfg.dir);
     if path.exists() && !cfg.reuse {
         fail(&format!(
             "{} exists: remove it first, or pass --reuse to read the store already there",
@@ -996,6 +999,64 @@ impl Dist {
             Dist::Latest => "latest",
         }
     }
+}
+
+/// Which filesystem `path` sits on, on Linux, and `None` anywhere else.
+///
+/// `/proc/mounts` rather than a `statfs` binding, because this crate has no
+/// libc dependency and parsing one file is cheaper than acquiring one.
+#[cfg(target_os = "linux")]
+fn filesystem_at(path: &Path) -> Option<String> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(_dev), Some(point), Some(fstype)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        // `/proc/mounts` escapes a space in a mount point as `\040`. Missing
+        // one costs this note, not a wrong answer, which is the right way
+        // round for something advisory.
+        let point = point.replace("\\040", " ");
+        if path.starts_with(&point) && best.as_ref().is_none_or(|(n, _)| point.len() > *n) {
+            best = Some((point.len(), fstype.to_string()));
+        }
+    }
+    best.map(|(_, fs)| fs)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filesystem_at(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Says so, loudly, if the store is about to be written to memory.
+///
+/// `mktemp -d` lands in `/tmp`, and `/tmp` is a **tmpfs on Ubuntu 24.04 and
+/// later** — so the obvious way to run this puts the store in RAM, where
+/// `fsync` is a no-op and no write reaches a device. The load, the settle and
+/// both journal rows then measure memory, and nothing in the output would
+/// have said so. It cost this harness two full runs before the check existed.
+///
+/// On stderr rather than stdout, so that it reaches someone reading a run
+/// and someone piping `--tsv` into a table alike, without putting a line in
+/// the table.
+fn warn_if_in_memory(path: &Path) {
+    let Some(fs) = filesystem_at(path) else {
+        return;
+    };
+    if fs != "tmpfs" && fs != "ramfs" {
+        return;
+    }
+    eprintln!(
+        "note: {} is on {fs}, so this store is in memory and not on disk.",
+        path.display()
+    );
+    eprintln!("note: fsync there is a no-op and no write reaches a device, so the load,");
+    eprintln!("note: settle and journal rows measure RAM rather than storage. `mktemp -d`");
+    eprintln!("note: lands in /tmp, which is a tmpfs on Ubuntu 24.04 and later: pass --dir");
+    eprintln!("note: (or BENCH_DIR, for run.sh) a path on real storage instead.");
 }
 
 /// Whether a timed phase should go round again.
