@@ -12,11 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A compaction that hands the thread back.
+//! The long jobs a store does, handing the thread back as they go.
+//!
+//! Two of them: the merge a compaction runs, and the walk of the memtable a
+//! flush writes out. Both are work rather than waiting, and both now happen
+//! beside the writes rather than inside one (§9), which is what makes the
+//! pacing load-bearing — an unpaced job on the owning thread is a job
+//! nothing else on that core runs during.
 //!
 //! "Cooperative" is a claim about something that does not happen — nothing
 //! else waits — so a test of it has to look at the future itself rather than
-//! at the answer it eventually gives. These poll the compaction by hand and
+//! at the answer it eventually gives. These poll the job by hand and
 //! count how often it goes to sleep, which is exactly how often the executor
 //! would have been free to run something else.
 //!
@@ -89,6 +95,109 @@ async fn ready_to_compact(env: &SimEnv, dir: &Path, unit: u64) -> (roble::Opened
     db.write(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     (db, table)
+}
+
+/// Opens with `unit` and leaves 300 keys in the memtable for a flush to
+/// walk, with nothing left over from the fixture's own logs.
+async fn ready_to_flush(env: &SimEnv, dir: &Path, unit: u64) -> roble::Opened<SimFs> {
+    let db = roble::open_with(
+        env,
+        dir,
+        Options::new()
+            .compaction_unit(unit)
+            // So that the only thing the flush below is paced for is its own
+            // walk: a merge after it would be counted in the same yields.
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+    // Whatever the fixture's logs replayed into the memtable, written out
+    // first, so the flush that is measured walks the 300 keys and no others.
+    db.flush().await.expect("the fixture's own flush");
+    let mut batch = Batch::new();
+    for i in 0..300 {
+        batch
+            .put(format!("y{i:04}").as_bytes(), b"value")
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    db
+}
+
+#[compio::test]
+async fn a_flush_hands_the_thread_back_as_it_goes() {
+    // The walk of a 64 MiB memtable is a few hundred thousand entries to
+    // read and encode, and left in one piece it is tens of milliseconds in
+    // which nothing else on the core runs. That is invisible while a flush
+    // happens inside the write that asked for it, and is the whole of what
+    // is left once it does not (§5, `crate::memtable::FLUSH_RESERVE`).
+    let (env, dir) = load("db-twin-a").await;
+    let db = ready_to_flush(&env, &dir, 50).await;
+
+    let (flushed, yields) = drive(db.flush());
+    flushed.expect("flush").expect("a table");
+    // 300 keys at 50 to a unit is six slices and the five gaps between
+    // them: the walk stops when the cursor runs out rather than handing the
+    // thread back on its way to finding that out. The upper bound matters as
+    // much as the lower for the reason the merge's does — a counter that
+    // never reset would yield on every entry after the first unit.
+    assert!(
+        (5..=7).contains(&yields),
+        "a walk of 300 keys at 50 to a unit is six slices and five gaps, not {yields}"
+    );
+}
+
+#[compio::test]
+async fn a_flush_with_a_unit_of_zero_walks_straight_through() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = ready_to_flush(&env, &dir, 0).await;
+
+    let (flushed, yields) = drive(db.flush());
+    flushed.expect("flush").expect("a table");
+    assert_eq!(
+        yields, 0,
+        "a caller that asked for no pacing should get none"
+    );
+}
+
+#[compio::test]
+async fn a_paced_flush_writes_the_table_an_unpaced_one_would() {
+    // The whole of it: a walk cut into slices has to write the table a walk
+    // in one go would have. The memtable is frozen before the walk starts
+    // and nothing adds to a frozen one (§5), so a yield in the middle of it
+    // cannot change what there is to read.
+    let mut built = Vec::new();
+    for unit in [0, 1, 7, 1000] {
+        let (env, dir) = load("db-twin-a").await;
+        let db = ready_to_flush(&env, &dir, unit).await;
+        db.flush().await.expect("flush").expect("a table");
+
+        let mut scan = db.scan().await.expect("scan");
+        scan.first().await.expect("first");
+        let mut seen = Vec::new();
+        while scan.is_valid() {
+            seen.push((scan.key().to_vec(), scan.value().to_vec()));
+            scan.next().await.expect("next");
+        }
+        assert!(!seen.is_empty());
+        let sizes: Vec<u64> = db
+            .versions()
+            .version
+            .level(0)
+            .iter()
+            .map(|t| t.size)
+            .collect();
+        built.push((unit, seen, sizes));
+    }
+
+    let (_, first, first_sizes) = &built[0];
+    for (unit, seen, sizes) in &built[1..] {
+        assert_eq!(seen, first, "a unit of {unit} changed what the store holds");
+        assert_eq!(
+            sizes, first_sizes,
+            "a unit of {unit} changed the tables it was written into"
+        );
+    }
 }
 
 #[compio::test]

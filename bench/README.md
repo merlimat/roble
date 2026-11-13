@@ -59,10 +59,14 @@ They always run in this order, whatever order `--phases` names them in.
   uses: its `PebbleBatch` reads back through itself before committing. With the
   WAL on, each commit syncs.
 - **settle** — leaves the database in a shape the read phases can be compared
-  over. roble compacts cooperatively on the thread that owns the store (§9), so
-  this drives the picker to quiescence and the cost is counted here; RocksDB
-  compacts on threads of its own, so this flushes and waits, and the cost shows
-  up in the CPU column. The CPU column is what makes those two comparable.
+  over. roble compacts cooperatively on the thread that owns the store (§9),
+  in a task this driver spawns beside each shard, so this drives the picker to
+  quiescence partly by merging and partly by handing that task the thread; the
+  cost is counted here either way. RocksDB compacts on threads of its own, so
+  this flushes and waits, and the cost shows up in the CPU column. The CPU
+  column is what makes those two comparable. On a `--no-wal` load this row is
+  where the compaction the load phase no longer pays for shows up: the load
+  row gets faster and this one gets slower by about as much.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
 - **get** — `--reads` keys drawn by `--distribution` (below), every one
@@ -268,28 +272,50 @@ p99.9 and max, and it needs all four: on this phase they span four orders of
 magnitude.
 
 **A writing mix drives compaction by writing.** roble compacts cooperatively
-on the thread that owns the store (§9), and a write that has to make room runs
-the compaction the picker chose along with the flush — so the phase does not
-have to yield to it, and L0 stays at **1** through 800,000 operations with the
-store steady at 45.7 MiB. The level shape is printed anyway, because the day
-that stops being true is the day this number is the first to say so.
+on the thread that owns the store (§9) — in a task this driver spawns beside
+each shard, which is the pattern `Opened::flush_wanted` and
+`Opened::compaction_wanted` document. A write at the line tells that task
+there is a memtable to write out and hands it the thread; it writes it out,
+and the merge the picker chooses follows. So the phase does not have to yield
+to any of it, and L0 stays inside its allowance of four — **1 or 2** through
+800,000 operations, with the store around 46 MiB — the two differing only in
+where the phase stops in a flush cycle. The level shape is printed anyway,
+because the day that stops being true is the day this number is the first to
+say so.
 
-**The stall lands on the write, not on the reads.** 400,000 operations of
-workload A:
+**The stall this phase found, and where it went.** This phase is what made
+the write stall visible, and the numbers it reported are what the flush line
+and the two tasks were built for. 400,000 operations of workload A, one
+shard, `--no-wal`, medians of three alternated runs each:
 
 ```
-ycsb-A        400000   443,088/s   p50 1us  p99 12us  max 117,948us
-  read   199790  p50 1us  p99 13us  p99.9 18us  max     171us
-  update 200210  p50 0us  p99  2us  p99.9  4us  max 117,948us
+before   ycsb-A  400000  400,922/s  p50 1us  p99 12us  max 131,991us
+  read   199790  p50 1us  p99 14us  p99.9    20us  max     231us
+  update 200210  p50 0us  p99  2us  p99.9     5us  max 131,991us
+
+after    ycsb-A  400000  412,527/s  p50 1us  p99 14us  max   1,305us
+  read   199790  p50 1us  p99 14us  p99.9    42us  max   1,305us
+  update 200210  p50 0us  p99 13us  p99.9   495us  max   1,251us
 ```
 
-A read's worst case is 171 us. One write in two hundred thousand waits
-**118 ms**, because it is the write that found the memtable full, flushed it,
-and ran a compaction before it could return. That is what cooperative
-compaction means and it is working as §9 describes — but it is a number worth
-having in front of you, and nothing here could produce it until this phase
-existed. Note that p99 reports none of it: at 12 us it is five thousand times
-below the worst case.
+One write in two hundred thousand used to wait **132 ms**, because it was the
+write that found the memtable full, flushed it, and ran a compaction before it
+could return. It now waits **1.3 ms**, which is a read's worst case: the flush
+happens in a task beside the writes, started an eighth of the budget before
+the memtable fills, and the merge happens in another.
+
+**What it cost** is in the other columns, and it is the same work spread
+differently rather than less of it. p99.9 on an update goes from 5 us to about
+500 us, and a read's worst case from 231 us to 1.3 ms, because a merge paced
+at `compaction_unit` entries now hands out its slices to whatever is running —
+reads included — where before it arrived as one 130 ms lump on a single write.
+The rate is unchanged, and so is the memory: peak RSS is 218 MiB against 217.
+`compaction_unit` is the lever on how large a slice is.
+
+At the 64 MiB memtable RocksDB and `cmd/pebble` default to, where a flush is
+sixteen times as much to write, the same comparison over 800,000 operations is
+139 ms down to **1.7 ms**, with a read's worst case untouched at about 250 us
+and the rate equal.
 
 42 MiB store, 50,000 operations, 64 MiB cache, one shard:
 

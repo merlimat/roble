@@ -100,7 +100,17 @@ impl<F: Fs> Opened<F> {
         // waits behind, and the narrowing is what that was in the way of.
         let flushed = {
             let change = self.changes().begin().await;
-            self.flush_inner(&change).await?
+            let flushed = self.flush_inner(&change).await;
+            // Remembered so that a task waiting to be told there is a
+            // memtable to write out is not told the same thing again at
+            // once: the next flush would write out the same memtable to the
+            // same disk, and a task that asked for it again on the spot
+            // would be spinning rather than retrying. A write is what makes
+            // it a retry (§5, `crate::open::Opened::flush_wanted`).
+            if flushed.is_err() {
+                self.saw_flush_failure();
+            }
+            flushed?
         };
         // Nothing written is nothing changed, and so nothing new for the
         // picker to see: its answer is the one it already gave, which the
@@ -165,9 +175,13 @@ impl<F: Fs> Opened<F> {
         // Nothing is awaited between the freeze above and the walk of the
         // memtable here, which is what makes the walk see everything the
         // freeze promised: an await in between would let a write apply to a
-        // memtable this has already read to the end.
+        // memtable this has already read to the end. The walk itself may
+        // await, and does — what the freeze bought is that the memtable it
+        // handed over is finished with, and a flush running beside the
+        // writes rather than inside one has to be able to put the thread
+        // down (§9, `crate::work`).
         let entries = memtable.borrow().len() as u64;
-        let (bytes, new_table) = build_table(&memtable.borrow(), table_num)?;
+        let (bytes, new_table) = build_table(&memtable, table_num, self.compaction_unit()).await?;
         self.metrics.flush_size.record(bytes.len() as u64);
         self.metrics.flush_bytes.add(bytes.len() as u64);
 
@@ -317,30 +331,71 @@ impl<F: Fs> Opened<F> {
 }
 
 /// Builds the table bytes, and the entry the MANIFEST will hold for it.
-fn build_table(memtable: &Memtable, file_num: u64) -> Result<(Vec<u8>, NewTable)> {
+///
+/// **Paced**, every `unit` entries, as a merge is and for the reason a merge
+/// is (§9, `crate::work`): this is the one part of a flush that is work
+/// rather than waiting, and a 64 MiB memtable is a few hundred thousand
+/// entries to walk and encode. Left unpaced it is tens of milliseconds in
+/// which nothing else on the core runs — which is invisible while a flush
+/// happens *inside* the write that asked for it, and is the whole of the
+/// remaining latency once it does not.
+///
+/// The memtable is borrowed a slice at a time rather than for the walk,
+/// because a borrow held across an await is a panic waiting for whoever
+/// borrows next. Nothing writes to this one — it is frozen, and a freeze
+/// waits for every write in flight (§5) — so the cursor is as good after a
+/// yield as before it.
+async fn build_table(
+    memtable: &std::cell::RefCell<Memtable>,
+    file_num: u64,
+    unit: u64,
+) -> Result<(Vec<u8>, NewTable)> {
     let mut writer = TableWriter::new(WriterOptions::default())?;
 
     // Every key the table will hold, point and tombstone alike, so the
     // bounds the MANIFEST records are the table's real ones.
     let mut bounds = Bounds::default();
 
-    let mut cursor = memtable.cursor();
-    cursor.first(memtable);
-    while cursor.is_valid() {
-        let encoded = cursor.key(memtable);
-        let key = InternalKey::decode(encoded)?;
-        writer.add(key, cursor.value(memtable))?;
-        bounds.saw_key(encoded)?;
-        bounds.saw_seq(key.seq_num);
-        cursor.next(memtable);
+    let mut cursor = {
+        let held = memtable.borrow();
+        let mut cursor = held.cursor();
+        cursor.first(&held);
+        cursor
+    };
+    loop {
+        let done = {
+            let held = memtable.borrow();
+            let mut did = 0;
+            while cursor.is_valid() {
+                let encoded = cursor.key(&held);
+                let key = InternalKey::decode(encoded)?;
+                writer.add(key, cursor.value(&held))?;
+                bounds.saw_key(encoded)?;
+                bounds.saw_seq(key.seq_num);
+                cursor.next(&held);
+                did += 1;
+                if did == unit {
+                    break;
+                }
+            }
+            !cursor.is_valid()
+        };
+        if done {
+            break;
+        }
+        // A unit of zero is a caller asking to be left alone — a bulk load,
+        // a repair tool. The slice above never breaks on a count of zero, so
+        // it walks to the end in one pass and this line is never reached.
+        crate::work::yield_now().await;
     }
 
+    let held = memtable.borrow();
     // Fragmented, because a range-deletion block holds fragments and the
     // memtable holds whatever was asked for. Two `delete_range` calls that
     // overlap are ordinary use — `/a`..`/d` then `/b`..`/d` — and without
     // this every flush of that memtable would be refused by the writer, so
     // the store could never shed it.
-    let tombstones = rangedel::fragment(&memtable.tombstones().iter().collect::<Vec<_>>());
+    let tombstones = rangedel::fragment(&held.tombstones().iter().collect::<Vec<_>>());
 
     for t in &tombstones {
         writer.add_range_deletion(&t.start, &t.end, t.seq_num)?;

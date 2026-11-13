@@ -14,11 +14,12 @@
 
 //! Pacing a long job so the thread it runs on stays usable (§9).
 //!
-//! Compaction is the only background CPU work roble does, and it runs on the
-//! owning thread. A merge that held the thread from its first key to its last
-//! would stop every read and every write on that core for as long as it took
-//! — which is the objection to cooperative compaction, and the answer is to
-//! make it cooperative in fact and not only in name: merge a slice, hand the
+//! Two jobs are long enough to need it, and both run on the owning thread:
+//! the merge a compaction runs, and the walk of the memtable a flush writes
+//! out. One that held the thread from its first key to its last would stop
+//! every read and every write on that core for as long as it took — which is
+//! the objection to doing either cooperatively, and the answer is to make
+//! them cooperative in fact and not only in name: do a slice, hand the
 //! executor back, resume.
 //!
 //! **A unit is work, not time.** The pacer counts entries, not milliseconds,
@@ -36,9 +37,10 @@
 use std::future::poll_fn;
 use std::task::Poll;
 
-/// How many entries a compaction merges before it offers the thread back.
+/// How many entries a merge, or the walk of a memtable, gets through before
+/// it offers the thread back.
 ///
-/// Roughly a few hundred microseconds of merging for Oxia's shape — small
+/// Roughly a few hundred microseconds of either for Oxia's shape — small
 /// records, and values of a few hundred bytes.
 pub const COMPACTION_UNIT: u64 = 4096;
 
