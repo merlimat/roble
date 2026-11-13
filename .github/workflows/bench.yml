@@ -34,16 +34,20 @@ on:
         default: "1"
       batches:
         description: >
-          Batches written to each shard. 10000 x 300 records is about 423 MiB
+          Batches written to each shard. 300 x 10000 records is about 423 MiB
           a shard, which is six times the 64 MiB memtable — enough that the
           load flushes as it goes and the store compacts into several levels.
           Much less than that and a memtable swallows the whole load, the load
           row measures a skiplist, and the read phases run over whatever
           `settle` was left to write in one go.
-        default: "10000"
-      records:
-        description: Records in each batch
         default: "300"
+      records:
+        description: >
+          Records in each batch. A thousand is the floor below which
+          per-commit cost starts to dominate, and for an engine that writes a
+          new root per commit it dominates completely; ten thousand leaves
+          room under it for the batch-size pass, which halves it ten times.
+        default: "10000"
       reads:
         description: Lookups in each get and floor phase
         default: "50000"

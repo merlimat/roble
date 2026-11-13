@@ -99,7 +99,11 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   to be compiled in: --features encina, --features rocksdb
   --shards N      stores to open, as Oxia opens one per shard (1)
   --batches N     batches written to each shard (200)
-  --records N     records in each batch (100)
+  --records N     records in each batch (10000). The size matters more than it
+                  looks: a copy-on-write B+tree writes a new root per commit,
+                  so a load driven one record at a time is hours and gigabytes
+                  where the same records batched are seconds. A thousand is
+                  the floor below which per-commit cost starts to dominate
   --value-bytes N bytes in each value (128)
   --reads N       lookups in each get and floor phase (100000)
   --cache-mb N    block cache for every shard together, in MiB (64)
@@ -1358,7 +1362,7 @@ impl Config {
             engine: "roble".to_string(),
             shards: 1,
             batches: 200,
-            records: 100,
+            records: 10000,
             value_bytes: 128,
             value_chunk: 0,
             reads: 100_000,
