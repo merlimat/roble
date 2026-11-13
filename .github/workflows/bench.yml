@@ -77,9 +77,15 @@ jobs:
       # Not shared with CI's cache: this builds the two optional engines,
       # which no other job does, and would otherwise evict what the gate
       # needs on every run.
+      #
+      # One cache per set of engines, because a run saves what it built and
+      # nothing else. Under a single key a `roble` run saved a cache with no
+      # RocksDB in it, and the next run of all four then compiled RocksDB
+      # from source — which is what three roble-only runs in a row left the
+      # next four-engine run to do.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: bench
+          key: bench-${{ github.event.inputs.engines }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # What librocksdb-sys needs to build its bindings. The other three
       # engines need nothing installed.
