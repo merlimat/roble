@@ -441,6 +441,30 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   arena is released when its table is written. That is **the only thing that
   bounds a store's memory**: nothing else writes a memtable out unless a caller
   asks (§6).
+
+  **The budget is the backstop, and the line sits an eighth below it.** A
+  write that pays for a flush waits for a table to be built, written and
+  synced, which at 64 MiB is a tenth of a second. So a store with a task
+  waiting on `Opened::flush_wanted` is told there is a memtable to write out
+  at seven eighths of the budget; that task freezes it and writes it out
+  while the writes carry on into the fresh one behind it, and the last eighth
+  is what they carry on into. The budget itself is unchanged and still counts
+  **every** memtable, the frozen one included — a store whose flushes stop
+  keeping up fills the reserve too, and then the write that finds it full
+  writes a memtable out itself, exactly as before. The swap is bounded
+  because the budget is.
+
+  An eighth and not a half. Two memtables sharing the budget evenly halves
+  the tables a flush writes, and halving them doubles how often L0 reaches
+  the depth the picker compacts it at: a third of a store's write throughput,
+  measured, for room nothing uses. The memtable being written out is the one
+  that filled; the one in front needs only the writes of a single flush.
+  roble cannot do better than a fraction here, because how long a flush takes
+  is a question about the clock and §10 does not let a store ask it — and the
+  two move together anyway, since a larger budget means a longer flush *and* a
+  larger eighth. A store with nobody to hand a flush to never reaches the line
+  for any purpose, so it keeps the whole budget for one memtable and writes
+  the tables it always did.
 - **Versions are immutable, and what they name is reference counted.** A
   version is the set of files per level. A flush or a
   compaction produces a version edit, which is appended to the MANIFEST and
@@ -1164,6 +1188,24 @@ unit is entries and not time, because §10 lets a store read the clock only
 where the env allows it, and a job that yielded on a timer would stop a seeded
 run replaying.
 
+**The walk of the memtable a flush writes out is paced by the same unit**, and
+for the same reason once a flush runs beside the writes rather than inside
+one. A 64 MiB memtable is a few hundred thousand entries to read and encode,
+and in one piece that is tens of milliseconds in which nothing else on the
+core runs — invisible while the write that asked for the flush was waiting on
+it anyway, and the whole of what is left once it is not. The rest of a flush
+is waiting on a disk, which costs the thread nothing.
+
+**A write hands the thread back too**, once, before it takes the write permit,
+whenever something is flushing or merging beside it. That is the same bargain
+from the other side, and without it the rest of this section does not happen:
+a store with the WAL off awaits nothing that is ever pending on a write — no
+log append, no disk — so a writer in a loop polls to completion every time and
+the task it just told there was a flush to do never gets a turn. It would be
+found out at the budget, where the write waits for the flush it starved, and
+at L0's depth, where it waits for the merge. The cost is a trip through the
+executor, and it is paid only while something is actually running.
+
 **What runs it.** A flush that wrote a table runs the compaction the picker
 chose, before it returns, unless `Options::disable_automatic_compactions`
 says otherwise — Pebble's switch of the same name, wanted for the same two
@@ -1220,8 +1262,12 @@ again.
 
 A write short of room in a memtable makes the room itself — a flush, before its
 batch is accepted (§4) — unless a change is already underway, in which case it
-waits for that one and asks again, and often finds the room already made. A
-write short of a shallow enough L0 does the same with a merge:
+waits for that one and asks again, and often finds the room already made. That
+is the backstop; the routine case does not reach it, because a store with a
+task waiting on `Opened::flush_wanted` was told there was a memtable to write
+out an eighth of the budget earlier and that task is already writing it (§5).
+A store without one has no such task to tell, and this is where it finds out.
+A write short of a shallow enough L0 does the same with a merge:
 `Options::l0_stop_writes_threshold`, Pebble's and the same twelve, which sits
 above the `l0_compaction_threshold` at which the picker merely starts *wanting*
 L0 compacted. Between the two a flush runs the merge and nothing waits; at the
@@ -1247,20 +1293,31 @@ owns L0's depth as well, and a write that waited for a merge nobody was going to
 run would wait for ever — which is what Pebble does in that configuration, and a
 worse answer than letting the caller have what it asked for.
 
-**Compacting in a task of its own.** A flush that finds somebody waiting to be
-told there is work tells them and returns; a flush that finds nobody runs the
-merge where it stands. `Opened::compaction_wanted` is the waiting, and the task
-is the **caller's**:
+**Flushing and compacting in tasks of their own.** A write that reaches the
+line tells whoever is waiting that there is a memtable to write out (§5); a
+flush that has written a table tells whoever is waiting that there is a merge
+to run, and runs it where it stands if nobody is. `Opened::flush_wanted` and
+`Opened::compaction_wanted` are the waiting, and the tasks are the
+**caller's**:
 
 ```rust
-let worker = Rc::clone(&db);
-env.spawn(async move {
-    loop {
-        worker.compaction_wanted().await;
-        let _ = worker.compact_once().await;
-    }
-});
+for (worker, work) in [(Rc::clone(&db), Flush), (Rc::clone(&db), Merge)] {
+    env.spawn(async move {
+        while worker.running() {
+            match work {
+                Flush => { worker.flush_wanted().await; let _ = worker.flush().await; }
+                Merge => { worker.compaction_wanted().await; let _ = worker.compact_once().await; }
+            }
+        }
+    });
+}
 ```
+
+Two waits and not one, because the two have to be able to run at the same
+time. A merge is the longest thing a store does and holds no permit while it
+runs, so a flush can go through the middle of one — but only if something is
+there to run it, and one task cannot be in two places. A store given only the
+merge task flushes inside its writes a memtable later.
 
 The store spawns nothing itself, and that is a decision rather than an
 omission. `Env::spawn` takes a `'static` future and a store's methods take
@@ -1273,12 +1330,23 @@ when, the caller says where. It keeps §12 intact as well, because no operation
 count in a failure sweep then depends on when a runtime chose to poll a
 detached task.
 
-`compaction_wanted` is level-triggered and asked again on every poll, so a task
-that starts after the work appeared is told at once rather than waiting for a
-flush that may not come. The exception is a compaction that **failed**: the
-picker gives the same answer against the same version, so a task told to go
-again at once would spin rather than retry, and the next change to the version
-is what makes it a retry. That is "later" with no clock to say when (§10).
+**`Opened::stop` is the half of "owns stopping them" the caller cannot write
+for itself.** A parked task is woken by what it is parked on and by nothing
+else, and both of these park on the store — so a store with no way to say
+"nothing more is coming" is a store its own tasks hold for ever, and a
+directory nothing unlocks. After `stop` both waits return at once,
+`Opened::running` is false, the loops end, and the last task to let go is what
+lets the store be dropped. Nothing else changes: a stopped store still reads,
+still writes, and still flushes and compacts inside its writes.
+
+Both waits are level-triggered and asked again on every poll, so a task that
+starts after the work appeared is told at once rather than waiting for an
+event that may not come. The exception in each case is work that **failed**,
+which is not wanted again until the thing it would read has changed: for a
+compaction, the version, since the picker gives the same answer against the
+same one; for a flush, a write, since until then it would write out the same
+memtable to the same disk. Either way a task told to go again at once would
+spin rather than retry. That is "later" with no clock to say when (§10).
 
 A failure is said twice over, because a compaction often has nobody to return
 an error to — a flush swallows the one it scheduled, and a task running one was

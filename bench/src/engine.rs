@@ -31,6 +31,9 @@
 use std::path::Path;
 use std::time::Instant;
 
+// The trait `DefaultEnv::spawn` comes from, which is how a store's caller
+// puts a flush and a merge somewhere other than a write (§9).
+use roble::Env as _;
 use roble_format::files as roble_files;
 
 use crate::report::Report;
@@ -181,9 +184,31 @@ macro_rules! step_loop {
 
 // --------------------------------------------------------------------- roble
 
+/// Hands the executor back, so a task waiting beside this one gets a turn.
+///
+/// roble's background work runs on the runtime that owns the store (§9), and
+/// a loop here that never awaited anything pending would poll to completion
+/// every time and never let those tasks run. Four lines rather than a
+/// dependency, as `roble::work` has for the same reason.
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return std::task::Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// roble, the subject.
 pub struct Roble {
-    db: roble::Opened<roble::FileFs>,
+    /// Shared with the two tasks `open` spawns beside it, which is what
+    /// takes a flush and a merge off the write that would otherwise pay for
+    /// them (§9, `roble::Opened::flush_wanted`).
+    db: std::rc::Rc<roble::Opened<roble::FileFs>>,
     /// The working space `get` hands back on every call. One per store,
     /// as Oxia holds one store per shard and reads them from one thread.
     ///
@@ -220,12 +245,62 @@ impl Store for Roble {
             )
             .await
             .unwrap_or_else(|e| fail(&format!("open {}: {e}", at.display())));
+            let db = std::rc::Rc::new(db);
+
+            // A store runs no tasks of its own (§9), so a flush and the
+            // merge the picker chooses happen wherever the caller puts
+            // them — and until something does, they happen inside the write
+            // that found the memtable full. Oxia has a task per shard
+            // already; these are that task, and running them is what the
+            // `ycsb` row's `max` column is a measurement of.
+            //
+            // Two of them, because a flush and a merge have to be able to
+            // run at once: a merge is the longest thing a store does and it
+            // holds no permit while it runs, so a flush can go through the
+            // middle of one — but only if something is there to run it. The
+            // flush hands the merge to the second task and goes straight
+            // back to waiting.
+            let flusher = std::rc::Rc::clone(&db);
+            roble::DefaultEnv.spawn(async move {
+                while flusher.running() {
+                    flusher.flush_wanted().await;
+                    let _ = flusher.flush().await;
+                }
+            });
+            let merger = std::rc::Rc::clone(&db);
+            roble::DefaultEnv.spawn(async move {
+                while merger.running() {
+                    merger.compaction_wanted().await;
+                    let _ = merger.compact_once().await;
+                }
+            });
+
             shards.push(Roble {
                 db,
                 lookup: std::cell::Cell::new(roble::Lookup::new()),
             });
         }
         shards
+    }
+
+    async fn reopen(shards: Vec<Self>, cfg: &Config, dir: &Path) -> Vec<Self> {
+        // The tasks `open` spawned hold the store while they wait, so
+        // dropping these would not release the directory and the open below
+        // would find it locked. Told there is nothing more coming, and then
+        // given the turns they need to hear it (§9, `roble::Opened::stop`).
+        for shard in &shards {
+            shard.db.stop();
+        }
+        let mut turns = 0;
+        while shards.iter().any(|s| std::rc::Rc::strong_count(&s.db) > 1) {
+            yield_now().await;
+            turns += 1;
+            if turns > 1_000_000 {
+                fail("the tasks beside these stores never let go of them");
+            }
+        }
+        drop(shards);
+        Self::open(cfg, dir).await
     }
 
     async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize, sync: bool) {
@@ -251,17 +326,29 @@ impl Store for Roble {
             .unwrap_or_else(|e| fail(&format!("flush: {e}")));
         // roble compacts cooperatively on the thread that owns the store
         // (§9), so this is the caller's to drive and its cost is counted here
-        // rather than in a background total.
+        // rather than in a background total — partly by doing the merges and
+        // partly by handing the thread to the task beside this shard, which
+        // is doing them too. A merge it has already claimed comes back here
+        // as an empty answer rather than an error, so those are waited out
+        // rather than counted, and what this returns is the share this call
+        // merged itself.
         let mut ran = 0;
+        let mut waited = 0;
         while self.db.pick().is_some() {
-            self.db
+            let merged = self
+                .db
                 .compact_once()
                 .await
                 .unwrap_or_else(|e| fail(&format!("compact: {e}")));
-            ran += 1;
-            if ran > 100_000 {
-                fail("the picker never settled");
+            if merged.is_empty() {
+                waited += 1;
+                if waited > 100_000 {
+                    fail("the picker never settled");
+                }
+            } else {
+                ran += 1;
             }
+            yield_now().await;
         }
         ran
     }

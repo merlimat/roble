@@ -170,6 +170,19 @@ pub struct Opened<F: Fs> {
     compacting: crate::change::Compacting,
     /// Who is waiting to be told there is a compaction worth running (§9).
     compaction_waiters: crate::change::Waiters,
+    /// Who is waiting to be told there is a memtable worth writing out (§5).
+    ///
+    /// Apart from the compaction waiters, because the two have to be able to
+    /// run at once: a merge is the longest thing a store does, and a flush
+    /// that queued behind one would be a write queueing behind it a memtable
+    /// later.
+    flush_waiters: crate::change::Waiters,
+    /// Whether the last flush failed, in which case there is nothing new for
+    /// a task to write out until the store has taken another write (§5).
+    flush_failed: std::cell::Cell<bool>,
+    /// Whether the caller has said it will run nothing more beside this
+    /// store, so the tasks waiting above can end and let go of it (§9).
+    stopped: std::cell::Cell<bool>,
     /// Whether the last compaction failed, in which case the picker's answer
     /// is not worth asking for again until the version changes (§9).
     compaction_failed: std::cell::Cell<bool>,
@@ -401,6 +414,9 @@ pub async fn open_with<E: Env>(
         compacting: Default::default(),
         compaction_waiters: Default::default(),
         compaction_failed: std::cell::Cell::new(false),
+        flush_waiters: Default::default(),
+        flush_failed: std::cell::Cell::new(false),
+        stopped: std::cell::Cell::new(false),
         next_seq: std::cell::Cell::new(next_seq),
         log: std::cell::RefCell::new(log),
         dir: dir.to_path_buf(),
@@ -695,6 +711,12 @@ impl<F: Fs> Opened<F> {
         self.make_room().await?;
         self.drain_l0().await?;
 
+        // Room made and L0 shallow enough, this write gives the thread up
+        // once to whatever is flushing or merging beside it — which is how
+        // the flush this write did *not* have to do gets to happen at all
+        // (§9, [`Opened::share_the_thread`]).
+        self.share_the_thread().await;
+
         // Held from here to the end of the function, which is the span no
         // other write may share and no freeze may happen in: the sequence
         // number stamped below and the offset the record goes to are both
@@ -748,6 +770,11 @@ impl<F: Fs> Opened<F> {
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
         self.next_seq.set(next);
+        // The store holds something a flush did not, so a flush that failed
+        // is worth asking for again (§5, [`Opened::flush_wanted`]). This is
+        // the only thing that changes that answer, which is why the retry
+        // hangs off a write and not off a clock (§10).
+        self.flush_failed.set(false);
 
         for entry in iter_kinds(batch.as_bytes())? {
             self.metrics.write_operations[entry].add(1);
@@ -791,6 +818,15 @@ impl<F: Fs> Opened<F> {
     /// otherwise pile L0 up for ever, which is the thing a flush was taught
     /// to prevent; a caller who would rather decide when to merge has
     /// [`crate::Options::disable_automatic_compactions`] for it.
+    ///
+    /// **Reaching the budget is the backstop and not the plan.** A store
+    /// with a task waiting on [`Opened::flush_wanted`] is told there is a
+    /// memtable to write out an eighth of the budget before it fills
+    /// ([`Opened::share_the_thread`], [`Opened::flush_line`]), and that task
+    /// freezes it and writes it out while the writes carry on into the fresh
+    /// one behind it. Only a store whose flushes have stopped keeping up —
+    /// or one with nobody to hand them to — comes down here, and then it is
+    /// this loop again.
     async fn make_room(&self) -> Result<()> {
         loop {
             if (self.unflushed_bytes() as u64) < self.memtable_size {
@@ -821,6 +857,60 @@ impl<F: Fs> Opened<F> {
                 return Ok(());
             }
         }
+    }
+
+    /// Tells whoever is waiting that there is a memtable to write out, and
+    /// hands the thread back once if there is work on it that this write is
+    /// otherwise about to run away from (§9, §10).
+    ///
+    /// After the room and the depth have been seen to, and not before: a
+    /// write that gave the thread away first would come back to a store
+    /// somebody else had just made room in, which is the right answer for
+    /// the write and the wrong place to decide it — the two waits above
+    /// are what §9 names as stalls, and they are what a store reports when
+    /// it is behind.
+    ///
+    /// The second half is the part that is easy to leave out, and without it
+    /// the first half does nothing. roble's background work is a task on the
+    /// runtime that owns the store, and a task only runs when the thread is
+    /// handed back to the executor. A write with the WAL off awaits nothing
+    /// that is ever pending — no log append, no disk — so a writer in a loop
+    /// polls to completion every time and the flush it asked for never gets
+    /// a turn, nor does the merge after it. It would be found out at the
+    /// budget, where the write waits for the flush it starved, and at L0's
+    /// depth, where it waits for the merge.
+    ///
+    /// So a write that has work going on beside it gives the thread up once
+    /// before taking the write permit — the same bargain a compaction makes
+    /// every [`crate::Options::compaction_unit`] entries, from the other
+    /// side. It costs a trip through the executor, which is why it is asked
+    /// only while something is actually running: a store with nothing going
+    /// on adds up what its memtables hold, reads two cells, and carries on.
+    async fn share_the_thread(&self) {
+        // Waking is what crossing the line *is*: the wait below it is
+        // level-triggered, so whoever is parked only looks again when told,
+        // and this is the write that has something new to tell them.
+        let told = (self.unflushed_bytes() as u64) >= self.flush_line()
+            && !self.flush_failed.get()
+            && self.flush_waiters.wake();
+        // A change underway is a flush — a compaction holds the permit only
+        // to decide and to record (§9) — and a claim is the merge itself.
+        if told || self.changes().underway() || self.compacting().underway() {
+            crate::work::yield_now().await;
+        }
+    }
+
+    /// How much a store holds before it starts wanting a memtable written
+    /// out, which is an eighth below the budget it stops writing at (§5).
+    ///
+    /// The eighth is the room the writes that arrive during a flush go into,
+    /// and [`crate::memtable::FLUSH_RESERVE`] says why it is an eighth and
+    /// not a half. Crossing it does nothing at all unless somebody is
+    /// waiting on [`Opened::flush_wanted`] to be told: a store on its own
+    /// goes on filling the whole budget for the one memtable, and writes the
+    /// tables it did before there was anywhere else for a flush to run.
+    pub fn flush_line(&self) -> u64 {
+        self.memtable_size - self.memtable_size / crate::memtable::FLUSH_RESERVE
     }
 
     /// Waits until L0 is shallow enough to accept another table, draining it
@@ -946,7 +1036,7 @@ impl<F: Fs> Opened<F> {
     /// What a caller watches to decide when to flush: §8 sizes a memtable at
     /// 4 MiB, to match Oxia.
     pub fn unflushed_bytes(&self) -> usize {
-        self.memtables().iter().map(|m| m.borrow().bytes()).sum()
+        self.memtables_each().map(|m| m.borrow().bytes()).sum()
     }
 
     /// The MANIFEST this store is appending to.
@@ -981,6 +1071,96 @@ impl<F: Fs> Opened<F> {
         &self.compacting
     }
 
+    /// Waits until there is a memtable worth writing out.
+    ///
+    /// The other half of what a store hands to a task of its own, and the
+    /// half that takes the flush off the write that found the memtable full
+    /// (§5). A write tells whoever is parked here an eighth of the budget
+    /// before it fills ([`Opened::flush_line`]); the task freezes that
+    /// memtable and writes it out while the writes carry on into the fresh
+    /// one, which is what the eighth is kept back for.
+    ///
+    /// ```ignore
+    /// let worker = std::rc::Rc::clone(&db);
+    /// env.spawn(async move {
+    ///     while worker.running() {
+    ///         worker.flush_wanted().await;
+    ///         let _ = worker.flush().await;
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// Its own wait and not [`Opened::compaction_wanted`]'s, because the two
+    /// have to be able to run at once. A merge is the longest thing a store
+    /// does and it holds no permit while it runs (§9), so a flush can go
+    /// through the middle of one — but only if something is there to run it,
+    /// and one task cannot be in two places. A caller that runs only the
+    /// compaction task gets its flushes back inside its writes a memtable
+    /// later.
+    ///
+    /// Level-triggered and asked again on every poll, as
+    /// [`Opened::compaction_wanted`] is, so a task that starts after the
+    /// line was crossed is told at once. The two exceptions are both
+    /// "later with no clock to say when" (§10): a change already underway
+    /// may be the very flush this would run, so this waits for it and looks
+    /// again rather than queueing to repeat it — Pebble's loop in
+    /// `maybeInduceWriteStall`, which `Opened::make_room` runs for the same
+    /// reason; and a flush that **failed** is not wanted again until the
+    /// store has taken another write, because until then it would write out
+    /// the same memtable to the same disk and fail the same way.
+    pub async fn flush_wanted(&self) {
+        std::future::poll_fn(|cx| {
+            if self.stopped.get() {
+                return std::task::Poll::Ready(());
+            }
+            if self.changes().underway() {
+                self.changes().park(cx);
+                return std::task::Poll::Pending;
+            }
+            let held = self.unflushed_bytes() as u64;
+            if self.flush_failed.get() || held == 0 || held < self.flush_line() {
+                self.flush_waiters.park(cx);
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(())
+        })
+        .await
+    }
+
+    /// Tells the tasks a caller runs beside this store that nothing more is
+    /// coming, so they can end and let go of it (§9).
+    ///
+    /// A store runs no tasks of its own, so the ones parked on
+    /// [`Opened::flush_wanted`] and [`Opened::compaction_wanted`] are the
+    /// caller's — and each of them holds the store while it waits. §9 says
+    /// the caller owns stopping them; this is the half of that the caller
+    /// cannot write for itself, because a parked task has to be woken by
+    /// whatever it is parked on. From here both waits return at once,
+    /// [`Opened::running`] is false, and the last task to let go is what
+    /// lets the store be dropped and the directory released.
+    ///
+    /// Nothing else changes: a store that has been stopped still reads,
+    /// still writes, and still flushes and compacts inside its writes, which
+    /// is what it did before anybody was listening.
+    pub fn stop(&self) {
+        self.stopped.set(true);
+        self.flush_waiters.wake();
+        self.compaction_waiters.wake();
+    }
+
+    /// Whether the tasks a caller runs beside this store should keep going.
+    ///
+    /// False once [`Opened::stop`] has been called, which is the loop
+    /// condition the examples on the two waits are written around.
+    pub fn running(&self) -> bool {
+        !self.stopped.get()
+    }
+
+    /// Takes account of a flush that failed (§5).
+    pub(crate) fn saw_flush_failure(&self) {
+        self.flush_failed.set(true);
+    }
+
     /// Waits until there is a compaction worth running.
     ///
     /// What a background compaction is built out of. **The store runs no
@@ -993,12 +1173,16 @@ impl<F: Fs> Opened<F> {
     /// ```ignore
     /// let worker = std::rc::Rc::clone(&db);
     /// env.spawn(async move {
-    ///     loop {
+    ///     while worker.running() {
     ///         worker.compaction_wanted().await;
     ///         let _ = worker.compact_once().await;
     ///     }
     /// });
     /// ```
+    ///
+    /// The loop ends when the caller says so ([`Opened::stop`]), which it
+    /// has to be able to do: the task holds the store while it waits, and a
+    /// store nothing lets go of is a directory nothing unlocks.
     ///
     /// A flush that finds somebody waiting here leaves the merge to them and
     /// returns; a flush that finds nobody runs it where it stands (§9). So a
@@ -1019,6 +1203,11 @@ impl<F: Fs> Opened<F> {
     /// retry. The next flush is what makes it a retry.
     pub async fn compaction_wanted(&self) {
         std::future::poll_fn(|cx| {
+            // Nothing more is coming, so the task around this is meant to
+            // end rather than wait ([`Opened::stop`]).
+            if self.stopped.get() {
+                return std::task::Poll::Ready(());
+            }
             // Somebody is already on it. Waiting for them is the only answer
             // that does not spin: the picker would name the tables they have
             // claimed, `compact_once` would stand down, and this would say
@@ -1069,8 +1258,11 @@ impl<F: Fs> Opened<F> {
         self.manifest_failed.set(true);
     }
 
-    /// How many bytes a memtable holds before a write writes it out (§4),
-    /// as [`crate::Options`] was asked for.
+    /// How many bytes a store holds before a write writes a memtable out
+    /// itself (§4), as [`crate::Options`] was asked for.
+    ///
+    /// The backstop, not the line a flush is usually started at: that is
+    /// [`Opened::flush_line`], an eighth below this (§5).
     pub fn memtable_size(&self) -> u64 {
         self.memtable_size
     }
