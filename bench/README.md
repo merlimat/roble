@@ -48,7 +48,8 @@ They always run in this order, whatever order `--phases` names them in.
   up in the CPU column.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
-- **get** — `--reads` random keys, every one present. Oxia's `Get` with
+- **get** — `--reads` keys drawn by `--distribution` (below), every one
+  present. Oxia's `Get` with
   `ComparisonEqual`, and the one comparison a bloom filter can answer.
 
   **Each engine reads it the best way it offers, and reports the value's
@@ -78,8 +79,8 @@ They always run in this order, whatever order `--phases` names them in.
   gives one, and the percentile columns collapse onto it. It empties the
   *engine's* caches, not the operating system's, so the blocks may still be in
   the page cache: what it measures is the work above the filesystem.
-- **floor** — `--reads` random probes, each one byte past a stored key so that
-  **no probe exists**. That is deliberate: Oxia's `getFloor` tries an exact
+- **floor** — `--reads` probes drawn by `--distribution` (below), each one
+  byte past a stored key so that **no probe exists**. That is deliberate: Oxia's `getFloor` tries an exact
   `Get` first and only seeks when it misses, so probing keys that exist would
   measure the `get` phase over again. What this times is the seek, which no
   filter can help.
@@ -108,6 +109,53 @@ A `levels` line is printed before the scans: how many tables sit at each level.
 A scan's cost is mostly how many iterators it has to merge, so without it a
 slow iterator cannot be told from a differently-shaped LSM — and on this
 workload that distinction turns out to be the whole story.
+
+## Which keys the read phases ask for
+
+`--distribution` picks how `get` and `floor` choose which record to probe.
+The default is **zipf**, because that is YCSB's default and `pebble bench
+ycsb`'s, and because uniform is the one shape no real workload has.
+
+- **zipf** — YCSB's skew at theta 0.99. Measured over 100,000 keys, the
+  hottest 1% of them take about 62% of the traffic.
+- **latest** — YCSB D's, where the most recently written records are the
+  hottest.
+- **uniform** — every key equally often, which is what the phases did before
+  there was a choice. Pass it to reproduce a number measured then.
+
+**The draw is Pebble's arithmetic, deliberately.** The zeta/eta/alpha
+constants and the three-branch draw are `randvar.Zipf` line for line, and the
+scramble is `cmd/pebble`'s own key hash — an FNV-1 variant, copied rather than
+corrected. A roble number and a `pebble bench ycsb` number are comparable only
+if the keys they ask for come from the same distribution, and running the same
+arithmetic is the cheapest way to be sure of that.
+
+**Zipf is scrambled and `latest` is not.** A raw Zipf draw makes the *lowest*
+record numbers the hottest, and record numbers are ordered the way the keys
+are — so without a scramble every hot key would land in the first table of the
+store, which is a shape no workload has and one that would make every cache
+number look far better than it is. Hashing the draw across the keyspace is
+what YCSB's `ScrambledZipfianGenerator` is for. `latest` means recent, and
+recency *is* the record number, so scrambling it would destroy the only
+property it has.
+
+**It matters where the cache binds, and almost nowhere else.** On a 42 MiB
+store, 50,000 reads, median of three:
+
+| cache | phase | uniform | zipf | latest |
+| --- | --- | --- | --- | --- |
+| 64 MiB | `get` | 571,317/s | 1.031x | 1.071x |
+| 64 MiB | `floor` | 311,634/s | 1.065x | 1.114x |
+| 4 MiB | `get` | 102,070/s | **1.351x** | **2.626x** |
+| 4 MiB | `floor` | 70,546/s | **1.301x** | **2.215x** |
+
+At 64 MiB the store fits in the block cache, every read hits whatever it asks
+for, and the distribution can only change which CPU cache line is warm. At
+4 MiB it decides the hit rate, and `floor`'s p50 falls from 14 us to 3 us. So
+the distribution is worth most on the *reads in cache and out of it* pass
+above, which is the pass that already exists to measure the miss path — and it
+was measuring that path with the one access pattern that makes a miss path
+look like a fair fight.
 
 ## One table, all the engines
 

@@ -108,6 +108,12 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   by sixteen times and the load phase then measures different
                   amounts of work
   --seed N        seed for the keys, the values and the lookup order (1)
+  --distribution D  which keys the get and floor phases ask for: uniform, zipf
+                  or latest (zipf). zipf is YCSB's skew at theta=0.99, drawn
+                  and scrambled as `pebble bench ycsb` draws it, so the two
+                  are comparable; latest is YCSB D's, where the newest records
+                  are the hottest. uniform reproduces a number measured before
+                  there was a choice
   --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
                   only durability point, and a commit syncs nothing
   --reuse         open the store that is already at DIR/<engine> instead of
@@ -172,7 +178,7 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
     }
     println!(
         "{}: {} shards x {} batches x {} records, {}-byte values, {} MiB cache, \
-         wal={}, seed={}",
+         wal={}, seed={}, keys={}",
         S::NAME,
         cfg.shards,
         cfg.batches,
@@ -181,6 +187,7 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
         cfg.cache_mb,
         if cfg.wal { "on" } else { "off" },
         cfg.seed,
+        cfg.distribution.name(),
     );
     // Said here rather than only in the README, so it travels with the
     // numbers. Go's `os.File.Sync` is `fcntl(F_FULLFSYNC)` on macOS, which
@@ -340,9 +347,10 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
     // allocations and not the harness's.
     let mut key = Vec::new();
     let mut probe = Vec::new();
+    let keys = Keys::new(cfg.distribution, total);
     for _ in 0..cfg.reads {
         let s = (rng.next() as usize) % cfg.shards;
-        let i = (rng.next() as usize) % total;
+        let i = keys.next(&mut rng);
         key_into(s, i, &mut key);
         probe.clear();
         probe.reserve(key.len() + 1);
@@ -616,6 +624,150 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
+
+    /// A float in `[0, 1)`, which is what the Zipf draw is defined on.
+    fn unit(&mut self) -> f64 {
+        // 53 bits, the mantissa, so every representable value is reachable
+        // and none is reachable twice.
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// zeta(n, theta) = sum of `1 / i^theta` for i in `1..=n`.
+///
+/// Computed once per run. At six million keys it is six million `powf`s,
+/// which is some tens of milliseconds before the first operation and nothing
+/// after it.
+fn zeta(n: u64, theta: f64) -> f64 {
+    (1..=n).map(|i| 1.0 / (i as f64).powf(theta)).sum()
+}
+
+/// A Zipf generator over `0..n`, drawn exactly as YCSB's and Pebble's are.
+///
+/// theta is 0.99, which is YCSB's default and the one `pebble bench ycsb`
+/// uses, and the three-branch draw below is Pebble's `randvar.Zipf` line for
+/// line. Both of those are deliberate: a roble number and a `pebble bench
+/// ycsb` number are only comparable if the keys they ask for are drawn from
+/// the same distribution, and the cheapest way to be sure of that is to run
+/// the same arithmetic.
+struct Zipf {
+    alpha: f64,
+    zeta_n: f64,
+    half_pow_theta: f64,
+    eta: f64,
+    n: u64,
+}
+
+/// YCSB's default skew, and `pebble bench ycsb`'s.
+const THETA: f64 = 0.99;
+
+impl Zipf {
+    fn new(n: u64) -> Self {
+        let zeta_n = zeta(n, THETA);
+        Zipf {
+            alpha: 1.0 / (1.0 - THETA),
+            eta: (1.0 - (2.0 / n as f64).powf(1.0 - THETA)) / (1.0 - zeta(2, THETA) / zeta_n),
+            zeta_n,
+            half_pow_theta: 1.0 + 0.5f64.powf(THETA),
+            n,
+        }
+    }
+
+    fn next(&self, rng: &mut Rng) -> u64 {
+        let u = rng.unit();
+        let uz = u * self.zeta_n;
+        if uz < 1.0 {
+            0
+        } else if uz < self.half_pow_theta {
+            1
+        } else {
+            (self.n as f64 * (self.eta * u - self.eta + 1.0).powf(self.alpha)) as u64
+        }
+    }
+}
+
+/// Pebble's key hash, which is an FNV-1 variant and not textbook FNV-1a: it
+/// multiplies before it mixes each byte in, where FNV-1a mixes first.
+///
+/// Copied rather than corrected, because its job here is to scramble the same
+/// way `pebble bench ycsb` scrambles.
+fn hash_key(mut key: u64) -> u64 {
+    let mut h: u64 = 14_695_981_039_346_656_037;
+    for _ in 0..8 {
+        h = h.wrapping_mul(1_099_511_628_211);
+        h ^= key & 0xff;
+        key >>= 8;
+    }
+    h
+}
+
+/// Which keys a read phase asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dist {
+    /// Every key equally often. What the phases did before there was a
+    /// choice, and what reproduces a number measured then.
+    Uniform,
+    /// YCSB's skew: some 1% of the keys take about half the traffic.
+    Zipf,
+    /// YCSB D's: the most recently written keys are the hottest.
+    Latest,
+}
+
+impl Dist {
+    fn parse(name: &str) -> Self {
+        match name {
+            "uniform" => Dist::Uniform,
+            "zipf" | "zipfian" => Dist::Zipf,
+            "latest" => Dist::Latest,
+            other => fail(&format!(
+                "--distribution takes uniform, zipf or latest, not {other:?}"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Dist::Uniform => "uniform",
+            Dist::Zipf => "zipf",
+            Dist::Latest => "latest",
+        }
+    }
+}
+
+/// Draws the record a read phase probes next.
+///
+/// **Zipf is scrambled and `latest` is not**, which is the one thing about
+/// this that is easy to get wrong. A raw Zipf draw makes the *lowest* record
+/// numbers the hottest, and record numbers are ordered the way the keys are —
+/// so an unscrambled Zipf would put every hot key in the first table of the
+/// store and measure a shape no workload has. Hashing the draw across the
+/// keyspace is what YCSB's `ScrambledZipfianGenerator` is for, and Pebble
+/// does the same thing by formatting the hash as the key. `latest` means
+/// recent, and recency *is* the record number, so scrambling it would destroy
+/// the only property it has.
+struct Keys {
+    dist: Dist,
+    zipf: Zipf,
+    total: u64,
+}
+
+impl Keys {
+    fn new(dist: Dist, total: usize) -> Self {
+        Keys {
+            dist,
+            zipf: Zipf::new(total as u64),
+            total: total as u64,
+        }
+    }
+
+    fn next(&self, rng: &mut Rng) -> usize {
+        let i = match self.dist {
+            Dist::Uniform => rng.next() % self.total,
+            Dist::Zipf => hash_key(self.zipf.next(rng)) % self.total,
+            Dist::Latest => self.total - 1 - self.zipf.next(rng).min(self.total - 1),
+        };
+        i as usize
+    }
 }
 
 /// What the run was asked for. The fields an engine needs to open itself or
@@ -638,6 +790,8 @@ pub struct Config {
     pub memtable_mb: u64,
     /// Seed for the keys, the values and the lookup order.
     pub seed: u64,
+    /// Which keys the read phases ask for.
+    pub distribution: Dist,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
     layout: bool,
@@ -660,6 +814,7 @@ impl Config {
             cache_mb: 64,
             memtable_mb: 4,
             seed: 1,
+            distribution: Dist::Zipf,
             wal: true,
             layout: false,
             reuse: false,
@@ -693,6 +848,7 @@ impl Config {
                 "--cache-mb" => cfg.cache_mb = number(value(arg)),
                 "--memtable-mb" => cfg.memtable_mb = number(value(arg)),
                 "--seed" => cfg.seed = number(value(arg)),
+                "--distribution" => cfg.distribution = Dist::parse(value(arg)),
                 "--phases" => {
                     cfg.phases = Some(
                         value(arg)
@@ -807,4 +963,98 @@ fn peak_rss_mib() -> u64 {
 pub fn fail(message: &str) -> ! {
     eprintln!("roble-bench: {message}");
     process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How often each record was drawn, over `draws` draws of `total` keys.
+    fn counts(dist: Dist, total: usize, draws: usize) -> Vec<u32> {
+        let keys = Keys::new(dist, total);
+        let mut rng = Rng::new(7);
+        let mut c = vec![0u32; total];
+        for _ in 0..draws {
+            c[keys.next(&mut rng)] += 1;
+        }
+        c
+    }
+
+    /// What share of the draws went to `of`, as a percentage.
+    fn share(c: &[u32], of: &[u32]) -> u64 {
+        let part: u64 = of.iter().map(|&x| x as u64).sum();
+        let all: u64 = c.iter().map(|&x| x as u64).sum();
+        part * 100 / all
+    }
+
+    /// The hottest keys, by how often they were drawn.
+    fn hottest(c: &[u32], n: usize) -> Vec<u32> {
+        let mut sorted = c.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        sorted[..n].to_vec()
+    }
+
+    const TOTAL: usize = 100_000;
+    const DRAWS: usize = 400_000;
+
+    /// The property that makes a skewed read phase worth running: some keys
+    /// are much hotter than others, and **which** keys they are is spread
+    /// across the store rather than sitting in its first table.
+    ///
+    /// The second half is the one that breaks silently. A raw Zipf draw makes
+    /// the lowest record numbers the hottest, record numbers are ordered the
+    /// way the keys are, and so every hot key would land in one table — a
+    /// shape no workload has, and one that would make every cache number look
+    /// far better than it is. Scrambling is what prevents it, and this is the
+    /// test that would notice it being dropped.
+    #[test]
+    fn zipf_is_concentrated_but_not_clustered() {
+        let c = counts(Dist::Zipf, TOTAL, DRAWS);
+        let hot = share(&c, &hottest(&c, TOTAL / 100));
+        assert!(hot > 40, "the hottest 1% of keys took only {hot}%");
+        let first = share(&c, &c[..TOTAL / 100]);
+        assert!(
+            first < 5,
+            "the first 1% of the keyspace took {first}%, so the draw is clustered"
+        );
+    }
+
+    /// `latest` is the one distribution that **is** meant to be clustered: it
+    /// is YCSB D's, where the newest records are the hottest, and recency is
+    /// the record number. Scrambling it would destroy the only property it
+    /// has, so this asserts the heat is at the end of the keyspace.
+    #[test]
+    fn latest_favours_the_newest_records() {
+        let c = counts(Dist::Latest, TOTAL, DRAWS);
+        let newest = share(&c, &c[TOTAL - TOTAL / 100..]);
+        assert!(newest > 40, "the newest 1% of keys took only {newest}%");
+    }
+
+    /// And uniform stays uniform, which is what reproduces a number measured
+    /// before there was a choice.
+    #[test]
+    fn uniform_favours_nothing() {
+        let c = counts(Dist::Uniform, TOTAL, DRAWS);
+        let hot = share(&c, &hottest(&c, TOTAL / 100));
+        assert!(
+            hot < 5,
+            "the hottest 1% of keys took {hot}%, which is not uniform"
+        );
+    }
+
+    /// Both skewed draws stay inside the keyspace at its edges, where the
+    /// `min`/`max` arithmetic is easiest to get wrong by one.
+    #[test]
+    fn a_draw_never_leaves_the_keyspace() {
+        for dist in [Dist::Uniform, Dist::Zipf, Dist::Latest] {
+            for total in [1, 2, 3, 1000] {
+                let keys = Keys::new(dist, total);
+                let mut rng = Rng::new(11);
+                for _ in 0..10_000 {
+                    let i = keys.next(&mut rng);
+                    assert!(i < total, "{} drew {i} of {total}", dist.name());
+                }
+            }
+        }
+    }
 }
