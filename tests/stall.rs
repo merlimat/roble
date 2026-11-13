@@ -461,6 +461,56 @@ async fn the_budget_stops_a_store_whose_flushes_nobody_takes() {
 }
 
 #[compio::test]
+async fn a_task_waits_for_the_flush_underway_rather_than_queueing_to_repeat_it() {
+    // The same second look `make_room` takes, from the task's side (§5).
+    // A change already underway may be the very flush this task would run,
+    // so it waits for that one and asks again — Pebble's loop in
+    // `maybeInduceWriteStall`. A task that queued for the permit instead
+    // would take it the moment it was free and write out a memtable the
+    // flush in front had just emptied, which is a table nobody needed and a
+    // merge nobody asked for.
+    let budget = ENTRIES * entry_cost();
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, opened(false, budget))
+        .await
+        .expect("open");
+    fill_past_the_line(&db, false).await;
+    assert!(flush_wanted_now(&db), "the line was reached");
+
+    // A flush suspended at its first operation, which is a flush holding the
+    // permit: the simulated filesystem never blocks, so this is the only way
+    // a change stays underway across a poll (§12).
+    env.sim().pause_at(1);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut flushing = pin!(db.flush());
+    assert!(
+        flushing.as_mut().poll(&mut cx).is_pending(),
+        "the flush should have paused part-way, with the permit in its hand"
+    );
+
+    assert!(
+        !flush_wanted_now(&db),
+        "the store is still at the line, but what is at it is the memtable the flush \
+         underway has already frozen — so the answer is to wait for that one"
+    );
+
+    let mut polls = 0;
+    let table = loop {
+        if let Poll::Ready(done) = flushing.as_mut().poll(&mut cx) {
+            break done;
+        }
+        polls += 1;
+        assert!(polls < 1_000, "the paused flush is not making progress");
+    };
+    table.expect("the flush").expect("a table");
+
+    assert!(
+        !flush_wanted_now(&db),
+        "and asking again once it has finished finds the room already made"
+    );
+}
+
+#[compio::test]
 async fn a_flush_that_failed_is_not_asked_for_again_until_a_write() {
     // The same rule a compaction that failed lives by (§9), for the same
     // reason: the picker — here, the line — gives the same answer against
