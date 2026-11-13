@@ -1009,7 +1009,14 @@ and passed to every store opened on it through `Options`, holding:
 - a **block cache**, keyed by (file number, offset), with a budget and CLOCK
   eviction, as encina's leaf cache;
 - a **table cache**, open readers with their index and filter blocks, bounded by
-  count, since an open reader costs file descriptors as well as memory.
+  count — **unbounded by default**, as RocksDB's `max_open_files` is, because
+  a bound smaller than the store is a cliff: a store with more tables than the
+  cache reopens one on nearly every lookup, and reopening a table is its
+  footer, metaindex, properties, index, filter and tombstones rather than a
+  file handle. At 243 tables against a budget of 128 that cost `floor`
+  fifty-five times. The budget remains settable and a deployment should set
+  it, because an open reader still costs a file descriptor: hundreds of shards
+  of a few hundred tables each will pass a default `ulimit -n` of 1024.
 
 Both are keyed by **store and file number**, not by file number alone. File
 numbers are per database, so two shards on one thread both have a table

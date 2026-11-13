@@ -472,7 +472,17 @@ Pebble's whether or not Pebble is in the table; RocksDB's differ enough to
 decide a result rather than inform it, and the benchmark sets them from
 roble's own constants — the memtable, the
 target file size, the L0 compaction and stop-writes thresholds, and the base
-level's budget. `--memtable-mb` is the one of them exposed as a flag, and it
+level's budget.
+
+**The open-table budget was the one knob this paragraph did not cover, and it
+decided a result.** RocksDB's `max_open_files` defaults to no limit and the
+benchmark never set it, so RocksDB held every one of its tables open while
+roble kept a default 128 of the 243 its store settled into — reopening one on
+nearly every lookup, which is a table's footer, index, filter and tombstones
+rather than a file handle. It cost `floor` fifty-five times and was read as a
+gap between the engines. roble's default is now no limit too, so the two
+match; a deployment that cares about file descriptors sets a budget on both
+(§8). `--memtable-mb` is the one of them exposed as a flag, and it
 is **64 MiB** — RocksDB's own default, and the size `cmd/pebble` hardcodes for
 its YCSB benchmark, so a number from here and a number from that tool are at
 least buffering the same amount.

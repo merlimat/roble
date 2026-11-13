@@ -39,11 +39,29 @@ use std::rc::Rc;
 use crate::env::Fs;
 use crate::table::OpenTable;
 
-/// How many tables one thread keeps open by default.
+/// How many tables one thread keeps open by default: **no limit**, which is
+/// RocksDB's own default for `max_open_files` and what it spells `-1`.
 ///
-/// A count rather than a size: what an open reader costs that matters first is
-/// a file descriptor.
-pub const DEFAULT_OPEN_TABLES: usize = 128;
+/// It was 128, and 128 is a cliff rather than a bound. A store with more
+/// tables than that reopens one on nearly every lookup — and reopening a
+/// table is its footer, its metaindex, its properties, its index, its filter
+/// and its tombstones, not a file handle. Measured on an 846 MiB store of 243
+/// tables, raising this took `floor` from 132 to 7,480 operations a second
+/// and the phase's CPU from 2.29 seconds to 0.04. The degradation is not
+/// gradual: it is nothing until the store outgrows the cache, then fifty-five
+/// times.
+///
+/// **What this costs is file descriptors**, which is what the old bound was
+/// for and what §8 still says about it. One per open table, and a node
+/// running hundreds of shards of a few hundred tables each will pass a
+/// default `ulimit -n` of 1024 without trying. A deployment that cares has to
+/// set a budget — [`Caches::new`] takes one — and the right number is the one
+/// CockroachDB derives from the system limit rather than any constant here.
+///
+/// The budget reaches the `limit` gauge as `budget as i64`, so an unlimited
+/// cache reports **-1** there. That is the same -1 RocksDB uses and it is
+/// meant to be read the same way.
+pub const DEFAULT_OPEN_TABLES: usize = usize::MAX;
 
 /// How many bytes of data blocks one thread keeps by default.
 ///
@@ -430,6 +448,36 @@ impl<F: Fs> Default for Caches<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default table cache keeps everything, which is what makes it a
+    /// bound nobody trips over rather than a cliff somebody falls off.
+    ///
+    /// A count smaller than the store is the shape that hurts: the entry
+    /// evicted is the one about to be asked for, so the cost is not a lower
+    /// hit rate but a reopen on nearly every lookup.
+    #[test]
+    fn an_unlimited_cache_evicts_nothing() {
+        let mut c: Clock<u32, u32> = Clock::new(DEFAULT_OPEN_TABLES);
+        // More than the old default of 128, so this would have swept.
+        for k in 0..1_000 {
+            c.insert(k, k, 1);
+        }
+        assert_eq!(c.len(), 1_000, "an unlimited cache dropped something");
+        for k in 0..1_000 {
+            assert_eq!(c.get(&k), Some(k), "entry {k} was evicted");
+        }
+    }
+
+    /// And a budget still bounds, because a deployment that cares about file
+    /// descriptors has to be able to say so (§8).
+    #[test]
+    fn a_budget_still_bounds_when_one_is_given() {
+        let mut c: Clock<u32, u32> = Clock::new(16);
+        for k in 0..1_000 {
+            c.insert(k, k, 1);
+        }
+        assert_eq!(c.len(), 16, "a cache given a budget did not keep to it");
+    }
 
     #[test]
     fn a_touch_buys_one_reprieve_from_the_sweep() {
