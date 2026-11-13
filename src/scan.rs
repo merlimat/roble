@@ -38,6 +38,12 @@
 //! [`crate::read`] re-seek every table once per key they reject. Here the
 //! iterators keep their place, so a run of deleted keys costs a step each
 //! rather than a seek each (§6).
+//!
+//! Two rewrites of this loop were built, measured and thrown away: lending a
+//! value rather than copying it into the caller's buffer (1.01), and
+//! replacing the two passes over the sources with a single merged stream
+//! (0.921). Both remove real work, and the step is not waiting on work — §8
+//! has the measurement and what follows from it.
 
 use std::rc::Rc;
 
