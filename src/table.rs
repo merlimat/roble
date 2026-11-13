@@ -245,6 +245,131 @@ impl<D: Disk> OpenTable<D> {
     /// `caching` decides what becomes of a block that had to be fetched (see
     /// [`Caching`]). The lookup happens either way; only the filling is
     /// conditional.
+    /// The blocks to read in one call: those around `at` in the direction a
+    /// scan is walking, while they sit together on disk and fit `ahead`.
+    ///
+    /// Just `at` when nothing says a scan is walking at all. A table's data
+    /// blocks are written one after another, so a window is usually bounded
+    /// only by the budget.
+    ///
+    /// A gap ends it, and not for correctness: every block is cut out of the
+    /// window by its own file offset, so bytes read between them would be
+    /// read and ignored rather than mistaken for anything. It ends it because
+    /// the budget counts the blocks and the read covers the span, and those
+    /// are the same number only while the blocks sit together.
+    fn window(&self, at: usize, ahead: u64, back: bool) -> (usize, usize) {
+        let (mut first, mut last) = (at, at);
+        let mut span = self.index[at].handle.span_len();
+        loop {
+            let (edge, next) = if back {
+                (first == 0, first.wrapping_sub(1))
+            } else {
+                (last + 1 >= self.index.len(), last + 1)
+            };
+            if edge {
+                return (first, last);
+            }
+            let grown = self.index[next].handle;
+            let (before, after) = if back {
+                (grown, self.index[first].handle)
+            } else {
+                (self.index[last].handle, grown)
+            };
+            if before.offset + before.span_len() != after.offset || span + grown.span_len() > ahead
+            {
+                return (first, last);
+            }
+            span += grown.span_len();
+            if back { first = next } else { last = next }
+        }
+    }
+
+    /// The block at index position `at`, taking the blocks around it in the
+    /// same read when `ahead` says a scan is walking them in order.
+    ///
+    /// A scan reads every block of a table exactly once, so every one of its
+    /// block reads is a cache miss by construction and each was a `pread` of
+    /// its own: one syscall per 16 KiB, which a profile of a forward scan put
+    /// at a quarter of everything it did. Reading the neighbouring blocks in
+    /// the same call is what Pebble's reader does for a sequential iterator,
+    /// and this is the only part of a step that grows with a record's size —
+    /// a larger value is fewer records to a block, so more syscalls for each.
+    ///
+    /// The blocks read ahead go into the block cache, which is where the
+    /// reads that follow look anyway. So nothing downstream changes, and a
+    /// window that turns out to be wasted costs the cache a few blocks it
+    /// would have held soon enough.
+    async fn block_at(
+        &self,
+        at: usize,
+        ahead: usize,
+        back: bool,
+        caching: Caching,
+    ) -> Result<Rc<Vec<u8>>> {
+        let handle = self.index[at].handle;
+        if let Some(held) = self.blocks.get(self.file_num, handle.offset) {
+            self.looked(caching, crate::metrics::BLOCK_HIT);
+            return Ok(held);
+        }
+        self.looked(caching, crate::metrics::BLOCK_MISS);
+
+        // A compaction reads each block once and never comes back, so filling
+        // the cache for it would spend the budget on blocks nobody asks for
+        // twice (`Caching`).
+        let (first, last) = match caching {
+            Caching::Keep => self.window(at, ahead as u64, back),
+            Caching::Discard => (at, at),
+        };
+        if first == last {
+            let bytes = fetch(
+                &self.disk,
+                self.metrics.as_deref(),
+                handle,
+                self.footer.checksum,
+            )
+            .await?;
+            if caching == Caching::Keep {
+                self.blocks
+                    .hold(self.file_num, handle.offset, Rc::clone(&bytes));
+            }
+            return Ok(bytes);
+        }
+
+        let from = self.index[first].handle;
+        let end = self.index[last].handle;
+        let span = end.offset + end.span_len() - from.offset;
+        let timer = self.metrics.as_ref().and_then(|m| m.read_duration.start());
+        let raw = read_exact(
+            &self.disk,
+            from.offset,
+            usize::try_from(span)
+                .map_err(|_| Error::Corrupt(format!("a read of {span} bytes is too large")))?,
+            Default::default(),
+        )
+        .await?;
+        drop(timer);
+        if let Some(m) = &self.metrics {
+            m.read.add(raw.len());
+        }
+        let mut wanted = None;
+        for i in first..=last {
+            let h = self.index[i].handle;
+            let start = usize::try_from(h.offset - from.offset).expect("inside the window");
+            let stop = start + usize::try_from(h.span_len()).expect("a block that was read");
+            let block = Rc::new(
+                match decode_fetched(&raw[start..stop], h.offset, self.footer.checksum)? {
+                    Decoded::Borrowed(b) => b.to_vec(),
+                    Decoded::Owned(v) => v,
+                },
+            );
+            if i == at {
+                wanted = Some(Rc::clone(&block));
+            }
+            self.blocks.hold(self.file_num, h.offset, block);
+        }
+        Ok(wanted.expect("the block the window was asked for"))
+    }
+
     async fn block(&self, handle: BlockHandle, caching: Caching) -> Result<Rc<Vec<u8>>> {
         if let Some(held) = self.blocks.get(self.file_num, handle.offset) {
             self.looked(caching, crate::metrics::BLOCK_HIT);
@@ -528,7 +653,26 @@ pub struct TableIter<D: Disk> {
     /// That block's bytes, once loaded.
     bytes: Option<Rc<Vec<u8>>>,
     cursor: roble_format::block::restart::DataCursor,
+    /// How many bytes the next crossing into a neighbouring block may read,
+    /// and which way the last crossing went.
+    ///
+    /// Zero until this iterator has crossed twice the same way, and doubling
+    /// after that: a seek reads one block and wants no more, and a scan over
+    /// two blocks would pay for a window it never reads. Only a crossing that
+    /// follows a crossing in the same direction says the rest of the table is
+    /// wanted, and says which end of it.
+    ahead: usize,
+    ahead_back: bool,
 }
+
+/// What a scan's second block crossing reads ahead, and where it stops
+/// doubling.
+///
+/// The ceiling is what one `pread` can carry without the window outliving its
+/// welcome in the block cache; the floor is four of the 16 KiB blocks
+/// `roble_format`'s writer aims at.
+const READAHEAD_FIRST: usize = 64 * 1024;
+const READAHEAD_MAX: usize = 256 * 1024;
 
 impl<D: Disk> OpenTable<D> {
     /// An iterator over this table, positioned nowhere.
@@ -544,6 +688,8 @@ impl<D: Disk> OpenTable<D> {
             table: Rc::clone(self),
             at: 0,
             bytes: None,
+            ahead: 0,
+            ahead_back: false,
         }
     }
 }
@@ -578,8 +724,29 @@ impl<D: Disk> TableIter<D> {
 
     /// Loads block `at`, leaving the cursor unpositioned within it.
     async fn load(&mut self, at: usize) -> Result<()> {
-        let handle = self.table.index[at].handle;
-        self.bytes = Some(self.table.block(handle, self.caching).await?);
+        // Which way this load crosses, if it is a crossing at all. A seek
+        // lands anywhere and says nothing about what comes next.
+        let back = match self.bytes {
+            Some(_) if at == self.at + 1 => Some(false),
+            Some(_) if at + 1 == self.at => Some(true),
+            _ => None,
+        };
+        let ahead = match back {
+            Some(b) if b == self.ahead_back => self.ahead,
+            _ => 0,
+        };
+        self.bytes = Some(
+            self.table
+                .block_at(at, ahead, back == Some(true), self.caching)
+                .await?,
+        );
+        match back {
+            Some(b) => {
+                self.ahead = (ahead.max(READAHEAD_FIRST / 2) * 2).min(READAHEAD_MAX);
+                self.ahead_back = b;
+            }
+            None => self.ahead = 0,
+        }
         self.at = at;
         Ok(())
     }
