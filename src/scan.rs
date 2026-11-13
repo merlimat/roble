@@ -405,7 +405,25 @@ pub struct Scan<D: Disk> {
     /// `Vec` the previous key was in, which is free the moment this scan
     /// steps off it (`advance`).
     spare: Option<Current>,
-    tables: Vec<Rc<OpenTable<D>>>,
+    /// The tables of this scan that hold a range tombstone at all.
+    ///
+    /// What `visible` has to consult, and usually nothing: a table with no
+    /// tombstones can never cover a key, so walking it is work that cannot
+    /// change an answer. The sweep used to walk every table the scan held
+    /// for every key it returned, and a profile of a forward scan over a
+    /// store settled into fourteen tables put `visible` at a quarter of the
+    /// whole scan — the largest single item in it, looking for tombstones
+    /// that a store nobody has called `delete_range` on does not have.
+    ///
+    /// Decided when the scan is made, which is sound because a table's
+    /// tombstones are fixed once it is written. The memtables below are
+    /// still being written to, so they are consulted a key at a time.
+    ///
+    /// This is also every table the scan needs to name: the file itself is
+    /// held open by the iterator reading it (`crate::table::TableIter` keeps
+    /// an `Rc` of its table), so the obsolete sweep is kept off all of them
+    /// without a list of its own (§5, `crate::obsolete`).
+    tombstoned: Vec<Rc<OpenTable<D>>>,
     /// Kept for their range tombstones, which are not in any source.
     ///
     /// More than one when a scan is reading through an uncommitted batch
@@ -451,7 +469,11 @@ impl<D: Disk> Scan<D> {
         metrics: Option<Rc<crate::metrics::Metrics>>,
     ) -> Self {
         placed.sort_by(|a, b| (a.level, &a.smallest).cmp(&(b.level, &b.smallest)));
-        let tables: Vec<Rc<OpenTable<D>>> = placed.iter().map(|p| Rc::clone(&p.table)).collect();
+        let tombstoned: Vec<Rc<OpenTable<D>>> = placed
+            .iter()
+            .filter(|p| !p.table.tombstones.is_empty())
+            .map(|p| Rc::clone(&p.table))
+            .collect();
         let mut iters: Vec<Source<D>> = Vec::with_capacity(placed.len() + memtables.len());
         // The level the run being built is still taking tables for, and
         // `None` at L0, where the tables overlap and so each has to stay a
@@ -496,7 +518,7 @@ impl<D: Disk> Scan<D> {
         Scan {
             iters,
             spare: None,
-            tables,
+            tombstoned,
             memtables,
             snapshot,
             lower,
@@ -796,7 +818,7 @@ impl<D: Disk> Scan<D> {
         if is_deletion(kind) {
             return Ok(false);
         }
-        if covered_by_tombstone(&self.tables, user, seq)? {
+        if covered_by_tombstone(&self.tombstoned, user, seq)? {
             return Ok(false);
         }
         // A memtable's tombstones are not in any source — they are kept
