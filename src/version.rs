@@ -399,13 +399,30 @@ fn apply_one(
                 new.file_num, new.level
             )));
         }
-        // By file number, so a version has one order however the
-        // edits arrived.
+        // **L0 by file number, every level below it by key.**
+        //
+        // Either order gives a version one shape however the edits arrived,
+        // which is all the old file-number order was for. Below L0 the
+        // ranges are disjoint, so ordering by the smallest bound is total as
+        // well — and it is what lets a lookup binary-search a level instead
+        // of walking it. With two hundred tables in a level that is the
+        // difference between three comparisons and two hundred, on every
+        // `get` and every `floor` (`crate::read`).
+        //
+        // L0 keeps file number, because its tables overlap: there is no key
+        // order to put them in.
+        //
+        // The bounds are compared encoded rather than decoded. An internal
+        // key is its user key followed by a trailer, so bytewise order on
+        // the whole thing is user-key order, and this way the comparison
+        // cannot fail on a key it would have to decode.
         let table = Table::from_new(new);
-        let pos = tables
-            .iter()
-            .position(|t| t.file_num > table.file_num)
-            .unwrap_or(tables.len());
+        let pos = if new.level == 0 {
+            tables.iter().position(|t| t.file_num > table.file_num)
+        } else {
+            tables.iter().position(|t| t.smallest > table.smallest)
+        }
+        .unwrap_or(tables.len());
         tables.insert(pos, table);
     }
     Ok(())
