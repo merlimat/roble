@@ -1522,12 +1522,21 @@ in both directions.
   CI measures coverage on every pull request (`cargo llvm-cov`), posts the totals
   as a status, and lists the lines and regions no test runs, such as the error
   branch of a `?`. An uncovered failure path needs a test or a written reason.
-- **Benchmarks** against Go Pebble on Oxia's shape: small records, a store per
-  shard, batches per write, floor lookups, scans both ways, and a checkpoint.
-  `bench/` is the Rust side and `harness/bench` the Go one, each engine in a
-  process of its own so the CPU time and the memory reported are its alone, and
-  both deriving their keys, values and lookup order from one seed with the same
-  generator. `bench/README.md` says what the phases are and, at more length,
+- **Benchmarks** on Oxia's shape: small records, a store per shard, batches per
+  write, floor lookups, scans both ways, short range scans, YCSB's six mixes and
+  a checkpoint. `bench/` runs roble, encina and RocksDB, each engine in a process
+  of its own so the CPU time and the memory reported are its alone, and all
+  deriving their keys, values and lookup order from one seed with the same
+  generator.
+
+  **There is no Go Pebble row.** There was one, from a driver under
+  `harness/bench` written to these phases and this key shape, and it has been
+  removed. `cmd/pebble`'s own benchmarks do not replace it: `ycsb` builds
+  `user` plus a hash plus an MVCC suffix, `scan` builds a hundred thousand
+  `key-` plus `uint32` records, and neither key shape is configurable — so they
+  measure Pebble on *their* workload, not on Oxia's. What ends with the driver
+  is the only like-for-like comparison against the engine roble exists to
+  replace, `floor` above all, which no `cmd/pebble` benchmark performs at all. `bench/README.md` says what the phases are and, at more length,
   the three ways a comparison like this misleads a careless reader: a sync
   primitive that differs by platform, a block cache the previous phase warmed,
   and a clock read per step that costs as much as the step. Each of the three

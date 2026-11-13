@@ -31,12 +31,17 @@
 #   4. The layout: every table of every level, with its size and key range,
 #      which is what a scan number has to be read against.
 #
-# ENGINES picks which to run; the default is all of them. roble and Pebble
-# need nothing installed. encina is fetched from git. RocksDB needs a C++
-# toolchain and libclang, which is why neither is a default cargo feature:
+# ENGINES picks which to run; the default is all of them. roble needs nothing
+# installed. encina is fetched from git. RocksDB needs a C++ toolchain and
+# libclang, which is why neither is a default cargo feature:
 #
-#   ENGINES="roble pebble" ./run.sh          # nothing to install
+#   ENGINES="roble" ./run.sh                 # nothing to install
 #   ENGINES="roble encina" ./run.sh          # adds a git fetch
+#
+# Go Pebble is **not** here any more. It had a driver of its own under
+# `harness/bench`, written to this harness's phases and key shape; that is
+# gone, and `cmd/pebble`'s own benchmarks do not replace it, because they
+# build their own keys. See the README.
 #
 # KEEP=1 leaves the stores on disk instead of removing them, and BENCH_DIR
 # puts them somewhere chosen rather than in a temporary directory — for
@@ -54,7 +59,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ENGINES="${ENGINES:-roble pebble rocksdb encina}"
+ENGINES="${ENGINES:-roble rocksdb encina}"
 
 # Where every store of every pass is written. Printed rather than hidden,
 # because the thing a run leaves behind is often what you wanted to look at:
@@ -85,9 +90,6 @@ run_engine() {
     encina|rocksdb)
       cargo run --release --quiet -p roble-bench --features "$engine" -- \
         --engine "$engine" --dir "$dir" "$@"
-      ;;
-    pebble)
-      (cd ../harness && go run ./bench --dir "$dir" "$@" 2>&1 | grep -v '^[0-9]\{4\}/')
       ;;
     *)
       echo "run.sh: unknown engine $engine" >&2

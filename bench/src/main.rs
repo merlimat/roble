@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Benchmarks roble, encina and RocksDB on the workload Oxia runs, in the
-//! phases and the output format `harness/bench` reports for Go Pebble, so all
-//! four can be read side by side. See README.md.
+//! Benchmarks roble, encina and RocksDB on the workload Oxia runs, so the
+//! three can be read side by side. See README.md.
+//!
+//! Go Pebble had a driver of its own here, written to these phases and this
+//! key shape, and it has been removed. Nothing replaces it: `cmd/pebble`'s
+//! benchmarks build their own keys, so they measure Pebble on their workload
+//! rather than on Oxia's. The README says what that costs.
 //!
 //! A run benchmarks one engine in a process of its own, so the CPU time and
 //! the size it reports are that engine's alone.
@@ -789,8 +793,7 @@ pub fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
 // ------------------------------------------------------------------- the rest
 
 /// xorshift64*, so the lookup order is the same on every run and in every
-/// engine without pulling in a dependency for it. `harness/bench` has the
-/// same generator, seeded the same way.
+/// engine without pulling in a dependency for it.
 struct Rng(u64);
 
 impl Rng {
