@@ -107,10 +107,15 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   fill it (default: the whole value, so incompressible). 16
                   makes a 128-byte value eight copies of one chunk, which
                   Snappy halves — the dial between the two extremes §8 needs
-  --memtable-mb N bytes a memtable holds before a flush, in MiB (4). Set on
+  --memtable-mb N bytes a memtable holds before a flush, in MiB (64). Set on
                   every engine that has one, because their own defaults differ
                   by sixteen times and the load phase then measures different
-                  amounts of work
+                  amounts of work. 64 is RocksDB's own default and the size
+                  `pebble bench ycsb` hardcodes. **A memtable this big needs a
+                  dataset well past it**: with less, the whole load fits in
+                  one and nothing flushes, so the load row measures a skiplist
+                  and the read phases run over whatever `settle` had to write
+                  all at once
   --seed N        seed for the keys, the values and the lookup order (1)
   --distribution D  which keys the get and floor phases ask for: uniform, zipf
                   or latest (zipf). zipf is YCSB's skew at theta=0.99, drawn
@@ -132,6 +137,13 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --scans SPEC    how long a scan-short scan is, as
                   [{zipf,uniform}:]min[-max] (zipf:1-1000), which is
                   `pebble bench ycsb`'s spelling of the same thing
+  --min-seconds N how long a timed phase runs for, at least (10). The scans,
+                  get, floor, scan-short and ycsb run until both --reads and
+                  this are satisfied; 0 turns it off and leaves --reads alone.
+                  It is here because --reads alone was not enough: at 200,000
+                  operations the mixes finished in under a second and the
+                  scans in tens of milliseconds, which is not long enough for
+                  a flush to land inside the measurement
   --workload X    which YCSB mix the ycsb phase runs, A to F (B). A is
                   50/50 read and update, B 95/5, C all reads, D 95/5 read and
                   insert over the latest distribution, E 95/5 scan and insert,
@@ -335,15 +347,31 @@ async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool, out: Output) 
         return;
     }
     let mut report = Report::new(name, out);
-    for store in shards {
-        let seen = store.scan(reverse, &mut report).await;
-        report.count += seen;
-    }
     let expected = (cfg.shards * cfg.batches * cfg.records) as u64;
-    if report.count != expected {
+    // One sweep over a 42 MiB store is tens of milliseconds, which is not a
+    // measurement. Sweeping again until `--min-seconds` is met is: the first
+    // pass reads what `settle` left in the cache and the ones after it read
+    // a cache the pass before warmed, so what this reports is a **steady
+    // state** scan rate rather than a first scan. `run.sh` keeps a pass that
+    // gives each direction a freshly loaded store of its own, which is where
+    // a first scan is still measured.
+    let started = Instant::now();
+    let mut passes = 0u64;
+    loop {
+        for store in shards {
+            let seen = store.scan(reverse, &mut report).await;
+            report.count += seen;
+        }
+        passes += 1;
+        if started.elapsed().as_secs_f64() >= cfg.min_seconds {
+            break;
+        }
+    }
+    if report.count != expected * passes {
         fail(&format!(
-            "the {name} saw {} records, not the {expected} that were written",
-            report.count
+            "the {name} saw {} records over {passes} passes, not the {} that were written",
+            report.count,
+            expected * passes
         ));
     }
     report.finish(size_of(shards).await);
@@ -371,7 +399,8 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
     let mut key = Vec::new();
     let mut probe = Vec::new();
     let keys = Keys::new(cfg.distribution, total);
-    for _ in 0..cfg.reads {
+    let started = Instant::now();
+    while more(cfg, report.count, started) {
         let s = (rng.next() as usize) % cfg.shards;
         let i = keys.next(&mut rng);
         key_into(s, i, &mut key);
@@ -443,7 +472,8 @@ async fn short_scans<S: Store>(cfg: &Config, shards: &[S], out: Output) {
     let keys = Keys::new(cfg.distribution, total);
     let lengths = Lengths::parse(&cfg.scans);
     let mut key = Vec::new();
-    for _ in 0..cfg.reads {
+    let started = Instant::now();
+    while more(cfg, report.count, started) {
         let s = (rng.next() as usize) % cfg.shards;
         let i = keys.next(&mut rng);
         key_into(s, i, &mut key);
@@ -492,7 +522,8 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
     let mut key = Vec::new();
     let mut counts = [0u64; 5];
     let mut latencies: [Vec<std::time::Duration>; 5] = std::array::from_fn(|_| Vec::new());
-    for _ in 0..cfg.reads {
+    let started = Instant::now();
+    while more(cfg, report.count, started) {
         let s = (rng.next() as usize) % cfg.shards;
         let op = w.pick(&mut rng);
         let at = Instant::now();
@@ -550,7 +581,13 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
         let took = at.elapsed();
         report.saw(took);
         counts[op.index()] += 1;
-        latencies[op.index()].push(took);
+        // Capped for the reason `Report::MAX_SAMPLES` is: a ten-second mix at
+        // three hundred thousand operations a second would keep tens of
+        // megabytes of `Duration` per operation kind, on a phase whose last
+        // line is the process's peak resident memory.
+        if latencies[op.index()].len() < 1_000_000 {
+            latencies[op.index()].push(took);
+        }
         report.count += 1;
     }
     report.finish(size_of(shards).await);
@@ -961,6 +998,21 @@ impl Dist {
     }
 }
 
+/// Whether a timed phase should go round again.
+///
+/// `--reads` says how many operations and `--min-seconds` says how long, and
+/// a phase runs until **both** are satisfied. The second one exists because
+/// the first was not enough on its own: at 200,000 operations the YCSB mixes
+/// finished in 0.14 to 0.77 seconds on a Linux VM, and the scans in 7 to 81
+/// *milli*seconds. A tenth of a second is not long enough for a flush to land
+/// inside the measurement, for a compaction to be provoked, or for a rate to
+/// be anything but the variance between two runs.
+///
+/// Ten seconds by default, which is also `pebble bench ycsb`'s `--duration`.
+fn more(cfg: &Config, done: u64, started: Instant) -> bool {
+    done < cfg.reads as u64 || started.elapsed().as_secs_f64() < cfg.min_seconds
+}
+
 /// One operation of a YCSB mix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
@@ -1216,6 +1268,8 @@ pub struct Config {
     pub scans: String,
     /// Which YCSB mix the `ycsb` phase runs.
     pub workload: String,
+    /// How long a timed phase runs for, at least, in seconds.
+    pub min_seconds: f64,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
     layout: bool,
@@ -1236,11 +1290,12 @@ impl Config {
             value_chunk: 0,
             reads: 100_000,
             cache_mb: 64,
-            memtable_mb: 4,
+            memtable_mb: 64,
             seed: 1,
             distribution: Dist::Zipf,
             scans: "zipf:1-1000".to_string(),
             workload: "B".to_string(),
+            min_seconds: 10.0,
             wal: true,
             layout: false,
             reuse: false,
@@ -1277,6 +1332,7 @@ impl Config {
                 "--distribution" => cfg.distribution = Dist::parse(value(arg)),
                 "--scans" => cfg.scans = value(arg).to_string(),
                 "--workload" => cfg.workload = value(arg).to_string(),
+                "--min-seconds" => cfg.min_seconds = number(value(arg)) as f64,
                 "--phases" => {
                     cfg.phases = Some(
                         value(arg)

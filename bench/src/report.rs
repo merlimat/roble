@@ -71,8 +71,19 @@ impl Report {
         n.is_multiple_of(Self::SAMPLE)
     }
 
+    /// How many latency samples a phase keeps.
+    ///
+    /// A phase that runs for ten seconds instead of a tenth of one keeps a
+    /// hundred times the samples, and a scan sampling one step in 64 at forty
+    /// million steps a second would reach seven million of them — over a
+    /// hundred megabytes, on a row whose last column is the process's peak
+    /// resident memory. The cap keeps that column measuring the engine.
+    const MAX_SAMPLES: usize = 1_000_000;
+
     pub fn saw(&mut self, took: Duration) {
-        self.latencies.push(took);
+        if self.latencies.len() < Self::MAX_SAMPLES {
+            self.latencies.push(took);
+        }
     }
 
     /// Prints the line, and says what the phase could not be asked to do.
