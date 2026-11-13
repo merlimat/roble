@@ -128,9 +128,16 @@ Creates the store at DIR/<engine>, which must not exist yet.
   --scans SPEC    how long a scan-short scan is, as
                   [{zipf,uniform}:]min[-max] (zipf:1-1000), which is
                   `pebble bench ycsb`'s spelling of the same thing
+  --workload X    which YCSB mix the ycsb phase runs, A to F (B). A is
+                  50/50 read and update, B 95/5, C all reads, D 95/5 read and
+                  insert over the latest distribution, E 95/5 scan and insert,
+                  F 50/50 read and read-modify-write. D and F are YCSB's
+                  definitions and not `pebble bench ycsb`'s, which has D on
+                  the default distribution and F as all inserts
   --phases LIST   comma-separated subset of
                   load,settle,scan-rev,scan,get,floor,scan-short,get-cold,
-                  checkpoint
+                  ycsb,checkpoint. **ycsb writes**, so it runs last and a
+                  --reuse after it finds more records than were loaded
                   (always run in that order, whatever order they are named in)";
 
 fn main() {
@@ -256,6 +263,11 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
     } else {
         shards
     };
+    // After everything that wants a store of a known size, because this one
+    // writes: A and B update, D and E insert, F writes back what it read.
+    if cfg.wants("ycsb") {
+        ycsb(cfg, &shards, out).await;
+    }
     if cfg.wants("checkpoint") {
         checkpoint(&shards, path, out).await;
     }
@@ -451,6 +463,126 @@ async fn short_scans<S: Store>(cfg: &Config, shards: &[S], out: Output) {
         report.count += 1;
     }
     report.finish(size_of(shards).await);
+}
+
+/// `--reads` operations drawn from one of YCSB's six mixes.
+///
+/// **This phase writes**, which no other read phase does: A and B update, D
+/// and E insert, F reads and writes back. So it is run last, after everything
+/// that wants a store of a known size, and a `--reuse` of the directory
+/// afterwards will find more records than `--batches x --records` and fail
+/// the count checks. That is the phase working, not breaking.
+///
+/// Each shard keeps **its own** keyspace, because each grows by its own
+/// inserts: a read on shard 3 has to draw from the records shard 3 has, and
+/// drawing from a total some other shard grew would ask for a key that was
+/// never written.
+async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
+    let w = Workload::parse(&cfg.workload);
+    let mut report = Report::new(w.row, out);
+    let total = cfg.batches * cfg.records;
+    let mut rng = Rng::new(cfg.seed ^ 0x7f4a_7c15);
+    let mut keys: Vec<Keys> = (0..cfg.shards).map(|_| Keys::new(w.dist, total)).collect();
+    let mut next_insert: Vec<usize> = vec![total; cfg.shards];
+    let lengths = Lengths::parse(&cfg.scans);
+    let mut key = Vec::new();
+    let mut counts = [0u64; 5];
+    let mut latencies: [Vec<std::time::Duration>; 5] = std::array::from_fn(|_| Vec::new());
+    for _ in 0..cfg.reads {
+        let s = (rng.next() as usize) % cfg.shards;
+        let op = w.pick(&mut rng);
+        let at = Instant::now();
+        match op {
+            Op::Read | Op::Rmw => {
+                let i = keys[s].next(&mut rng);
+                key_into(s, i, &mut key);
+                let len = shards[s].get(&key).await.unwrap_or_else(|| {
+                    fail(&format!(
+                        "{} found no answer for {:?}",
+                        w.row,
+                        String::from_utf8_lossy(&key)
+                    ))
+                });
+                if len != cfg.value_bytes {
+                    fail(&format!(
+                        "{} answered {len} bytes, not the {} written",
+                        w.row, cfg.value_bytes
+                    ));
+                }
+                // The write half of a read-modify-write, which is the only
+                // thing separating F from a plain read.
+                if op == Op::Rmw {
+                    shards[s].write_batch(cfg, s, i, 1, false).await;
+                }
+            }
+            // The value is the one this record already had, because
+            // `value_for` is a function of the record number. An update is a
+            // new version of the key either way, which is the cost being
+            // measured; no engine here deduplicates identical values.
+            Op::Update => {
+                let i = keys[s].next(&mut rng);
+                shards[s].write_batch(cfg, s, i, 1, false).await;
+            }
+            Op::Insert => {
+                let i = next_insert[s];
+                next_insert[s] += 1;
+                shards[s].write_batch(cfg, s, i, 1, false).await;
+                // Only now, so that nothing reads the key before it is there.
+                keys[s].grow();
+            }
+            Op::Scan => {
+                let i = keys[s].next(&mut rng);
+                key_into(s, i, &mut key);
+                let want = lengths.next(&mut rng);
+                let saw = shards[s].scan_from(&key, want).await;
+                if saw > want {
+                    fail(&format!(
+                        "{} scanned {saw} records, more than the {want} asked for",
+                        w.row
+                    ));
+                }
+            }
+        }
+        let took = at.elapsed();
+        report.saw(took);
+        counts[op.index()] += 1;
+        latencies[op.index()].push(took);
+        report.count += 1;
+    }
+    report.finish(size_of(shards).await);
+    // A mix's own p50 is two distributions laid on top of each other, so it
+    // says very little; the per-operation line is what a mixed row is read
+    // against. Left out of `--tsv`, which is one line per phase by contract.
+    if !cfg.tsv {
+        let mut parts = Vec::new();
+        for i in 0..counts.len() {
+            if counts[i] == 0 {
+                continue;
+            }
+            latencies[i].sort_unstable();
+            let q = |f: f64| latencies[i][((latencies[i].len() - 1) as f64 * f).round() as usize];
+            parts.push(format!(
+                "{} {} p50 {}us p99 {}us",
+                Op::at(i).name(),
+                counts[i],
+                q(0.50).as_micros(),
+                q(0.99).as_micros()
+            ));
+        }
+        println!("  {}", parts.join(",  "));
+        // What the writes left behind. roble compacts cooperatively on the
+        // thread that owns the store (§9) and this phase never yields to
+        // that, so a mix that writes can finish with an L0 the `settle`
+        // before it had emptied — which is a thing to see rather than to
+        // discover in the next phase's number.
+        println!("  levels {}", level_shape(shards));
+        if !w.pebble_agrees {
+            println!(
+                "  note: `pebble bench ycsb` defines {} differently, so it has no row here",
+                w.row
+            );
+        }
+    }
 }
 
 /// One point lookup per shard, on a store just reopened.
@@ -727,6 +859,25 @@ impl Zipf {
         self.at(rng.unit())
     }
 
+    /// Extends the draw to cover `n` values.
+    ///
+    /// zeta is a sum over `1..=n`, so growing it needs only the new terms —
+    /// which is what makes a workload that inserts affordable: YCSB D and E
+    /// add a record every twentieth operation, and recomputing zeta from
+    /// scratch each time would be the benchmark measuring itself. Pebble's
+    /// `computeZetaIncrementally` exists for the same reason.
+    fn grow(&mut self, n: u64) {
+        if n <= self.n {
+            return;
+        }
+        for i in self.n + 1..=n {
+            self.zeta_n += 1.0 / (i as f64).powf(THETA);
+        }
+        self.n = n;
+        self.eta =
+            (1.0 - (2.0 / n as f64).powf(1.0 - THETA)) / (1.0 - zeta(2, THETA) / self.zeta_n);
+    }
+
     /// The draw for a given point of the distribution, which is where the
     /// bound can be checked.
     ///
@@ -793,6 +944,129 @@ impl Dist {
             Dist::Zipf => "zipf",
             Dist::Latest => "latest",
         }
+    }
+}
+
+/// One operation of a YCSB mix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Op {
+    /// Read a record that is there.
+    Read,
+    /// Write a record that is there again, making a new version of it.
+    Update,
+    /// Write a record that was not there, growing the keyspace.
+    Insert,
+    /// Seek and step, as `scan-short` does.
+    Scan,
+    /// Read a record and write it back, which is YCSB F.
+    Rmw,
+}
+
+impl Op {
+    fn name(self) -> &'static str {
+        match self {
+            Op::Read => "read",
+            Op::Update => "update",
+            Op::Insert => "insert",
+            Op::Scan => "scan",
+            Op::Rmw => "rmw",
+        }
+    }
+
+    fn at(i: usize) -> Op {
+        [Op::Read, Op::Update, Op::Insert, Op::Scan, Op::Rmw][i]
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Op::Read => 0,
+            Op::Update => 1,
+            Op::Insert => 2,
+            Op::Scan => 3,
+            Op::Rmw => 4,
+        }
+    }
+}
+
+/// A YCSB workload: which operations, in what proportion, over which keys.
+pub struct Workload {
+    row: &'static str,
+    /// Operations and their percentages, which sum to 100.
+    ops: &'static [(Op, u32)],
+    /// **The workload picks this, not `--distribution`.** D is defined as
+    /// the latest distribution and the rest as zipfian, and a YCSB workload
+    /// that drew from somewhere else would not be that workload.
+    dist: Dist,
+    /// Whether `pebble bench ycsb` defines this one the same way, and so
+    /// whether a Pebble number belongs beside it.
+    pebble_agrees: bool,
+}
+
+impl Workload {
+    /// YCSB's six, as the paper and the `workload*` files define them.
+    ///
+    /// **D and F are not Pebble's.** `cmd/pebble` has D on the default
+    /// distribution with a `TODO(peter): default to skewed-latest`, and F as
+    /// 100% inserts with a `TODO(peter): the real workload is
+    /// read-modify-write`. Both are carried here as YCSB defines them, and
+    /// both are marked as having no Pebble counterpart rather than being
+    /// quietly compared against a different workload.
+    fn parse(letter: &str) -> Self {
+        match letter {
+            "A" | "a" => Workload {
+                row: "ycsb-A",
+                ops: &[(Op::Read, 50), (Op::Update, 50)],
+                dist: Dist::Zipf,
+                pebble_agrees: true,
+            },
+            "B" | "b" => Workload {
+                row: "ycsb-B",
+                ops: &[(Op::Read, 95), (Op::Update, 5)],
+                dist: Dist::Zipf,
+                pebble_agrees: true,
+            },
+            "C" | "c" => Workload {
+                row: "ycsb-C",
+                ops: &[(Op::Read, 100)],
+                dist: Dist::Zipf,
+                pebble_agrees: true,
+            },
+            "D" | "d" => Workload {
+                row: "ycsb-D",
+                ops: &[(Op::Read, 95), (Op::Insert, 5)],
+                dist: Dist::Latest,
+                pebble_agrees: false,
+            },
+            "E" | "e" => Workload {
+                row: "ycsb-E",
+                ops: &[(Op::Scan, 95), (Op::Insert, 5)],
+                dist: Dist::Zipf,
+                pebble_agrees: true,
+            },
+            "F" | "f" => Workload {
+                row: "ycsb-F",
+                ops: &[(Op::Read, 50), (Op::Rmw, 50)],
+                dist: Dist::Zipf,
+                pebble_agrees: false,
+            },
+            other => fail(&format!("--workload takes A to F, not {other:?}")),
+        }
+    }
+
+    /// Draws the next operation.
+    fn pick(&self, rng: &mut Rng) -> Op {
+        let roll = (rng.next() % 100) as u32;
+        let mut seen = 0;
+        for &(op, weight) in self.ops {
+            seen += weight;
+            if roll < seen {
+                return op;
+            }
+        }
+        // The weights sum to 100 and `roll` is below 100, so this is the
+        // last arm of the loop reached by a rounding that cannot happen; a
+        // test asserts the sum.
+        self.ops[self.ops.len() - 1].0
     }
 }
 
@@ -886,6 +1160,12 @@ impl Keys {
         }
     }
 
+    /// Takes one more record into the keyspace, for a workload that inserts.
+    fn grow(&mut self) {
+        self.total += 1;
+        self.zipf.grow(self.total);
+    }
+
     fn next(&self, rng: &mut Rng) -> usize {
         let i = match self.dist {
             Dist::Uniform => rng.next() % self.total,
@@ -920,6 +1200,8 @@ pub struct Config {
     pub distribution: Dist,
     /// How long a `scan-short` scan is.
     pub scans: String,
+    /// Which YCSB mix the `ycsb` phase runs.
+    pub workload: String,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
     layout: bool,
@@ -944,6 +1226,7 @@ impl Config {
             seed: 1,
             distribution: Dist::Zipf,
             scans: "zipf:1-1000".to_string(),
+            workload: "B".to_string(),
             wal: true,
             layout: false,
             reuse: false,
@@ -979,6 +1262,7 @@ impl Config {
                 "--seed" => cfg.seed = number(value(arg)),
                 "--distribution" => cfg.distribution = Dist::parse(value(arg)),
                 "--scans" => cfg.scans = value(arg).to_string(),
+                "--workload" => cfg.workload = value(arg).to_string(),
                 "--phases" => {
                     cfg.phases = Some(
                         value(arg)
@@ -1241,6 +1525,102 @@ mod tests {
                 assert!(drawn < n, "n={n} u={u} drew {drawn}");
             }
         }
+    }
+
+    /// Growing a Zipf has to leave it exactly where building it at the
+    /// larger size would have. Checked against that, rather than against
+    /// itself, because the incremental sum is the whole claim.
+    #[test]
+    fn growing_a_zipf_matches_building_one() {
+        let mut grown = Zipf::new(500);
+        for n in [501, 502, 700, 2000] {
+            grown.grow(n);
+            let fresh = Zipf::new(n);
+            assert!(
+                (grown.zeta_n - fresh.zeta_n).abs() < 1e-9,
+                "n={n}: zeta {} against {}",
+                grown.zeta_n,
+                fresh.zeta_n
+            );
+            assert!((grown.eta - fresh.eta).abs() < 1e-9, "n={n}: eta");
+            for u in [0.0, 0.25, 0.5, 0.75, 0.999] {
+                assert_eq!(grown.at(u), fresh.at(u), "n={n} u={u}");
+            }
+        }
+    }
+
+    /// Growing never shrinks: a smaller `n` is ignored rather than
+    /// corrupting the sum.
+    #[test]
+    fn growing_a_zipf_backwards_does_nothing() {
+        let mut z = Zipf::new(1000);
+        let (zeta, eta) = (z.zeta_n, z.eta);
+        z.grow(10);
+        z.grow(1000);
+        assert_eq!(z.n, 1000);
+        assert!((z.zeta_n - zeta).abs() < 1e-12 && (z.eta - eta).abs() < 1e-12);
+    }
+
+    /// The mixes are YCSB's, and `pick` hands them back in those
+    /// proportions.
+    ///
+    /// The percentages are **written out here** rather than read from the
+    /// table under test. A test that asks the table what it claims and then
+    /// checks the draws against that would pass whatever the table said,
+    /// which is what the first version of this did.
+    #[test]
+    fn the_mixes_are_ycsbs_mixes() {
+        let expected: &[(&str, &[(Op, u32)])] = &[
+            ("A", &[(Op::Read, 50), (Op::Update, 50)]),
+            ("B", &[(Op::Read, 95), (Op::Update, 5)]),
+            ("C", &[(Op::Read, 100)]),
+            ("D", &[(Op::Read, 95), (Op::Insert, 5)]),
+            ("E", &[(Op::Scan, 95), (Op::Insert, 5)]),
+            ("F", &[(Op::Read, 50), (Op::Rmw, 50)]),
+        ];
+        // Enough draws that 0.3 of a percentage point is six sigma, so the
+        // tolerance catches a one-in-a-hundred shift without ever flaking.
+        const DRAWS: u32 = 1_000_000;
+        for (letter, want) in expected {
+            let w = Workload::parse(letter);
+            assert_eq!(w.ops, *want, "{letter} is not YCSB {letter}");
+            let sum: u32 = want.iter().map(|&(_, p)| p).sum();
+            assert_eq!(sum, 100, "{letter} sums to {sum}");
+
+            let mut rng = Rng::new(13);
+            let mut seen = [0u32; 5];
+            for _ in 0..DRAWS {
+                seen[w.pick(&mut rng).index()] += 1;
+            }
+            for &(op, pct) in *want {
+                let got = seen[op.index()] as f64 * 100.0 / DRAWS as f64;
+                assert!(
+                    (got - pct as f64).abs() < 0.3,
+                    "{letter}: {} came out {got:.2}%, not {pct}%",
+                    op.name()
+                );
+            }
+            for (i, &n) in seen.iter().enumerate() {
+                assert!(
+                    want.iter().any(|&(op, _)| op.index() == i) || n == 0,
+                    "{letter} drew {} {n} times and should never",
+                    Op::at(i).name()
+                );
+            }
+        }
+    }
+
+    /// The two YCSB definitions `cmd/pebble` does not share, and the one
+    /// distribution a workload fixes for itself.
+    #[test]
+    fn d_is_latest_and_d_and_f_have_no_pebble_row() {
+        assert_eq!(Workload::parse("D").dist, Dist::Latest);
+        for letter in ["A", "B", "C", "E"] {
+            assert_eq!(Workload::parse(letter).dist, Dist::Zipf, "{letter}");
+            assert!(Workload::parse(letter).pebble_agrees, "{letter}");
+        }
+        assert!(!Workload::parse("D").pebble_agrees);
+        assert!(!Workload::parse("F").pebble_agrees);
     }
 
     /// Both skewed draws stay inside the keyspace at its edges, where the

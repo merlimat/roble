@@ -99,6 +99,13 @@ They always run in this order, whatever order `--phases` names them in.
   `cmd/pebble`'s `scan` does `SeekGE` and then steps a count. A bounded scan
   would let roble open only the tables the bounds reach (§5), so this is the
   pessimistic case for every engine alike.
+- **ycsb** — `--reads` operations drawn from one of YCSB's six mixes, chosen
+  by `--workload`. **This is the only phase that writes while it reads**, so
+  it is the only one where a flush or a compaction can land inside a
+  measurement — which is the state Oxia serves in and which every other phase
+  here avoids by construction. It runs last, and a `--reuse` of the directory
+  afterwards will find more records than `--batches x --records` and fail the
+  count checks: that is the phase having worked, not broken.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
 `run.sh` adds four passes of its own. **Batch against single insert** writes
@@ -213,6 +220,53 @@ With the default `zipf:1-1000` spec, 20,000 scans:
 | --- | --- | --- |
 | 64 MiB | 65,394/s | 68,321/s |
 | 4 MiB | 26,236/s | 28,972/s |
+
+## The YCSB mixes
+
+`--workload` takes A to F. The proportions are YCSB's, from the paper and the
+`workload*` files, and the distribution is **the workload's** rather than
+`--distribution` — a YCSB workload drawing from somewhere else would not be
+that workload.
+
+| | operations | keys | `pebble bench ycsb` |
+| --- | --- | --- | --- |
+| A | 50% read, 50% update | zipf | same |
+| B | 95% read, 5% update | zipf | same |
+| C | 100% read | zipf | same |
+| D | 95% read, 5% insert | **latest** | **differs** |
+| E | 95% scan, 5% insert | zipf | same |
+| F | 50% read, 50% read-modify-write | zipf | **differs** |
+
+**D and F are YCSB's definitions and not Pebble's.** `cmd/pebble` has D on the
+default distribution, carrying a `TODO(peter): default to skewed-latest`, and
+F as 100% inserts, carrying a `TODO(peter): the real workload is
+read-modify-write`. Rather than quietly compare two different workloads, those
+two are run as YCSB defines them and the phase prints a note saying Pebble has
+no row beside it. A, B, C and E are the same thing on both sides.
+
+**What a mix reports.** One row for the workload, as YCSB reports throughput,
+plus a per-operation line — because a 50/50 mix's own p50 is two distributions
+laid on top of each other and says very little. The level shape the writes left
+is printed too: roble compacts cooperatively on the thread that owns the store
+(§9) and this phase never yields to that, so a writing mix can finish with an
+L0 that the `settle` before it had emptied.
+
+42 MiB store, 50,000 operations, 64 MiB cache, one shard:
+
+| | ops/s | per operation |
+| --- | ---: | --- |
+| A | 476,987 | read p50 1us p99 15us, update p50 0us p99 2us |
+| B | 542,478 | read p50 1us p99 13us, update p50 0us p99 1us |
+| C | 593,827 | read p50 0us p99 13us |
+| D | 576,719 | read p50 0us p99 14us, insert p50 0us p99 4us |
+| E | 68,413 | scan p50 5us p99 85us, insert p50 0us p99 3us |
+| F | 381,497 | read p50 1us p99 14us, rmw p50 2us p99 16us |
+
+A and F show a worst case in the milliseconds where the read-only phases show
+tens of microseconds — that is a flush landing inside a measurement, and it is
+the first time anything here has measured one. E is `scan-short`'s number,
+which it should be: 95% of E is that scan. A leaves `L0=2` where the `settle`
+before it left `L0=1`.
 
 ## One table, all the engines
 
