@@ -102,6 +102,20 @@ pub trait Store: Sized {
     /// and returns how many it saw.
     async fn scan(&self, reverse: bool, report: &mut Report) -> u64;
 
+    /// Steps at most `count` records from the first at or after `from`, and
+    /// returns how many it saw.
+    ///
+    /// The whole thing is **one** operation, timed by the caller, which is
+    /// the point of it: a scan of the whole table amortises the seek and the
+    /// per-source setup away to nothing, and a scan of twenty records does
+    /// not. Oxia's `KeyRangeScan` is far likelier to be the second.
+    ///
+    /// No upper bound is given, because YCSB E gives none and
+    /// `cmd/pebble`'s `scan` does `SeekGE` and then steps a count. A bounded
+    /// scan would let roble open only the tables the bounds reach (§5), so
+    /// what this measures is the pessimistic case for every engine alike.
+    async fn scan_from(&self, from: &[u8], count: u64) -> u64;
+
     /// The value at `key`, if any.
     /// The length of the value for `key`, or `None` if it is not there.
     ///
@@ -302,6 +316,26 @@ impl Store for Roble {
         )
     }
 
+    async fn scan_from(&self, from: &[u8], count: u64) -> u64 {
+        let mut c = self
+            .db
+            .scan()
+            .await
+            .unwrap_or_else(|e| fail(&format!("scan: {e}")));
+        c.seek_ge(from)
+            .await
+            .unwrap_or_else(|e| fail(&format!("seek_ge: {e}")));
+        let mut seen = 0;
+        while seen < count && c.is_valid() {
+            std::hint::black_box((c.key(), c.value()));
+            seen += 1;
+            c.next()
+                .await
+                .unwrap_or_else(|e| fail(&format!("step: {e}")));
+        }
+        seen
+    }
+
     async fn get(&self, key: &[u8]) -> Option<usize> {
         // Moved out for the call and put back after. Moving it is a few
         // pointers either way, and the buffers keep the capacity they
@@ -434,6 +468,25 @@ impl Store for Encina {
                 report.saw(at.elapsed());
             }
             match next {
+                Some((k, v)) => {
+                    std::hint::black_box((k, v));
+                    seen += 1;
+                }
+                None => break,
+            }
+        }
+        seen
+    }
+
+    async fn scan_from(&self, from: &[u8], count: u64) -> u64 {
+        let mut iter = self.db.range(from..);
+        let mut seen = 0;
+        while seen < count {
+            match iter
+                .next()
+                .await
+                .unwrap_or_else(|e| fail(&format!("scan: {e}")))
+            {
                 Some((k, v)) => {
                     std::hint::black_box((k, v));
                     seen += 1;
@@ -620,6 +673,27 @@ impl Store for Rocks {
                 }
                 Some(Err(e)) => fail(&format!("scan: {e}")),
                 None => break,
+            }
+        }
+        seen
+    }
+
+    async fn scan_from(&self, from: &[u8], count: u64) -> u64 {
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            from,
+            rocksdb::Direction::Forward,
+        ));
+        let mut seen = 0;
+        for next in iter {
+            if seen == count {
+                break;
+            }
+            match next {
+                Ok((k, v)) => {
+                    std::hint::black_box((&k, &v));
+                    seen += 1;
+                }
+                Err(e) => fail(&format!("scan: {e}")),
             }
         }
         seen

@@ -125,8 +125,12 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   range, after the store has settled
   --tsv           one tab-separated line per phase instead of a table, for a
                   script that puts several engines side by side
+  --scans SPEC    how long a scan-short scan is, as
+                  [{zipf,uniform}:]min[-max] (zipf:1-1000), which is
+                  `pebble bench ycsb`'s spelling of the same thing
   --phases LIST   comma-separated subset of
-                  load,settle,scan-rev,scan,get,floor,get-cold,checkpoint
+                  load,settle,scan-rev,scan,get,floor,scan-short,get-cold,
+                  checkpoint
                   (always run in that order, whatever order they are named in)";
 
 fn main() {
@@ -239,6 +243,9 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
     }
     if cfg.wants("floor") {
         lookups(cfg, &shards, true, out).await;
+    }
+    if cfg.wants("scan-short") {
+        short_scans(cfg, &shards, out).await;
     }
     // Last of the read phases, because it closes the stores and opens them
     // again: everything above it wants the caches the one before left.
@@ -396,6 +403,49 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
                 "{name} answered {len} bytes for {:?}, not the {} written",
                 String::from_utf8_lossy(&probe),
                 cfg.value_bytes,
+            ));
+        }
+        report.count += 1;
+    }
+    report.finish(size_of(shards).await);
+}
+
+/// `--reads` short range scans, each one a seek and then a few steps.
+///
+/// This is YCSB E's read, and the phase the harness most needed. A whole
+/// table scan divides its seek and its per-source setup across every record
+/// in the store, so both vanish; a scan of twenty records is mostly those two
+/// things. Oxia's `KeyRangeScan` is the second kind, and until now nothing
+/// here measured it.
+///
+/// Each scan is **one** timed operation, as YCSB counts it, and not a sample
+/// per step.
+async fn short_scans<S: Store>(cfg: &Config, shards: &[S], out: Output) {
+    let mut report = Report::new("scan-short", out);
+    let total = cfg.batches * cfg.records;
+    let mut rng = Rng::new(cfg.seed ^ 0x2545_f491);
+    let keys = Keys::new(cfg.distribution, total);
+    let lengths = Lengths::parse(&cfg.scans);
+    let mut key = Vec::new();
+    for _ in 0..cfg.reads {
+        let s = (rng.next() as usize) % cfg.shards;
+        let i = keys.next(&mut rng);
+        key_into(s, i, &mut key);
+        let want = lengths.next(&mut rng);
+        // What is left between this key and the end of the shard, which is
+        // what a scan can see when it asks for more than that.
+        let left = (total - sorted_position(i, total)) as u64;
+        let at = Instant::now();
+        let saw = shards[s].scan_from(&key, want).await;
+        report.saw(at.elapsed());
+        // Checked, because a seek that landed in the wrong place would
+        // otherwise be the fastest engine in the table: a scan sees what it
+        // asked for, or everything left if that is less.
+        let expected = want.min(left);
+        if saw != expected {
+            fail(&format!(
+                "scan-short asked for {want} records from {:?} and saw {saw}, not {expected}",
+                String::from_utf8_lossy(&key)
             ));
         }
         report.count += 1;
@@ -674,15 +724,27 @@ impl Zipf {
     }
 
     fn next(&self, rng: &mut Rng) -> u64 {
-        let u = rng.unit();
+        self.at(rng.unit())
+    }
+
+    /// The draw for a given point of the distribution, which is where the
+    /// bound can be checked.
+    ///
+    /// `u` is below 1 and so the third branch is below `n` in exact
+    /// arithmetic — but `eta * u - eta + 1` is an f64 and rounds, and at a
+    /// `u` near enough to 1 it rounds *to* 1, which would put the draw one
+    /// past the end. The clamp is that rounding's only backstop, and taking
+    /// `u` as an argument is what lets a test reach it.
+    fn at(&self, u: f64) -> u64 {
         let uz = u * self.zeta_n;
-        if uz < 1.0 {
+        let drawn = if uz < 1.0 {
             0
         } else if uz < self.half_pow_theta {
             1
         } else {
             (self.n as f64 * (self.eta * u - self.eta + 1.0).powf(self.alpha)) as u64
-        }
+        };
+        drawn.min(self.n - 1)
     }
 }
 
@@ -732,6 +794,70 @@ impl Dist {
             Dist::Latest => "latest",
         }
     }
+}
+
+/// How long a short range scan is.
+///
+/// `[{zipf,uniform}:]min[-max]`, which is `pebble bench ycsb`'s `--scans`
+/// spelling, so that a scan length spec can be pasted between the two.
+///
+/// **Not scrambled, where the key draw is.** A scan length is a magnitude and
+/// not a key: short scans being the common case is the shape YCSB E has and
+/// the shape Oxia has, and an unscrambled Zipf draw is exactly that. The
+/// scramble exists only to stop hot *keys* collecting in one table.
+pub struct Lengths {
+    min: u64,
+    zipf: Option<Zipf>,
+    spread: u64,
+}
+
+impl Lengths {
+    fn parse(spec: &str) -> Self {
+        let (kind, range) = match spec.split_once(':') {
+            Some((k, r)) => (k, r),
+            None => ("uniform", spec),
+        };
+        let (min, max) = match range.split_once('-') {
+            Some((a, b)) => (number(a), number(b)),
+            None => (number(range), number(range)),
+        };
+        if min == 0 || max < min {
+            fail(&format!("--scans wants 1 <= min <= max, not {spec:?}"));
+        }
+        let spread = max + 1 - min;
+        Lengths {
+            min,
+            spread,
+            zipf: match kind {
+                "uniform" => None,
+                "zipf" | "zipfian" => Some(Zipf::new(spread)),
+                other => fail(&format!("--scans takes zipf: or uniform:, not {other:?}")),
+            },
+        }
+    }
+
+    fn next(&self, rng: &mut Rng) -> u64 {
+        self.min
+            + match &self.zipf {
+                Some(z) => z.next(rng),
+                None => rng.next() % self.spread,
+            }
+    }
+}
+
+/// Where record `i` falls in key order, among `total` of them.
+///
+/// The keys are `/shard-%04d/bucket-%02d/key-%010d` and bucket is `i % 64`,
+/// so they sort by bucket first and by id within it — which is *not* the
+/// order the record numbers are in. A short scan starting at record `i` can
+/// therefore see `total - this` records and no more, and that is what lets
+/// the phase check the count it got back.
+fn sorted_position(i: usize, total: usize) -> usize {
+    let bucket = i % 64;
+    // How many records fall in the buckets before this one: bucket `b` holds
+    // every `i` with `i % 64 == b`.
+    let before: usize = (0..bucket).map(|b| (total + 63 - b) / 64).sum();
+    before + i / 64
 }
 
 /// Draws the record a read phase probes next.
@@ -792,6 +918,8 @@ pub struct Config {
     pub seed: u64,
     /// Which keys the read phases ask for.
     pub distribution: Dist,
+    /// How long a `scan-short` scan is.
+    pub scans: String,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
     layout: bool,
@@ -815,6 +943,7 @@ impl Config {
             memtable_mb: 4,
             seed: 1,
             distribution: Dist::Zipf,
+            scans: "zipf:1-1000".to_string(),
             wal: true,
             layout: false,
             reuse: false,
@@ -849,6 +978,7 @@ impl Config {
                 "--memtable-mb" => cfg.memtable_mb = number(value(arg)),
                 "--seed" => cfg.seed = number(value(arg)),
                 "--distribution" => cfg.distribution = Dist::parse(value(arg)),
+                "--scans" => cfg.scans = value(arg).to_string(),
                 "--phases" => {
                     cfg.phases = Some(
                         value(arg)
@@ -1040,6 +1170,77 @@ mod tests {
             hot < 5,
             "the hottest 1% of keys took {hot}%, which is not uniform"
         );
+    }
+
+    /// `sorted_position` is what `scan-short` checks its answers against, so
+    /// it is checked against the only thing that cannot be wrong: sorting the
+    /// keys. Totals either side of a multiple of 64, because the buckets are
+    /// uneven when 64 does not divide the total and that is where an
+    /// off-by-one lives.
+    #[test]
+    fn sorted_position_agrees_with_sorting_the_keys() {
+        for total in [1, 2, 63, 64, 65, 100, 1000, 1003] {
+            let mut keys: Vec<(Vec<u8>, usize)> = (0..total).map(|i| (key_for(0, i), i)).collect();
+            keys.sort();
+            for (pos, (_, i)) in keys.iter().enumerate() {
+                assert_eq!(sorted_position(*i, total), pos, "record {i} of {total}");
+            }
+        }
+    }
+
+    /// A scan length stays in its range, and the zipf spec makes short scans
+    /// the common case — which is the shape YCSB E has and the reason the
+    /// lengths are *not* scrambled.
+    #[test]
+    fn scan_lengths_are_short_far_more_often_than_long() {
+        let lengths = Lengths::parse("zipf:1-1000");
+        let mut rng = Rng::new(3);
+        let mut short = 0;
+        for _ in 0..10_000 {
+            let n = lengths.next(&mut rng);
+            assert!((1..=1000).contains(&n), "drew {n}");
+            if n <= 10 {
+                short += 1;
+            }
+        }
+        assert!(
+            short > 3_000,
+            "only {short} of 10000 scans were 10 records or fewer"
+        );
+    }
+
+    /// And the other two spellings mean what they say.
+    #[test]
+    fn a_scan_length_spec_means_what_it_says() {
+        let mut rng = Rng::new(5);
+        let fixed = Lengths::parse("7");
+        let spread = Lengths::parse("uniform:3-4");
+        let mut threes = 0;
+        for _ in 0..1_000 {
+            assert_eq!(fixed.next(&mut rng), 7);
+            let n = spread.next(&mut rng);
+            assert!(n == 3 || n == 4, "drew {n}");
+            threes += (n == 3) as u32;
+        }
+        assert!(
+            (300..700).contains(&threes),
+            "{threes} of 1000 were 3, which is not uniform"
+        );
+    }
+
+    /// The clamp in `Zipf::at`, which nothing reachable through `Rng` can
+    /// exercise: `unit()` is `[0, 1)`, and the branch needs a `u` whose
+    /// arithmetic rounds to exactly 1. Driven directly, because the
+    /// alternative is a guard nobody has ever run.
+    #[test]
+    fn a_zipf_draw_stays_below_its_bound_even_at_one() {
+        for n in [2u64, 3, 1000, 1_000_000] {
+            let z = Zipf::new(n);
+            for u in [0.0, 0.5, 1.0 - f64::EPSILON, 1.0 - f64::EPSILON / 4.0, 1.0] {
+                let drawn = z.at(u);
+                assert!(drawn < n, "n={n} u={u} drew {drawn}");
+            }
+        }
     }
 
     /// Both skewed draws stay inside the keyspace at its edges, where the
