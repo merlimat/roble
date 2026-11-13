@@ -263,10 +263,33 @@ no row beside it. A, B, C and E are the same thing on both sides.
 
 **What a mix reports.** One row for the workload, as YCSB reports throughput,
 plus a per-operation line — because a 50/50 mix's own p50 is two distributions
-laid on top of each other and says very little. The level shape the writes left
-is printed too: roble compacts cooperatively on the thread that owns the store
-(§9) and this phase never yields to that, so a writing mix can finish with an
-L0 that the `settle` before it had emptied.
+laid on top of each other and says very little. That line carries p50, p99,
+p99.9 and max, and it needs all four: on this phase they span four orders of
+magnitude.
+
+**A writing mix drives compaction by writing.** roble compacts cooperatively
+on the thread that owns the store (§9), and a write that has to make room runs
+the compaction the picker chose along with the flush — so the phase does not
+have to yield to it, and L0 stays at **1** through 800,000 operations with the
+store steady at 45.7 MiB. The level shape is printed anyway, because the day
+that stops being true is the day this number is the first to say so.
+
+**The stall lands on the write, not on the reads.** 400,000 operations of
+workload A:
+
+```
+ycsb-A        400000   443,088/s   p50 1us  p99 12us  max 117,948us
+  read   199790  p50 1us  p99 13us  p99.9 18us  max     171us
+  update 200210  p50 0us  p99  2us  p99.9  4us  max 117,948us
+```
+
+A read's worst case is 171 us. One write in two hundred thousand waits
+**118 ms**, because it is the write that found the memtable full, flushed it,
+and ran a compaction before it could return. That is what cooperative
+compaction means and it is working as §9 describes — but it is a number worth
+having in front of you, and nothing here could produce it until this phase
+existed. Note that p99 reports none of it: at 12 us it is five thousand times
+below the worst case.
 
 42 MiB store, 50,000 operations, 64 MiB cache, one shard:
 
