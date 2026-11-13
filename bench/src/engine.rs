@@ -29,7 +29,7 @@
 //! [`Store::reverse`] and [`Store::checkpoint`].
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // The trait `DefaultEnv::spawn` comes from, which is how a store's caller
 // puts a flush and a merge somewhere other than a write (§9).
@@ -332,8 +332,16 @@ impl Store for Roble {
         // as an empty answer rather than an error, so those are waited out
         // rather than counted, and what this returns is the share this call
         // merged itself.
+        // The guard is a clock and not a count, because the two things this
+        // loop does happen at wildly different rates. A merge it performs
+        // itself is one iteration of real work; a merge the task beside this
+        // shard has already claimed comes back empty and costs one yield, and
+        // the loop spins through those for as long as that merge takes. At
+        // six million records it passed a hundred thousand yields waiting on
+        // work that was proceeding perfectly well, and a count tuned for
+        // merges called that a stuck picker.
+        let started = Instant::now();
         let mut ran = 0;
-        let mut waited = 0;
         while self.db.pick().is_some() {
             let merged = self
                 .db
@@ -341,9 +349,11 @@ impl Store for Roble {
                 .await
                 .unwrap_or_else(|e| fail(&format!("compact: {e}")));
             if merged.is_empty() {
-                waited += 1;
-                if waited > 100_000 {
-                    fail("the picker never settled");
+                if started.elapsed() > Duration::from_secs(600) {
+                    fail(&format!(
+                        "the picker never settled: ten minutes of compaction after {ran} merges \
+                         of this call's own, and it still has work to choose"
+                    ));
                 }
             } else {
                 ran += 1;
