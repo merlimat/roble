@@ -145,8 +145,8 @@ impl<D: Disk> Run<D> {
         self.tables[self.at].iter.key()
     }
 
-    async fn entry(&self) -> Result<crate::table::Entry> {
-        self.tables[self.at].iter.entry().await
+    async fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.tables[self.at].iter.value_into(out).await
     }
 
     /// Positions on the first entry at or after `target`, an internal key.
@@ -284,16 +284,23 @@ impl<D: Disk> Source<D> {
         }
     }
 
-    async fn entry(&self) -> Result<crate::table::Entry> {
+    /// The value the source is on, into a buffer the caller keeps.
+    ///
+    /// What a step reads, where it used to read the whole entry: `entry`
+    /// builds a `Vec` for the key as well, and a merge step has the key
+    /// already — it compared it to find this source. That was two
+    /// allocations a step, of which one was thrown away unread.
+    async fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
         match self {
-            Source::Table(it) => it.entry().await,
-            Source::Run(run) => run.entry().await,
+            Source::Table(it) => it.value_into(out).await,
+            Source::Run(run) => run.value_into(out).await,
             Source::Mem(m) => {
                 let table = m.table.borrow();
-                Ok(crate::table::Entry {
-                    key: m.key.clone(),
-                    value: m.cursor.value(&table).to_vec(),
-                })
+                let value = m.cursor.value(&table);
+                out.clear();
+                out.reserve(value.len());
+                out.extend_from_slice(value);
+                Ok(())
             }
         }
     }
@@ -629,7 +636,9 @@ impl<D: Disk> Scan<D> {
             next.user.clear();
             next.user
                 .extend_from_slice(InternalKey::decode(self.iters[w].key())?.user_key);
-            let chosen = self.take_newest_visible(&next.user, Dir::Forward).await?;
+            let chosen = self
+                .take_newest_visible(&next.user, Dir::Forward, &mut next.value)
+                .await?;
 
             if let Some(upper) = &self.upper
                 && next.user >= *upper
@@ -637,10 +646,9 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             }
-            if let Some((seq, kind, value)) = chosen
+            if let Some((seq, kind)) = chosen
                 && self.visible(&next.user, seq, kind)?
             {
-                next.value = value;
                 self.spare = self.current.replace(next);
                 self.stepped_onto();
                 return Ok(());
@@ -665,7 +673,9 @@ impl<D: Disk> Scan<D> {
             next.user.clear();
             next.user
                 .extend_from_slice(InternalKey::decode(self.iters[w].key())?.user_key);
-            let chosen = self.take_newest_visible(&next.user, Dir::Reverse).await?;
+            let chosen = self
+                .take_newest_visible(&next.user, Dir::Reverse, &mut next.value)
+                .await?;
 
             if let Some(lower) = &self.lower
                 && next.user < *lower
@@ -673,10 +683,9 @@ impl<D: Disk> Scan<D> {
                 self.current = None;
                 return Ok(());
             }
-            if let Some((seq, kind, value)) = chosen
+            if let Some((seq, kind)) = chosen
                 && self.visible(&next.user, seq, kind)?
             {
-                next.value = value;
                 self.spare = self.current.replace(next);
                 self.stepped_onto();
                 return Ok(());
@@ -703,8 +712,9 @@ impl<D: Disk> Scan<D> {
         &mut self,
         user: &[u8],
         dir: Dir,
-    ) -> Result<Option<(u64, Kind, Vec<u8>)>> {
-        let mut chosen: Option<(u64, Kind, Vec<u8>)> = None;
+        value: &mut Vec<u8>,
+    ) -> Result<Option<(u64, Kind)>> {
+        let mut chosen: Option<(u64, Kind)> = None;
         for i in 0..self.iters.len() {
             loop {
                 if !self.iters[i].is_valid() {
@@ -725,11 +735,14 @@ impl<D: Disk> Scan<D> {
                     break;
                 }
                 // A version written after this scan began is not its business.
-                if visible_at(seq_num, self.snapshot)
-                    && chosen.as_ref().is_none_or(|(seq, _, _)| seq_num > *seq)
+                if visible_at(seq_num, self.snapshot) && chosen.is_none_or(|(seq, _)| seq_num > seq)
                 {
-                    let entry = self.iters[i].entry().await?;
-                    chosen = Some((seq_num, kind, entry.value));
+                    // Into the buffer the scan already holds, which a later
+                    // source with a higher sequence number simply overwrites:
+                    // `value_into` clears before it writes, so what is left
+                    // at the end is the newest version's and nothing else's.
+                    self.iters[i].value_into(value).await?;
+                    chosen = Some((seq_num, kind));
                 }
                 match dir {
                     Dir::Forward => self.iters[i].next().await?,
