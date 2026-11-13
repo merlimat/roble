@@ -1007,7 +1007,19 @@ impl Dist {
 /// libc dependency and parsing one file is cheaper than acquiring one.
 #[cfg(target_os = "linux")]
 fn filesystem_at(path: &Path) -> Option<String> {
-    let path = std::fs::canonicalize(path).ok()?;
+    // The directory does not exist yet — this runs before anything is
+    // written, which is the whole point of it — so resolve the nearest
+    // ancestor that does. Canonicalizing the path itself just fails, which
+    // is how the first version of this check silently did nothing.
+    let mut probe = path.to_path_buf();
+    let path = loop {
+        if let Ok(resolved) = std::fs::canonicalize(&probe) {
+            break resolved;
+        }
+        if !probe.pop() || probe.as_os_str().is_empty() {
+            break std::env::current_dir().ok()?;
+        }
+    };
     let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
     let mut best: Option<(usize, String)> = None;
     for line in mounts.lines() {
