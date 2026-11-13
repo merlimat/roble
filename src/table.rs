@@ -644,6 +644,15 @@ async fn fetch<D: Disk>(
 /// caller sees one sequence rather than a sequence of blocks. Reverse is
 /// dearer than forward for the reason §4 gives: within a block, stepping back
 /// rescans from a restart point.
+///
+/// Rebuilding the block from those bytes on every step — `self` to the `Rc`
+/// to the `Vec` to the data, and twice a record, once to move the cursor and
+/// once to read the value it landed on — looks like the thing to remove, and
+/// is not. Dropping the clone, keeping the parsed shape, and holding the
+/// block beside its bytes behind `unsafe` were each built and measured:
+/// together they are some 2 ns of a 28 ns step, and each one that grows this
+/// struct costs a reverse scan more than it saves. What the step is actually
+/// spending, and why that makes the loop the wrong place to look, is §8.
 pub struct TableIter<D: Disk> {
     table: Rc<OpenTable<D>>,
     /// What this iterator's block reads do with what they fetch.

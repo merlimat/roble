@@ -1050,6 +1050,73 @@ a bound rather than a hope because a write enforces it: what a store holds
 across every memtable it has is `Options::memtable_size` plus one batch (§4,
 §6).
 
+### Where a warm scan step goes
+
+A scan step whose block is already in the block cache costs about 28 ns on an
+M-series laptop, and taking work out of it has repeatedly measured nothing.
+The reason is that the work is not what it is spending. Measured in situ —
+each variant against a control that walks the same entries in one
+non-resumable loop, so that run-to-run drift divides out — a step is roughly:
+
+| | of a ~28 ns step |
+| --- | --- |
+| the `async` layering, on a path that never yields | ~0.6 ns |
+| cloning the `Rc` the block cache handed out, and re-reading the block's restart count | ~1.7 ns |
+| walking `self` → `Rc` → `Vec` → the data to rebuild the block | ~0.4 ns, at the noise floor |
+| the cursor's state living in memory rather than in registers | the remaining ~11 ns |
+
+The last row is what an iterator **is**. The control keeps the position, the
+assembled prefix-compressed key and the value's range in registers because it
+never returns; an iterator has to leave them where the next call will find
+them, and so reads and writes them through memory on every step. Pebble's
+`rowblk.Iter` is a heap object for the same reason and pays the same. There is
+no indirection left to remove: holding the parsed block beside its bytes —
+which needs `unsafe`, since the block borrows them — was built and measured at
+the noise floor, while growing `TableIter` from 112 to 152 bytes.
+
+**And the step is latency-bound, not throughput-bound.** This is the part that
+generalises. Dropping the `Rc` clone measured **1.037 on a 30 MB store, ahead
+in 12 of 12 paired runs**, and on an 847 MB store **1.007 forward and 0.978
+reverse**. The same change, the same code: a win where the store fits in the
+CPU's cache and nothing where it does not, because past that point a step
+waits on memory and the instructions removed from it were already hiding under
+the wait. Worse, a struct grown to hold the saving then costs more than the
+saving is worth, which is where the reverse regression comes from — reverse
+touches far more memory per record, so it is the first to feel it.
+
+That is the explanation for a row of null results, each one paired and
+alternated, each one reverted:
+
+| | forward scan | note |
+| --- | --- | --- |
+| lending the value instead of copying it | 1.01 | §6 |
+| not copying the key in the merge | 1.0032 over 20 runs | cost `floor` 2.3%; see `OpenTable::value_into` |
+| caching the parsed block's shape | 0.947 | grows `TableIter` by 24 bytes |
+| rewriting the merge as one stream | 0.921 | |
+| dropping the `Rc` clone | 1.007 at 847 MB, 1.037 at 30 MB | 0.978 reverse at 847 MB |
+| holding the block beside its bytes (`unsafe`) | noise | grows `TableIter` by 40 bytes |
+
+The three changes that did pay were all asymptotic rather than constant: a
+source per level instead of per table (a seek and a compare per table), a
+read-ahead window (a syscall per block), and deciding once which tables can
+hold a tombstone (a sweep per table per key). **So scan work belongs at the
+memory the step waits on — read-ahead, block layout, direct I/O (§10) — and
+not at the contents of the loop.** A profile is not precise enough to steer
+the latter anyway: at ~90 ns a step spread over a dozen items of 3-15 ns,
+`sample`'s per-frame attribution cannot separate them.
+
+**What all of this is measured on, which is not yet Oxia.** A quiesced store,
+scanned end to end, with point lookups drawn uniformly, in one process on one
+laptop. Every one of those differs from the workload §1 describes. A skewed
+distribution keeps a hot working set in the CPU's cache — which is the 30 MB
+regime above, where the loop's contents *did* measure, and not the 847 MB one
+where they did not. Nothing here mixes reads with writes, scans a short range
+rather than a whole table, or runs while a compaction does, and Oxia does all
+three. So this section is a conclusion about the benchmark before it is one
+about roble, and the standing task is to make the benchmark worth concluding
+from: skewed and latest-key distributions, short range scans, read-modify-
+write, and a background compaction under the read phases.
+
 ## 9. Compaction
 
 As built, `compact(level, tables)` does the merge and `pick()` chooses what to
