@@ -572,8 +572,20 @@ uses its own; a rate credits the background one with work it still paid for.
 - **count** — records for load and the scans, lookups for get and floor,
   shards for settle and checkpoint. **rate/s** is that count per second of
   wall clock.
-- **p50 / p99 / max us** — one operation: a batch commit for load, a sampled
-  step for the scans, a lookup for get and floor, one shard's checkpoint.
+- **p50 / p99 / max us** — one operation: a sampled step for the scans, a
+  lookup for get and floor, one scan for scan-short, one operation for ycsb,
+  one shard's checkpoint.
+
+  **`load` reports `max` alone and a dash for the other two**, because its
+  latency is per *commit* where its count and its rate are per *record*. At
+  `--records 10000` a p50 of six milliseconds is six milliseconds of batch
+  size and nothing else — halve the batch and it halves — so the two columns
+  moved with a flag the reader had chosen and looked like measurements.
+
+  `max` stays, and is the reason the row is not simply dropped: a flush or a
+  compaction landing inside a write shows up there and nowhere else. It is
+  what made roble's write stall visible at all, at 129 ms with a 4 MiB
+  memtable and 738 ms at 64 MiB, before any phase wrote while it read.
 - **cpu s** — the whole process's CPU time, user and system, background
   threads included. This is the column that makes the engines comparable at
   all, since roble compacts on the thread that owns the store and RocksDB

@@ -320,7 +320,7 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
 
 /// Writes every batch of every shard, timing each commit.
 async fn load<S: Store>(cfg: &Config, shards: &[S], out: Output) {
-    let mut report = Report::new("load", out);
+    let mut report = Report::new("load", out).max_only();
     for (s, store) in shards.iter().enumerate() {
         for b in 0..cfg.batches {
             let at = Instant::now();

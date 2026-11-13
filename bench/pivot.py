@@ -39,13 +39,27 @@ PHASES = [
 
 # What each metric is called, which column of the line holds it, and how to
 # spell a value. `rate` first: it is the headline for every phase.
+def _num(value, fmt):
+    """Formats a measurement, or passes a dash straight through.
+
+    A phase can decline a column — `load` reports no p50 or p99, because its
+    latency is per commit where its count and rate are per record — and says
+    so with a dash. Formatting it as a number would raise; formatting the
+    dash as a number is what a reader wants to see anyway.
+    """
+    try:
+        return fmt(value)
+    except ValueError:
+        return value
+
+
 METRICS = {
-    "rate": ("rate/s", 3, lambda v: f"{float(v):,.0f}"),
-    "p50": ("p50 us", 4, lambda v: f"{int(v):,}"),
-    "p99": ("p99 us", 5, lambda v: f"{int(v):,}"),
-    "max": ("max us", 6, lambda v: f"{int(v):,}"),
-    "cpu": ("cpu s", 7, lambda v: f"{float(v):.2f}"),
-    "size": ("size MiB", 8, lambda v: f"{float(v):.1f}"),
+    "rate": ("rate/s", 3, lambda v: _num(v, lambda x: f"{float(x):,.0f}")),
+    "p50": ("p50 us", 4, lambda v: _num(v, lambda x: f"{int(x):,}")),
+    "p99": ("p99 us", 5, lambda v: _num(v, lambda x: f"{int(x):,}")),
+    "max": ("max us", 6, lambda v: _num(v, lambda x: f"{int(x):,}")),
+    "cpu": ("cpu s", 7, lambda v: _num(v, lambda x: f"{float(x):.2f}")),
+    "size": ("size MiB", 8, lambda v: _num(v, lambda x: f"{float(x):.1f}")),
 }
 
 
