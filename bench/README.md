@@ -84,6 +84,21 @@ They always run in this order, whatever order `--phases` names them in.
   `Get` first and only seeks when it misses, so probing keys that exist would
   measure the `get` phase over again. What this times is the seek, which no
   filter can help.
+- **scan-short** — `--reads` short range scans, each a seek to a key drawn by
+  `--distribution` and then up to `--scans` steps. **YCSB E's read, and the
+  one the other scan phases cannot stand in for.** `scan` and `scan-rev` walk
+  the whole store, so they divide the seek and the per-source setup across
+  every record in it and both vanish; Oxia's `KeyRangeScan` reads tens of
+  records, where they are most of the cost. Each scan is **one** timed
+  operation, as YCSB counts it, and not a sample per step. The phase checks
+  the count it got back against what is left between the start key and the end
+  of the shard, so a seek that landed in the wrong place cannot pass as a fast
+  one.
+
+  No upper bound is given to the iterator, because YCSB gives none and
+  `cmd/pebble`'s `scan` does `SeekGE` and then steps a count. A bounded scan
+  would let roble open only the tables the bounds reach (§5), so this is the
+  pessimistic case for every engine alike.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
 `run.sh` adds four passes of its own. **Batch against single insert** writes
@@ -156,6 +171,48 @@ the distribution is worth most on the *reads in cache and out of it* pass
 above, which is the pass that already exists to measure the miss path — and it
 was measuring that path with the one access pattern that makes a miss path
 look like a fair fight.
+
+### How long a scan is
+
+`--scans` takes `[{zipf,uniform}:]min[-max]`, which is `pebble bench ycsb`'s
+spelling of the same thing, and defaults to `zipf:1-1000` as Pebble's does.
+`--scans 20` fixes every scan at twenty records.
+
+**Scan lengths are not scrambled, where the keys are.** A length is a
+magnitude and not a key, and short scans being the common case is the shape
+YCSB E has and the shape Oxia has — which is exactly what an unscrambled Zipf
+draw gives. The scramble exists only to stop hot *keys* collecting in one
+table.
+
+**What a short scan is made of.** Fixed lengths, 20,000 scans, 42 MiB store,
+64 MiB cache, median of three:
+
+| records | scans/s | us/scan | us/record |
+| ---: | ---: | ---: | ---: |
+| 1 | 205,873 | 4.86 | 4.857 |
+| 10 | 174,381 | 5.73 | 0.573 |
+| 100 | 78,648 | 12.71 | 0.127 |
+| 500 | 23,355 | 42.82 | 0.086 |
+
+which is **4.8 us of seek and setup, then 76 ns a record**. A ten-record scan
+is 83% setup, a hundred-record scan 38%, and the 300,000-record `scan` phase
+0.002% — so the whole-table phases have been measuring the one case where the
+setup does not exist. Note also that 76 ns a record is *faster* than `scan`'s
+178 ns: short scans over a skewed keyspace return to the same blocks, and
+those stay in the CPU's cache where a whole-table walk streams 42 MiB past it
+once (§8).
+
+That 4.8 us is worth reading against `floor`, which is 3.2 us for a seek that
+answers one key. The difference is the merge roble builds over every table in
+the version before the first step — which an Oxia `KeyRangeScan` would not
+pay, because it has bounds and `scan_range` opens only the tables they reach.
+
+With the default `zipf:1-1000` spec, 20,000 scans:
+
+| cache | uniform | zipf |
+| --- | --- | --- |
+| 64 MiB | 65,394/s | 68,321/s |
+| 4 MiB | 26,236/s | 28,972/s |
 
 ## One table, all the engines
 
