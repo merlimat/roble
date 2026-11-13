@@ -1,8 +1,23 @@
 # roble benchmark
 
-Compares roble with **Go Pebble**, **RocksDB** and **encina** on the workload
-Oxia runs: small records, a store per shard, batches per write, point and
-ordered lookups, scans in both directions, and a checkpoint.
+Compares roble with **RocksDB** and **encina** on the workload Oxia runs:
+small records, a store per shard, batches per write, point and ordered
+lookups, scans in both directions, short range scans, YCSB's six mixes and a
+checkpoint.
+
+**Go Pebble is not here, and that is a loss worth stating plainly.** It had a
+driver of its own under `harness/bench`, written to these phases and this key
+shape, and it has been removed. `cmd/pebble`'s own benchmarks do not replace
+it: `ycsb` builds its keys as `user` plus an FNV hash plus an MVCC suffix,
+`scan` builds a hundred thousand `key-` plus `uint32` records and writes while
+it reads, and neither key shape is configurable. They measure Pebble on *their*
+workload, not on Oxia's. So what ended with the driver is the only
+like-for-like comparison against the engine roble exists to replace — `load`,
+`settle` and its CPU column, `scan`, `scan-rev`, `get`, `get-cold`,
+`checkpoint`, and `floor`, which no `cmd/pebble` benchmark performs at all.
+Numbers quoted below that name Pebble are from runs made while the driver
+still existed; they are kept as the record of what was measured, not as
+something a run today reproduces.
 
 Each run benchmarks one engine in a process of its own, so the CPU time and the
 peak memory it reports belong to that engine alone. `run.sh` runs all of them
@@ -11,8 +26,7 @@ and prints them one after the other.
 | engine | what it is here for | how to get it |
 |---|---|---|
 | roble | the subject | always built |
-| Pebble | the compatibility target: the same files, the same format version, Oxia's own settings | `harness/bench`, needs Go |
-| RocksDB | the engine Pebble replaced, and a second LSM to check a ratio against | `--features rocksdb`, needs a C++ toolchain and libclang |
+| RocksDB | the engine Pebble replaced, and the LSM to check a ratio against | `--features rocksdb`, needs a C++ toolchain and libclang |
 | encina | a copy-on-write B+tree that owes nobody compatibility — §2 claims Pebble's format is worth its price without naming the price, and this is the price | `--features encina`, fetched from git |
 
 Neither optional engine is a default cargo feature, so an ordinary
@@ -26,12 +40,15 @@ reverse iteration: Oxia's `KeyRangeScanReverse` is on a serving path, an LSM
 pays more for `prev` than for `next`, and the design says so without saying by
 how much. `scan-rev` is that number and `scan` is its control.
 
-Two reference LSMs rather than one, because a ratio from a single pair of
-numbers is not trustworthy enough to decide anything: the first run of the
-reverse comparison had roble at 1.26x and Pebble at 1.44x, which read as roble
-being the better of the two. It is not — the forward rates move by a fifth
-between runs, and with RocksDB alongside, all three sit in one band of about
-1.1x to 1.2x. One comparison says a number; two say whether it means anything.
+A ratio from a single pair of numbers is not trustworthy enough to decide
+anything. The first run of the reverse comparison had roble at 1.26x and
+Pebble at 1.44x, which read as roble being the better of the two. It is not —
+the forward rates move by a fifth between runs, and with RocksDB alongside,
+all three sat in one band of about 1.1x to 1.2x. One comparison says a number;
+two say whether it means anything. That lesson is why RocksDB is still here
+now that Pebble is not: with one reference LSM left, a ratio against it says
+less than it did, and a surprising one should be met with another run before
+it is believed.
 
 ## Phases
 
@@ -43,9 +60,9 @@ They always run in this order, whatever order `--phases` names them in.
   WAL on, each commit syncs.
 - **settle** — leaves the database in a shape the read phases can be compared
   over. roble compacts cooperatively on the thread that owns the store (§9), so
-  this drives the picker to quiescence and the cost is counted here; Pebble
+  this drives the picker to quiescence and the cost is counted here; RocksDB
   compacts on threads of its own, so this flushes and waits, and the cost shows
-  up in the CPU column.
+  up in the CPU column. The CPU column is what makes those two comparable.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
 - **get** — `--reads` keys drawn by `--distribution` (below), every one
@@ -55,12 +72,12 @@ They always run in this order, whatever order `--phases` names them in.
   **Each engine reads it the best way it offers, and reports the value's
   length rather than the value.** That is not a detail: every one of them can
   produce a value without handing back an owned copy, and they do it
-  differently. roble reads into a `Lookup` the caller keeps; Pebble's `Get`
-  borrows the value from the block it is in and gives back a closer; RocksDB
-  has `get_pinned`; encina passes the borrowed value to a closure. Asking for
-  an owned value charged some of them for an allocation this row is not about
-  while others borrowed — which is what it used to do, so **roble's `get` row
-  was not like-for-like with Pebble's** until this was fixed. A length still
+  differently. roble reads into a `Lookup` the caller keeps; RocksDB has
+  `get_pinned`; encina passes the borrowed value to a closure; Pebble's `Get`
+  borrowed from the block it was in and gave back a closer. Asking for an
+  owned value charged some of them for an allocation this row is not about
+  while others borrowed — which is what it used to do, and it is how roble's
+  `get` row came to be not like-for-like with Pebble's until it was fixed. A length still
   proves the value was read, and the phase checks it against `--value-bytes`
   so that an engine cannot win by not producing one.
 
@@ -268,20 +285,41 @@ the first time anything here has measured one. E is `scan-short`'s number,
 which it should be: 95% of E is that scan. A leaves `L0=2` where the `settle`
 before it left `L0=1`.
 
+### Cross-checking against Pebble's own tool
+
+There is no Pebble column here any more, but `cmd/pebble` can still say
+whether a roble number is in a plausible band:
+
+```sh
+go install github.com/cockroachdb/pebble/v2/cmd/pebble@v2.1.7
+pebble bench ycsb --workload B --values 128 --keys zipf <dir>
+```
+
+**This is a sanity check and not a row.** Its keys are `user` plus an FNV
+hash plus a ten-byte MVCC suffix, built in `makeKey` with no flag to change
+them, so it is Pebble on YCSB's shape rather than on Oxia's. A and B and C and
+E are at least the same mix of operations over the same skew, which is enough
+to notice an order of magnitude and not enough to settle a percentage. D and F
+are not even that, for the reasons above.
+
 ## One table, all the engines
 
 `run.sh` collects every engine's `--tsv` lines and pivots them with
 `pivot.py` into one table — a row per operation and metric, a column per
-engine — so the comparison is read across a row rather than by holding four
+engine — so the comparison is read across a row rather than by holding three
 blocks in your head:
 
 ```
-                           roble      pebble     rocksdb      encina
-scan       rate/s      2,444,142  33,848,584  10,133,423  48,184,380
-           p50 us              0           0           0           0
-           cpu s            0.12        0.01        0.03        0.01
-floor      rate/s        127,139     474,211     488,003   2,392,593
+                           roble     rocksdb      encina
+scan       rate/s      2,444,142  10,133,423  48,184,380
+           p50 us              0           0           0
+           cpu s            0.12        0.03        0.01
+floor      rate/s        127,139     488,003   2,392,593
 ```
+
+The run this was taken from had a fourth column, `pebble`, at 33,848,584 for
+`scan` and 474,211 for `floor`. It is left out here because nothing produces
+it any more.
 
 A phase an engine cannot do shows `—` in the table and the reason underneath,
 never a blank that reads as a zero. Run one engine alone and the aligned
@@ -296,7 +334,7 @@ per-run output comes back instead.
 `ENGINES` picks which to run, so the ones needing a toolchain can be left out:
 
 ```sh
-ENGINES="roble pebble" ./run.sh --no-wal        # nothing to install
+ENGINES="roble" ./run.sh --no-wal               # nothing to install
 ENGINES="roble encina" ./run.sh --no-wal        # adds a git fetch
 ```
 
@@ -306,10 +344,9 @@ Or one engine at a time:
 cargo run --release -p roble-bench -- --dir /path/to/scratch --no-wal
 cargo run --release -p roble-bench --features encina -- --engine encina --dir /path/to/scratch --no-wal
 cargo run --release -p roble-bench --features rocksdb -- --engine rocksdb --dir /path/to/scratch --no-wal
-cd ../harness && go run ./bench --dir /path/to/scratch --no-wal
 ```
 
-The store is created at `DIR/roble` or `DIR/pebble`, which must not exist yet.
+The store is created at `DIR/<engine>`, which must not exist yet.
 `--help` lists the options; both engines take the same ones and the same
 `--seed`, and both derive their keys, their values and their lookup order from
 it with the same generator, so the two hold the same bytes and probe them in
@@ -317,18 +354,20 @@ the same sequence.
 
 ## Reading the numbers
 
-**`--no-wal` is Oxia's configuration**, and on macOS it is the only one in
-which the load row means anything. Go's `os.File.Sync` is
-`fcntl(F_FULLFSYNC)` there, which flushes the drive's own write cache;
-compio's and RocksDB's are `fsync`, which does not. So with the WAL on, roble
-appears several times faster at writing than Pebble and is really just
-promising less. On Linux — which is what Oxia runs — they all are `fsync`. The
-benchmark prints a note when the configuration is the one that cannot be
-compared.
+**`--no-wal` is Oxia's configuration.** It used to be the only one in which
+the load row meant anything on macOS: Go's `os.File.Sync` is
+`fcntl(F_FULLFSYNC)` there, which flushes the drive's own write cache, where
+compio's and RocksDB's are `fsync`, which does not — so with the WAL on, roble
+appeared several times faster at writing than Pebble and was really just
+promising less. With the Go driver gone, every engine in the table syncs the
+same way and that trap is no longer in it. It is kept here because it is
+exactly the trap anyone setting a roble number beside a Go Pebble number
+obtained elsewhere will walk into, and because on Linux — which is what Oxia
+runs — they are all `fsync` anyway.
 
 **encina's load row is not quite in the same units.** Its `write` is durable
-by itself and takes no sync flag, so `--no-wal` asks roble, Pebble and RocksDB
-for less than it asks encina for. That counts against encina on the load row
+by itself and takes no sync flag, so `--no-wal` asks roble and RocksDB for
+less than it asks encina for. That counts against encina on the load row
 and nowhere else.
 
 **The phases share a block cache and run in order**, so whichever of the two
@@ -345,10 +384,11 @@ overhead — enough, on the forward scan, to reverse which engine looks quicker.
 The rate comes from the phase's own wall clock, which the sampling leaves
 alone.
 
-**Every LSM knob is set the same on all three, because their own defaults are
-not comparable.** roble took Pebble's defaults (§4, §9), so those two agree
-already; RocksDB's differ enough to decide a result rather than inform it, and
-the benchmark now sets them from roble's own constants — the memtable, the
+**Every LSM knob is set the same on both, because their own defaults are not
+comparable.** roble took Pebble's defaults (§4, §9), so the settings here are
+Pebble's whether or not Pebble is in the table; RocksDB's differ enough to
+decide a result rather than inform it, and the benchmark sets them from
+roble's own constants — the memtable, the
 target file size, the L0 compaction and stop-writes thresholds, and the base
 level's budget. `--memtable-mb` is the one of them exposed as a flag, at 4 MiB:
 RocksDB's own default is 64, so left alone it buffered this whole workload and
@@ -356,13 +396,12 @@ flushed nothing during the load while the other two wrote 30 MiB of tables.
 
 The target file size was the one that looked decisive and was not. RocksDB's
 default is 64 MiB against their 2, which settled a 34 MiB store into a *single*
-table where roble leaves eleven and Pebble nine — so a lookup searched one
-table instead of three. Setting it to 2 MiB gives RocksDB sixteen tables and
+table where roble leaves eleven (and Pebble, when it was still measured here,
+nine) — so a lookup searched one table instead of three. Setting it to 2 MiB gives RocksDB sixteen tables and
 changes its point reads by under 1% on the same machine, because its filters
 absorb them. Worth aligning anyway, and worth recording that the layout did
 not explain the gap it looked certain to explain. `--no-wal` is another: it takes
-`disable_wal` on roble, `DisableWAL` on Pebble and `disable_WAL` on RocksDB's
-write options, and setting only the sync flag on the last of those left it
+`disable_wal` on roble and `disable_WAL` on RocksDB's write options, and setting only the sync flag on the last of those left it
 writing a journal the others were not — worth 5 MiB of directory and half its
 load rate. `--cache-mb` is the third, divided per store for encina, whose
 cache is its own.
@@ -372,8 +411,8 @@ values are random and give Snappy nothing to find — so without it every
 engine's compression setting is inert and the size column says nothing. A
 value is one random chunk repeated to fill it: 128 is incompressible, 8 is a
 sixteenfold repeat. roble's size does not move across that range, because its
-writer only ever writes `NoCompression`; Pebble's and RocksDB's fall by three
-to four and a half times.
+writer only ever writes `NoCompression`; RocksDB's falls by three to four and
+a half times.
 
 **Values are pseudo-random by default.** A value made of one repeated byte compresses to
 nothing, and with one the size column reported Snappy saving 2.5× — a
@@ -382,15 +421,16 @@ serialized records, which sit somewhere between the two, so the size column
 here is the incompressible end of the range rather than the answer for any
 particular shard.
 
-**The journal rows are the most platform-dependent numbers here, and on macOS
-they cannot be compared between engines at all.** Each engine's own on-against-
-off ratio is honest about that engine on this machine — it is its own sync both
-times — but the ratios are not comparable with each other, because they are not
-the same syscall. On this laptop Pebble pays **36x** for the journal and roble
-**1.7x**, and almost all of that difference is `F_FULLFSYNC` against `fsync`
-rather than anything about either engine. This is the measurement that most
-needs the Linux runner below; treat the macOS figures as a demonstration that
-the asymmetry is real, not as the WAL's cost.
+**The journal rows are the most platform-dependent numbers here.** Each
+engine's own on-against-off ratio is honest about that engine on this machine,
+since it is its own sync both times. Across engines it was once not comparable
+at all on macOS: Pebble paid **36x** for the journal against roble's **1.7x**,
+and almost all of that was `F_FULLFSYNC` against `fsync` rather than anything
+about either engine. That pair of numbers is a record of what was measured
+while the Go driver existed, not something a run today produces. roble and
+RocksDB are the same syscall as each other, so their ratios can be compared —
+on Linux, which is what the runner below is for, and where this measurement
+belongs anyway.
 
 **The single-insert row is not like for like, and what it shows is expected.**
 With `--no-wal` the three LSMs sync nothing per commit while encina commits
@@ -398,30 +438,30 @@ each record durably whatever it is asked — so at one record per commit a
 copy-on-write B+tree is writing a new root and an fsync behind it, 300,000
 times. It drops to 0.006x of its batched rate; that is what the structure
 does, not a defect, and it is not a number to set beside three engines that
-were not asked to sync. Run without `--no-wal` for the comparison where all
-four commit durably. The pass is most useful read *within* an engine: how much
-of its throughput depends on the caller batching. roble keeps 0.84x and Pebble
-0.94x, because a memtable absorbs a single insert; RocksDB keeps 0.24x.
+were not asked to sync. Run without `--no-wal` for the comparison where every
+engine commits durably. The pass is most useful read *within* an engine: how
+much of its throughput depends on the caller batching. roble keeps 0.84x
+because a memtable absorbs a single insert, and RocksDB keeps 0.24x; Pebble
+kept 0.94x when it was still measured here.
 
 **`settle` is not comparable row for row**, by construction. roble's does the
-compaction work on the thread that owns the store; Pebble's and RocksDB's wait
-for background threads; encina has nothing to settle at all. Compare the
+compaction work on the thread that owns the store; RocksDB's waits for
+background threads; encina has nothing to settle at all. Compare the
 `cpu s` column and the `levels` line, not the rate.
 
 **The `levels` line is not enough to explain a scan number, and `--layout` is
 the reason this is worth saying.** On this workload roble settles at
-`L0=1 L1=13`, Pebble at `L6=11` and RocksDB at a single file, which looks like
-all the explanation a scan gap needs. The layout shows it is not: roble's
-thirteen L1 tables partition the key space with no overlapping pair, exactly
-as Pebble's eleven at L6 do, and a run small enough to leave two tables in
-each engine keeps roble 4.3x behind. The shape is not the cost — the per-step
+`L0=1 L1=13` and RocksDB at a single file, which looks like all the
+explanation a scan gap needs. The layout shows it is not: roble's thirteen L1
+tables partition the key space with no overlapping pair, exactly as Pebble's
+eleven at L6 did when it was measured here, and a run small enough to leave
+two tables in each engine kept roble 4.3x behind. The shape is not the cost — the per-step
 path is. Which is why `--layout` prints the ranges and not just the counts:
 the counts invited the wrong answer and were believed for a day.
 
 **`cpu s`, not `rate/s`, is the column to compare** when the engines schedule
-work differently. roble compacts on the thread that owns the store; Pebble and
-RocksDB use their own; a rate credits the background ones with work they still
-paid for.
+work differently. roble compacts on the thread that owns the store; RocksDB
+uses its own; a rate credits the background one with work it still paid for.
 
 ## Columns
 
@@ -431,8 +471,8 @@ paid for.
 - **p50 / p99 / max us** — one operation: a batch commit for load, a sampled
   step for the scans, a lookup for get and floor, one shard's checkpoint.
 - **cpu s** — the whole process's CPU time, user and system, background
-  threads included. This is the column that makes the two engines comparable
-  at all, since roble compacts on the thread that owns the store and Pebble
+  threads included. This is the column that makes the engines comparable at
+  all, since roble compacts on the thread that owns the store and RocksDB
   compacts on its own.
 - **size MiB** — what the store occupies on disk at the end of the phase.
 
@@ -453,8 +493,8 @@ cargo run --release -p roble-bench --features count-alloc -- --dir /tmp/b --no-w
 `mimalloc` swaps the process allocator. `count-alloc` wraps the system one and
 counts, printing a final line of allocations and bytes asked for — as
 `<engine>\tallocs\t<n>\t<bytes>` under `--tsv`. Only Rust allocations: a
-`#[global_allocator]` does not reach RocksDB's C++ `new` or Pebble's Go heap,
-so this measures roble and encina.
+`#[global_allocator]` does not reach RocksDB's C++ `new`, so this measures
+roble and encina.
 
 A phase's own count is the difference between a run with it and a run without
 it, which charges nothing to opening the store:
@@ -501,10 +541,14 @@ is a different measurement.
 
 ## On a Linux runner
 
-macOS cannot give an honest load row with the WAL on: Go's `os.File.Sync` is
-`fcntl(F_FULLFSYNC)` there and compio's is `fsync`, so Pebble flushes the
-drive's write cache and roble does not. On Linux they are all `fsync`, which
-is also what Oxia runs.
+Linux is what Oxia runs, and several things here can only be measured there.
+compio drives io_uring on Linux and kqueue on macOS, which is a different I/O
+path entirely; `O_DIRECT` exists only on Linux (§8); the page cache can
+actually be dropped; and a cgroup can hold a store to its budget. macOS also
+could not give an honest load row with the WAL on while the Go driver was
+here, since Go's `os.File.Sync` is `fcntl(F_FULLFSYNC)` there and compio's is
+`fsync` — a trap that left with it, but one that returns the moment a roble
+number is set beside a Go Pebble number from anywhere else.
 
 The **Benchmark** workflow runs this on `ubuntu-latest` and posts the tables to
 the job summary. It is `workflow_dispatch` only and gates nothing: a shared

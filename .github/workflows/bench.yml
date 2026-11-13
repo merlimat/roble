@@ -43,7 +43,7 @@ on:
         default: "50000"
       engines:
         description: Which engines to run, space separated
-        default: roble pebble rocksdb encina
+        default: roble rocksdb encina
       wal:
         description: >
           WAL on, or off as Oxia runs it. Off makes the load rows comparable
@@ -63,17 +63,13 @@ jobs:
   bench:
     name: Benchmark on Linux
     runs-on: ubuntu-latest
-    # Four engines over several passes, one of which writes 300,000 records
+    # Three engines over several passes, one of which writes 300,000 records
     # one commit at a time. The default inputs finish well inside this; a
     # much larger `--batches` may not.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: harness/go.mod
-          cache-dependency-path: harness/go.sum
       # Not shared with CI's cache: this builds the two optional engines,
       # which no other job does, and would otherwise evict what the gate
       # needs on every run.
