@@ -318,12 +318,45 @@ go install github.com/cockroachdb/pebble/v2/cmd/pebble@v2.1.7
 pebble bench ycsb --workload B --values 128 --keys zipf <dir>
 ```
 
-**This is a sanity check and not a row.** Its keys are `user` plus an FNV
-hash plus a ten-byte MVCC suffix, built in `makeKey` with no flag to change
-them, so it is Pebble on YCSB's shape rather than on Oxia's. A and B and C and
-E are at least the same mix of operations over the same skew, which is enough
-to notice an order of magnitude and not enough to settle a percentage. D and F
-are not even that, for the reasons above.
+**It is weaker than that sentence suggests, and it was measured rather than
+assumed.** Run on a Linux VM against the same 300,000 records and 200,000
+operations this harness uses:
+
+| | roble | pebble ycsb |
+| --- | ---: | ---: |
+| A | 332,197/s | 398,403/s |
+| B | 617,766/s | 481,764/s |
+| C | 602,702/s | 553,338/s |
+| D | 649,683/s | 482,812/s |
+| E | 68,555/s | 93,853/s |
+| F | 260,979/s | 199,631/s |
+
+Those look comparable and are not, because `cmd/pebble/db.go` hardcodes its
+own engine options and exposes only `--cache` and `--disable-wal`:
+
+- `MemTableSize: 64 << 20` — **64 MB**, against the 4 MiB this harness pins on
+  every engine precisely because defaults are not comparable. The dataset is
+  42 MiB, so it fits in one memtable and the run barely flushes: the reported
+  write amplification is 2.2 to 2.7. **A, B, D and F therefore measure a
+  skiplist rather than an LSM.**
+- `Comparer: cockroachkvs.Comparer` — CockroachDB's MVCC comparer, which is
+  the class of comparer roble refuses (§3), with the matching `KeySchema` and
+  a `cockroach_merge_operator`.
+- `FormatMajorVersion: FormatNewest`, where roble's pin is Pebblev4 (§3).
+- `CompactionConcurrencyRange: 1..3` — background compaction on up to three
+  threads. `--concurrency` sets the number of *client* workers and does not
+  touch it.
+- Its keys are `user` plus an FNV hash plus a ten-byte MVCC suffix, built in
+  `makeKey` with no flag to change them.
+- `Filter utility: 0.0%` in every run above.
+
+So this is Pebble on CockroachDB's workload with CockroachDB's settings, and
+the right way to read the table is that **none of those six pairs is a
+comparison**. It is worth running to confirm the tool works and that roble is
+not off by an order of magnitude from an engine of the same family; it cannot
+settle a percentage, a phase, or a direction. The thing that could — a driver
+on Oxia's key shape through these phases — is what was removed with
+`harness/bench`.
 
 ## One table, all the engines
 
