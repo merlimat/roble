@@ -557,6 +557,12 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
     // A mix's own p50 is two distributions laid on top of each other, so it
     // says very little; the per-operation line is what a mixed row is read
     // against. Left out of `--tsv`, which is one line per phase by contract.
+    //
+    // It carries p99.9 and max as well as p50 and p99, because on this phase
+    // those are four orders apart: roble compacts on the thread that owns the
+    // store (§9), a write-triggered flush runs the compaction the picker
+    // chose, and the write that pays for it waits. p99 is 11us and the worst
+    // case is 127ms, so a column that stops at p99 reports none of it.
     if !cfg.tsv {
         let mut parts = Vec::new();
         for i in 0..counts.len() {
@@ -566,19 +572,24 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
             latencies[i].sort_unstable();
             let q = |f: f64| latencies[i][((latencies[i].len() - 1) as f64 * f).round() as usize];
             parts.push(format!(
-                "{} {} p50 {}us p99 {}us",
+                "{} {} p50 {}us p99 {}us p99.9 {}us max {}us",
                 Op::at(i).name(),
                 counts[i],
                 q(0.50).as_micros(),
-                q(0.99).as_micros()
+                q(0.99).as_micros(),
+                q(0.999).as_micros(),
+                q(1.0).as_micros()
             ));
         }
         println!("  {}", parts.join(",  "));
-        // What the writes left behind. roble compacts cooperatively on the
-        // thread that owns the store (§9) and this phase never yields to
-        // that, so a mix that writes can finish with an L0 the `settle`
-        // before it had emptied — which is a thing to see rather than to
-        // discover in the next phase's number.
+        // What the writes left behind, which is the evidence that the
+        // compaction kept up. roble compacts cooperatively on the thread
+        // that owns the store (§9), and a write that has to make room runs
+        // the compaction the picker chose along with the flush — so a mix
+        // that writes drives compaction by writing, and does not need the
+        // phase to yield to it. L0 stays at one through 800,000 operations.
+        // Printed anyway, because the day that stops being true is the day
+        // this number is the first to say so.
         println!("  levels {}", level_shape(shards));
         if !w.pebble_agrees {
             println!(
