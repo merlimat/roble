@@ -125,15 +125,21 @@ for dir in scan-rev scan; do
   table "$dir" "${args[@]}" --phases "load,settle,$dir"
 done
 
-# The same records, written one batch at a time against one record at a time.
-# `--records 1` makes every commit its own record, so the load row's rate — it
-# is records per second either way — is directly comparable, and the p50 is a
-# batch commit in one and a single insert in the other.
+# The same records, written in the configured batch against one a tenth the
+# size. The load row's rate is records per second either way, so it is
+# directly comparable, and the p50 is one commit of each size.
+#
+# **Both sides batch.** This used to write the small side one record per
+# commit, which separated per-commit cost from per-record cost cleanly and was
+# untenable at any real dataset size: a copy-on-write B+tree writes a new root
+# per commit, so encina spent over an hour on six million of them and 2.2 GiB
+# of disk, to measure a ratio two batch sizes give just as well. A hundredfold
+# spread between them says what a single insert said.
 #
 # The totals are matched by moving the records into the batch count, which
 # needs the two numbers this was asked for; without them it is the defaults.
 batches=200
-records=100
+records=10000
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[$i]}" in
     --batches) batches="${args[$((i + 1))]}" ;;
@@ -142,14 +148,18 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 done
 total=$((batches * records))
 
+small=$((records / 10))
+[ "$small" -gt 0 ] || small=1
+small_batches=$((total / small))
+
 echo
-echo "=== batch insert against single insert, $total records either way ==="
+echo "=== a commit of $records records against one of $small, $total records either way ==="
 echo
 echo "-- batches of $records --"
 table batch "${args[@]}" --phases load --batches "$batches" --records "$records"
 echo
-echo "-- one record per commit --"
-table single "${args[@]}" --phases load --batches "$total" --records 1
+echo "-- batches of $small --"
+table smallbatch "${args[@]}" --phases load --batches "$small_batches" --records "$small"
 
 # The same insert, with the journal and without it. Within one engine this is
 # an honest comparison even on macOS, because it is that engine's own sync

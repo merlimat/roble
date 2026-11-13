@@ -129,10 +129,10 @@ They always run in this order, whatever order `--phases` names them in.
   count checks: that is the phase having worked, not broken.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
-`run.sh` adds four passes of its own. **Batch against single insert** writes
-the same total records in batches and then one record per commit, so that the
-per-commit cost can be told from the per-record cost; see the warning about it
-below. **Insert with the journal against without it**, which is the WAL's cost per
+`run.sh` adds four passes of its own. **A large commit against a small one**
+writes the same total records in batches of `--records` and then in batches a
+tenth the size, so that the per-commit cost can be told from the per-record
+cost; see the warning about it below. **Insert with the journal against without it**, which is the WAL's cost per
 engine. **The reads in cache and out of it**, at 64 MiB and 4 MiB against 34 MiB
 of data — which measures the block-cache *miss* path and not a disk, since all
 three LSMs read through the operating system's page cache (§8: direct I/O is
@@ -527,17 +527,26 @@ RocksDB are the same syscall as each other, so their ratios can be compared —
 on Linux, which is what the runner below is for, and where this measurement
 belongs anyway.
 
-**The single-insert row is not like for like, and what it shows is expected.**
-With `--no-wal` the three LSMs sync nothing per commit while encina commits
-each record durably whatever it is asked — so at one record per commit a
-copy-on-write B+tree is writing a new root and an fsync behind it, 300,000
-times. It drops to 0.006x of its batched rate; that is what the structure
-does, not a defect, and it is not a number to set beside three engines that
-were not asked to sync. Run without `--no-wal` for the comparison where every
-engine commits durably. The pass is most useful read *within* an engine: how
-much of its throughput depends on the caller batching. roble keeps 0.84x
-because a memtable absorbs a single insert, and RocksDB keeps 0.24x; Pebble
-kept 0.94x when it was still measured here.
+**The batch-size pass is read *within* an engine, not across engines**: how
+much of its throughput depends on the caller batching. With `--no-wal` the
+LSMs sync nothing per commit while encina commits durably whatever it is
+asked, so the per-commit cost it shows is a different cost from theirs. Run
+without `--no-wal` for the comparison where every engine commits durably.
+
+**Both sides of it batch, and that is a change.** It used to write the small
+side one record per commit, which separated the two costs as cleanly as
+anything could and was untenable at any real dataset size. A copy-on-write
+B+tree writes a new root per commit: at 300,000 records encina dropped to
+0.006x of its batched rate, and at six million it spent over an hour and
+2.2 GiB of disk on that one row before it was stopped. A tenfold spread
+between two batch sizes says the same thing in seconds, which is why
+`--records` defaults to 10,000 and the pass halves it ten times rather than
+going to one. If the single-insert number is what you actually want,
+`--records 1` still gives it — at a dataset size you chose on purpose.
+
+The old numbers, for the record: roble kept 0.84x of its batched rate at one
+record per commit because a memtable absorbs a single insert, RocksDB 0.24x,
+and Pebble 0.94x when it was still measured here.
 
 **`settle` is not comparable row for row**, by construction. roble's does the
 compaction work on the thread that owns the store; RocksDB's waits for
