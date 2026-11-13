@@ -33,8 +33,14 @@ on:
         description: Stores to open, as Oxia opens one per shard
         default: "1"
       batches:
-        description: Batches written to each shard
-        default: "1000"
+        description: >
+          Batches written to each shard. 10000 x 300 records is about 423 MiB
+          a shard, which is six times the 64 MiB memtable — enough that the
+          load flushes as it goes and the store compacts into several levels.
+          Much less than that and a memtable swallows the whole load, the load
+          row measures a skiplist, and the read phases run over whatever
+          `settle` was left to write in one go.
+        default: "10000"
       records:
         description: Records in each batch
         default: "300"
@@ -63,10 +69,15 @@ jobs:
   bench:
     name: Benchmark on Linux
     runs-on: ubuntu-latest
-    # Three engines over several passes, one of which writes 300,000 records
-    # one commit at a time. The default inputs finish well inside this; a
-    # much larger `--batches` may not.
-    timeout-minutes: 60
+    # Three engines over several passes, one of which writes every record one
+    # commit at a time — at the default inputs that is 3,000,000 commits, and
+    # for a copy-on-write B+tree with no batching it is the longest single
+    # thing this workflow does.
+    # Three engines, six passes, ten seconds a timed phase, over a 423 MiB
+    # store. That is roughly half an hour on a quiet machine and a shared
+    # runner is slower, so the ceiling is well above the expectation rather
+    # than near it.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

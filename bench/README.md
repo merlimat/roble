@@ -446,9 +446,22 @@ Pebble's whether or not Pebble is in the table; RocksDB's differ enough to
 decide a result rather than inform it, and the benchmark sets them from
 roble's own constants — the memtable, the
 target file size, the L0 compaction and stop-writes thresholds, and the base
-level's budget. `--memtable-mb` is the one of them exposed as a flag, at 4 MiB:
-RocksDB's own default is 64, so left alone it buffered this whole workload and
-flushed nothing during the load while the other two wrote 30 MiB of tables.
+level's budget. `--memtable-mb` is the one of them exposed as a flag, and it
+is **64 MiB** — RocksDB's own default, and the size `cmd/pebble` hardcodes for
+its YCSB benchmark, so a number from here and a number from that tool are at
+least buffering the same amount.
+
+**A memtable that size dictates the dataset.** It was 4 MiB before, for a
+reason that has not gone away: left at RocksDB's 64 MiB default, RocksDB
+buffered the whole workload and flushed nothing during the load while the
+other engines wrote 30 MiB of tables. Standardising on 64 MiB hands that
+problem to *every* engine instead of one, so the dataset has to be well past
+64 MiB per shard or the load row measures a skiplist and the read phases run
+over whatever `settle` was left to write in one go. At `--value-bytes 128` a
+record costs about 148 bytes on disk, so a shard needs **upwards of half a
+million records** before a 64 MiB memtable is doing anything, and several
+million before flushes are routine rather than occasional. The defaults alone
+no longer give a meaningful load row; `--batches 20000 --records 300` does.
 
 The target file size was the one that looked decisive and was not. RocksDB's
 default is 64 MiB against their 2, which settled a 34 MiB store into a *single*
