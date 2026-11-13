@@ -253,20 +253,46 @@ impl<F: Fs> Opened<F> {
     /// rejected; a scan steps instead, and skipping deleted keys is its job
     /// rather than this one's.
     async fn positioned(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
-        let mut scan = self.scan().await?;
-        match how {
-            Comparison::Ceiling => scan.seek_ge(key).await?,
+        // **Bounded on the side the comparison already decides.** A `Floor`
+        // cannot answer above `key`, a `Ceiling` cannot answer below it, and
+        // `scan_with` opens only the tables its bounds reach — so the half of
+        // the store on the wrong side of the probe is never opened at all.
+        // Unbounded, this built a merge over every table in the version for
+        // every one of these lookups, which at six million records is two
+        // hundred and forty-three of them.
+        //
+        // The other side stays open because nothing here knows how far the
+        // answer is: a `Floor` whose neighbourhood is entirely deleted is
+        // answered by a key arbitrarily far below.
+        let (lower, upper) = match how {
+            Comparison::Ceiling => (Some(key), None),
             Comparison::Higher => {
                 successor_into(key, &mut buf.target);
-                scan.seek_ge(&buf.target).await?
+                (Some(buf.target.as_slice()), None)
             }
             // The greatest key at or below `key` is the greatest key strictly
-            // below the one after it.
+            // below the one after it, and `upper` is exclusive.
             Comparison::Floor => {
                 successor_into(key, &mut buf.target);
-                scan.seek_lt(&buf.target).await?
+                (None, Some(buf.target.as_slice()))
             }
-            Comparison::Lower => scan.seek_lt(key).await?,
+            Comparison::Lower => (None, Some(key)),
+            Comparison::Equal => unreachable!("Equal is a point lookup"),
+        };
+        let mut scan = self.scan_range(lower, upper).await?;
+        match how {
+            Comparison::Ceiling | Comparison::Higher => {
+                let at = lower
+                    .expect("a lower bound for a forward comparison")
+                    .to_vec();
+                scan.seek_ge(&at).await?
+            }
+            Comparison::Floor | Comparison::Lower => {
+                let at = upper
+                    .expect("an upper bound for a backward comparison")
+                    .to_vec();
+                scan.seek_lt(&at).await?
+            }
             Comparison::Equal => unreachable!("Equal is a point lookup"),
         }
         if !scan.is_valid() {
