@@ -26,7 +26,10 @@
 //!    edit's minimum unflushed log number falls away.
 //! 2. Write the table and sync it, then sync the directory. A table whose
 //!    name never reached the disk is a table the MANIFEST will point at and
-//!    nobody can open.
+//!    nobody can open. The bytes go out in chunks as the walk of the memtable
+//!    finishes them rather than all at the end, which bounds what a flush
+//!    holds to a block and changes nothing about this order: the sync is
+//!    still after the last chunk, and the edit still after the sync.
 //! 3. Append the version edit to the MANIFEST and sync **that**. Until this
 //!    moment the new table is a file nothing refers to, and a crash leaves
 //!    the database exactly as it was, with both logs still holding every
@@ -59,6 +62,21 @@ use crate::env::{Access, Disk, Fs};
 use crate::error::{Error, Result};
 use crate::memtable::Memtable;
 use crate::open::Opened;
+
+/// How many of a table's bytes a flush gathers before handing them to the
+/// disk.
+///
+/// The writer finishes a block at a time and holds nothing it has handed over
+/// (`roble_format::sst::TableWriter::take_ready`), so the choice here is only
+/// how large a write is: one per block would be four thousand of them for a
+/// 64 MiB memtable, and one for the table is the buffer this is here to get
+/// rid of. A megabyte is large enough that the per-write cost is noise
+/// against the encoding either side of it, and small enough that what a flush
+/// holds is a rounding error beside the memtable it is writing out.
+///
+/// Every table smaller than this — which is every table the tests write — is
+/// still one write, made by `finish`.
+const WRITE_CHUNK: usize = 1 << 20;
 
 impl<F: Fs> Opened<F> {
     /// Writes the memtable out as a table and records it in the MANIFEST.
@@ -172,30 +190,36 @@ impl<F: Fs> Opened<F> {
         // why this reads the counter again rather than adding to it.
         let table_num = self.versions().next_file_num;
 
-        // Nothing is awaited between the freeze above and the walk of the
-        // memtable here, which is what makes the walk see everything the
-        // freeze promised: an await in between would let a write apply to a
-        // memtable this has already read to the end. The walk itself may
-        // await, and does — what the freeze bought is that the memtable it
-        // handed over is finished with, and a flush running beside the
-        // writes rather than inside one has to be able to put the thread
-        // down (§9, `crate::work`).
-        let entries = memtable.borrow().len() as u64;
-        let (bytes, new_table) = build_table(&memtable, table_num, self.compaction_unit()).await?;
-        self.metrics.flush_size.record(bytes.len() as u64);
-        self.metrics.flush_bytes.add(bytes.len() as u64);
-
-        // 2. The table, then the directory, so its name is durable too.
+        // 2. The table, then the directory, so its name is durable too. The
+        //    file is created before the walk because the walk writes into it:
+        //    a flush that built the whole table first held a memtable's worth
+        //    of bytes to do it, and that buffer is what this is not.
+        //
+        //    The create awaits, which the walk of a frozen memtable does not
+        //    mind, and the reason is the freeze rather than any absence of
+        //    awaits: `freeze_memtable` waits for every write in flight and
+        //    only then swaps, so from the moment it returned this memtable is
+        //    nobody's to write to and every write applies to the one that
+        //    replaced it (§5). The walk awaits too, and must — a flush
+        //    running beside the writes rather than inside one has to be able
+        //    to put the thread down (§9, `crate::work`).
+        //
+        //    Nothing can sweep in this window either, which is why a
+        //    half-written table needs no telling the collector about: the
+        //    flush holds the one-change-at-a-time permit from the top of this
+        //    function to the bottom, and `crate::obsolete::sweep` will not run
+        //    without one (§5, `crate::change`). So the only reader of a table
+        //    the MANIFEST does not yet name is this flush.
         let path = self
             .dir
             .join(roble_format::files::table_filename(table_num));
         let disk = self.fs().create(&path).await?;
-        let written = bytes.len();
-        let (result, _) = disk
-            .write(WriteBuf::new(bytes), 0, Default::default())
-            .await;
-        result?;
-        self.metrics.written.add(written);
+        let entries = memtable.borrow().len() as u64;
+        let (written, new_table) =
+            build_table(&memtable, &disk, table_num, self.compaction_unit()).await?;
+        self.metrics.flush_size.record(written);
+        self.metrics.flush_bytes.add(written);
+        self.metrics.written.add(written as usize);
         {
             let _timer = self.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
@@ -330,7 +354,8 @@ impl<F: Fs> Opened<F> {
     }
 }
 
-/// Builds the table bytes, and the entry the MANIFEST will hold for it.
+/// Writes the memtable out as a table into `disk`, and says how many bytes
+/// that took and what the MANIFEST will hold for it.
 ///
 /// **Paced**, every `unit` entries, as a merge is and for the reason a merge
 /// is (§9, `crate::work`): this is the one part of a flush that is work
@@ -340,17 +365,29 @@ impl<F: Fs> Opened<F> {
 /// happens *inside* the write that asked for it, and is the whole of the
 /// remaining latency once it does not.
 ///
+/// **Bounded**, because the bytes are handed to the disk as the writer
+/// finishes them. The whole table used to come back from here as one `Vec`,
+/// which made a flush cost the memtable bound — 64 MiB as Oxia configures
+/// it, and more than that while the `Vec` doubled — on a node running
+/// hundreds of stores, which is the thing §8 bounds. What is held now is
+/// what Pebble's writer holds: the open
+/// data block, the index, the filter's hashes, and at most [`WRITE_CHUNK`]
+/// of finished bytes waiting for a write.
+///
 /// The memtable is borrowed a slice at a time rather than for the walk,
 /// because a borrow held across an await is a panic waiting for whoever
 /// borrows next. Nothing writes to this one — it is frozen, and a freeze
 /// waits for every write in flight (§5) — so the cursor is as good after a
 /// yield as before it.
-async fn build_table(
+async fn build_table<D: Disk>(
     memtable: &std::cell::RefCell<Memtable>,
+    disk: &D,
     file_num: u64,
     unit: u64,
-) -> Result<(Vec<u8>, NewTable)> {
+) -> Result<(u64, NewTable)> {
     let mut writer = TableWriter::new(WriterOptions::default())?;
+    // Where the next chunk goes, and in the end how large the table is.
+    let mut at = 0u64;
 
     // Every key the table will hold, point and tombstone alike, so the
     // bounds the MANIFEST records are the table's real ones.
@@ -380,6 +417,18 @@ async fn build_table(
             }
             !cursor.is_valid()
         };
+        // Out of the writer and onto the disk, so that what the next slice
+        // encodes is all this holds. Outside the borrow above, because this
+        // awaits.
+        if writer.ready_len() >= WRITE_CHUNK {
+            let spent = write_chunk(disk, &mut at, writer.take_ready()).await?;
+            // Back to the writer rather than dropped, so a flush holds one
+            // chunk's worth of buffer and not a fresh one per chunk: the
+            // allocator keeps large free regions resident, so freeing and
+            // allocating a megabyte sixty-four times costs more memory than
+            // passing one megabyte round does (§8).
+            writer.reuse(spent);
+        }
         if done {
             break;
         }
@@ -389,13 +438,19 @@ async fn build_table(
         crate::work::yield_now().await;
     }
 
-    let held = memtable.borrow();
     // Fragmented, because a range-deletion block holds fragments and the
     // memtable holds whatever was asked for. Two `delete_range` calls that
     // overlap are ordinary use — `/a`..`/d` then `/b`..`/d` — and without
     // this every flush of that memtable would be refused by the writer, so
     // the store could never shed it.
-    let tombstones = rangedel::fragment(&held.tombstones().iter().collect::<Vec<_>>());
+    //
+    // Taken out of the borrow rather than held under it, because what
+    // follows writes to the disk and a `RefCell` held across an await is a
+    // panic waiting for whoever borrows next.
+    let tombstones = {
+        let held = memtable.borrow();
+        rangedel::fragment(&held.tombstones().iter().collect::<Vec<_>>())
+    };
 
     for t in &tombstones {
         writer.add_range_deletion(&t.start, &t.end, t.seq_num)?;
@@ -410,11 +465,26 @@ async fn build_table(
         bounds.saw_key(&key::encode(&t.end, SEQ_NUM_MAX, Kind::RangeDelete))?;
     }
 
-    let bytes = writer.finish()?;
-    let size = bytes.len() as u64;
+    // Everything the walk did not take: the blocks still buffered, then the
+    // index, the range-deletion and filter blocks, the properties, the
+    // metaindex and the footer. For a table smaller than one chunk — which
+    // is every table in the tests — this is the only write.
+    let _ = write_chunk(disk, &mut at, writer.finish()?).await?;
     let mut new_table = bounds.into_new_table(0, file_num)?;
-    new_table.size = size;
-    Ok((bytes, new_table))
+    new_table.size = at;
+    Ok((at, new_table))
+}
+
+/// Appends one chunk of a table at `at`, moves `at` past it, and gives the
+/// buffer back for the next chunk.
+async fn write_chunk<D: Disk>(disk: &D, at: &mut u64, chunk: Vec<u8>) -> Result<Vec<u8>> {
+    let len = chunk.len() as u64;
+    let (result, buf) = disk
+        .write(WriteBuf::new(chunk), *at, Default::default())
+        .await;
+    result?;
+    *at += len;
+    Ok(buf.into_vec())
 }
 
 /// The least and greatest keys a table will hold, and their sequence numbers.
