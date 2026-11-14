@@ -807,6 +807,17 @@ impl<D: Disk> Scan<D> {
     /// on another key proves the rest are already clear of this one. Pebble's
     /// `findNextEntry` and `findPrevEntry` work the same way.
     ///
+    /// **The order the versions arrive in is not load-bearing**, which is
+    /// worth knowing because it is on the compaction path and this looks like
+    /// that one. `crate::compact`'s merge keeps the *first* version it meets
+    /// of a user key and drops the rest, so it depends on newest-first
+    /// arrival; this picks the highest sequence number the snapshot allows,
+    /// so the arrival order decides only how many times `value_into` runs.
+    /// Flipping the trailer half of [`Heap::less`], in either direction or
+    /// both, answers identically — hand mutation-testing confirms it, where
+    /// the same mutation of the compaction heap is caught at once. Same
+    /// structure, different half of it carrying the weight.
+    ///
     /// Every source ends past the key — forward, past its last version;
     /// backward, before its first — so the caller can simply go round again.
     async fn take_newest_visible(
