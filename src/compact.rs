@@ -460,19 +460,36 @@ async fn merge<D: Disk>(
     // taking an owned entry per survivor meant allocating that key again,
     // and the value again, for each one.
     let mut value = Vec::new();
-    let mut seen: Option<Vec<u8>> = None;
+    // The user key of the entry last taken, and whether there is one. Reused
+    // for the same reason `value` is, and it is the same loop: a fresh
+    // allocation to answer "was the last key this one?" is one per entry
+    // read, not one per survivor, so a compaction that drops nearly
+    // everything pays it most.
+    let mut seen = Vec::new();
+    let mut seen_any = false;
 
     while let Some(w) = least(&iters)? {
-        let encoded = iters[w].key().to_vec();
-        let k = InternalKey::decode(&encoded)?;
-        let user = k.user_key.to_vec();
+        // Borrowed from the iterator rather than copied out of it. What
+        // `key` hands back is the cursor's own assembled buffer
+        // (`block::restart::Cursor::key`), so it stays put until something
+        // advances the iterator — which nothing here does until the entry
+        // has been written, `value_into` reading it through a shared borrow
+        // as `key` does. The one copy left is `Output::add`'s, which the
+        // table being built has to have.
+        let encoded = iters[w].key();
+        let k = InternalKey::decode(encoded)?;
+        let user = k.user_key;
 
         // The first version met for a user key is its newest, since trailers
         // descend. Every one after it is superseded and goes.
-        let newest = seen.as_deref() != Some(user.as_slice());
-        seen = Some(user.clone());
+        let newest = !seen_any || seen != user;
+        if newest {
+            seen.clear();
+            seen.extend_from_slice(user);
+            seen_any = true;
+        }
 
-        if newest && keep(&user, k.seq_num, k.kind, &tombstones, below) {
+        if newest && keep(user, k.seq_num, k.kind, &tombstones, below) {
             // The break comes *before* the key rather than after, so the
             // span that closes ends at a key the next table holds and the
             // two tables meet rather than overlap. Only a user key the
@@ -480,13 +497,13 @@ async fn merge<D: Disk>(
             // drops above every surviving user key appears exactly once, so
             // any of them will do.
             if open.estimate >= target_bytes && !open.is_empty() {
-                let finished = std::mem::replace(&mut open, Output::new(Some(user.clone()))?);
-                if let Some((bytes, bounds, entries)) = finished.finish(&tombstones, Some(&user))? {
+                let finished = std::mem::replace(&mut open, Output::new(Some(user.to_vec()))?);
+                if let Some((bytes, bounds, entries)) = finished.finish(&tombstones, Some(user))? {
                     write(bytes, bounds, entries).await?;
                 }
             }
             iters[w].value_into(&mut value).await?;
-            open.add(k, &encoded, &value)?;
+            open.add(k, encoded, &value)?;
         }
         iters[w].next().await?;
         pacer.did(1).await;
