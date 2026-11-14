@@ -20,12 +20,15 @@
 //! that no longer exists. So the rule is written as a list of what may go,
 //! never as a list of what must stay, and the fall-through is to keep:
 //!
-//! - A **table** goes when the current version names it at no level **and
-//!   no reader is open for it**. The version is where every read starts, so
-//!   a table it does not name is one nothing can newly ask for — but a scan
-//!   that began before the version changed holds open readers of its own,
-//!   and those are exactly the reads that would find the file gone. See
-//!   [`Readers`].
+//! - A **table** goes when the current version names it at no level, **no
+//!   reader is open for it**, and **no compaction is in the middle of
+//!   writing it**. The version is where every read starts, so a table it
+//!   does not name is one nothing can newly ask for — but a scan that began
+//!   before the version changed holds open readers of its own, and those are
+//!   exactly the reads that would find the file gone (see [`Readers`]); and a
+//!   compaction's output is on disk before the edit that claims it, which is
+//!   this rule's description of a file a crash left behind and is not one
+//!   (see [`Pending`]).
 //! - A **log** goes when its number is below `min_unflushed_log_num`. That
 //!   counter is the MANIFEST's statement that every record in the logs below
 //!   it is in a table, and it is durable before any file is touched.
@@ -192,12 +195,83 @@ impl Readers {
     }
 }
 
+/// The tables a compaction has written and nothing refers to yet (§5).
+///
+/// A compaction writes every output before the edit that claims any of them,
+/// and writes them as the merge finishes them rather than under the permit
+/// (`crate::compact`), so a flush's sweep can run in the gap. From the
+/// sweep's side an output table is indistinguishable from what an
+/// interrupted compaction leaves behind — a file on disk the version does
+/// not name — and collecting it would leave the edit that follows naming a
+/// file that is gone.
+///
+/// Pebble has the same hazard and answers it from the other end: it tracks
+/// created and deleted objects in memory, so an in-flight output is never a
+/// candidate, and its one directory listing says it "must not be called
+/// concurrently with compactions and flushes" and waits for them
+/// (`scanObsoleteFiles`). roble's sweep is a listing every time, so it is
+/// told which numbers to leave alone instead — which is the set older Pebble
+/// and RocksDB keep as `pendingOutputs`.
+#[derive(Default)]
+pub(crate) struct Pending {
+    tables: RefCell<BTreeSet<u64>>,
+}
+
+impl Pending {
+    /// Puts the numbers a compaction is about to write out of the sweep's
+    /// reach, until the [`Writing`] is dropped.
+    pub(crate) fn writing(&self) -> Writing<'_> {
+        Writing {
+            pending: self,
+            tables: Vec::new(),
+        }
+    }
+
+    /// The tables a compaction is in the middle of writing.
+    pub(crate) fn tables(&self) -> BTreeSet<u64> {
+        self.tables.borrow().clone()
+    }
+}
+
+/// The output tables one compaction is writing, released when it is dropped.
+///
+/// A guard for the reason [`crate::change::Claim`] is one: a compaction that
+/// failed half way through, or whose future was thrown away, would otherwise
+/// leave the files it had written out of every sweep's reach for ever — and
+/// those are precisely the files that have to be collected.
+pub(crate) struct Writing<'a> {
+    pending: &'a Pending,
+    tables: Vec<u64>,
+}
+
+impl Writing<'_> {
+    /// Takes account of one more output table, before the file exists.
+    ///
+    /// Before, and not after: a sweep that listed the directory between the
+    /// file being created and the number being recorded here would find a
+    /// table nothing says to keep.
+    pub(crate) fn add(&mut self, file_num: u64) {
+        self.pending.tables.borrow_mut().insert(file_num);
+        self.tables.push(file_num);
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.pending.tables.borrow_mut();
+        for table in &self.tables {
+            pending.remove(table);
+        }
+    }
+}
+
 /// Deletes every obsolete file among `names`, and says which it deleted.
 ///
 /// A table that `in_use` names is left where it is, however obsolete: the
 /// file is unreachable to anything starting from the version, and still open
-/// to a reader that started before it changed. Nothing is lost by waiting —
-/// the next sweep finds it again, as it does every file this leaves behind.
+/// to a reader that started before it changed, or still being written by a
+/// compaction whose edit has not landed. Nothing is lost by waiting — the
+/// next sweep finds it again, as it does every file this leaves behind.
 pub(crate) async fn remove_obsolete<F: Fs>(
     fs: &F,
     dir: &Path,
@@ -210,10 +284,10 @@ pub(crate) async fn remove_obsolete<F: Fs>(
         if !is_obsolete(name, live) {
             continue;
         }
-        // A table a reader still has open is left where it is. Only a
-        // table has readers, and a file number names one file, so nothing
-        // else can match: the numbers come from the one counter the
-        // MANIFEST carries.
+        // A table a reader still has open, or a compaction is still
+        // writing, is left where it is. Only a table is either of those,
+        // and a file number names one file, so nothing else can match: the
+        // numbers come from the one counter the MANIFEST carries.
         if files::parse_filename(name).is_some_and(|p| in_use.contains(&p.file_num)) {
             continue;
         }
@@ -260,7 +334,11 @@ impl<F: Fs> Opened<F> {
             let versions = self.versions();
             Live::of(&versions, manifest_num, &names)?
         };
-        let in_use = self.release_dead_readers(&live);
+        let mut in_use = self.release_dead_readers(&live);
+        // The outputs of a compaction that is running beside this sweep,
+        // which the permit cannot speak for because the compaction writes
+        // them without it (§9, `Pending`).
+        in_use.extend(self.pending().tables());
         let removed = remove_obsolete(self.fs(), &self.dir, &names, &live, &in_use).await?;
         self.forget_markers(&removed);
         Ok(removed)

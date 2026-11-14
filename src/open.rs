@@ -155,6 +155,10 @@ pub struct Opened<F: Fs> {
     /// what keeps the sweep from deleting one out from under a scan (§5,
     /// `crate::obsolete`).
     readers: std::rc::Rc<crate::obsolete::Readers>,
+    /// The output tables a compaction has written and no version names yet,
+    /// which is what keeps the sweep off a file the edit is about to name
+    /// (§5, `crate::obsolete`).
+    pending: crate::obsolete::Pending,
     /// Whether an append to the MANIFEST has failed, after which this store
     /// records nothing more (`crate::flush`).
     manifest_failed: std::cell::Cell<bool>,
@@ -431,6 +435,7 @@ pub async fn open_with<E: Env>(
         memtable_size: options.memtable_size,
         max_manifest_bytes: options.max_manifest_bytes,
         readers: std::rc::Rc::new(crate::obsolete::Readers::default()),
+        pending: Default::default(),
         manifest_failed: std::cell::Cell::new(false),
         changes: crate::change::Changes::default(),
         l0_compaction_threshold: options.l0_compaction_threshold,
@@ -1059,6 +1064,12 @@ impl<F: Fs> Opened<F> {
     /// (`crate::obsolete`).
     pub(crate) fn readers(&self) -> &std::rc::Rc<crate::obsolete::Readers> {
         &self.readers
+    }
+
+    /// The output tables a compaction is in the middle of writing
+    /// (`crate::obsolete`).
+    pub(crate) fn pending(&self) -> &crate::obsolete::Pending {
+        &self.pending
     }
 
     /// Lets go of the table cache's reader for one of this store's tables.

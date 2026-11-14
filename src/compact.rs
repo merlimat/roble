@@ -48,8 +48,21 @@
 //! dropping one that still has something to delete brings a key back from the
 //! dead. The second mistake is the one worth not making first.
 //!
-//! The output is a single table. Splitting it at a target size belongs with
-//! the picker, which is the part that has opinions about how large a file
+//! **Where the output goes.** A table is written the moment the merge has
+//! finished it, not when the merge has finished: nothing accumulates, so
+//! what a compaction holds is one output table and not all of them. That
+//! matters because the one job this has no bound on is L0's — the picker
+//! takes all of L0 and every L0 table whose range meets it below, so the
+//! output is L0's depth times a memtable (§9, `crate::pick`) — and because
+//! roble's first consumer runs hundreds of stores on one node, where a
+//! transient per-store peak is multiplied by hundreds. Pebble goes a layer
+//! further and writes each *block* as it fills, so what it holds is one
+//! block and one index; roble's `TableWriter` builds a whole table's bytes,
+//! which is what bounds this at the target file size rather than at a block.
+//!
+//! The split points are the target size's, and the sizes themselves are the
+//! picker's business (§9): this is the part that cannot write a table
+//! straddling a boundary, not the part with opinions about how large a file
 //! should be.
 
 use std::collections::BTreeSet;
@@ -202,11 +215,33 @@ impl<F: Fs> Opened<F> {
         // level below holds are the same ones or fewer. Too wide keeps a
         // tombstone that could have gone, which costs a little space; too
         // narrow would drop one that was still hiding something.
-        let merged = merge(
+        //
+        // Every output is written and made durable here, as the merge
+        // finishes it, and still before the edit that claims any of them: a
+        // crash in the middle leaves files nothing refers to, which the
+        // sweep collects, and the database exactly as it was. Streaming
+        // them does not weaken that — the edit is after the merge, so it is
+        // after every write — but it does mean the files are on disk while
+        // another change can be underway, which is what `writing` is for.
+        let mut new_tables = Vec::new();
+        let mut written: Vec<(u64, u64)> = Vec::new();
+        let mut writing = self.pending().writing();
+        merge(
             &tables,
             below,
             self.target_file_size(output_level),
             self.compaction_unit(),
+            async |bytes, bounds: Bounds, entries| {
+                let file_num = self.take_file_num(&mut writing).await;
+                written.push((file_num, entries));
+                let mut new_table = bounds.into_new_table(output_level, file_num)?;
+                new_table.size = bytes.len() as u64;
+                self.metrics.compaction_tables[1].add(1);
+                self.metrics.compaction_io[1].add(new_table.size);
+                self.write_table(file_num, bytes).await?;
+                new_tables.push(new_table);
+                Ok(())
+            },
         )
         .await?;
         // Read, and done with. The readers are dropped here rather than at
@@ -215,38 +250,24 @@ impl<F: Fs> Opened<F> {
         // `crate::obsolete`).
         drop(tables);
 
-        // The permit again, for all of what is left, because all of what is
-        // left changes what the store is made of. The numbers the outputs
-        // take are read from the version and spent by the edit, so anything
-        // in between that read the same version would read the same numbers
-        // — which is why this is one hold and not two.
+        // The permit again, for the edit and everything after it, because
+        // all of what is left changes what the store is made of.
         let change = self.changes().begin().await;
-
-        // Every output written and made durable before the edit that claims
-        // any of them: a crash in the middle leaves files nothing refers to,
-        // which the sweep collects, and the database exactly as it was.
-        let first_file_num = self.versions().next_file_num;
-        let mut new_tables = Vec::with_capacity(merged.len());
-        let mut written: Vec<(u64, u64)> = Vec::new();
-        for (i, (bytes, bounds, entries)) in merged.into_iter().enumerate() {
-            let file_num = first_file_num + i as u64;
-            written.push((file_num, entries));
-            let mut new_table = bounds.into_new_table(output_level, file_num)?;
-            new_table.size = bytes.len() as u64;
-            self.metrics.compaction_tables[1].add(1);
-            self.metrics.compaction_io[1].add(new_table.size);
-            self.write_table(file_num, bytes).await?;
-            new_tables.push(new_table);
-        }
 
         // Nothing survived? The inputs still go: an edit that only deletes is
         // as much a compaction as one that writes.
+        //
+        // The counter rather than the last number spent: a flush that
+        // interleaved with the merge has taken numbers of its own, and an
+        // edit saying the number after *this* compaction's last would hand
+        // one of them out again (`take_file_num`). Pebble writes the live
+        // counter into every edit for the same reason.
+        let next_file_num = self.versions().next_file_num;
         let edit = VersionEdit {
             comparer_name: None,
             min_unflushed_log_num: None,
             obsolete_prev_log_num: None,
-            next_file_num: (!new_tables.is_empty())
-                .then(|| first_file_num + new_tables.len() as u64),
+            next_file_num: (!new_tables.is_empty()).then_some(next_file_num),
             last_seq_num: Some(self.last_seq_num()),
             deleted_tables: inputs.iter().map(|(l, m)| (*l, m.file_num)).collect(),
             new_tables,
@@ -340,6 +361,35 @@ impl<F: Fs> Opened<F> {
         Ok((inputs, below))
     }
 
+    /// Takes the number for one output table, and spends it.
+    ///
+    /// Taken *and* spent, which is not how the rest of roble numbers a file:
+    /// a flush reads the counter and lets its edit spend it, and a rotation
+    /// spends past the marker, both safe because the permit is held from the
+    /// one to the other. A merge holds no permit (§9), so a number it took
+    /// and left would be a number the flush beside it takes as well — and
+    /// then one of the two tables is written over the other. So the permit is
+    /// taken for this one step, and the counter moves inside it: there is no
+    /// await between reading it and bumping it, so nothing else can be
+    /// between either. Pebble's `getNextDiskFileNum` is this, an atomic
+    /// increment it says needs no lock at all.
+    ///
+    /// What a number taken by a compaction that then fails costs is that it
+    /// is never used: the in-memory counter is past it and the MANIFEST's is
+    /// not, so the next open hands it out again, by which time the sweep has
+    /// collected the file it named. Pebble skips numbers the same way.
+    async fn take_file_num(&self, writing: &mut crate::obsolete::Writing<'_>) -> u64 {
+        let _change = self.changes().begin().await;
+        let mut versions = self.versions_mut();
+        let file_num = versions.next_file_num;
+        versions.next_file_num = file_num + 1;
+        drop(versions);
+        // Under the same permit, so no sweep can run between the number
+        // being spent and the sweep being told to leave it alone.
+        writing.add(file_num);
+        file_num
+    }
+
     /// Writes the output table and makes its name durable.
     async fn write_table(&self, file_num: u64, bytes: Vec<u8>) -> Result<()> {
         let path = self.dir.join(roble_format::files::table_filename(file_num));
@@ -360,16 +410,23 @@ impl<F: Fs> Opened<F> {
     }
 }
 
-/// Merges every input into one table's bytes, dropping what may go.
+/// Merges every input into tables of up to `target_bytes`, dropping what may
+/// go, and hands each one to `write` as it is finished.
 ///
-/// Returns `None` when nothing survived, which is not an error: a level of
-/// superseded keys and spent tombstones compacts to nothing at all.
+/// `write` rather than a list of tables, so that the bytes of a finished
+/// table are somebody else's the moment they are finished and nothing here
+/// holds more than the one being built. It may be called no times at all,
+/// which is not an error: a level of superseded keys and spent tombstones
+/// compacts to nothing at all. Pebble splits the same two halves apart the
+/// other way round, with `compact.Runner` as a pump its caller draws one
+/// output table at a time from.
 async fn merge<D: Disk>(
     tables: &[Rc<OpenTable<D>>],
     below: &[(Vec<u8>, Vec<u8>)],
     target_bytes: u64,
     unit: u64,
-) -> Result<Vec<(Vec<u8>, Bounds, u64)>> {
+    mut write: impl AsyncFnMut(Vec<u8>, Bounds, u64) -> Result<()>,
+) -> Result<()> {
     // The thread goes back to whatever else is ready every `unit` entries,
     // so a merge of a million keys is a million keys' worth of work rather
     // than a million keys' worth of waiting for everyone else (§9).
@@ -397,7 +454,6 @@ async fn merge<D: Disk>(
     // walking it would have to decide what an overlap meant.
     let tombstones = fragment(tables);
 
-    let mut outputs = Vec::new();
     let mut open = Output::new(None)?;
     // Reused for every entry that survives the merge. A compaction reads
     // millions of them and already holds the encoded key it is writing, so
@@ -425,7 +481,9 @@ async fn merge<D: Disk>(
             // any of them will do.
             if open.estimate >= target_bytes && !open.is_empty() {
                 let finished = std::mem::replace(&mut open, Output::new(Some(user.clone()))?);
-                outputs.push(finished.finish(&tombstones, Some(&user))?);
+                if let Some((bytes, bounds, entries)) = finished.finish(&tombstones, Some(&user))? {
+                    write(bytes, bounds, entries).await?;
+                }
             }
             iters[w].value_into(&mut value).await?;
             open.add(k, &encoded, &value)?;
@@ -434,8 +492,10 @@ async fn merge<D: Disk>(
         pacer.did(1).await;
     }
 
-    outputs.push(open.finish(&tombstones, None)?);
-    Ok(outputs.into_iter().flatten().collect())
+    if let Some((bytes, bounds, entries)) = open.finish(&tombstones, None)? {
+        write(bytes, bounds, entries).await?;
+    }
+    Ok(())
 }
 
 /// One table a compaction is building, and the span of keys it owns.

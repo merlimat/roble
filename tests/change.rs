@@ -347,6 +347,166 @@ async fn a_sweep_never_collects_a_table_a_flush_just_added() {
     }
 }
 
+/// One `Poll::Pending` and no more, so that a loop waiting on something
+/// another future is doing gives that future its turn rather than spinning.
+async fn a_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
+/// Sets up a store with one compaction to run that writes several tables.
+///
+/// Several, because the gap these tests are about opens as soon as the first
+/// output is on disk and stays open until the edit: one output would
+/// exercise its end and not its middle. The merge yields after every entry,
+/// which is what gives whatever is running beside it a turn while the gap is
+/// open.
+async fn ready_to_split(env: &SimEnv, dir: &Path) -> (roble::Opened<SimFs>, Model, Vec<u64>) {
+    let db = roble::open_with(
+        env,
+        dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .compaction_unit(1)
+            .target_file_size(4096),
+    )
+    .await
+    .expect("open");
+    let mut model = contents(&db).await;
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..100 {
+        let key = format!("p{i:04}").into_bytes();
+        batch.put(&key, &value).expect("put");
+        model.insert(key, value.clone());
+    }
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    (db, model, vec![table])
+}
+
+#[compio::test]
+async fn a_sweep_never_collects_a_table_a_compaction_is_writing() {
+    // A compaction writes each output the moment the merge has finished it,
+    // which is before the edit that claims any of them and with no permit
+    // held (§9, `crate::compact`). So the file is on disk, no version names
+    // it, and that is this sweep's description of what an interrupted
+    // compaction leaves behind — it would delete a table the edit is about
+    // to name. `crate::obsolete::Pending` is what says otherwise.
+    //
+    // The sweep is held back until there is a file for it to get wrong,
+    // which is what the two tests above get from `pause_at`: a sweep polled
+    // at the start of the merge lists a directory the outputs are not in
+    // yet, and a listing taken before a file was created is not a listing
+    // that names it.
+    let (env, dir) = load("db-twin-a").await;
+    let (db, model, inputs) = ready_to_split(&env, &dir).await;
+    let first_output = db.versions().next_file_num;
+    let path = dir.join(roble_format::files::table_filename(first_output));
+
+    let (compacted, swept) = interleave(db.compact(0, &inputs), async {
+        while env.sim().durable(&path).is_none() {
+            a_turn().await;
+        }
+        db.remove_obsolete_files().await
+    });
+    let swept = swept.expect("the sweep");
+    let outputs = compacted.expect("the compaction");
+    assert!(
+        outputs.len() > 2,
+        "20 KiB against a 4 KiB target should be several tables, got {outputs:?}"
+    );
+    assert_eq!(
+        outputs.first().copied(),
+        Some(first_output),
+        "the sweep was waiting for the wrong file, so it ran before there was one"
+    );
+    for table in &outputs {
+        let name = roble_format::files::table_filename(*table);
+        assert!(
+            !swept.contains(&name),
+            "the sweep collected {name}, which the compaction was still writing: {swept:?}"
+        );
+    }
+    assert_eq!(contents(&db).await, model);
+
+    drop(db);
+    let reopened = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(contents(&reopened).await, model, "reopened");
+}
+
+#[compio::test]
+async fn a_compactions_edit_never_takes_back_a_number_a_flush_spent() {
+    // A compaction numbers each output as the merge finishes it, and the
+    // merge holds no permit (§9), so a flush beside it takes numbers of its
+    // own in between. An edit that said "the number after my last output is
+    // the next one" would hand those out again, and the next table written
+    // would be written over the flush's.
+    let (env, dir) = load("db-twin-a").await;
+    let (db, mut model, inputs) = ready_to_split(&env, &dir).await;
+    // Something for the flush to write, after the compaction's inputs were
+    // named: the flush must not be the one that produced them.
+    model.extend(write_keys(&db, "v", 5).await);
+    let first_output = db.versions().next_file_num;
+    let path = dir.join(roble_format::files::table_filename(first_output));
+
+    // The flush is held back until the compaction has numbered an output,
+    // which is the order that makes this a rewind rather than a gap: a flush
+    // that took all of its numbers first leaves nothing for a later edit to
+    // take back.
+    let (compacted, flushed) = interleave(db.compact(0, &inputs), async {
+        while env.sim().durable(&path).is_none() {
+            a_turn().await;
+        }
+        db.flush().await
+    });
+    let outputs = compacted.expect("the compaction");
+    let flushed = flushed.expect("the flush").expect("a table");
+    assert_eq!(
+        outputs.first().copied(),
+        Some(first_output),
+        "the flush was waiting for the wrong file, so it ran before the merge had numbered one"
+    );
+    assert!(
+        flushed < *outputs.last().expect("an output"),
+        "the flush took its number after the merge had finished, so nothing of this \
+         compaction's was numbered after it: {outputs:?} and {flushed}"
+    );
+    assert!(
+        outputs.iter().all(|t| *t != flushed),
+        "the flush and the compaction wrote the same table: {outputs:?} and {flushed}"
+    );
+
+    let spent = db
+        .versions()
+        .version
+        .table_file_nums()
+        .into_iter()
+        .max()
+        .expect("a table");
+    assert!(
+        db.versions().next_file_num > spent,
+        "the edit took back {spent}, so the next table written takes a name that is in use"
+    );
+
+    // And the proof of it: another flush, which has to find a free number.
+    model.extend(write_keys(&db, "w", 5).await);
+    db.flush().await.expect("flush").expect("a table");
+    assert_eq!(contents(&db).await, model);
+
+    drop(db);
+    let reopened = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(contents(&reopened).await, model, "reopened");
+}
+
 #[compio::test]
 async fn a_flush_that_compacts_does_not_wait_on_itself() {
     // The permit is taken by `flush` and held across the compaction it
