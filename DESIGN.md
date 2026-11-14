@@ -1262,6 +1262,38 @@ buffers (not the thread's frames, which are `Rc`), and gets back an edit to
 apply. The default executor runs the job cooperatively on the calling thread.
 Start there; add the pool when a benchmark asks for it.
 
+**What the bet is worth, measured.** Holding the whole process to one CPU is
+the comparison this bet needs, since a rate measured with six cores free is
+roble's one core against RocksDB's six (`bench/README.md`, "One core each").
+Over 6,000,000 records on one core each, roble loads at **1.08x** RocksDB's
+rate for 0.82x its CPU — where with six cores available RocksDB loads 1.85x
+faster than roble. The load comparison was a core-count artifact, and
+correcting it reverses the result.
+
+The premise holds too. roble gains nothing from five more cores: across YCSB A
+to F its rate moves between 0.98x and 1.01x of its pinned rate, which is this
+section's "one store, one thread" measured rather than assumed. It is in fact
+*faster* pinned — loading 1.19x and getting 1.09x what it does unpinned —
+while spending 1.31x the CPU unpinned for identical `settle` work. The extra
+CPU for the same output is what a flush landing on a core other than the
+store's would cost: it reads a memtable cold in that core's cache and writes
+blocks the store's core then has to re-fetch. That is the explanation the
+numbers fit, not one they prove.
+
+The bet's other half comes out worse. roble pays **1.66x** RocksDB's CPU to
+reach quiescence on one core, and 1.87x on six: a cooperative compaction's cost
+arrives later rather than never, and `settle` is where it arrives. And the read
+gaps are not core-count artifacts at all — RocksDB's rate on the mixes moves
+only 0.94x to 1.08x across the same five cores, so taking them away does not
+close them. `floor` widens, from 0.51x at six cores to **0.31x** at one,
+because pinning buys RocksDB 1.70x where it buys roble 1.03x. That asymmetry
+fits §8's conclusion: a step already missing to DRAM has no cache locality left
+to win, and RocksDB's evidently had some.
+
+One run per cell, on the VM of §12's benchmark note. The deltas quoted above
+are far outside the spread those runs show, except `get-cold`, which moved
+1.74x between roble's own two runs and is not quoted here for that reason.
+
 **Write stalls.** Both of them, and both are a write waiting for work somebody
 else is already doing rather than queueing up to repeat it. Pebble's
 `maybeInduceWriteStall` is the shape: look, wait for the change underway, look
@@ -1680,6 +1712,12 @@ Stated rather than quietly decided:
   `cpu s` column is where to look — a cooperative compaction's cost lands on
   the thread that owns the store, so it shows up in the phase that drove it
   rather than in a background total.
+
+  The first reading is in §9, from holding both engines to one CPU: roble loads
+  at 1.08x RocksDB's rate for 0.82x its CPU, and then pays 1.66x its CPU to
+  settle. So the bet pays on the write path and the debt lands in `settle` —
+  which is where an offload path would be aimed, and not at the lookups, which
+  the same comparison showed are not core-bound at all.
 - **What reverse iteration costs** is now measured, and it is not the problem
   this entry expected. `bench/` runs every engine over the same workload, each
   scan direction in a process of its own so that neither reads a cache the

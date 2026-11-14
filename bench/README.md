@@ -645,6 +645,95 @@ the counts invited the wrong answer and were believed for a day.
 work differently. roble compacts on the thread that owns the store; RocksDB
 uses its own; a rate credits the background one with work it still paid for.
 
+## One core each
+
+The `cpu s` column says what a phase cost. It does not say what the rate would
+have been had the engines been given the same machine, and on a multi-core box
+they are not: roble is single-threaded by design, compaction included (§9), so
+one store uses one core and no more, while RocksDB puts flushes and compactions
+on background threads and uses several. A rate measured with six cores free is
+roble's one core against RocksDB's six.
+
+Which comparison is the right one depends on how the thing is deployed. roble's
+first consumer shards, one store per thread, so the question that decides a
+design is throughput *per core* — six roble shards on six cores against one
+RocksDB on the same six. Holding the whole process to one CPU asks it directly:
+
+```sh
+taskset -c 3 ./run.sh --shards 1 --batches 600 --records 10000 --no-wal
+```
+
+Affinity is inherited by every thread and every child, so the one prefix covers
+the build wrapper, the engine's background threads, and the `systemd-run` scope
+the memory-budget pass runs in — a `--scope` runs in the caller's own context
+rather than under the user manager, which is why it carries. Without `--scope`
+it does not: the same prefix around `systemd-run --user` leaves the command's
+`Cpus_allowed_list` at `0-5`, because the user manager starts it and the user
+manager was never pinned.
+
+`taskset` rather than a cgroup, although a cgroup is where `AllowedCPUs=` lives:
+cgroup v2 delegates `cpu`, `memory` and `pids` to a user slice but not `cpuset`,
+so that one needs root. `CPUQuota=100%` needs no root and is a different thing —
+one core's worth of CPU *time*, which the threads may spend in parallel and then
+be throttled for the rest of the 100 ms period. That throttle arrives as a stall
+in `p99` and `max us`, the same columns a flush lands in, so the knob that reads
+clean is the cpuset one.
+
+Pick a CPU that is not also serving interrupts. `/proc/interrupts` on the VM
+these numbers come from pins one virtio block queue to each of the six CPUs and
+puts the network and console queues on CPU 0 as well, which is why the line
+above says 3 and not 0.
+
+### What it found
+
+Over 6,000,000 records with `--cache-mb 64 --no-wal`, one run per cell. `@1` is
+pinned to CPU 3, `@6` is the whole machine:
+
+```
+                   roble@1    roble@6      rdb@1      rdb@6  r/rdb@1  r/rdb@6
+load rate/s      1,058,670    887,989    982,406  1,641,511     1.08     0.54
+load cpu s            4.62       5.65       5.63       6.60     0.82     0.86
+settle cpu s          4.29       5.63       2.58       3.01     1.66     1.87
+scan-rev rate/s  4,276,323  4,111,481  7,390,524  6,119,023     0.58     0.67
+scan rate/s      9,360,204  8,871,463 10,694,376  8,386,035     0.88     1.06
+get rate/s         296,950    273,074    422,038    322,870     0.70     0.85
+floor rate/s        75,875     73,680    245,444    144,572     0.31     0.51
+get-cold rate/s      4,822      2,764      2,524      1,907     1.91     1.45
+ycsb-A rate/s      227,333    228,680    558,071    600,958     0.41     0.38
+ycsb-B rate/s      239,271    242,248    464,290    489,395     0.52     0.49
+ycsb-C rate/s      284,304    282,889    401,897    404,830     0.71     0.70
+ycsb-D rate/s      454,141    456,616    687,450    713,687     0.66     0.64
+ycsb-E rate/s       26,384     25,844     51,744     48,625     0.51     0.53
+ycsb-F rate/s      152,121    150,858    364,804    388,630     0.42     0.39
+```
+
+**roble's two columns are the same column.** Across the six mixes its rate
+moves between 0.98x and 1.01x of its pinned rate, so five more cores buy it
+nothing — which is what "one store, one thread" predicts, now measured. Read
+`@1` and ignore `@6`.
+
+**The load comparison was a core-count artifact.** At six cores RocksDB loads
+1.85x faster; on one core each, roble loads 1.08x faster for 0.82x the CPU,
+because RocksDB's load is the one phase that really does use the extra cores
+(1.67x across the five). This is the comparison to quote for a shard-per-core
+deployment, and it is the opposite of the uncapped one.
+
+**The read gaps are not core-count artifacts.** RocksDB's rate on the mixes
+moves only 0.94x to 1.08x across the same five cores — in a read-dominated ten
+seconds its background threads have little to do — so the cap neither explains
+nor closes them. `floor` widens under the cap, from 0.51x to 0.31x, because
+pinning is worth 1.70x to RocksDB and 1.03x to roble. A step already missing to
+DRAM has no locality left to win, which is what §8 concluded by another route.
+
+Both engines are faster pinned on every read phase, so an unpinned run of
+either is measuring thread migration as well as the engine.
+
+Two columns that are not comparisons. `peak rss` is 249 MiB against 203: roble's
+Rust allocator is mimalloc while RocksDB's C++ internals go through glibc
+malloc, so part of that gap is the allocator. And `get-cold` moved 1.74x between
+roble's own two runs — it is the only phase that reaches the device, behind a
+qcow2 on host writeback, and one run of each is not enough to call it.
+
 ## Columns
 
 - **count** — records for load and the scans, lookups for get and floor,
