@@ -31,8 +31,12 @@
 //! **A direction change re-seeks.** Going forward leaves the iterators past
 //! the current key; going backward leaves them before it. Turning round means
 //! they are all on the wrong side, so they are sought again rather than
-//! stepped. That costs one seek per table at the turn and nothing while the
-//! direction holds, which is the trade Pebble's merging iterator makes too.
+//! stepped, and the [`Heap`] is rebuilt the other way round with them, since
+//! its top is the least internal key or the greatest and never both. That
+//! costs one seek per source plus a heapify at the turn, and nothing while
+//! the direction holds, which is the trade Pebble's merging iterator makes
+//! too — `switchToMinHeap` and `switchToMaxHeap` re-seek the levels and
+//! reinitialise the heap in one step.
 //!
 //! What a scan fixes, which `get` still pays: the four ordered comparisons in
 //! [`crate::read`] re-seek every table once per key they reject. Here the
@@ -44,6 +48,13 @@
 //! replacing the two passes over the sources with a single merged stream
 //! (0.921). Both remove real work, and the step is not waiting on work — §8
 //! has the measurement and what follows from it.
+//!
+//! The [`Heap`] below is not a third of those, and the distinction is §8's
+//! own: the three changes that did pay were asymptotic rather than constant,
+//! and this one removes the O(sources) term from a step instead of shaving
+//! instructions off it. The thrown-away stream rewrite restructured the two
+//! passes while keeping that term; this removes it, and folds the second pass
+//! into the heap that replaced the first.
 
 use std::rc::Rc;
 
@@ -108,9 +119,15 @@ pub(crate) struct Placed<D: Disk> {
 /// because positioning a scan used to seek every table it held and throw all
 /// but one answer away: `floor` over a store settled into fourteen tables
 /// spent 470 ns a table doing that, six sevenths of its 2 µs. And a
-/// comparison, because [`Scan::least`] and [`Scan::greatest`] walk every
-/// source on every step, 7.5 ns a table a step — over half of what a forward
-/// scan cost at the same shape.
+/// comparison, because the merge used to walk every source on every step,
+/// 7.5 ns a table a step — over half of what a forward scan cost at the same
+/// shape.
+///
+/// The second of those two arguments is weaker now that the merge is a
+/// [`Heap`]: a step sifts rather than scans, so a source costs a step
+/// `log(sources)` rather than one comparison each. The grouping still pays —
+/// the seek per table is untouched, and a smaller heap is a shallower one —
+/// but it is no longer most of a step, and this is where that was claimed.
 ///
 /// Correctness rests on the disjointness and nothing else. Two sources at the
 /// same key are settled by sequence number (`take_newest_visible`), never by
@@ -286,7 +303,24 @@ impl<D: Disk> Source<D> {
         match self {
             Source::Table(it) => it.key(),
             Source::Run(run) => run.key(),
-            Source::Mem(m) => &m.key,
+            Source::Mem(m) => {
+                // A table's iterator panics when it is asked for a key it is
+                // not on, and a memtable's would hand back the last key it
+                // copied — `capture` leaves the buffer alone when the cursor
+                // has gone invalid, because clearing it would cost a step
+                // that is about to be thrown away anyway.
+                //
+                // Spelled out because of the shape of the failure. [`Heap`]
+                // holds only sources that are on an entry, and a bug that
+                // broke that invariant would, through this arm, leave a
+                // spent source at the top of the heap answering with a key
+                // that no longer exists — which is not a wrong answer but a
+                // loop that never ends. Pebble guards its heap's
+                // `REQUIRES: every iterKV is non-nil` under
+                // `invariants.Enabled` for the same reason.
+                debug_assert!(m.valid, "a memtable source is not on an entry");
+                &m.key
+            }
         }
     }
 
@@ -402,6 +436,14 @@ struct Current {
 /// Pebble's are: `lower` is included and `upper` is not.
 pub struct Scan<D: Disk> {
     iters: Vec<Source<D>>,
+    /// The sources arranged so that the next key is the top of a heap rather
+    /// than the winner of a look at every one of them.
+    ///
+    /// Empty until the scan is positioned, and rebuilt by every call that
+    /// positions it. Nothing reads it before then: `next` and `prev` return
+    /// at once while `current` is `None`, and every other entry point seeks
+    /// first.
+    heap: Heap,
     /// The buffers of the key this scan has moved off, kept to be filled
     /// again.
     ///
@@ -523,6 +565,7 @@ impl<D: Disk> Scan<D> {
         }
         Scan {
             iters,
+            heap: Heap::default(),
             spare: None,
             tombstoned,
             memtables,
@@ -568,6 +611,33 @@ impl<D: Disk> Scan<D> {
         &self.current.as_ref().expect("scan is not on a key").value
     }
 
+    /// Seeks every source to the first entry at or after `target` and builds
+    /// the forward heap over them.
+    ///
+    /// The two belong together because a heap is good for one direction only:
+    /// its top is the least internal key or the greatest, never both. So
+    /// every call that repositions the sources wholesale has to say which way
+    /// it left them, and this is where that is said. Pebble pairs them for
+    /// the same reason, in `switchToMinHeap`.
+    async fn sought_ge(&mut self, target: &[u8]) -> Result<()> {
+        for it in &mut self.iters {
+            it.seek_ge(target).await?;
+        }
+        self.dir = Dir::Forward;
+        self.heap = Heap::new(&self.iters, Dir::Forward)?;
+        Ok(())
+    }
+
+    /// The same backwards: every source before `target`, greatest on top.
+    async fn sought_lt(&mut self, target: &[u8]) -> Result<()> {
+        for it in &mut self.iters {
+            it.seek_lt(target).await?;
+        }
+        self.dir = Dir::Reverse;
+        self.heap = Heap::new(&self.iters, Dir::Reverse)?;
+        Ok(())
+    }
+
     /// Positions on the first key at or after `from`, respecting the bounds.
     pub async fn seek_ge(&mut self, from: &[u8]) -> Result<()> {
         let from = match &self.lower {
@@ -575,10 +645,7 @@ impl<D: Disk> Scan<D> {
             _ => from.to_vec(),
         };
         let target = key::search_key(&from);
-        for it in &mut self.iters {
-            it.seek_ge(&target).await?;
-        }
-        self.dir = Dir::Forward;
+        self.sought_ge(&target).await?;
         self.advance().await
     }
 
@@ -589,10 +656,7 @@ impl<D: Disk> Scan<D> {
             _ => bound.to_vec(),
         };
         let target = key::search_key(&bound);
-        for it in &mut self.iters {
-            it.seek_lt(&target).await?;
-        }
-        self.dir = Dir::Reverse;
+        self.sought_lt(&target).await?;
         self.retreat().await
     }
 
@@ -611,6 +675,7 @@ impl<D: Disk> Scan<D> {
                     it.last().await?;
                 }
                 self.dir = Dir::Reverse;
+                self.heap = Heap::new(&self.iters, Dir::Reverse)?;
                 self.retreat().await
             }
         }
@@ -626,10 +691,7 @@ impl<D: Disk> Scan<D> {
             // The iterators are all before the current key; going forward
             // means seeking past it.
             let target = key::search_key(&successor(&current.user));
-            for it in &mut self.iters {
-                it.seek_ge(&target).await?;
-            }
-            self.dir = Dir::Forward;
+            self.sought_ge(&target).await?;
         }
         // Going forward, `advance` has already left them past the current key.
         self.advance().await
@@ -642,10 +704,7 @@ impl<D: Disk> Scan<D> {
         };
         if self.dir == Dir::Forward {
             let target = key::search_key(&current.user);
-            for it in &mut self.iters {
-                it.seek_lt(&target).await?;
-            }
-            self.dir = Dir::Reverse;
+            self.sought_lt(&target).await?;
         }
         self.retreat().await
     }
@@ -653,7 +712,7 @@ impl<D: Disk> Scan<D> {
     /// Moves to the next visible key, skipping deletions.
     async fn advance(&mut self) -> Result<()> {
         loop {
-            let Some(w) = self.least()? else {
+            let Some(w) = self.heap.top() else {
                 self.current = None;
                 return Ok(());
             };
@@ -690,7 +749,7 @@ impl<D: Disk> Scan<D> {
     /// Moves to the previous visible key, skipping deletions.
     async fn retreat(&mut self) -> Result<()> {
         loop {
-            let Some(w) = self.greatest()? else {
+            let Some(w) = self.heap.top() else {
                 self.current = None;
                 return Ok(());
             };
@@ -727,12 +786,37 @@ impl<D: Disk> Scan<D> {
     /// Steps every source over every version of `user`, returning the newest
     /// one the snapshot can see.
     ///
-    /// The same rule both ways: among the versions a source holds, take the
+    /// The same rule both ways: among the versions the sources hold, take the
     /// highest sequence number at or below the snapshot. Going forward the
-    /// first version met is the newest, so this usually stops at once; going
-    /// backward the first met is the oldest, so it reads them all. That
+    /// versions arrive newest first, so the first one taken is the answer and
+    /// every later one is refused on its sequence number; going backward they
+    /// arrive oldest first, so each newer one overwrites the value. That
     /// asymmetry is why reverse is dearer, and it is the same one the block
     /// cursor has.
+    ///
+    /// **Driven by the heap, which is what makes it cheap.** This used to
+    /// walk all the sources and step each one past `user`, so a step paid a
+    /// trailer decode and a user-key comparison per source whether or not
+    /// that source was anywhere near the key — a second O(sources) beside
+    /// [`Scan::advance`]'s. It does not need one: every version of `user` is
+    /// at the top of the heap before anything else is, because the heap is
+    /// ordered by internal key and `user`'s versions sort ahead of every key
+    /// the merge has left (forward) or behind them (backward). So "pop while
+    /// the top is still on this user key" visits exactly the sources holding
+    /// it, which is one of them in the common case, and the first top that is
+    /// on another key proves the rest are already clear of this one. Pebble's
+    /// `findNextEntry` and `findPrevEntry` work the same way.
+    ///
+    /// **The order the versions arrive in is not load-bearing**, which is
+    /// worth knowing because it is on the compaction path and this looks like
+    /// that one. `crate::compact`'s merge keeps the *first* version it meets
+    /// of a user key and drops the rest, so it depends on newest-first
+    /// arrival; this picks the highest sequence number the snapshot allows,
+    /// so the arrival order decides only how many times `value_into` runs.
+    /// Flipping the trailer half of [`Heap::less`], in either direction or
+    /// both, answers identically — hand mutation-testing confirms it, where
+    /// the same mutation of the compaction heap is caught at once. Same
+    /// structure, different half of it carrying the weight.
     ///
     /// Every source ends past the key — forward, past its last version;
     /// backward, before its first — so the caller can simply go round again.
@@ -743,80 +827,35 @@ impl<D: Disk> Scan<D> {
         value: &mut Vec<u8>,
     ) -> Result<Option<(u64, Kind)>> {
         let mut chosen: Option<(u64, Kind)> = None;
-        for i in 0..self.iters.len() {
-            loop {
-                if !self.iters[i].is_valid() {
-                    break;
-                }
-                // The trailer, read out of the borrowed key rather than out of
-                // a copy of it. Copying was how this ended the borrow before
-                // the `entry().await` below, which needs the source mutably —
-                // and it cost one allocation per source per step, so a scan
-                // over a store settled into fourteen tables made fourteen of
-                // them for every record it returned. Scoping the borrow to
-                // the three scalars this actually needs costs none.
-                let (seq_num, kind, matches) = {
-                    let k = InternalKey::decode(self.iters[i].key())?;
-                    (k.seq_num, k.kind, k.user_key == user)
-                };
-                if !matches {
-                    break;
-                }
-                // A version written after this scan began is not its business.
-                if visible_at(seq_num, self.snapshot) && chosen.is_none_or(|(seq, _)| seq_num > seq)
-                {
-                    // Into the buffer the scan already holds, which a later
-                    // source with a higher sequence number simply overwrites:
-                    // `value_into` clears before it writes, so what is left
-                    // at the end is the newest version's and nothing else's.
-                    self.iters[i].value_into(value).await?;
-                    chosen = Some((seq_num, kind));
-                }
-                match dir {
-                    Dir::Forward => self.iters[i].next().await?,
-                    Dir::Reverse => self.iters[i].prev().await?,
-                }
+        while let Some(i) = self.heap.top() {
+            // The trailer, read out of the borrowed key rather than out of a
+            // copy of it. Copying was how this ended the borrow before the
+            // `value_into().await` below, which needs the source mutably —
+            // and it cost one allocation per source per step. Scoping the
+            // borrow to the three scalars this actually needs costs none.
+            let (seq_num, kind, matches) = {
+                let k = InternalKey::decode(self.iters[i].key())?;
+                (k.seq_num, k.kind, k.user_key == user)
+            };
+            if !matches {
+                break;
             }
+            // A version written after this scan began is not its business.
+            if visible_at(seq_num, self.snapshot) && chosen.is_none_or(|(seq, _)| seq_num > seq) {
+                // Into the buffer the scan already holds, which a later
+                // version with a higher sequence number simply overwrites:
+                // `value_into` clears before it writes, so what is left at
+                // the end is the newest visible version's and nothing else's.
+                self.iters[i].value_into(value).await?;
+                chosen = Some((seq_num, kind));
+            }
+            match dir {
+                Dir::Forward => self.iters[i].next().await?,
+                Dir::Reverse => self.iters[i].prev().await?,
+            }
+            self.heap.stepped(&self.iters)?;
         }
         Ok(chosen)
-    }
-
-    /// The iterator on the least internal key, if any is still positioned.
-    fn least(&self) -> Result<Option<usize>> {
-        let mut best: Option<usize> = None;
-        for i in 0..self.iters.len() {
-            if !self.iters[i].is_valid() {
-                continue;
-            }
-            match best {
-                None => best = Some(i),
-                Some(b) => {
-                    if key::compare(self.iters[i].key(), self.iters[b].key())?.is_lt() {
-                        best = Some(i);
-                    }
-                }
-            }
-        }
-        Ok(best)
-    }
-
-    /// The iterator on the greatest internal key, if any is still positioned.
-    fn greatest(&self) -> Result<Option<usize>> {
-        let mut best: Option<usize> = None;
-        for i in 0..self.iters.len() {
-            if !self.iters[i].is_valid() {
-                continue;
-            }
-            match best {
-                None => best = Some(i),
-                Some(b) => {
-                    if key::compare(self.iters[i].key(), self.iters[b].key())?.is_gt() {
-                        best = Some(i);
-                    }
-                }
-            }
-        }
-        Ok(best)
     }
 
     /// Whether the newest version of `user` is a live value.
@@ -858,6 +897,201 @@ impl<D: Disk> Scan<D> {
 /// stand-ins with real sequence numbers.
 fn visible_at(seq: u64, snapshot: u64) -> bool {
     seq <= snapshot || seq & key::SEQ_NUM_BATCH != 0
+}
+
+/// The sources of a scan, arranged so that the next key costs a sift rather
+/// than a look at every one of them.
+///
+/// A step used to ask every source for its key twice over — once to find the
+/// extreme one and once to walk the chosen user key's versions — so a scan
+/// over a store settled into a memtable and a handful of levels paid a
+/// comparison and a trailer decode per source per record. That is the term
+/// §14 named as the read path's remaining structural cost, and it is the term
+/// a heap removes: Pebble's merging iterator is a heap for this reason
+/// (`mergingIterHeap` in `merging_iter_heap.go`), and this is that structure,
+/// `winnerChild` included.
+///
+/// Every source in the heap is on an entry: one that runs out leaves, so
+/// [`Heap::top`] needs no validity check and no comparison is ever made
+/// against a source positioned nowhere.
+///
+/// Why a second copy of this rather than the one `crate::compact` already
+/// has. The two merge different things — a compaction merges
+/// `crate::table::TableIter`s while a scan merges [`Source`]s, which is
+/// already an enum over a table, a run of them and a memtable — so sharing
+/// would mean a trait for "the key at index i" over both. That part is free,
+/// monomorphised. What is not is `reverse`: a scan needs a heap that flips
+/// and a compaction merges forward only, so the shared `less` would carry a
+/// direction a compaction never changes, in the one function a compaction's
+/// merge calls most. That path is measured and this one is not yet, so the
+/// duplication is the cheaper risk; worth revisiting if a third merge appears
+/// or once both are measured over the same shapes.
+#[derive(Default)]
+struct Heap {
+    /// A binary heap in an array, the answer at `items[0]`: the children of
+    /// `i` are at `2i + 1` and `2i + 2`.
+    items: Vec<Item>,
+    /// Whether the order is flipped, so that the top is the *greatest*
+    /// internal key — Pebble's `mergingIterHeap.reverse`.
+    ///
+    /// One heap that turns round rather than two structures, which is
+    /// Pebble's choice and worth copying for a reason beyond the code saved:
+    /// a scan's two directions have to agree about ties and about what "the
+    /// answer" is, and one comparator with a flag cannot drift from itself
+    /// the way a `least` and a `greatest` written out separately can.
+    reverse: bool,
+}
+
+/// One position in the heap.
+struct Item {
+    /// The source whose key this position holds.
+    source: usize,
+    /// Which of **this position's** two children beat the other, when that
+    /// is known — Pebble's `winnerChild`, and worth having for the reason its
+    /// comment gives: a sift-down that knows this already compares the winner
+    /// against the parent and stops, so a replacement that still wins costs
+    /// one comparison instead of two.
+    ///
+    /// It belongs to the position and not to the source sitting there, which
+    /// is why [`Heap::swap`] exchanges `source` alone. A swap into `i`
+    /// changes what one of `i`'s children holds, so `i` forgets; the position
+    /// swapped *down* to keeps what it knew, because its own children are
+    /// untouched, and that is the whole saving.
+    winner: Winner,
+}
+
+/// Which child of a heap position won, if it has been worked out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Winner {
+    Unknown,
+    Left,
+    Right,
+}
+
+impl Heap {
+    /// Heapifies the sources that are on an entry, ordered for `dir`.
+    fn new<D: Disk>(iters: &[Source<D>], dir: Dir) -> Result<Self> {
+        let items = iters
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.is_valid())
+            .map(|(source, _)| Item {
+                source,
+                winner: Winner::Unknown,
+            })
+            .collect();
+        let mut heap = Heap {
+            items,
+            reverse: dir == Dir::Reverse,
+        };
+        for i in (0..heap.items.len() / 2).rev() {
+            heap.down(i, heap.items.len(), iters)?;
+        }
+        Ok(heap)
+    }
+
+    /// The source on the extreme internal key — least going forward, greatest
+    /// going backward — if any is still positioned.
+    fn top(&self) -> Option<usize> {
+        self.items.first().map(|item| item.source)
+    }
+
+    /// Puts the heap right after the source on top has been stepped.
+    ///
+    /// Only the top has moved, and it has moved the way the order runs, so a
+    /// sift-down from the root is all that is owed — Pebble's `fixTop`. A
+    /// source that has run out leaves instead, which is what keeps every key
+    /// in the heap a key that exists.
+    fn stepped<D: Disk>(&mut self, iters: &[Source<D>]) -> Result<()> {
+        let n = self.items.len();
+        if iters[self.items[0].source].is_valid() {
+            return self.down(0, n, iters);
+        }
+        // The last position takes the root's place and the heap shrinks, as
+        // Pebble's `pop` does. The root's own `winner` survives: its children
+        // are positions 1 and 2, and the position that moved is neither of
+        // those unless the heap is small enough that the right child is
+        // already gone, in which case nothing reads it. The stale `winner` at
+        // the *removed* position's parent is never read either, since that
+        // parent now has at most one child and the heap only ever shrinks.
+        self.swap(0, n - 1);
+        self.items.truncate(n - 1);
+        self.down(0, n - 1, iters)
+    }
+
+    /// Whether the key at position `a` comes first in the heap's order.
+    ///
+    /// Going forward that is internal key order itself — user keys ascending
+    /// and, within a user key, trailers descending, so the newest version of
+    /// a key arrives before its older ones. Going backward it is exactly that
+    /// order reversed, which is what Pebble's `reverse` branch spells out as
+    /// "user key greater, then trailer smaller".
+    ///
+    /// The source index breaks a tie beyond the key, in both directions,
+    /// because that is what the two linear scans this replaces did: each only
+    /// ever took a *strictly* more extreme key, and so left the **first**
+    /// source holding the extreme one as the answer. A tie means two sources
+    /// hold the same user key, sequence number and kind, which cannot happen
+    /// while sequence numbers are handed out once — a batch's stand-ins
+    /// included, since those number each entry in turn (`key::SEQ_NUM_BATCH`)
+    /// — but a heap is not stable, and the index settles it anyway. That
+    /// makes the order total, so the extreme key is unique and the heap
+    /// cannot choose differently from the scans whatever shape it is in: by
+    /// construction rather than by argument. Pebble leaves this to the
+    /// sequence numbers.
+    fn less<D: Disk>(&self, a: usize, b: usize, iters: &[Source<D>]) -> Result<bool> {
+        let (a, b) = (self.items[a].source, self.items[b].source);
+        let ordered = key::compare(iters[a].key(), iters[b].key())?;
+        let ordered = if self.reverse {
+            ordered.reverse()
+        } else {
+            ordered
+        };
+        Ok(match ordered {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => a < b,
+        })
+    }
+
+    /// Exchanges the sources at two positions, leaving `winner` where it is.
+    fn swap(&mut self, a: usize, b: usize) {
+        let (x, y) = (self.items[a].source, self.items[b].source);
+        self.items[a].source = y;
+        self.items[b].source = x;
+    }
+
+    /// Sifts the source at `i` down through a heap of `n` positions until the
+    /// heap property holds again.
+    fn down<D: Disk>(&mut self, mut i: usize, n: usize, iters: &[Source<D>]) -> Result<()> {
+        loop {
+            let left = 2 * i + 1;
+            if left >= n {
+                break;
+            }
+            let mut child = left;
+            let right = left + 1;
+            if right < n {
+                if self.items[i].winner == Winner::Unknown {
+                    self.items[i].winner = if self.less(right, left, iters)? {
+                        Winner::Right
+                    } else {
+                        Winner::Left
+                    };
+                }
+                if self.items[i].winner == Winner::Right {
+                    child = right;
+                }
+            }
+            if !self.less(child, i, iters)? {
+                break;
+            }
+            self.swap(i, child);
+            self.items[i].winner = Winner::Unknown;
+            i = child;
+        }
+        Ok(())
+    }
 }
 
 impl<F: crate::env::Fs> crate::Opened<F> {

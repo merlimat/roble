@@ -129,6 +129,11 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   there was a choice
   --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
                   only durability point, and a commit syncs nothing
+  --no-compactions  compact nothing, so the read phases see L0 exactly as
+                  the flushes left it. Without it the shape a run reads
+                  depends on how far a clock-paced compaction got before
+                  the reads began, and two runs of one binary read
+                  different stores. Not with settle, whose job it undoes
   --reuse         open the store that is already at DIR/<engine> instead of
                   refusing it, so that a load and the reads over it can be two
                   processes with something done in between — dropping the
@@ -212,7 +217,7 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
     }
     println!(
         "{}: {} shards x {} batches x {} records, {}-byte values, {} MiB cache, \
-         wal={}, seed={}, keys={}",
+         wal={}, seed={}, keys={}{}",
         S::NAME,
         cfg.shards,
         cfg.batches,
@@ -222,6 +227,11 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
         if cfg.wal { "on" } else { "off" },
         cfg.seed,
         cfg.distribution.name(),
+        if cfg.compactions {
+            ""
+        } else {
+            ", compactions=off"
+        },
     );
     // Said here rather than only in the README, so it travels with the
     // numbers. Go's `os.File.Sync` is `fcntl(F_FULLFSYNC)` on macOS, which
@@ -1352,6 +1362,9 @@ pub struct Config {
     pub min_seconds: f64,
     /// Whether the WAL is on, which is also whether a commit syncs.
     pub wal: bool,
+    /// Whether the engine may compact on its own, rather than only when
+    /// `settle` drives it.
+    pub compactions: bool,
     layout: bool,
     reuse: bool,
     tsv: bool,
@@ -1377,6 +1390,7 @@ impl Config {
             workload: "B".to_string(),
             min_seconds: 10.0,
             wal: true,
+            compactions: true,
             layout: false,
             reuse: false,
             tsv: false,
@@ -1425,6 +1439,10 @@ impl Config {
                     cfg.wal = false;
                     took_value = false;
                 }
+                "--no-compactions" => {
+                    cfg.compactions = false;
+                    took_value = false;
+                }
                 "--layout" => {
                     cfg.layout = true;
                     took_value = false;
@@ -1450,6 +1468,18 @@ impl Config {
         }
         if cfg.shards == 0 || cfg.batches == 0 || cfg.records == 0 {
             fail("--shards, --batches and --records all have to be at least 1");
+        }
+        // Refused rather than given a meaning, because it would have a
+        // different one per engine: roble's `settle` drives the merges
+        // itself and would compact regardless, while RocksDB's waits for
+        // its own threads, which this flag has stopped, and would leave L0
+        // as it found it. Two rows that look alike and are not is the thing
+        // this harness exists to avoid.
+        if !cfg.compactions && cfg.wants("settle") {
+            fail(
+                "--no-compactions reads a store as the load left it, and settle compacts it: \
+                 leave settle out of --phases",
+            );
         }
         cfg
     }
