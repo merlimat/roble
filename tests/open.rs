@@ -1095,10 +1095,21 @@ async fn a_task_of_its_own_can_be_the_one_that_compacts() {
     db.write(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
-    for _ in 0..64 {
-        if merged.get() > 0 {
-            break;
-        }
+    // Until the merge has landed, which is bounded by the clock and not, as
+    // the wait above is, by a count of turns. That one waits for a single
+    // poll, and any turn gives one. This one waits for the whole of
+    // `compact_once` — the inputs opened, the output written, the MANIFEST,
+    // the sweep — and how many of this loop's turns that I/O spans depends
+    // on what else the machine's disk is doing: some sixty on a quiet one,
+    // past a hundred on a busy one. Sixty-four of them failed this test
+    // anywhere from one run in a hundred to five in six, against merges
+    // that every one of those runs went on to finish, which is the reason
+    // `settle` in the benchmark is guarded the same way (#119). The minute
+    // is not a claim about how long a merge takes, only a bound past which
+    // it is not coming, so a task that never runs still fails the test
+    // rather than hanging it.
+    let waiting = std::time::Instant::now();
+    while merged.get() == 0 && waiting.elapsed() < std::time::Duration::from_secs(60) {
         give_the_runtime_a_turn(&tick).await;
     }
 
