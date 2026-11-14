@@ -11,13 +11,24 @@ description = "Benchmarks roble against Go Pebble on the workload Oxia runs"
 # Both comparisons are optional, and off by default, so an ordinary
 # `cargo build --workspace` neither clones encina nor needs a C++ toolchain
 # for RocksDB. `bench/run.sh` turns on whichever it was asked for.
+#
+# mimalloc is the exception, and on by default. roble is a library and never
+# picks the allocator — whatever links it does — so the benchmark should run
+# under one a deployment would link rather than whatever the platform ships,
+# which can decide a result on its own: macOS's libmalloc keeps large freed
+# regions, and at six million records that alone put `load,settle` near a
+# gigabyte of peak RSS where mimalloc on the same machine held about a quarter
+# of it. It needs a C compiler, which every platform this builds on has.
+# `--no-default-features` puts the system allocator back, for measuring what
+# the choice is worth.
 [features]
-default = []
+default = ["mimalloc"]
 encina = ["dep:encina"]
 rocksdb = ["dep:rocksdb"]
-# Swaps the process allocator, to answer whether roble is allocator-bound.
+# The process allocator. On by default; see above.
 mimalloc = ["dep:mimalloc"]
-# Counts every allocation the process makes, to size the question.
+# Counts every allocation the process makes, to size the question. It wraps
+# whichever allocator is underneath, so it composes with the default.
 count-alloc = []
 
 [dependencies]

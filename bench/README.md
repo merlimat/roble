@@ -665,19 +665,28 @@ The last line is the process's peak resident memory.
 
 roble is a library, so `#[global_allocator]` is never its choice — it belongs
 to whatever binary links it, which for the first consumer is Oxia's data
-server. Two features exist to measure what that choice is worth, and they are
-mutually exclusive because each installs an allocator:
+server. **The benchmark builds with mimalloc by default**, because the
+platform's own allocator can decide a result by itself: macOS's libmalloc
+keeps large freed regions rather than returning them, and at six million
+records that alone put roble's `load,settle` peak RSS near a gigabyte where
+the same build under mimalloc, on the same machine, held about a quarter of
+it. A benchmark should run under an allocator a deployment would link, and
+glibc and mimalloc both qualify where macOS's does not.
 
 ```sh
-cargo run --release -p roble-bench --features mimalloc -- --dir /tmp/b --no-wal
-cargo run --release -p roble-bench --features count-alloc -- --dir /tmp/b --no-wal
+cargo run --release -p roble-bench -- --dir /tmp/b --no-wal                          # mimalloc
+cargo run --release -p roble-bench --no-default-features -- --dir /tmp/b --no-wal    # system
+cargo run --release -p roble-bench --features count-alloc -- --dir /tmp/b --no-wal   # counted
 ```
 
-`mimalloc` swaps the process allocator. `count-alloc` wraps the system one and
-counts, printing a final line of allocations and bytes asked for — as
-`<engine>\tallocs\t<n>\t<bytes>` under `--tsv`. Only Rust allocations: a
-`#[global_allocator]` does not reach RocksDB's C++ `new`, so this measures
-roble and encina.
+`--no-default-features` puts the system allocator back, which is how the
+comparison below was made. `count-alloc` wraps whichever allocator is
+underneath — mimalloc by default — and counts, printing a final line of
+allocations and bytes asked for, as `<engine>\tallocs\t<n>\t<bytes>` under
+`--tsv`. The count is the same under either, since it counts requests rather
+than what serving them cost. Only Rust allocations: a `#[global_allocator]`
+does not reach RocksDB's C++ `new`, so this measures roble and encina, and
+RocksDB runs under its own allocator whatever the feature says.
 
 A phase's own count is the difference between a run with it and a run without
 it, which charges nothing to opening the store:
