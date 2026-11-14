@@ -392,7 +392,9 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
             4..=5 => {
                 let probe = &probes[rng.below(probes.len() as u64) as usize];
                 scan.seek_lt(probe).await.expect("seek_lt");
-                place = entries.iter().rposition(|(k, _)| k.as_slice() < probe.as_slice());
+                place = entries
+                    .iter()
+                    .rposition(|(k, _)| k.as_slice() < probe.as_slice());
                 false
             }
             6..=7 => {

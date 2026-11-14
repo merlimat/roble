@@ -227,7 +227,11 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
         if cfg.wal { "on" } else { "off" },
         cfg.seed,
         cfg.distribution.name(),
-        if cfg.compactions { "" } else { ", compactions=off" },
+        if cfg.compactions {
+            ""
+        } else {
+            ", compactions=off"
+        },
     );
     // Said here rather than only in the README, so it travels with the
     // numbers. Go's `os.File.Sync` is `fcntl(F_FULLFSYNC)` on macOS, which
