@@ -1717,13 +1717,44 @@ Stated rather than quietly decided:
   reverse 1.61 to 2.27 M/s, CPU down a third. Against Pebble the gap goes
   from 6.3x to 3.9x forward.
 
-  What is left is structural rather than wasteful. **The merge is O(sources)
-  per step**: `least` compares every source's key to find the smallest, and
-  `take_newest_visible` then walks every source again to step it past the
-  key, so fourteen tables mean about forty trailer decodes and comparisons
-  per record where a heap would mean a handful. That is the next thing to fix
-  and it is a redesign of the merge, not a tidy-up — worth doing with the
-  benchmark already in place to judge it.
+  What was left was structural rather than wasteful, and it is now a heap.
+  `least` compared every source's key to find the smallest, and
+  `take_newest_visible` then walked every source again to step it past that
+  key — a comparison per source, then a trailer decode and a user-key
+  comparison per source — so a step cost about `2N` for `N` sources. The
+  merge is Pebble's `mergingIterHeap` instead: **one heap that flips its
+  comparator** rather than a `least` and a `greatest`, which is Pebble's
+  `reverse`, with the second walk driven by it, because every version of a
+  user key reaches the top of the heap before anything else does. A step
+  costs about three whatever `N` is.
+
+  **The forty this entry predicted had already gone when it was written.** It
+  counted a settled store's fourteen tables as fourteen sources, which they
+  stopped being when a source became a level: L1's tables are disjoint and
+  are read as one run. So a settled store merges one to three sources,
+  depending on where `settle` happens to stop, and paid two to six operations
+  a record. The store that pays the `2N` is one with compactions still owed,
+  and `bench/ --no-compactions` now holds that shape still — `L0=12`, every
+  run — where leaving `settle` out did not. Over 300,000 records, eight pairs
+  alternating the two binaries, each run loading a store of its own:
+
+  | | sources | per record | `scan` | `scan-rev` | `scan-short` | `floor` | `get` |
+  |---|---|---|---|---|---|---|---|
+  | `L0=12` | 13 | 25.8 → 3.0 | 3.19x | 1.78x | 2.22x | 1.02x | 1.02x |
+  | settled | 1–3 | 2–6 → 2–3 | 1.07x | 1.06x | 1.04x | 0.99x | 1.02x |
+
+  Each ratio is the median over the eight pairs of the heap's rate against
+  the linear scans', and `get` is the control: a point lookup never builds a scan, so what it does is the noise.
+  The settled row sits close to that noise, which is §8's rule again — at one
+  to three sources the merge was never most of a step, and a step waits on
+  memory. `floor` does not move in either shape, and should not: it builds a
+  scan per lookup and steps it once, so it pays a heapify that costs about
+  what the linear walk did and never takes a second step to recover it.
+
+  So the row that matters is the unsettled one, since Oxia serves from a
+  store that is taking writes. And the gap to RocksDB and encina this entry
+  opened with was measured over a settled store, where this moves a scan by
+  some six per cent: whatever that gap is, it is not the merge.
 
 - **What Pebble compatibility costs** has a number now, which §2 claimed was
   worth paying without ever naming it. Against encina on the same workload,
