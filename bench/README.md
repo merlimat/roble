@@ -67,6 +67,28 @@ They always run in this order, whatever order `--phases` names them in.
   column is what makes those two comparable. On a `--no-wal` load this row is
   where the compaction the load phase no longer pays for shows up: the load
   row gets faster and this one gets slower by about as much.
+
+  **Leaving `settle` out does not give a reproducible unsettled store**, which
+  is what `--no-compactions` is for. Without it the load compacts as it goes,
+  paced by a clock, so how far it got before the reads began varies from run
+  to run: eight runs over the same 300,000 records read four different
+  shapes, from `L0=8 L1=4` to `L1=13`, and neither of the two binaries timed
+  read the same shape twice running — so a read rate from one run is not
+  comparable with a rate from another. With the flag nothing merges at all,
+  so a load leaves L0 holding exactly what the flushes wrote — every table
+  its own source in the merge, which is the widest a scan gets and the state
+  a store under write load is heading for. Both LSMs turn their own
+  compactions off (roble's `disable_automatic_compactions`, together with
+  the task this driver would otherwise spawn to run them; RocksDB's
+  `disable_auto_compactions`), and both then stop holding writes at the L0
+  stop-writes line, since nothing would ever drain it. encina has no
+  compactions to stop. `settle` is refused alongside the flag rather than
+  given a meaning, because it would get a different one per engine: roble's
+  drives the merges itself, and RocksDB's waits for threads the flag has
+  stopped. `--reuse` does not help either way: opening a store flushes what the log
+  replay put back in the memtable, and without the flag that lets the picker
+  run, so a store reads as one shape in the process that wrote it and another
+  in the next.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
 - **get** — `--reads` keys drawn by `--distribution` (below), every one

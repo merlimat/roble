@@ -241,7 +241,11 @@ impl Store for Roble {
                     .memtable_size(cfg.memtable_mb * 1024 * 1024)
                     // Oxia's configuration: its replication log is the source
                     // of truth, so the store need only be durable at a flush.
-                    .disable_wal(!cfg.wal),
+                    .disable_wal(!cfg.wal)
+                    // Stops the merge a flush would run where it stands, and
+                    // the stall a write would wait out for one; the task
+                    // below that would run it is not spawned either.
+                    .disable_automatic_compactions(!cfg.compactions),
             )
             .await
             .unwrap_or_else(|e| fail(&format!("open {}: {e}", at.display())));
@@ -267,13 +271,21 @@ impl Store for Roble {
                     let _ = flusher.flush().await;
                 }
             });
-            let merger = std::rc::Rc::clone(&db);
-            roble::DefaultEnv.spawn(async move {
-                while merger.running() {
-                    merger.compaction_wanted().await;
-                    let _ = merger.compact_once().await;
-                }
-            });
+            //
+            // Not under `--no-compactions`. The store's own option is not
+            // enough to stop this task: `compaction_wanted` answers from the
+            // picker and `compact_once` is the explicit call the option
+            // leaves alone, so the task would go on merging exactly what
+            // the option was asked to leave.
+            if cfg.compactions {
+                let merger = std::rc::Rc::clone(&db);
+                roble::DefaultEnv.spawn(async move {
+                    while merger.running() {
+                        merger.compaction_wanted().await;
+                        let _ = merger.compact_once().await;
+                    }
+                });
+            }
 
             shards.push(Roble {
                 db,
@@ -671,6 +683,13 @@ impl Store for Rocks {
             );
             options
                 .set_level_zero_stop_writes_trigger(roble::pick::L0_STOP_WRITES_THRESHOLD as i32);
+            // `--no-compactions`. RocksDB then also stops counting L0
+            // against the stop-writes trigger above
+            // (`GetWriteStallConditionAndCause` checks
+            // `disable_auto_compactions` first), which is what roble does
+            // with its own option (`drain_l0`): a load that waited for a
+            // merge nobody will run would wait for ever.
+            options.set_disable_auto_compactions(!cfg.compactions);
             options.set_block_based_table_factory(&table);
             options.set_compression_type(rocksdb::DBCompressionType::Snappy);
             let db = rocksdb::DB::open(&options, &at)
