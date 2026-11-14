@@ -48,8 +48,9 @@
 //! dropping one that still has something to delete brings a key back from the
 //! dead. The second mistake is the one worth not making first.
 //!
-//! **Where the output goes.** A table is written the moment the merge has
-//! finished it, not when the merge has finished: nothing accumulates, so
+//! **Where the output goes.** A table's bytes are written as the writer
+//! finishes each block, and the table the moment the merge has finished it
+//! rather than when the merge has finished: nothing accumulates, so
 //! what a compaction holds is one output table and not all of them. That
 //! matters because the one job this has no bound on is L0's — the picker
 //! takes all of L0 and every L0 table whose range meets it below, so the
@@ -226,21 +227,42 @@ impl<F: Fs> Opened<F> {
         let mut new_tables = Vec::new();
         let mut written: Vec<(u64, u64)> = Vec::new();
         let mut writing = self.pending().writing();
+        // The output the merge is part way through: its number, its file, and
+        // how much of it is on disk. `None` until the first chunk of one
+        // arrives, so a merge that drops everything it read spends no number
+        // and leaves no file. Only ever one at a time — the merge finishes an
+        // output before it starts the next, so the `Last` that closes this
+        // file comes before any `More` for the one after it.
+        let mut open: Option<(u64, F::Disk, u64)> = None;
         merge(
             &tables,
             below,
             self.target_file_size(output_level),
             self.compaction_unit(),
-            async |bytes, bounds: Bounds, entries| {
-                let file_num = self.take_file_num(&mut writing).await;
-                written.push((file_num, entries));
-                let mut new_table = bounds.into_new_table(output_level, file_num)?;
-                new_table.size = bytes.len() as u64;
-                self.metrics.compaction_tables[1].add(1);
-                self.metrics.compaction_io[1].add(new_table.size);
-                self.write_table(file_num, bytes).await?;
-                new_tables.push(new_table);
-                Ok(())
+            async |chunk| {
+                let (bytes, last) = match chunk {
+                    Chunk::More(bytes) => (bytes, None),
+                    Chunk::Last(bytes, bounds, entries) => (bytes, Some((bounds, entries))),
+                };
+                if open.is_none() {
+                    let file_num = self.take_file_num(&mut writing).await;
+                    open = Some((file_num, self.create_table(file_num).await?, 0));
+                }
+                let spent = {
+                    let (_, disk, at) = open.as_mut().expect("just opened above");
+                    self.append_table(disk, at, bytes).await?
+                };
+                if let Some((bounds, entries)) = last {
+                    let (file_num, disk, size) = open.take().expect("open, and the last of it");
+                    written.push((file_num, entries));
+                    let mut new_table = bounds.into_new_table(output_level, file_num)?;
+                    new_table.size = size;
+                    self.metrics.compaction_tables[1].add(1);
+                    self.metrics.compaction_io[1].add(new_table.size);
+                    self.finish_table(disk).await?;
+                    new_tables.push(new_table);
+                }
+                Ok(spent)
             },
         )
         .await?;
@@ -390,16 +412,34 @@ impl<F: Fs> Opened<F> {
         file_num
     }
 
-    /// Writes the output table and makes its name durable.
-    async fn write_table(&self, file_num: u64, bytes: Vec<u8>) -> Result<()> {
+    /// Creates the file an output table is written into.
+    ///
+    /// The number was claimed before this was called, which is the ordering
+    /// `obsolete::Writing::add` insists on: a sweep listing the directory
+    /// between the file appearing and the number being recorded would find a
+    /// table nothing says to keep. It matters more now than it did when a
+    /// table was one write — the file is on disk, incomplete, for as long as
+    /// the merge takes to fill it (§5).
+    async fn create_table(&self, file_num: u64) -> Result<F::Disk> {
         let path = self.dir.join(roble_format::files::table_filename(file_num));
-        let disk = self.fs().create(&path).await?;
+        self.fs().create(&path).await
+    }
+
+    /// Appends a chunk of an output table at `at`, moves `at` past it, and
+    /// gives the buffer back for the next chunk.
+    async fn append_table(&self, disk: &F::Disk, at: &mut u64, bytes: Vec<u8>) -> Result<Vec<u8>> {
         let written = bytes.len();
-        let (result, _) = disk
-            .write(WriteBuf::new(bytes), 0, Default::default())
+        let (result, buf) = disk
+            .write(WriteBuf::new(bytes), *at, Default::default())
             .await;
         result?;
+        *at += written as u64;
         self.metrics.written.add(written);
+        Ok(buf.into_vec())
+    }
+
+    /// Makes a finished output table durable, and its name with it.
+    async fn finish_table(&self, disk: F::Disk) -> Result<()> {
         {
             let _timer = self.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
@@ -410,12 +450,34 @@ impl<F: Fs> Opened<F> {
     }
 }
 
+/// What a merge hands its caller: some of the output table it is building,
+/// and whether that output is finished.
+///
+/// One sink taking this rather than two closures — "open me a file" and
+/// "here is a finished table" — because both need the same borrows of the
+/// caller's state, the numbers it has claimed and the tables it is
+/// collecting, and two `AsyncFnMut`s cannot share them.
+///
+/// The caller gets no file number and opens no file until the first chunk of
+/// an output arrives, which is what keeps a merge that drops everything it
+/// read from leaving a file behind.
+pub(crate) enum Chunk {
+    /// More of the output being built, to append to it.
+    More(Vec<u8>),
+    /// The last of an output, with what the MANIFEST needs for it.
+    Last(Vec<u8>, Bounds, u64),
+}
+
 /// Merges every input into tables of up to `target_bytes`, dropping what may
 /// go, and hands each one to `write` as it is finished.
 ///
 /// `write` rather than a list of tables, so that the bytes of a finished
-/// table are somebody else's the moment they are finished and nothing here
-/// holds more than the one being built. It may be called no times at all,
+/// table are somebody else's the moment they are finished — and it is handed
+/// [`Chunk`]s rather than whole tables, so that what is held is not even the
+/// one being built: a block of it, and the index and filter the format makes
+/// the writer keep to the end (`roble_format::sst::TableWriter`). The buffer
+/// comes back from `write` and is handed on to the next output, so a merge of
+/// a hundred tables holds one chunk's worth of it. It may be called no times at all,
 /// which is not an error: a level of superseded keys and spent tombstones
 /// compacts to nothing at all. Pebble splits the same two halves apart the
 /// other way round, with `compact.Runner` as a pump its caller draws one
@@ -425,7 +487,7 @@ async fn merge<D: Disk>(
     below: &[(Vec<u8>, Vec<u8>)],
     target_bytes: u64,
     unit: u64,
-    mut write: impl AsyncFnMut(Vec<u8>, Bounds, u64) -> Result<()>,
+    mut write: impl AsyncFnMut(Chunk) -> Result<Vec<u8>>,
 ) -> Result<()> {
     // The thread goes back to whatever else is ready every `unit` entries,
     // so a merge of a million keys is a million keys' worth of work rather
@@ -500,7 +562,11 @@ async fn merge<D: Disk>(
             if open.estimate >= target_bytes && !open.is_empty() {
                 let finished = std::mem::replace(&mut open, Output::new(Some(user.to_vec()))?);
                 if let Some((bytes, bounds, entries)) = finished.finish(&tombstones, Some(user))? {
-                    write(bytes, bounds, entries).await?;
+                    // To the table that has just been started: the buffer
+                    // the last one's bytes went to the disk in is the one
+                    // this one's want (`TableWriter::reuse`).
+                    let spent = write(Chunk::Last(bytes, bounds, entries)).await?;
+                    open.writer.reuse(spent);
                 }
             }
             iters[w].value_into(&mut value).await?;
@@ -508,11 +574,19 @@ async fn merge<D: Disk>(
         }
         iters[w].next().await?;
         heap.advanced(&iters)?;
+        // Out of the writer and onto the disk, so that what the next entries
+        // encode is all this merge holds. After the iterator has moved on, so
+        // nothing borrowed from it is alive across the write.
+        if open.writer.ready_len() >= crate::flush::WRITE_CHUNK {
+            let spent = write(Chunk::More(open.writer.take_ready())).await?;
+            open.writer.reuse(spent);
+        }
         pacer.did(1).await;
     }
 
     if let Some((bytes, bounds, entries)) = open.finish(&tombstones, None)? {
-        write(bytes, bounds, entries).await?;
+        // Nothing left to hand the buffer on to: this was the last output.
+        let _ = write(Chunk::Last(bytes, bounds, entries)).await?;
     }
     Ok(())
 }
