@@ -63,8 +63,8 @@ use crate::error::{Error, Result};
 use crate::memtable::Memtable;
 use crate::open::Opened;
 
-/// How many of a table's bytes a flush gathers before handing them to the
-/// disk.
+/// How many of a table's bytes a flush, or a compaction, gathers before
+/// handing them to the disk.
 ///
 /// The writer finishes a block at a time and holds nothing it has handed over
 /// (`roble_format::sst::TableWriter::take_ready`), so the choice here is only
@@ -76,7 +76,11 @@ use crate::open::Opened;
 ///
 /// Every table smaller than this — which is every table the tests write — is
 /// still one write, made by `finish`.
-const WRITE_CHUNK: usize = 1 << 20;
+///
+/// Shared with `crate::compact`, which writes its outputs the same way and
+/// has the stronger reason to: a target file size doubles per level, so an
+/// L6 output is 128 MiB of it where a flush is bounded by the memtable.
+pub(crate) const WRITE_CHUNK: usize = 1 << 20;
 
 impl<F: Fs> Opened<F> {
     /// Writes the memtable out as a table and records it in the MANIFEST.

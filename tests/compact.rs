@@ -627,6 +627,97 @@ async fn a_scan_open_across_a_compaction_keeps_reading() {
     }
 }
 
+/// An output table written in several chunks reads back whole.
+///
+/// A merge hands its output's bytes to the disk as the writer finishes each
+/// block, so a table larger than the megabyte a write gathers is several
+/// writes at increasing offsets rather than one at zero (§6,
+/// `roble::compact`). Every offset in a table — a data block's handle in the
+/// index, the index's and the metaindex's in the footer — is an offset in the
+/// *file*, so a merge that lost count of what it had already written would
+/// produce a table unreadable past its first chunk.
+///
+/// Nothing else here notices. Every other target in these tests is
+/// kilobytes, so every other output is written in the single write `finish`
+/// makes and the handles come out the same either way. Hence a test that is
+/// large on purpose, and that checks an output really did take more than one
+/// write before believing what it read.
+#[compio::test]
+async fn a_chunked_compaction_output_reads_back_whole() {
+    /// What a write gathers before making it, in `roble::flush`.
+    const CHUNK: u64 = 1 << 20;
+    const RECORDS: usize = 32 * 1024;
+
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            // L1's target is twice this: 4 MiB, so an output spans four
+            // chunks where every other test's spans none.
+            .target_file_size(2 << 20)
+            // Larger than the job, so the write does not flush part way
+            // through and leave two L0 tables.
+            .memtable_size(64 << 20),
+    )
+    .await
+    .expect("create");
+
+    let value = vec![b'v'; 256];
+    let mut batch = Batch::new();
+    for i in 0..RECORDS {
+        batch
+            .put(format!("q{i:08}").as_bytes(), &value)
+            .expect("put");
+    }
+    let a = flush_batch(&db, &mut batch).await;
+    drop(batch);
+
+    let before = contents(&db).await;
+    assert_eq!(before.len(), RECORDS, "every record should be in the store");
+
+    let outputs = db.compact(0, &[a]).await.expect("compact");
+    let largest = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .map(|t| t.size)
+        .max()
+        .expect("an output table");
+    assert!(
+        outputs.len() > 1,
+        "this test wants several outputs, got {outputs:?}"
+    );
+    assert!(
+        largest > CHUNK,
+        "this test is only about an output of several chunks, and {largest} bytes is not one"
+    );
+
+    // The memtable was emptied by the flush and the inputs are gone, so this
+    // reads the merge's own tables — at the offsets its chunked writes put
+    // them.
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "a chunked compaction changed an answer"
+    );
+    for key in [0, RECORDS / 2, RECORDS - 1] {
+        let key = format!("q{key:08}");
+        assert_eq!(
+            db.get(key.as_bytes(), Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(value.clone()),
+            "{key} should be readable from the merged table"
+        );
+    }
+}
+
 /// Opens with a target file size small enough that a test can cross it.
 async fn open_splitting(env: &SimEnv, dir: &Path, target: u64) -> roble::Opened<SimFs> {
     roble::open_with(env, dir, roble::Options::new().target_file_size(target))
