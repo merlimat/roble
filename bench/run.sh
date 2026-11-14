@@ -255,6 +255,9 @@ if drop_caches; then
     run_engine "$engine" "$out/disk-$engine" "${args[@]}" --reuse --tsv \
       --phases scan,get,floor --cache-mb 4 \
       | awk -F'\t' 'NF >= 3' >> "$lines"
+    # Not before the `--reuse` above, which is the whole point of this pass
+    # writing the store in one process and reading it in another.
+    [ -n "${KEEP:-}" ] || rm -rf "$out/disk-$engine"
   done
   python3 pivot.py --metrics rate,p50,cpu < "$lines"
 else
@@ -362,4 +365,7 @@ for engine in $ENGINES; do
   echo
   run_engine "$engine" "$out/layout-$engine" "${args[@]}" \
     --phases load,settle --layout
+  # The layout has been printed, so the store has said what it had to say.
+  # `KEEP=1` is how you ask to keep it and point `roble sst dump` at it.
+  [ -n "${KEEP:-}" ] || rm -rf "$out/layout-$engine"
 done
