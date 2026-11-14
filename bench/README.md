@@ -553,19 +553,30 @@ that was worth a pass of its own.** Every engine here but encina reads through
 the operating system's page cache (§8 — direct I/O is roble's goal and not its
 state), and at any dataset this harness can load in reasonable time the store
 fits in RAM. So `get` and `floor` measure finding and parsing a block again,
-not fetching one. At six million records, roble's `get` reads 2.6x encina's
-warm; held to a 256 MiB cgroup it reads **1.7x**, and `floor` goes from 1.6x
-to **1.01x** — level with a B+tree. The ratio was mostly the page cache.
+not fetching one. At six million records and a 4 MiB block cache, roble's
+`get` reads 18.5x encina's warm; held to a 256 MiB cgroup it reads **1.7x**,
+and `floor` goes from 4.5x to **1.01x** — level with a B+tree. The ratio was
+mostly the page cache. (At a 64 MiB cache the warm ratios are 8.1x and 1.7x,
+because encina's own cache then holds more of its tree.)
 
-**`drop_caches` cannot measure that, and it fails in the direction that
-flatters.** It empties the cache once; millions of random lookups then fault
-the store back in within the first second of a ten-second phase, so the pass
-charges one cold second against nine warm ones — and it charges exactly the
-engines that use the page cache, while an `O_DIRECT` engine is unaffected. It
-therefore reports roble's `get` at **16x** encina's: wider than the warm
-2.6x, where the truth is 1.7x. A `scan` is the exception and is honest there,
-because reading 846 MiB in order keeps meeting blocks nothing has faulted in
-yet: roble loses 32% and RocksDB 29% where encina loses 2%.
+**`drop_caches` does not measure that, though not for the reason first given
+here.** The cold-disk pass runs `scan`, `get` and `floor` in that order, and
+the scan reads the whole store back into the page cache in key order, so the
+lookups after it run warm: roble's `get` comes out at 17x encina's against
+18.5x warm, and `floor` at 4.7x against 4.5x. Dropping the cache moves neither
+ratio, in either direction. The `scan` row is the honest one there, because
+reading 846 MiB in order keeps meeting blocks nothing has faulted in yet:
+roble loses 32% and RocksDB 29% where encina loses 2%.
+
+An earlier version of this paragraph claimed the opposite on both counts —
+that random lookups re-fault the store within the first second of a phase, and
+that `drop_caches` therefore *widened* the gap, from a warm 2.6x to 16x. The
+2.6x was an arithmetic error (it is 307,075 / 37,797 = 8.1x), the 16x was set
+beside a column at a different cache size, and random reads re-warm a store
+slowly, not at once: with the page cache dropped and only YCSB C after it,
+roble ran at 0.71x its warm rate and RocksDB at 0.33x across the whole phase,
+p99 73 and 118 us against 8 and 5. That is what a restart onto a cold store
+looks like, and it is a different question from a store held to a budget.
 
 So `run.sh` has a pass that holds the reads to a `BUDGET_MB` cgroup (256 MiB
 by default) instead. cgroup v2 charges a page to whichever cgroup faulted it

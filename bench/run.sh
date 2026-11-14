@@ -267,16 +267,21 @@ else
 fi
 
 # The reads under a memory budget, which is the one pass that holds a
-# *random* lookup to a device. The pass above does not, and that is worth
-# stating plainly because its numbers look as though it does: `drop_caches`
-# empties the page cache once, and millions of lookups over a store far larger
-# than the block cache fault the whole store back in within the first second of
-# a ten-second phase. So it charges an engine for one cold second and nine warm
-# ones — and it charges exactly the engines that *use* the page cache, which
-# widens the gap over an engine that bypasses it instead of closing it.
-# Measured at six million records: roble's `get` reads 16x encina's under
-# `drop_caches` alone, against 2.6x warm and 1.7x under this pass. The middle
-# column is the misleading one.
+# *random* lookup to a device. The pass above does not, and it is worth being
+# exact about why, because its rows look as though it does: it runs `scan`,
+# `get` and `floor` in that order, and the scan reads the whole store back into
+# the page cache in key order, so the lookups after it run warm. Only its
+# `scan` row is cold. At six million records and the 4 MiB cache both passes
+# use, roble's `get` reads 18.5x encina's warm, 17x after `drop_caches` and
+# 1.7x under this pass; `floor` 4.5x, 4.7x and 1.01x. Dropping the cache moves
+# neither ratio. The budget is what moves them.
+#
+# Reordering would not rescue it either. Random reads on their own re-warm a
+# store slowly rather than at once: with the page cache dropped and nothing but
+# YCSB C after it, roble ran at 0.71x its warm rate and RocksDB at 0.33x across
+# a whole ten-second phase, with p99 at 73 and 118 us against 8 and 5 warm. That
+# is a measurement of a restart — a cold store warming up — and not of a store
+# held to a budget, which is what this pass is for.
 #
 # A cgroup gives what emptying the cache cannot. cgroup v2 charges a page to
 # whichever cgroup first faulted it in, so a budget the store does not fit in
@@ -355,8 +360,8 @@ if cgroup_budget_works; then
 else
   echo "=== the reads under a memory budget: skipped ==="
   echo "(needs Linux and a systemd user session with the memory controller"
-  echo " delegated — without it the reads stay in the page cache, and the"
-  echo " pass above charges one cold second against nine warm ones)"
+  echo " delegated — without it the reads stay in the page cache, and only"
+  echo " the pass above's scan row is a cold measurement)"
 fi
 
 echo
