@@ -1112,11 +1112,14 @@ async fn a_merge_of_interleaved_and_repeated_keys_answers_what_a_btreemap_would(
             batch.delete(gone.as_bytes()).expect("delete");
             model.remove(gone.as_bytes());
             if slot == 7 {
-                let (lo, hi) = (format!("p{:04}", 100 + round * 20), format!("p{:04}", 112 + round * 20));
-                batch.delete_range(lo.as_bytes(), hi.as_bytes()).expect("delete range");
-                model.retain(|k, _| {
-                    k.as_slice() < lo.as_bytes() || k.as_slice() >= hi.as_bytes()
-                });
+                let (lo, hi) = (
+                    format!("p{:04}", 100 + round * 20),
+                    format!("p{:04}", 112 + round * 20),
+                );
+                batch
+                    .delete_range(lo.as_bytes(), hi.as_bytes())
+                    .expect("delete range");
+                model.retain(|k, _| k.as_slice() < lo.as_bytes() || k.as_slice() >= hi.as_bytes());
             }
             tables.push(flush_batch(&db, &mut batch).await);
         }
