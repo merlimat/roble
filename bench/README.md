@@ -526,6 +526,41 @@ serialized records, which sit somewhere between the two, so the size column
 here is the incompressible end of the range rather than the answer for any
 particular shard.
 
+**The read columns are page-cache-bound unless something stops them, and
+that was worth a pass of its own.** Every engine here but encina reads through
+the operating system's page cache (§8 — direct I/O is roble's goal and not its
+state), and at any dataset this harness can load in reasonable time the store
+fits in RAM. So `get` and `floor` measure finding and parsing a block again,
+not fetching one. At six million records, roble's `get` reads 2.6x encina's
+warm; held to a 256 MiB cgroup it reads **1.7x**, and `floor` goes from 1.6x
+to **1.01x** — level with a B+tree. The ratio was mostly the page cache.
+
+**`drop_caches` cannot measure that, and it fails in the direction that
+flatters.** It empties the cache once; millions of random lookups then fault
+the store back in within the first second of a ten-second phase, so the pass
+charges one cold second against nine warm ones — and it charges exactly the
+engines that use the page cache, while an `O_DIRECT` engine is unaffected. It
+therefore reports roble's `get` at **16x** encina's: wider than the warm
+2.6x, where the truth is 1.7x. A `scan` is the exception and is honest there,
+because reading 846 MiB in order keeps meeting blocks nothing has faulted in
+yet: roble loses 32% and RocksDB 29% where encina loses 2%.
+
+So `run.sh` has a pass that holds the reads to a `BUDGET_MB` cgroup (256 MiB
+by default) instead. cgroup v2 charges a page to whichever cgroup faulted it
+in, so a budget the store does not fit in has the kernel reclaiming for as
+long as the phase runs. The load stays outside the budget — a constrained
+writeback path is a different measurement — and systemd's user session
+normally has the memory controller delegated, so this needs no root where
+`drop_caches` needs one. The pass verifies the budget is actually applied
+rather than silently ignored, and skips with a reason if it is not.
+
+Two things to hold against its numbers. The budget is a chosen number and the
+result is a function of it: the pass says the read columns are
+page-cache-bound, not where an engine lands at a particular deployment's
+budget. And `MemoryHigh` throttling stalls the allocator while reclaim runs,
+with that work charged to the process, so every engine's `cpu s` falls well
+under 100% there — read the rates.
+
 **The journal rows are the most platform-dependent numbers here.** Each
 engine's own on-against-off ratio is honest about that engine on this machine,
 since it is its own sync both times. Across engines it was once not comparable
