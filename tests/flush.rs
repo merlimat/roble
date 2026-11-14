@@ -211,6 +211,95 @@ async fn a_flushed_range_deletion_still_covers() {
     );
 }
 
+/// A table written in several chunks reads back whole.
+///
+/// A flush hands its bytes to the disk as the writer finishes them rather
+/// than all at the end, so a table larger than one chunk is several writes at
+/// increasing offsets instead of one at zero (§6, `roble::flush`). Every
+/// offset in the table — a data block's handle in the index, the index's and
+/// the metaindex's in the footer — is an offset in the *file*, so a writer
+/// that forgot what it had already handed over would put a handle at the
+/// offset within the chunk and the table would be unreadable past the first
+/// one.
+///
+/// Nothing else notices: a chunk is a megabyte, and every other table in
+/// these tests is smaller than that, so it is written in the single write
+/// `finish` makes and the handles are the same either way. Hence a test that
+/// is large on purpose, and that checks the table really did take more than
+/// one write before believing what it read.
+#[compio::test]
+async fn a_table_written_in_several_chunks_reads_back_whole() {
+    // Enough for four chunks and change: a chunk is a megabyte, and these
+    // are 268 bytes of key and value each.
+    const RECORDS: usize = 16 * 1024;
+    const CHUNK: u64 = 1 << 20;
+
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            // Larger than what is written, so the write does not flush the
+            // memtable before the flush below gets to it.
+            .memtable_size(64 << 20),
+    )
+    .await
+    .expect("create");
+
+    let value = vec![b'v'; 256];
+    let mut batch = Batch::new();
+    for i in 0..RECORDS {
+        batch
+            .put(format!("k{i:08}").as_bytes(), &value)
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+
+    let before = contents(&db).await;
+    assert_eq!(before.len(), RECORDS, "every record should be in the store");
+
+    let table = db.flush().await.expect("flush").expect("a table");
+    let size = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .find(|t| t.file_num == table)
+        .expect("the table should be in L0")
+        .size;
+    assert!(
+        size > 2 * CHUNK,
+        "this test is only about a table of several chunks, and {size} bytes is not one"
+    );
+
+    assert_eq!(contents(&db).await, before, "a flush changed an answer");
+
+    // Reopened, so the memtable that could still answer these is gone and
+    // every record has to come out of the table's blocks — at the offsets
+    // the chunked writes put them.
+    drop(db);
+    let db = open_unscheduled(&env, &dir).await;
+    assert_eq!(
+        contents(&db).await,
+        before,
+        "the table should hold every record the memtable did"
+    );
+    for key in [0, RECORDS / 2, RECORDS - 1] {
+        let key = format!("k{key:08}");
+        assert_eq!(
+            db.get(key.as_bytes(), Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(value.clone()),
+            "{key} should be readable from the table"
+        );
+    }
+}
+
 #[compio::test]
 async fn flushing_nothing_writes_nothing() {
     let (env, dir) = load("db-reads").await;

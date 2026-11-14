@@ -23,6 +23,19 @@
 //! The index separator for a data block is that block's last internal key.
 //! Pebble shortens it; a reader only needs it to be an upper bound for its own
 //! block and below the next block's first key, which the last key satisfies.
+//!
+//! **A finished block is not kept.** Pebble's writer hands each data block to
+//! its write queue as soon as it is full, and
+//! `layoutWriter.writePrecompressedBlock` copies it into a `bufio.Writer` over
+//! the file — so the bytes of a table leave the process while the table is
+//! still being written, and what stays is the list the comment on
+//! `RawRowWriter.EstimatedSize` gives: the open data block, the open index
+//! block, the open range-deletion block. This writer does the same with the
+//! push inverted into a pull: finished bytes gather in a buffer the caller
+//! takes with [`TableWriter::take_ready`] whenever it chooses. The pull is
+//! what lets this crate stay synchronous — roble's `Disk::write` is async and
+//! takes an owned buffer, and a writer that called it would drag both of those
+//! across a crate boundary that has neither.
 
 use std::collections::BTreeMap;
 
@@ -68,16 +81,27 @@ impl Default for WriterOptions {
     }
 }
 
-/// Builds a Pebble sstable in memory.
+/// Builds a Pebble sstable, a block at a time.
 ///
 /// Keys must be added in increasing internal-key order: increasing user key,
 /// and for equal user keys decreasing sequence number. The writer checks this
 /// rather than trusting it, because a table that is out of order is accepted
 /// by a writer and then silently misread by every seek.
+///
+/// Finished bytes accumulate until they are taken. A caller with a file to
+/// write to drains them as it goes — [`TableWriter::ready_len`] says how many
+/// are waiting, [`TableWriter::take_ready`] hands them over — and appends
+/// each chunk at the offset the ones before it ended at. A caller with
+/// nowhere to stream to takes none and lets [`TableWriter::finish`] hand over
+/// the whole table, which is what it returns when nothing was taken earlier.
 #[derive(Debug)]
 pub struct TableWriter {
     opts: WriterOptions,
-    out: Vec<u8>,
+    /// Finished bytes the caller has not taken yet.
+    buf: Vec<u8>,
+    /// How many it has, which is what keeps a block handle's offset an offset
+    /// in the *file* rather than in what is left of the buffer.
+    taken: u64,
     data: BlockBuilder,
     index: BlockBuilder,
     prev_key: Vec<u8>,
@@ -104,7 +128,8 @@ impl TableWriter {
         }
         Ok(TableWriter {
             opts,
-            out: Vec::new(),
+            buf: Vec::new(),
+            taken: 0,
             data: BlockBuilder::new(DEFAULT_RESTART_INTERVAL),
             index: BlockBuilder::new(INDEX_RESTART_INTERVAL),
             prev_key: Vec::new(),
@@ -238,23 +263,74 @@ impl TableWriter {
         Ok(())
     }
 
+    /// How many finished bytes are waiting to be taken.
+    ///
+    /// What a caller streaming to a file watches to decide a write is worth
+    /// making. The threshold is the caller's: this crate has no disk and so
+    /// no opinion about how large a write should be.
+    pub fn ready_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Takes the finished bytes, for the caller to append to the file.
+    ///
+    /// They belong at the offset where everything taken before them ended, so
+    /// a caller appends them in the order it took them and nothing else
+    /// writes to that file. What is taken is gone from the writer, which is
+    /// the whole point: it is why a 64 MiB table costs a block and not 64 MiB
+    /// to write, which is what §8 asks of a node running hundreds of stores.
+    pub fn take_ready(&mut self) -> Vec<u8> {
+        let ready = std::mem::take(&mut self.buf);
+        self.taken += ready.len() as u64;
+        ready
+    }
+
+    /// Takes a drained buffer back, to build the next chunk in.
+    ///
+    /// Not an optimisation of allocation *count* but of what the process
+    /// holds: a flush that allocated a fresh megabyte for every chunk and
+    /// freed it after the write left the allocator a cache of large free
+    /// regions, which is resident memory by another name and measured as
+    /// 30 MiB of it on a 64 MiB table. One buffer, handed round, is what the
+    /// chunking is supposed to cost (§8).
+    ///
+    /// roble's `Disk::write` hands its buffer back, which is what makes this
+    /// possible: the buffer that went to the disk is the one the next chunk
+    /// wants, and the disk has finished with it. Anything added since it was
+    /// taken is kept, ahead of whatever comes next, so the bytes stay in
+    /// order however the caller interleaves the two.
+    pub fn reuse(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        buf.append(&mut self.buf);
+        self.buf = buf;
+    }
+
     /// Appends a block and its trailer, returning its handle.
     fn write_block(&mut self, block: &[u8]) -> Result<BlockHandle> {
-        let offset = self.out.len() as u64;
+        // The offset in the file, which is what a handle means: the bytes
+        // already taken, then the ones still here.
+        let offset = self.taken + self.buf.len() as u64;
         // Uncompressed is roble's default and keeps a cached block the bytes
         // that came off the disk (DESIGN.md §8).
         let block_type = 0u8;
         let checksum = ChecksumType::Crc32c.compute(block, block_type)?;
-        self.out.extend_from_slice(block);
-        self.out.push(block_type);
-        self.out.extend_from_slice(&checksum.to_le_bytes());
+        self.buf.extend_from_slice(block);
+        self.buf.push(block_type);
+        self.buf.extend_from_slice(&checksum.to_le_bytes());
         Ok(BlockHandle {
             offset,
             length: block.len() as u64,
         })
     }
 
-    /// Finishes the table and returns its bytes.
+    /// Finishes the table and returns the bytes not already taken.
+    ///
+    /// For a caller that never called [`TableWriter::take_ready`] that is the
+    /// whole table, which is what the tools and the round-trip checks want.
+    /// For one that drained as it went it is the rest: whatever blocks are
+    /// still buffered, then the index, the range-deletion and filter blocks,
+    /// the properties, the metaindex and the footer — appended at the offset
+    /// the last chunk ended at.
     pub fn finish(mut self) -> Result<Vec<u8>> {
         self.flush_data_block()?;
 
@@ -310,7 +386,7 @@ impl TableWriter {
         let metaindex_handle = self.write_block(&metaindex_block)?;
 
         self.write_footer(metaindex_handle, index_handle);
-        Ok(self.out)
+        Ok(self.buf)
     }
 
     fn write_footer(&mut self, metaindex: BlockHandle, index: BlockHandle) {
@@ -325,7 +401,7 @@ impl TableWriter {
         let version_at = FOOTER_LEN - 8 - 4;
         footer[version_at..version_at + 4].copy_from_slice(&4u32.to_le_bytes());
         footer[FOOTER_LEN - 8..].copy_from_slice(PEBBLE_MAGIC);
-        self.out.extend_from_slice(&footer);
+        self.buf.extend_from_slice(&footer);
     }
 
     /// The properties Go Pebble reads back, sorted, as a row block needs.

@@ -594,6 +594,13 @@ impl Output {
             return Ok(None);
         }
         let entries = self.points as u64;
+        // The whole table in one buffer, which is what `finish` gives a
+        // caller that took nothing as it went. A flush streams instead
+        // (`crate::flush`), and this could: the writer holds no finished
+        // block either way. What is missing here is somewhere to stream
+        // *to* — a merge has no file open, because it does not know which
+        // table it is writing until it decides to end one, and giving it one
+        // is the per-table sink a compaction needs first.
         Ok(Some((self.writer.finish()?, self.bounds, entries)))
     }
 }
