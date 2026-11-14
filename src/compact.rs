@@ -468,7 +468,8 @@ async fn merge<D: Disk>(
     let mut seen = Vec::new();
     let mut seen_any = false;
 
-    while let Some(w) = least(&iters)? {
+    let mut heap = Heap::new(&iters)?;
+    while let Some(w) = heap.top() {
         // Borrowed from the iterator rather than copied out of it. What
         // `key` hands back is the cursor's own assembled buffer
         // (`block::restart::Cursor::key`), so it stays put until something
@@ -506,6 +507,7 @@ async fn merge<D: Disk>(
             open.add(k, encoded, &value)?;
         }
         iters[w].next().await?;
+        heap.advanced(&iters)?;
         pacer.did(1).await;
     }
 
@@ -658,21 +660,167 @@ fn fragment<D: Disk>(tables: &[Rc<OpenTable<D>>]) -> Vec<Tombstone> {
     rangedel::fragment(&all)
 }
 
-/// The iterator on the least internal key, if any is still positioned.
-fn least<D: Disk>(iters: &[crate::table::TableIter<D>]) -> Result<Option<usize>> {
-    let mut best: Option<usize> = None;
-    for (i, it) in iters.iter().enumerate() {
-        if !it.is_valid() {
-            continue;
+/// The inputs of a merge, arranged so that finding the least key again costs
+/// a sift rather than a look at every input.
+///
+/// A merge asks for the least key once per entry it pulls, and a scan over
+/// the inputs answers in O(N) every time. N is one table and its overlaps
+/// below L0, but all of L0 plus the whole overlapping run of the level below
+/// for an L0 job (§9, `crate::pick`), and those wide jobs are the ones that
+/// merge nearly all the entries — so the scan is the term that grows as a
+/// store does. Pebble's merging iterator is a heap for the same reason
+/// (`mergingIterHeap`), and `compact.Iter` draws from it on the compaction
+/// path.
+///
+/// Every input in the heap is on an entry: one that runs out leaves it, so
+/// `top` needs no validity check and a comparison is never made against an
+/// iterator that is positioned nowhere.
+struct Heap {
+    /// A binary heap in an array, least at `items[0]`: the children of `i`
+    /// are at `2i + 1` and `2i + 2`.
+    items: Vec<Item>,
+}
+
+/// One position in the heap.
+struct Item {
+    /// The input whose key this position holds.
+    input: usize,
+    /// Which of **this position's** two children beat the other, when that
+    /// is known — Pebble's `winnerChild`, and worth having for the reason
+    /// its comment gives: a sift-down that knows this already compares the
+    /// winner against the parent and stops, so a replacement that still
+    /// wins costs one comparison instead of two.
+    ///
+    /// It belongs to the position and not to the input sitting there, which
+    /// is why [`Heap::swap`] exchanges `input` alone. A swap into `i`
+    /// changes what one of `i`'s children holds, so `i` forgets; the
+    /// position swapped *down* to keeps what it knew, because its own
+    /// children are untouched, and that is the whole saving.
+    winner: Winner,
+}
+
+/// Which child of a heap position won, if it has been worked out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Winner {
+    Unknown,
+    Left,
+    Right,
+}
+
+impl Heap {
+    /// Heapifies the inputs that are on an entry.
+    fn new<D: Disk>(iters: &[crate::table::TableIter<D>]) -> Result<Self> {
+        let items = iters
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.is_valid())
+            .map(|(input, _)| Item {
+                input,
+                winner: Winner::Unknown,
+            })
+            .collect();
+        let mut heap = Heap { items };
+        for i in (0..heap.items.len() / 2).rev() {
+            heap.down(i, heap.items.len(), iters)?;
         }
-        match best {
-            None => best = Some(i),
-            Some(b) => {
-                if key::compare(it.key(), iters[b].key())?.is_lt() {
-                    best = Some(i);
+        Ok(heap)
+    }
+
+    /// The input on the least internal key, if any is still positioned.
+    fn top(&self) -> Option<usize> {
+        self.items.first().map(|item| item.input)
+    }
+
+    /// Puts the heap right after the iterator on top has been advanced.
+    ///
+    /// The top's key has grown, and nothing else has changed, so a sift-down
+    /// from the root is all that is owed — Pebble's `fixTop`. An input that
+    /// has run out leaves instead, which is what keeps every key in the heap
+    /// a key that exists.
+    fn advanced<D: Disk>(&mut self, iters: &[crate::table::TableIter<D>]) -> Result<()> {
+        let n = self.items.len();
+        if iters[self.items[0].input].is_valid() {
+            return self.down(0, n, iters);
+        }
+        // The last position takes the root's place and the heap shrinks, as
+        // Pebble's `pop` does. The root's own `winner` survives: its
+        // children are positions 1 and 2, and the position that moved is
+        // neither of those unless the heap is small enough that the right
+        // child is already gone, in which case nothing reads it.
+        self.swap(0, n - 1);
+        self.items.truncate(n - 1);
+        self.down(0, n - 1, iters)
+    }
+
+    /// Whether the key at position `a` sorts before the one at `b`.
+    ///
+    /// An internal key carries a descending trailer, so this is Pebble's
+    /// `mergingIterHeap.less` exactly: user keys ascending, and the newest
+    /// version of a user key first. The index breaks a tie beyond that,
+    /// which the scan this replaces did by only ever taking a strictly
+    /// smaller key and so leaving the *first* input holding the least one on
+    /// top. A tie means one compaction read the same user key, sequence
+    /// number and kind from two of its inputs, which cannot happen while
+    /// sequence numbers are handed out once — but a heap is not stable, and
+    /// an unstable choice there would change which value the output kept.
+    /// Settling it on the index makes the order total, so the least key is
+    /// unique and the heap cannot pick differently from the scan whatever
+    /// shape it is in. Pebble leaves this to the sequence numbers.
+    fn less<D: Disk>(
+        &self,
+        a: usize,
+        b: usize,
+        iters: &[crate::table::TableIter<D>],
+    ) -> Result<bool> {
+        let (a, b) = (self.items[a].input, self.items[b].input);
+        Ok(match key::compare(iters[a].key(), iters[b].key())? {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => a < b,
+        })
+    }
+
+    /// Exchanges the inputs at two positions, leaving `winner` where it is.
+    fn swap(&mut self, a: usize, b: usize) {
+        let (x, y) = (self.items[a].input, self.items[b].input);
+        self.items[a].input = y;
+        self.items[b].input = x;
+    }
+
+    /// Sifts the input at `i` down through a heap of `n` positions until the
+    /// heap property holds again.
+    fn down<D: Disk>(
+        &mut self,
+        mut i: usize,
+        n: usize,
+        iters: &[crate::table::TableIter<D>],
+    ) -> Result<()> {
+        loop {
+            let left = 2 * i + 1;
+            if left >= n {
+                break;
+            }
+            let mut child = left;
+            let right = left + 1;
+            if right < n {
+                if self.items[i].winner == Winner::Unknown {
+                    self.items[i].winner = if self.less(right, left, iters)? {
+                        Winner::Right
+                    } else {
+                        Winner::Left
+                    };
+                }
+                if self.items[i].winner == Winner::Right {
+                    child = right;
                 }
             }
+            if !self.less(child, i, iters)? {
+                break;
+            }
+            self.swap(i, child);
+            self.items[i].winner = Winner::Unknown;
+            i = child;
         }
+        Ok(())
     }
-    Ok(best)
 }

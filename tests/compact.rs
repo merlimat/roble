@@ -1046,3 +1046,133 @@ async fn every_key_and_every_gap_find_their_table_in_a_deep_level() {
         }
     }
 }
+
+/// A merge whose inputs interleave and repeat the same user keys, against a
+/// `BTreeMap` of what was written.
+///
+/// The merge picks the least key with a heap (`compact::Heap`), and what a
+/// heap can do that the scan before it could not is pick a *different* one of
+/// two equal keys: it is not stable, and `least` left the first input holding
+/// the least key on top because it only ever replaced its best on a strictly
+/// smaller one. That matters because dropping superseded versions depends on
+/// the newest version of a user key arriving first — so a merge that ordered
+/// two versions the other way round would keep the older value and drop the
+/// newer, and the store would answer with it.
+///
+/// So the inputs are built to make both halves of the order load-bearing.
+/// Every table owns one residue class of the keyspace, which puts the least
+/// key in a different input at nearly every step and keeps the heap's top
+/// moving; and every table writes the multiples of sixteen again, so those
+/// user keys reach the merge in as many versions as there are inputs, with a
+/// value that says which batch wrote it. A heap that yielded versions out of
+/// order would answer with the wrong batch's value, which no amount of
+/// key-order checking would catch.
+///
+/// The job is made wide on purpose — the whole of L0 plus the whole
+/// overlapping run of L1 — because a heap over two inputs is a heap that
+/// barely sifts.
+#[compio::test]
+async fn a_merge_of_interleaved_and_repeated_keys_answers_what_a_btreemap_would() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .target_file_size(4096)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    let mut model = contents(&db).await;
+    let mut batches = 0u64;
+    // Two rounds, so the second merge reads the run the first one left in L1
+    // alongside a fresh L0: a compaction's inputs are not all one level's.
+    for round in 0..2u64 {
+        let mut tables = Vec::new();
+        for slot in 0..8u64 {
+            let b = batches;
+            batches += 1;
+            let mut batch = Batch::new();
+            // This table's own keys, and then the keys every table writes.
+            let mut keys: Vec<u64> = (0..400).filter(|i| i % 8 == slot).collect();
+            keys.extend((0..400).step_by(16));
+            keys.sort_unstable();
+            keys.dedup();
+            for i in keys {
+                let key = format!("p{i:04}");
+                let value = format!("b{b:02}-p{i:04}-{}", "v".repeat(60));
+                batch.put(key.as_bytes(), value.as_bytes()).expect("put");
+                model.insert(key.into_bytes(), value.into_bytes());
+            }
+            // A deletion whose key another table in the same job still holds,
+            // so the merge has to drop what is under it rather than beside
+            // it, and a span of them on the last batch of the round.
+            let gone = format!("p{:04}", slot * 8 + 3);
+            batch.delete(gone.as_bytes()).expect("delete");
+            model.remove(gone.as_bytes());
+            if slot == 7 {
+                let (lo, hi) = (format!("p{:04}", 100 + round * 20), format!("p{:04}", 112 + round * 20));
+                batch.delete_range(lo.as_bytes(), hi.as_bytes()).expect("delete range");
+                model.retain(|k, _| {
+                    k.as_slice() < lo.as_bytes() || k.as_slice() >= hi.as_bytes()
+                });
+            }
+            tables.push(flush_batch(&db, &mut batch).await);
+        }
+
+        // Every L0 table and the whole L1 run it meets, which is the job the
+        // picker makes of L0 and the only one here with a wide merge in it.
+        let inputs = tables.len() + db.versions().version.level(1).len();
+        assert!(
+            inputs >= 8,
+            "round {round} has to merge at least eight inputs to be testing a heap, merges {inputs}"
+        );
+        if round == 1 {
+            assert!(
+                db.versions().version.level(1).len() > 1,
+                "the second round has to read an L1 run of several tables, reads {}",
+                db.versions().version.level(1).len()
+            );
+        }
+        let outputs = db.compact(0, &tables).await.expect("compact into L1");
+        assert!(
+            outputs.len() > 1,
+            "round {round} has to split its output for the boundary to be tested, wrote {}",
+            outputs.len()
+        );
+    }
+
+    assert_eq!(
+        contents(&db).await,
+        model,
+        "the merge kept the wrong version of a key, or lost one"
+    );
+
+    // The output is one run in key order. A merge that yielded two keys the
+    // wrong way round could still have been read back in order by a scan
+    // that merged the tables again, so the level is checked as well as the
+    // answer. Two outputs may meet at one user key, which is a clipped
+    // tombstone's exclusive sentinel and not an overlap
+    // (`a_tombstone_across_a_split_leaves_tables_that_touch`).
+    let level = db.versions().version.level(1).to_vec();
+    for pair in level.windows(2) {
+        let (lhs, rhs) = (&pair[0], &pair[1]);
+        let (largest, smallest) = (
+            lhs.largest_user_key().expect("largest"),
+            rhs.smallest_user_key().expect("smallest"),
+        );
+        assert!(
+            largest <= smallest,
+            "L1 tables {} and {} overlap or are out of order",
+            lhs.file_num,
+            rhs.file_num
+        );
+        assert!(
+            largest < smallest || lhs.largest_is_exclusive().expect("exclusive"),
+            "L1 tables {} and {} share a bound that is not an exclusive sentinel",
+            lhs.file_num,
+            rhs.file_num
+        );
+    }
+}
