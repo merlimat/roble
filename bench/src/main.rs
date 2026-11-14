@@ -36,45 +36,50 @@
 mod engine;
 mod report;
 
-// Behind a feature, so the default build is measured on the platform's own
-// allocator — which is what a consumer gets unless it chooses otherwise.
-#[cfg(all(feature = "mimalloc", feature = "count-alloc"))]
-compile_error!(
-    "`mimalloc` and `count-alloc` each install a global allocator, so only one \
-     can be on at a time: build twice and compare the two runs"
-);
-
-#[cfg(feature = "mimalloc")]
+// mimalloc by default, and `bench/Cargo.toml` says why: the platform's own
+// allocator can decide a result by itself, and roble never chooses one.
+// `--no-default-features` measures the system allocator instead.
+//
+// Counting installs its own `#[global_allocator]` and forwards to this one, so
+// only one of the two statics may exist.
+#[cfg(all(feature = "mimalloc", not(feature = "count-alloc")))]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(feature = "count-alloc")]
 mod counting {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    // The allocator under the count is the one the build would use without
+    // it, so counting never changes which allocator is being measured.
+    #[cfg(feature = "mimalloc")]
+    use mimalloc::MiMalloc as Base;
+    #[cfg(not(feature = "mimalloc"))]
+    use std::alloc::System as Base;
 
     pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
 
     pub struct Counting;
 
-    // SAFETY: every method forwards to `System` with the layout it was given
-    // and returns what `System` returned, so the allocator contract is
-    // whatever `System`'s is. The counters are the only addition.
+    // SAFETY: every method forwards to `Base` with the layout it was given and
+    // returns what `Base` returned, so the allocator contract is whatever
+    // `Base`'s is. The counters are the only addition.
     #[allow(unsafe_code)]
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Relaxed);
             BYTES.fetch_add(layout.size() as u64, Relaxed);
-            unsafe { System.alloc(layout) }
+            unsafe { Base.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout) }
+            unsafe { Base.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
             ALLOCS.fetch_add(1, Relaxed);
             BYTES.fetch_add(new.saturating_sub(layout.size()) as u64, Relaxed);
-            unsafe { System.realloc(ptr, layout, new) }
+            unsafe { Base.realloc(ptr, layout, new) }
         }
     }
 }
