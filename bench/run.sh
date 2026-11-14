@@ -17,7 +17,7 @@
 # Runs every engine over the same workload and prints one table of all of them.
 # See README.md.
 #
-# Four passes, because they answer different questions:
+# Five passes, because they answer different questions:
 #
 #   1. Every phase, every engine, in one table. The phases share a cache and
 #      run in order, so whichever of the two scans goes second reads one the
@@ -28,7 +28,10 @@
 #      DESIGN.md §14 asks for, and the first pass only approximates it.
 #   3. Batch insert against single insert, at the same total number of
 #      records, so the per-commit cost can be told from the per-record cost.
-#   4. The layout: every table of every level, with its size and key range,
+#   4. The reads under a memory budget, which is the only pass where a random
+#      lookup reaches a device: dropping the page cache cannot hold one cold,
+#      because the lookups fault the store straight back in.
+#   5. The layout: every table of every level, with its size and key range,
 #      which is what a scan number has to be read against.
 #
 # ENGINES picks which to run; the default is all of them. roble needs nothing
@@ -48,6 +51,12 @@
 # looking at what a run actually wrote:
 #
 #   KEEP=1 BENCH_DIR=/tmp/bench ./run.sh --phases load,settle
+#
+# BUDGET_MB is the memory budget the read pass holds the engines to, in MiB
+# (256 by default), and is the knob to raise if an engine cannot finish inside
+# it:
+#
+#   BUDGET_MB=512 ./run.sh --batches 600 --records 10000
 #
 # --cache-mb is passed through, so a single engine can be swept across cache
 # sizes directly; run.sh runs the reads at two of them (see below).
@@ -252,6 +261,99 @@ else
   echo "=== the reads from a disk: skipped ==="
   echo "(needs Linux and a sudo that can write /proc/sys/vm/drop_caches;"
   echo " without it a small cache only measures the miss path in RAM)"
+fi
+
+# The reads under a memory budget, which is the one pass that holds a
+# *random* lookup to a device. The pass above does not, and that is worth
+# stating plainly because its numbers look as though it does: `drop_caches`
+# empties the page cache once, and millions of lookups over a store far larger
+# than the block cache fault the whole store back in within the first second of
+# a ten-second phase. So it charges an engine for one cold second and nine warm
+# ones — and it charges exactly the engines that *use* the page cache, which
+# widens the gap over an engine that bypasses it instead of closing it.
+# Measured at six million records: roble's `get` reads 16x encina's under
+# `drop_caches` alone, against 2.6x warm and 1.7x under this pass. The middle
+# column is the misleading one.
+#
+# A cgroup gives what emptying the cache cannot. cgroup v2 charges a page to
+# whichever cgroup first faulted it in, so a budget the store does not fit in
+# has the kernel reclaiming it for as long as the phase runs rather than
+# keeping it resident. systemd's user session normally has the memory
+# controller delegated, so unlike `drop_caches` this needs no root.
+#
+# BUDGET_MB sets the budget. It has to clear every engine's own footprint —
+# its block cache, and its open tables' indexes and filters, which since
+# `DEFAULT_OPEN_TABLES` went unlimited are held outside that cache — or the
+# pass measures an engine thrashing against its own cache rather than reading
+# a store too large to cache. 256 MiB clears the 40–70 MiB the three engines
+# want at `--cache-mb 4`.
+budget_mb="${BUDGET_MB:-256}"
+
+# Whether the budget is really in force, rather than quietly ignored. A
+# `-p MemoryMax=` that systemd accepts and an undelegated controller never
+# applies would give numbers that look budgeted and are not, which is the one
+# failure this pass must not have.
+cgroup_budget_works() {
+  [ "$(uname -s)" = Linux ] || return 1
+  command -v systemd-run > /dev/null 2>&1 || return 1
+  local got
+  # Single-quoted on purpose: the substitution has to run in the inner shell,
+  # inside the scope, since the question is what *that* cgroup's budget is.
+  # shellcheck disable=SC2016
+  got=$(systemd-run --user --scope --quiet -p MemoryMax=64M -- \
+          sh -c 'cat /sys/fs/cgroup$(cut -d: -f3 < /proc/self/cgroup)/memory.max' \
+          2>/dev/null | tr -d '[:space:]')
+  [ "$got" = "$((64 * 1024 * 1024))" ]
+}
+
+# The binary, not `cargo run`: this pass puts the command inside the budget,
+# and cargo's own footprint is not the measurement. Every feature set writes
+# the same path, so the build has to be the one immediately before the run
+# that uses it.
+build_engine() {
+  case "$1" in
+    roble) cargo build --release --quiet -p roble-bench ;;
+    encina|rocksdb) cargo build --release --quiet -p roble-bench --features "$1" ;;
+    *) echo "run.sh: unknown engine $1" >&2; exit 2 ;;
+  esac
+}
+
+echo
+if cgroup_budget_works; then
+  echo "=== the reads under a $budget_mb MiB budget: the store cannot stay cached ==="
+  echo
+  target_dir=$(cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+  bin="$target_dir/release/roble-bench"
+  lines="$out/budget.tsv"
+  : > "$lines"
+  for engine in $ENGINES; do
+    build_engine "$engine"
+    sel=()
+    [ "$engine" = roble ] || sel=(--engine "$engine")
+    # The load runs outside the budget on purpose: a constrained writeback
+    # path is a different measurement, and this pass is about the reads.
+    run_engine "$engine" "$out/budget-$engine" "${args[@]}" \
+      --phases load,settle --cache-mb 4 > /dev/null
+    drop_caches || true
+    if ! systemd-run --user --scope --quiet \
+           -p MemoryMax="${budget_mb}M" -p MemoryHigh="$((budget_mb * 3 / 4))M" -- \
+           "$bin" "${sel[@]}" --dir "$out/budget-$engine" "${args[@]}" --reuse \
+             --tsv --phases scan,get,floor --cache-mb 4 \
+         | awk -F'\t' 'NF >= 3' >> "$lines"; then
+      echo "($engine did not finish inside $budget_mb MiB; raise BUDGET_MB)"
+    fi
+    [ -n "${KEEP:-}" ] || rm -rf "$out/budget-$engine"
+  done
+  python3 pivot.py --metrics rate,p50,cpu < "$lines"
+  echo
+  echo "(read the rates, not cpu s: reclaim and MemoryHigh throttling are"
+  echo " charged to the process, so every engine falls well under 100% here)"
+else
+  echo "=== the reads under a memory budget: skipped ==="
+  echo "(needs Linux and a systemd user session with the memory controller"
+  echo " delegated — without it the reads stay in the page cache, and the"
+  echo " pass above charges one cold second against nine warm ones)"
 fi
 
 echo
