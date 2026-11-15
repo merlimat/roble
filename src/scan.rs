@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Scanning: one iterator per table, merged into one sequence (§4).
+//! Scanning: one iterator per level, merged into one sequence (§4).
 //!
 //! Three rules, and the reverse direction is where each of them bites.
 //!
@@ -188,6 +188,12 @@ struct Level<D: Disk> {
     /// than a scan used to gather up front, which was every tombstoned table
     /// its bounds reached, and usually it is nothing at all: a store nobody
     /// has called `delete_range` on has no tombstones to gather.
+    ///
+    /// Emptying it at a seek is for its size and not for any answer, and is
+    /// untested with that reason (§12): a tombstone of any table of the
+    /// version is true of every key it covers, so a list holding more than
+    /// it needs decides nothing differently. What is tested is the other
+    /// direction — that a table the merge still needs is never missing.
     tombstoned: Vec<Rc<OpenTable<D>>>,
 }
 
@@ -256,8 +262,9 @@ impl<D: Disk> Level<D> {
 
     /// Positions on the first entry at or after `target`, an internal key.
     ///
-    /// In the first table whose largest bound reaches the target: every
-    /// table before it ends below the target, and if this one holds nothing
+    /// In the first table whose largest bound reaches the target — Pebble's
+    /// `findFileGE` — since every table before it ends below the target. If
+    /// this one holds nothing
     /// that high — the target fell in the gap before the next table, or past
     /// the last point key of one that ends in a range deletion — `onward`
     /// carries on into the next. No table reaching it means nothing at or
@@ -277,8 +284,9 @@ impl<D: Disk> Level<D> {
 
     /// Positions on the last entry before `target`, an internal key.
     ///
-    /// In the last table starting below the target, with the same carrying
-    /// on the other way: every table after it starts at or above the target,
+    /// In the last table starting below the target — Pebble's `findFileLT` —
+    /// with the same carrying on the other way: every table after it starts
+    /// at or above the target,
     /// and none starting below it means nothing to find.
     async fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
         self.tombstoned.clear();
@@ -976,7 +984,7 @@ fn visible_at(seq: u64, snapshot: u64) -> bool {
 /// Why a second copy of this rather than the one `crate::compact` already
 /// has. The two merge different things — a compaction merges
 /// `crate::table::TableIter`s while a scan merges [`Source`]s, which is
-/// already an enum over a table, a run of them and a memtable — so sharing
+/// already an enum over a level and a memtable — so sharing
 /// would mean a trait for "the key at index i" over both. That part is free,
 /// monomorphised. What is not is `reverse`: a scan needs a heap that flips
 /// and a compaction merges forward only, so the shared `less` would carry a

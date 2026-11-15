@@ -186,6 +186,11 @@ impl Pinned {
 
     /// Every table some version a reader still holds names, letting go of the
     /// note of each version nothing holds any more.
+    ///
+    /// Letting go is untested, with a reason (§12): a note of a version
+    /// nothing holds upgrades to nothing and so names no table, and keeping
+    /// it changes no answer. What it saves is a list growing by a note for
+    /// every edit a scan was open across, for as long as the store is open.
     pub(crate) fn tables(&self) -> BTreeSet<u64> {
         let mut versions = self.versions.borrow_mut();
         versions.retain(|v| v.strong_count() > 0);
