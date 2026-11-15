@@ -56,6 +56,11 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
+/// Held by each test for the whole of its run. The counter is global and the
+/// harness runs tests on threads of their own, so two at once would each
+/// count the other's allocations.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden")
@@ -76,7 +81,11 @@ fn fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
 /// overlap in L0 above one in L6, so a lookup searches more than one of them
 /// and a per-table allocation would show up as more than one per lookup.
 #[compio::test]
+// Held across the awaits on purpose: `SERIAL` is what keeps the other test
+// out of the count, and each test runs on a runtime of its own thread.
+#[allow(clippy::await_holding_lock)]
 async fn a_warm_point_lookup_allocates_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, dir) = fixture("db-reads");
     let db = roble::open(&roble::DefaultEnv, &dir)
         .await
@@ -121,5 +130,72 @@ async fn a_warm_point_lookup_allocates_nothing() {
         0,
         "{RUNS} warm point lookups allocated {made} times, {:.3} each",
         made as f64 / RUNS as f64
+    );
+}
+
+/// A warm `floor` or `ceiling` through a kept `Lookup` allocates nothing
+/// either.
+///
+/// The four ordered comparisons are a scan positioned once and read, and a
+/// scan has far more to build than a point lookup: a source for each level
+/// and each memtable, a heap over them, its bounds, the internal key it
+/// seeks to, and a block cursor for every table it opens. A `Lookup` keeps
+/// one scan parked between calls and rebuilds it in its own allocations, so
+/// once the first few calls have grown every buffer to the size the data
+/// needs there is nothing left to ask the allocator for — this is what says
+/// so. Both directions, because a backward seek and a forward one reach
+/// their answer through different code, and on keys either side of every
+/// stored one, so a probe lands on a key and between two.
+#[compio::test]
+// Held across the awaits on purpose: `SERIAL` is what keeps the other test
+// out of the count, and each test runs on a runtime of its own thread.
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_ordered_lookup_allocates_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, dir) = fixture("db-reads");
+    let db = roble::open(&roble::DefaultEnv, &dir)
+        .await
+        .expect("open the database Go wrote");
+
+    let mut probes = Vec::new();
+    {
+        let mut scan = db.scan().await.expect("scan");
+        scan.first().await.expect("first");
+        while scan.is_valid() && probes.len() < 64 {
+            probes.push(scan.key().to_vec());
+            probes.push([scan.key(), b"!"].concat());
+            scan.next().await.expect("next");
+        }
+    }
+    assert!(probes.len() > 2, "the fixture should hold keys to probe");
+
+    let mut buf = Lookup::new();
+    let comparisons = [Comparison::Floor, Comparison::Ceiling];
+    // Warm, as the point lookup above is: every buffer grown, every table
+    // open, every block cached.
+    for _ in 0..20 {
+        for probe in &probes {
+            for how in comparisons {
+                db.get_into(probe, how, &mut buf).await.expect("get_into");
+            }
+        }
+    }
+
+    const ROUNDS: u64 = 20;
+    let before = ALLOCS.load(Relaxed);
+    for _ in 0..ROUNDS {
+        for probe in &probes {
+            for how in comparisons {
+                db.get_into(probe, how, &mut buf).await.expect("get_into");
+            }
+        }
+    }
+    let made = ALLOCS.load(Relaxed) - before;
+    let lookups = ROUNDS * probes.len() as u64 * comparisons.len() as u64;
+    assert_eq!(
+        made,
+        0,
+        "{lookups} warm floors and ceilings allocated {made} times, {:.3} each",
+        made as f64 / lookups as f64
     );
 }

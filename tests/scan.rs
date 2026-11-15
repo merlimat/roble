@@ -317,7 +317,7 @@ async fn roble_scans_where_go_pebble_scans() {
 /// constantly, and the loop after it turns at *every* key in both directions.
 ///
 /// L0 is where the sources are: its tables overlap, so each stays a source of
-/// its own, where a level below L0 is read as one source (`Scan::new`).
+/// its own, where a level below L0 is read as one source (`Scan::rebuild`).
 /// Compaction is off so they stay there, and the last round is left in the
 /// memtable, which is a source whose contents are not fixed and which holds
 /// the newest version of nearly every shared key.
@@ -468,15 +468,16 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
 /// hides what lies under it once the level has stepped into the next table,
 /// in both directions, and after a seek that lands back in the same table.
 ///
-/// A level below L0 opens one table at a time (`roble::scan`), so by the time
-/// the merge decides about a key from the level below, the level above may
-/// already be on its next table. Pebble keeps a level on a table until the
-/// merge has passed its tombstones, by interleaving their bounds among the
-/// point keys; roble keeps every tombstoned table a level has opened since it
-/// was last positioned. A level that kept only its current table's tombstones
-/// would answer with keys a range deletion hides, and only where a table's
-/// tombstone reaches past its last point key — forward — or starts before its
-/// first — backward — which is the shape built here.
+/// A level below L0 reads one table at a time, and its range deletions are
+/// those of the table it last opened (`roble::scan`). That is only enough if
+/// the level does not open its next table while the merge is still deciding
+/// keys the last one's tombstones cover. Pebble keeps it from doing so by
+/// interleaving the tombstones' bounds among the point keys; roble leaves the
+/// next table unopened until the merge reaches its bound. A level that opened
+/// it as soon as it ran out of point keys would answer with keys a range
+/// deletion hides, and only where a table's tombstone reaches past its last
+/// point key — forward — or starts before its first — backward — which is
+/// the shape built here.
 ///
 /// L1 holds two tables, each the output of compacting one flush on its own:
 /// `a` ends in a range deletion past its last point key and `b` starts with

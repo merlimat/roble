@@ -105,17 +105,15 @@ impl<D: Disk> Snapshot<D> {
     /// whatever its scans' bounds, so a caller can scan a range and then look
     /// up keys outside it.
     pub fn scan_range(&self, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<Scan<D>> {
-        let scan = Scan::new(
+        let mut scan = Scan::empty(Some(Rc::clone(&self.metrics)));
+        scan.rebuild(
             &self.version,
             &self.tables,
-            self.memtables.clone(),
+            self.memtables.iter().cloned(),
             self.seq,
-            lower.map(|b| b.to_vec()),
-            upper.map(|b| b.to_vec()),
-            Some(Rc::clone(&self.metrics)),
+            lower,
+            upper,
         )?;
-        self.metrics.scans.add(1);
-        self.metrics.scans_open.add(1);
         Ok(scan)
     }
 

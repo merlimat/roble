@@ -103,9 +103,14 @@ pub struct Lookup {
     /// One table's candidate, before it is known to be the newest.
     entry_key: Vec<u8>,
     entry_value: Vec<u8>,
-    /// The lower end of the window a backward comparison tries first
-    /// ([`Opened::window_below`]).
-    bound: Vec<u8>,
+    /// The scan the four ordered comparisons are positioned through, parked
+    /// between them (`Scan::park`) so that the next one rebuilds it
+    /// in its own allocations rather than making new ones.
+    ///
+    /// Behind `Any` because a scan is generic over the store's disk and this
+    /// buffer is not; the first comparison on a store makes it, and a buffer
+    /// handed to a store with another disk makes it again.
+    scan: KeptScan,
     /// A block cursor, with the table format it was built for.
     ///
     /// A cursor assembles the prefix-compressed key it is on into a `Vec`, so
@@ -115,6 +120,46 @@ pub struct Lookup {
         roble_format::TableFormat,
         roble_format::block::restart::DataCursor,
     )>,
+}
+
+/// A parked [`crate::Scan`], of whatever disk it was last made for.
+///
+/// Parked, it holds nothing of a store — no version, table or memtable — so a
+/// caller can keep the [`Lookup`] it is in for as long as it likes without
+/// keeping a single file from the obsolete sweep.
+#[derive(Default)]
+struct KeptScan(Option<Box<dyn std::any::Any>>);
+
+impl std::fmt::Debug for KeptScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "KeptScan(parked)"
+        } else {
+            "KeptScan(none)"
+        })
+    }
+}
+
+impl KeptScan {
+    /// The scan, made for `D` if it was not already.
+    fn get<D: crate::env::Disk>(
+        &mut self,
+        metrics: &std::rc::Rc<crate::metrics::Metrics>,
+    ) -> &mut crate::scan::Scan<D> {
+        if !self
+            .0
+            .as_ref()
+            .is_some_and(|kept| kept.is::<crate::scan::Scan<D>>())
+        {
+            self.0 = Some(Box::new(crate::scan::Scan::<D>::empty(Some(
+                std::rc::Rc::clone(metrics),
+            ))));
+        }
+        self.0
+            .as_mut()
+            .and_then(|kept| kept.downcast_mut())
+            .expect("made for this disk just above")
+    }
 }
 
 impl Lookup {
@@ -256,23 +301,28 @@ impl<F: Fs> Opened<F> {
     /// rejected; a scan steps instead, and skipping deleted keys is its job
     /// rather than this one's.
     async fn positioned(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
-        // Split so the answer, the probe and the window's bound can be held
-        // at once; they are disjoint parts of the caller's one buffer.
+        // Split so the answer, the probe and the scan can be held at once;
+        // they are disjoint parts of the caller's one buffer.
         let Lookup {
             key: found_key,
             value: found_value,
             target,
-            bound,
+            scan,
             ..
         } = buf;
         // **Bounded on the side the comparison already decides.** A `Floor`
         // cannot answer above `key` and a `Ceiling` cannot answer below it,
-        // so no level of the scan needs a table on the wrong side of the
-        // probe.
+        // so the scan is told so, and none of its levels will step into a
+        // table on the wrong side of the probe. Each comparison's boundary
+        // is said here and nowhere else.
         //
         // The other side stays open because nothing here knows how far the
         // answer is: a `Floor` whose neighbourhood is entirely deleted is
-        // answered by a key arbitrarily far below.
+        // answered by a key arbitrarily far below. Leaving it open costs
+        // nothing: a scan opens a table only when the merge reaches it
+        // (`crate::scan`), so the one seek below opens at most one table a
+        // level however much of the store lies on the open side, and none in
+        // a level whose landing table lies wholly past where the answer is.
         let (lower, upper) = match how {
             Comparison::Ceiling => (Some(key), None),
             Comparison::Higher => {
@@ -289,93 +339,27 @@ impl<F: Fs> Opened<F> {
             Comparison::Equal => unreachable!("Equal is a point lookup"),
         };
 
-        // **And bounded on the other side as well, first, where the answer
-        // nearly always is.** Half-open, the scan above seeks every level
-        // that has a table starting below the probe, and a level holding only
-        // a few tables scattered over the keyspace — an L1 of nineteen, at
-        // six million records — usually lands in one that ends far below it.
-        // Seeking that table backward reads and decodes its last block for a
-        // key that cannot be the answer, since another level's is nearer.
-        // Building the scan is not the cost any more — its levels open
-        // nothing until a seek lands in them (`crate::scan`) — but those
-        // seeks are: without this, `floor` ran at 0.77x of what it does with
-        // it. So a backward comparison first tries a window just below the
-        // probe, inside one table of every level, and a level whose landing
-        // table ends below the window has nothing in it to seek at all. Only
-        // if nothing in the window is visible does it pay for the half-open
-        // scan.
-        //
-        // The window's answer is exact, not a guess. A scan bounded to it
-        // reads every table that holds an entry in it and every tombstone
-        // that can cover one — a range deletion lies inside its own table's
-        // bounds (§5) — and never answers from below its lower bound. So it
-        // finds the greatest visible key in the window if there is one, and
-        // that is the floor: anything else visible below the probe is below
-        // the window and smaller. Only a window whose every key is deleted
-        // finds nothing, and then the answer is further down.
-        if let Some(upper) = upper
-            && self.window_below(upper, bound)?
-        {
-            let mut scan = self.scan_range(Some(bound), Some(upper)).await?;
-            scan.seek_lt(upper).await?;
-            if scan.is_valid() {
-                found_key.extend_from_slice(scan.key());
-                found_value.extend_from_slice(scan.value());
-                return Ok(true);
+        // Through the scan the buffer keeps, rebuilt in its own allocations
+        // and parked again however the seek went, so that it never holds the
+        // store between two lookups.
+        let scan = scan.get::<F::Disk>(&self.metrics);
+        let found = async {
+            self.rebuild_scan(scan, std::iter::empty(), lower, upper)?;
+            match (lower, upper) {
+                (Some(lower), None) => scan.seek_ge(lower).await?,
+                (None, Some(upper)) => scan.seek_lt(upper).await?,
+                _ => unreachable!("an ordered comparison is bounded on exactly one side"),
             }
-        }
-
-        let mut scan = self.scan_range(lower, upper).await?;
-        match (lower, upper) {
-            (Some(lower), None) => scan.seek_ge(lower).await?,
-            (None, Some(upper)) => scan.seek_lt(upper).await?,
-            _ => unreachable!("an ordered comparison is bounded on exactly one side"),
-        }
-        if !scan.is_valid() {
-            return Ok(false);
-        }
-        found_key.extend_from_slice(scan.key());
-        found_value.extend_from_slice(scan.value());
-        Ok(true)
-    }
-
-    /// The lower end of the window a backward comparison to `upper` tries
-    /// first, into `out`, or `false` when there is no window to try.
-    ///
-    /// In each level below L0, a seek backward from `upper` lands in the last
-    /// table starting below it. The window starts where the latest-starting
-    /// of those does, which keeps it inside one table of every level: each
-    /// other level's landing table starts no later, and the tables before
-    /// that one end before it starts. A landing table that ends before the
-    /// window starts is one the window's scan does not seek. L0's tables and the memtables are not
-    /// consulted here because the scan takes in whichever of them reach the
-    /// window anyway.
-    ///
-    /// It starts at a key some table begins with, so it nearly always holds
-    /// a key to find. `false` only when no level below L0 has a table
-    /// starting below `upper`, where the half-open scan has nothing below L0
-    /// to open either.
-    fn window_below(&self, upper: &[u8], out: &mut Vec<u8>) -> Result<bool> {
-        let versions = self.versions();
-        let mut latest: Option<&[u8]> = None;
-        for (level, tables) in versions.version.levels() {
-            if level == 0 {
-                continue;
+            if !scan.is_valid() {
+                return Ok(false);
             }
-            let starting = crate::version::starting_below(tables, upper)?;
-            if starting > 0 {
-                let start = tables[starting - 1].smallest_user_key()?;
-                if latest.is_none_or(|latest| start > latest) {
-                    latest = Some(start);
-                }
-            }
+            found_key.extend_from_slice(scan.key());
+            found_value.extend_from_slice(scan.value());
+            Ok(true)
         }
-        out.clear();
-        let Some(start) = latest else {
-            return Ok(false);
-        };
-        out.extend_from_slice(start);
-        Ok(true)
+        .await;
+        scan.park();
+        found
     }
 
     /// The newest entry any table holds for `user`.
