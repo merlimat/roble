@@ -609,3 +609,42 @@ async fn a_batch_settles_a_put_against_its_own_range_deletion() {
         assert_eq!(seen, want, "the scan should agree with the Equal path");
     }
 }
+
+/// A batch whose index outgrows a megabyte still builds it, reads back
+/// through it and commits.
+///
+/// A batch's index is a memtable with no budget, so its arena grows the
+/// ordinary way at every size — only a store's memtable goes straight to its
+/// budget past a megabyte (`crate::memtable`). The bench loads in batches of
+/// ten thousand records, about two megabytes of index each, and nothing here
+/// built one that large before, which left the line keeping a budget-less
+/// arena out of that path untested.
+#[compio::test]
+async fn a_batch_larger_than_a_megabyte_reads_back_and_commits() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let value = vec![b'v'; 200];
+    let n = 10_000u64;
+    let mut batch = db.batch();
+    for i in 0..n {
+        batch
+            .put(format!("big{i:06}").as_bytes(), &value)
+            .expect("put");
+    }
+    let last = format!("big{:06}", n - 1);
+    let found = batch
+        .get(last.as_bytes(), Comparison::Equal)
+        .await
+        .expect("get")
+        .expect("the batch's own last key, read through its index");
+    assert_eq!(found.value, value);
+    batch.commit(false).await.expect("commit");
+
+    let found = db
+        .get(b"big000000", Comparison::Equal)
+        .await
+        .expect("get")
+        .expect("committed");
+    assert_eq!(found.value, value);
+}

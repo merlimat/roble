@@ -1176,6 +1176,21 @@ a bound rather than a hope because a write enforces it: what a store holds
 across every memtable it has is `Options::memtable_size` plus one batch (§4,
 §6).
 
+**A store's memtable is allocated at its budget, not grown to it.** The arena
+grows as a `Vec` does while it is under a megabyte, and the first time it needs
+more it goes to the whole budget in one step. Grown by doubling all the way, it
+reallocated at every power of two and held the old copy and the new while it
+moved: a 64 MiB memtable passed 43 MiB on its way to its 56 MiB flush line,
+took an 86 MiB allocation and held 129 MiB for the copy, which made it the
+largest thing a store held at its peak in YCSB A — and left a 56 MiB memtable
+in an 86 MiB allocation afterwards. The bound above counted keys and values
+and was right about them; it was the arena around them that ran to twice it.
+Pages are resident only once written, so a budget-sized allocation costs what
+the memtable holds; and below a megabyte nothing changes, so an idle store's
+memtable — Oxia runs hundreds — is not handed its budget for a few writes.
+With the benchmark's own samples made smaller as well, roble's peak in YCSB A
+and F in cache went from 47–68 MiB over RocksDB's to within 3 (`bench/`).
+
 ### Where a warm scan step goes
 
 A scan step whose block is already in the block cache costs about 28 ns on an

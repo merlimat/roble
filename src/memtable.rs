@@ -123,7 +123,18 @@ pub struct Memtable {
     /// The tallest node so far.
     height: usize,
     rng: u64,
+    /// What the store will let this memtable hold before it is written out,
+    /// or zero for one that has no budget — a batch's index. The arena grows
+    /// to it in one step rather than by doubling ([`Memtable::make_room`]).
+    budget: usize,
 }
+
+/// How large an arena grows the ordinary way before it goes straight to its
+/// budget ([`Memtable::make_room`]): small enough that the copy it saves
+/// nothing on is cheap, large enough that an idle store's memtable — and
+/// Oxia runs hundreds of stores, most of them idle — is not handed its whole
+/// budget for a handful of writes.
+const GROW_TO_BUDGET_PAST: usize = 1 << 20;
 
 /// How many bytes a memtable holds before a write writes it out (§4, §8).
 ///
@@ -166,12 +177,48 @@ impl Memtable {
             given: 0,
             head: [NIL; MAX_HEIGHT],
             height: 1,
+            budget: 0,
             // A zero seed would leave the generator stuck, so it is nudged.
             rng: if seed == 0 {
                 0x9e37_79b9_7f4a_7c15
             } else {
                 seed
             },
+        }
+    }
+
+    /// An empty memtable that a store will fill to `budget` bytes.
+    ///
+    /// The budget is what a store's memtables are written out at, so it is
+    /// how large this one's arena will get, and the arena goes there in one
+    /// step once it is past [`GROW_TO_BUDGET_PAST`]. Grown by doubling the way
+    /// a `Vec` grows, the arena reallocated at each power of two and held the
+    /// old copy and the new at once while it moved: a 64 MiB store's memtable
+    /// passed 43 MiB on its way to its 56 MiB flush line, took an 86 MiB
+    /// allocation, and held 129 MiB for the copy — the largest single thing a
+    /// store held at its peak in YCSB A, and a 64 MiB memtable kept in an
+    /// 86 MiB one afterwards (`bench/`).
+    pub fn with_budget(seed: u64, budget: usize) -> Self {
+        Memtable {
+            budget,
+            ..Self::new(seed)
+        }
+    }
+
+    /// Room in the arena for `more` bytes, before they are appended.
+    ///
+    /// Below [`GROW_TO_BUDGET_PAST`], and for a memtable with no budget,
+    /// nothing: the append grows the arena as a `Vec` grows. Past it and
+    /// within the budget, the arena is grown to the whole budget at once, so
+    /// it moves once and small, and never holds more than its budget. Past
+    /// the budget — a store with nothing to write its memtable out to fills
+    /// the whole budget, and the arena's bookkeeping takes it over — the
+    /// ordinary growth resumes: growing by exactly what each write needs
+    /// would move it on every write.
+    fn make_room(&mut self, more: usize) {
+        let needed = self.arena.len() + more;
+        if needed > self.arena.capacity() && needed > GROW_TO_BUDGET_PAST && needed <= self.budget {
+            self.arena.reserve_exact(self.budget - self.arena.len());
         }
     }
 
@@ -300,6 +347,7 @@ impl Memtable {
         // Already there? Replace its value, appending the new bytes.
         let next = self.link(prev[0], 0);
         if next != NIL && order(self.key(next), key) == Ordering::Equal {
+            self.make_room(value.len());
             let value_at = self.arena.len() as u32;
             self.arena.extend_from_slice(value);
             self.given += value.len();
@@ -309,6 +357,7 @@ impl Memtable {
         }
 
         let height = self.random_height();
+        self.make_room(LINKS + 4 * height + key.len() + value.len());
         let me = self.arena.len() as u32;
         let value_at = me as usize + LINKS + 4 * height + key.len();
         self.arena
