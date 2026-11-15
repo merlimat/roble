@@ -285,12 +285,19 @@ impl Version {
             .collect()
     }
 
-    /// The file number of every table whose key range contains `user`, into
-    /// `out`.
+    /// Every table whose key range contains `user`, into `out`: its file
+    /// number, and the largest sequence number it holds.
+    ///
+    /// The sequence number is what lets a lookup leave a table unopened: a
+    /// table whose newest entry is older than the best answer so far can
+    /// neither beat that answer nor hold a tombstone over it (`crate::read`).
+    /// It covers a table's range deletions as well as its point keys, since
+    /// flushes and compactions both count each tombstone's (`crate::flush`,
+    /// `Bounds::saw_seq`).
     ///
     /// Order does not matter to any caller: every comparison they make is by
     /// key or by trailer, never by position in the tree.
-    pub(crate) fn tables_containing(&self, user: &[u8], out: &mut Vec<u64>) -> Result<()> {
+    pub(crate) fn tables_containing(&self, user: &[u8], out: &mut Vec<(u64, u64)>) -> Result<()> {
         out.clear();
         for (level, tables) in self.levels() {
             if level == 0 {
@@ -298,11 +305,11 @@ impl Version {
                 // key and there is no order to search.
                 for meta in tables {
                     if meta.smallest_user_key()? <= user && meta.largest_user_key()? >= user {
-                        out.push(meta.file_num);
+                        out.push((meta.file_num, meta.largest_seq_num));
                     }
                 }
             } else if let Some(meta) = table_containing(tables, user)? {
-                out.push(meta.file_num);
+                out.push((meta.file_num, meta.largest_seq_num));
             }
         }
         Ok(())

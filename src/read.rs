@@ -100,8 +100,9 @@ pub struct Lookup {
     value: Vec<u8>,
     /// The encoded internal key a seek targets.
     target: Vec<u8>,
-    /// The tables whose key range holds the key being read.
-    file_nums: Vec<u64>,
+    /// The tables whose key range holds the key being read, each with the
+    /// largest sequence number it holds.
+    tables: Vec<(u64, u64)>,
     /// One table's candidate, before it is known to be the newest.
     entry_key: Vec<u8>,
     entry_value: Vec<u8>,
@@ -298,11 +299,11 @@ impl<F: Fs> Opened<F> {
         // every table's metadata out instead, two `Vec`s of bounds a table,
         // and a store settling into more tables made every lookup allocate
         // more — 28 per `get` at four tables and 122 at twenty-six, measured.
-        version.tables_containing(user, &mut buf.file_nums)?;
+        version.tables_containing(user, &mut buf.tables)?;
         let Some(found) = self.newest_for(user, buf).await? else {
             return Ok(false);
         };
-        if !self.visible(user, &found, &buf.file_nums).await? {
+        if !self.visible(user, &found, &buf.tables).await? {
             return Ok(false);
         }
         // The key an `Equal` found is the key it was asked for.
@@ -392,7 +393,7 @@ impl<F: Fs> Opened<F> {
         let Lookup {
             value,
             target,
-            file_nums,
+            tables,
             entry_key,
             entry_value,
             cursor,
@@ -403,9 +404,10 @@ impl<F: Fs> Opened<F> {
 
         // The memtables first — the one writes go to, and the one a flush is
         // writing out if there is one. Anything either holds was written
-        // after every table was, so one of them usually wins outright, but
-        // the comparison below is by trailer either way: this is an ordering
-        // of convenience, not of correctness.
+        // after every table was, so when one holds the key, every table is
+        // then skipped by the sequence-number check below. The comparison is
+        // by trailer either way: the order is what makes the skip possible,
+        // not what makes the answer right.
         for held in self.memtables_each() {
             let memtable = held.borrow();
             let mut cursor = memtable.cursor();
@@ -428,7 +430,26 @@ impl<F: Fs> Opened<F> {
             }
         }
 
-        for &file_num in file_nums.iter() {
+        for &(file_num, largest_seq) in tables.iter() {
+            // **A table too old to change the answer is not opened.** A
+            // version of the key in it would carry a sequence number no larger
+            // than the table's largest, and the best so far is already at
+            // least that new — equal included, since a candidate replaces the
+            // best only when it is strictly newer below. After a memtable has
+            // answered, that is every table: a memtable holds only writes no
+            // table has taken yet, so its entries are newer than any table's.
+            // That is what lets a read of a key just written skip the tables
+            // altogether, as Pebble and RocksDB do by stopping at the first
+            // source that has it; here it falls out of the sequence numbers
+            // rather than resting on the order sources are searched in.
+            //
+            // `<=` rather than `<` is not pinned by any test, and cannot be:
+            // a table whose newest entry ties the best so far holds nothing
+            // that could win, so the two read alike and differ only in
+            // whether that table is opened for nothing.
+            if best.as_ref().is_some_and(|b| largest_seq <= b.trailer >> 8) {
+                continue;
+            }
             let table = self.open_table(file_num).await?;
             // The filter is consulted only here: it answers about one key, and
             // the ordered comparisons are asking about a range (§6).
@@ -471,7 +492,12 @@ impl<F: Fs> Opened<F> {
     }
 
     /// Whether `found` is a live value for `user`.
-    async fn visible(&self, user: &[u8], found: &Candidate, containing: &[u64]) -> Result<bool> {
+    async fn visible(
+        &self,
+        user: &[u8],
+        found: &Candidate,
+        containing: &[(u64, u64)],
+    ) -> Result<bool> {
         if crate::table::is_deletion(found.kind) {
             return Ok(false);
         }
@@ -490,7 +516,15 @@ impl<F: Fs> Opened<F> {
         // One table at a time, rather than opening all of them and then
         // asking: any covering tombstone answers the whole question, so the
         // tables after it need not be opened at all.
-        for &file_num in containing {
+        for &(file_num, largest_seq) in containing {
+            // Only a tombstone newer than the entry covers it, and a table
+            // holds nothing newer than its largest sequence number — so a
+            // table no newer than the entry has nothing to say, and is not
+            // opened to be asked. `<=` and `<` read alike here for the same
+            // reason as in `newest_for`, and so are not told apart by a test.
+            if largest_seq <= seq {
+                continue;
+            }
             let table = self.open_table(file_num).await?;
             if crate::table::covered_by_tombstone(std::slice::from_ref(&table), user, seq)? {
                 return Ok(false);

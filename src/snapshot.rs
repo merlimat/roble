@@ -180,7 +180,7 @@ impl<D: Disk> Snapshot<D> {
         let mut containing = Vec::new();
         self.version.tables_containing(user, &mut containing)?;
         let mut bracketing = Vec::with_capacity(containing.len());
-        for file_num in containing {
+        for (file_num, _) in containing {
             bracketing.push(open_table(&*self.tables, file_num).await?);
         }
 
