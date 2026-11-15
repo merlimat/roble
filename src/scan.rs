@@ -65,12 +65,14 @@ use roble_format::key::{self, Kind};
 
 use crate::env::Disk;
 use crate::error::Result;
-use crate::read::successor;
+use crate::read::successor_into;
 use std::cell::RefCell;
 
 use crate::memtable::{Memtable, MemtableCursor};
 use crate::table::{OpenTable, TableIter, covered_by_tombstone, is_deletion};
 use crate::version::{Table, Version};
+use roble_format::TableFormat;
+use roble_format::block::restart::DataCursor;
 
 /// One source of entries in a merge: a level's tables, or a memtable.
 ///
@@ -125,9 +127,9 @@ pub(crate) async fn open_table<D: Disk>(
 /// holds tables whose key ranges do not overlap, so at most one of them can
 /// hold any given key and they can be read one after another as if they were
 /// a single table. A seek lands in the one table that can hold its target —
-/// found by its bounds in the version, which are exact — and opens it; a
-/// step off the end of a table opens the next. So making a scan opens
-/// nothing, and positioning it opens one table a level.
+/// found by its bounds in the version, which are exact — and a step off the
+/// end of a table moves to the next. So making a scan opens nothing, and
+/// positioning it opens at most one table a level.
 ///
 /// That is the whole of what this is for. A scan used to open every table its
 /// bounds reached and build an iterator for each, because holding a table
@@ -137,6 +139,33 @@ pub(crate) async fn open_table<D: Disk>(
 /// building that scan, against 32.7% in the seek that answered it. What keeps
 /// the files now is the version this holds (`crate::obsolete::Pinned`), which
 /// names the tables this has not opened yet as well as the one it has.
+///
+/// **A table the level lands in is opened only when the merge needs it.**
+/// When the table lies wholly past where the level is going — a seek whose
+/// target falls before the table starts, going forward, or after it ends,
+/// going backward, and every step from one table into the next — the
+/// level's next entry is that table's first or last, and the version already
+/// knows a key no entry of the table passes: its smallest bound, or its
+/// largest. So the level waits there, `deferred`, and stands in the merge
+/// with that bound for a key ([`Level::key`]). If the bound never reaches the
+/// top of the heap, the table is never opened; when it does, the scan opens
+/// it ([`Level::realize`]) and the heap is put right. This is what a `floor`
+/// needs from a level holding a few tables scattered over the keyspace — an
+/// L1 of nineteen at six million records — whose landing table usually ends
+/// far below the probe: seeking it would read and decode its last block for a
+/// key another level beats. A window `floor` used to try first existed to
+/// skip exactly that seek, and this skips it for every scan, either way round.
+///
+/// **Tombstones come from the table the level last opened**, as Pebble's and
+/// RocksDB's come from each level's current file ([`Scan::visible`]). A range
+/// deletion lies within its own table's bounds (§5), so of a level's tables
+/// only the one whose bounds take in the key being decided can cover it.
+/// Pebble keeps that table current by interleaving its tombstones' bounds
+/// among the point keys, so its level iterator cannot leave the table while
+/// the merge still needs them. The deferral above does the same here: the
+/// next table is not opened until its bound reaches the top of the heap, and
+/// any key a tombstone of that table can cover sorts after its bound, so by
+/// the time such a key is decided its table is the one the level has open.
 ///
 /// L0's tables overlap, so each of those is a level of its own here, one
 /// table long. That is not merely the degenerate case: it is what lets L0's
@@ -158,43 +187,25 @@ struct Level<D: Disk> {
     from: usize,
     to: usize,
     tables: Rc<dyn Opener<D>>,
-    /// Which table of the stretch is positioned, counted from `from`.
+    /// Which table of the stretch the level is on or waiting at, counted
+    /// from `from`.
     at: usize,
-    /// Its iterator. `None` until a seek has landed in a table, and after
-    /// one that found no table to land in.
+    /// The iterator of the table it last opened. `None` until a seek has
+    /// opened one, and after a seek that found no table to land in.
+    ///
+    /// While the level is `deferred` this is still the table it left, which
+    /// is what keeps that table's tombstones in reach of the keys the merge
+    /// decides before it gets to the next one.
     iter: Option<TableIter<D>>,
-    /// The tables this level has opened since it was last positioned that
-    /// hold range deletions — every table of the level a tombstone covering
-    /// the scan's next answer can be in.
-    ///
-    /// Pebble and RocksDB consult only the tombstones of each level's
-    /// current table, and can because a range deletion lies within its own
-    /// table's bounds (§5): a key the merge is deciding about lies in at
-    /// most one table of the level, and their level iterators do not move
-    /// past a table until the merge has passed its tombstones — Pebble
-    /// interleaves their bounds among the point keys to hold it there. This
-    /// is that rule without the interleaving. Going forward, the table that
-    /// can hold the key being decided is at or after the one the last seek
-    /// landed in, since the key is at or past the seek's target, and at or
-    /// before the one this is on, since this has stepped past the key; and
-    /// every table between those two is one this opened on the way. Going
-    /// backward the same holds the other way round. So the tables gathered
-    /// here since the seek take in the one that matters, and a table whose
-    /// tombstones end before its last point key is not lost when the level
-    /// steps on past it.
-    ///
-    /// Nothing is taken out until the next seek, so a long scan through a
-    /// level holds every tombstoned table it has crossed. That is never more
-    /// than a scan used to gather up front, which was every tombstoned table
-    /// its bounds reached, and usually it is nothing at all: a store nobody
-    /// has called `delete_range` on has no tombstones to gather.
-    ///
-    /// Emptying it at a seek is for its size and not for any answer, and is
-    /// untested with that reason (§12): a tombstone of any table of the
-    /// version is true of every key it covers, so a list holding more than
-    /// it needs decides nothing differently. What is tested is the other
-    /// direction — that a table the merge still needs is never missing.
-    tombstoned: Vec<Rc<OpenTable<D>>>,
+    /// Waiting at table `at` without having opened it, and which way the
+    /// scan is going: forward the level's next entry is the table's first,
+    /// backward its last.
+    deferred: Option<Dir>,
+    /// A block cursor to build the next table's iterator on, kept from the
+    /// scan this one was rebuilt out of ([`Scan::rebuild`]). A cursor
+    /// assembles the key it is on into a buffer, and a fresh one per table
+    /// opened is an allocation per table.
+    cursor: Option<(TableFormat, DataCursor)>,
 }
 
 impl<D: Disk> Level<D> {
@@ -204,6 +215,7 @@ impl<D: Disk> Level<D> {
         level: u32,
         from: usize,
         to: usize,
+        cursor: Option<(TableFormat, DataCursor)>,
     ) -> Self {
         Level {
             version: Rc::clone(version),
@@ -213,8 +225,17 @@ impl<D: Disk> Level<D> {
             tables: Rc::clone(tables),
             at: 0,
             iter: None,
-            tombstoned: Vec::new(),
+            deferred: None,
+            cursor,
         }
+    }
+
+    /// The block cursors it holds, for the next scan to build on.
+    fn into_cursors(self) -> impl Iterator<Item = (TableFormat, DataCursor)> {
+        self.iter
+            .map(TableIter::into_cursor)
+            .into_iter()
+            .chain(self.cursor)
     }
 
     /// The tables this level may read, in key order.
@@ -231,31 +252,79 @@ impl<D: Disk> Level<D> {
         self.iter.as_mut().expect("a level is on a table")
     }
 
-    fn is_valid(&self) -> bool {
+    /// Whether the table it last opened is on an entry.
+    fn on_entry(&self) -> bool {
         self.iter.as_ref().is_some_and(TableIter::is_valid)
     }
 
+    /// Whether it has an entry to offer, opened or not.
+    fn is_valid(&self) -> bool {
+        self.deferred.is_some() || self.on_entry()
+    }
+
+    /// Whether it is waiting at a table it has not opened.
+    fn is_deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// The table it last opened, whose tombstones are the level's.
+    fn table(&self) -> Option<&Rc<OpenTable<D>>> {
+        self.iter.as_ref().map(TableIter::table)
+    }
+
+    /// The key it is on, or while it is deferred the bound of the table it
+    /// is waiting at, which no entry of that table passes in the direction
+    /// the scan is going.
     fn key(&self) -> &[u8] {
-        self.iter.as_ref().expect("a level is on a table").key()
+        match self.deferred {
+            Some(Dir::Forward) => &self.metas()[self.at].smallest,
+            Some(Dir::Reverse) => &self.metas()[self.at].largest,
+            None => self.iter.as_ref().expect("a level is on a table").key(),
+        }
     }
 
     async fn value_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        debug_assert!(self.deferred.is_none(), "a deferred level has no value");
         let iter = self.iter.as_ref().expect("a level is on a table");
         iter.value_into(out).await
     }
 
-    /// Puts the level on the `i`th table of its stretch, opening it unless
-    /// it is the one the level is on already, and gathers its tombstones.
+    /// Opens the `i`th table of its stretch and puts the level on it, unless
+    /// it is the one the level last opened.
     async fn load(&mut self, i: usize) -> Result<()> {
-        if self.iter.is_none() || self.at != i {
-            let file_num = self.metas()[i].file_num;
-            let table = open_table(&*self.tables, file_num).await?;
-            self.iter = Some(table.iter());
-            self.at = i;
+        let file_num = self.metas()[i].file_num;
+        self.at = i;
+        if self.table().is_some_and(|t| t.file_num == file_num) {
+            return Ok(());
         }
-        let table = self.iter.as_ref().expect("just loaded").table();
-        if !table.tombstones.is_empty() {
-            self.tombstoned.push(Rc::clone(table));
+        let table = open_table(&*self.tables, file_num).await?;
+        let cursor = self
+            .iter
+            .take()
+            .map(TableIter::into_cursor)
+            .or(self.cursor.take());
+        self.iter = Some(table.iter_reusing(cursor));
+        Ok(())
+    }
+
+    /// Opens the table a deferred level is waiting at and puts it on that
+    /// table's first entry, or its last going backward — carrying on past
+    /// the table if it holds none, which may leave the level deferred again,
+    /// at the next.
+    async fn realize(&mut self) -> Result<()> {
+        let Some(dir) = self.deferred.take() else {
+            return Ok(());
+        };
+        self.load(self.at).await?;
+        match dir {
+            Dir::Forward => {
+                self.iter().first().await?;
+                self.onward();
+            }
+            Dir::Reverse => {
+                self.iter().last().await?;
+                self.back();
+            }
         }
         Ok(())
     }
@@ -263,90 +332,104 @@ impl<D: Disk> Level<D> {
     /// Positions on the first entry at or after `target`, an internal key.
     ///
     /// In the first table whose largest bound reaches the target — Pebble's
-    /// `findFileGE` — since every table before it ends below the target. If
-    /// this one holds nothing
-    /// that high — the target fell in the gap before the next table, or past
-    /// the last point key of one that ends in a range deletion — `onward`
-    /// carries on into the next. No table reaching it means nothing at or
-    /// after it in the stretch, and then nothing is opened at all.
+    /// `findFileGE` — since every table before it ends below the target. A
+    /// table that starts past the target is waited at rather than opened. No
+    /// table reaching the target means nothing at or after it in the
+    /// stretch.
     async fn seek_ge(&mut self, target: &[u8]) -> Result<()> {
-        self.tombstoned.clear();
+        self.deferred = None;
         let user = InternalKey::decode(target)?.user_key;
         let i = crate::version::ending_below(self.metas(), user)?;
         if i == self.metas().len() {
             self.iter = None;
             return Ok(());
         }
+        // `>` and not `>=` is not pinned by a test, and need not be (§12): a
+        // table starting at the target has its first entry for an answer
+        // either way, found by the seek below or by the wait.
+        if self.metas()[i].smallest_user_key()? > user {
+            self.at = i;
+            self.deferred = Some(Dir::Forward);
+            return Ok(());
+        }
         self.load(i).await?;
         self.iter().seek_ge(target).await?;
-        self.onward().await
+        self.onward();
+        Ok(())
     }
 
     /// Positions on the last entry before `target`, an internal key.
     ///
     /// In the last table starting below the target — Pebble's `findFileLT` —
-    /// with the same carrying on the other way: every table after it starts
-    /// at or above the target,
-    /// and none starting below it means nothing to find.
+    /// since every table after it starts at or above the target. A table
+    /// that ends before the target is waited at rather than opened, and none
+    /// starting below it means nothing to find.
     async fn seek_lt(&mut self, target: &[u8]) -> Result<()> {
-        self.tombstoned.clear();
+        self.deferred = None;
         let user = InternalKey::decode(target)?.user_key;
         let i = crate::version::starting_below(self.metas(), user)?;
         if i == 0 {
             self.iter = None;
             return Ok(());
         }
+        if self.metas()[i - 1].largest_user_key()? < user {
+            self.at = i - 1;
+            self.deferred = Some(Dir::Reverse);
+            return Ok(());
+        }
         self.load(i - 1).await?;
         self.iter().seek_lt(target).await?;
-        self.back().await
+        self.back();
+        Ok(())
     }
 
     /// Positions on the level's last entry.
     async fn last(&mut self) -> Result<()> {
-        self.tombstoned.clear();
+        self.deferred = None;
         self.load(self.metas().len() - 1).await?;
         self.iter().last().await?;
-        self.back().await
+        self.back();
+        Ok(())
     }
 
-    /// Steps forward, crossing into the next table at the end of this one.
+    /// Steps forward, onto the next table at the end of this one.
     async fn next(&mut self) -> Result<()> {
+        debug_assert!(self.deferred.is_none(), "a deferred level is not stepped");
         self.iter().next().await?;
-        self.onward().await
+        self.onward();
+        Ok(())
     }
 
-    /// Steps backward, crossing into the previous table at the start of this
-    /// one.
+    /// Steps backward, onto the previous table at the start of this one.
     async fn prev(&mut self) -> Result<()> {
+        debug_assert!(self.deferred.is_none(), "a deferred level is not stepped");
         self.iter().prev().await?;
-        self.back().await
+        self.back();
+        Ok(())
     }
 
-    /// Moves on to the next table for as long as the one the level is on has
-    /// nothing to offer, and to its first entry, which is then the answer:
-    /// everything past the table a seek chose begins above what it asked for.
+    /// Moves on to the next table when the one the level is on has nothing
+    /// more to offer, and waits there.
     ///
     /// Reached in two ways, and neither is the edge case it looks. A table
     /// can simply be spent, which is how a scan crosses from one table of a
-    /// level into the next. Or a seek can choose a table that turns out to
+    /// level into the next. Or a seek can land in a table that turns out to
     /// hold no point key that high — the table is one whose bounds reach
     /// further than its point keys, because a range deletion does, or one of
     /// the range-deletion-only ones Pebble writes.
-    async fn onward(&mut self) -> Result<()> {
-        while !self.is_valid() && self.at + 1 < self.metas().len() {
-            self.load(self.at + 1).await?;
-            self.iter().first().await?;
+    fn onward(&mut self) {
+        if !self.on_entry() && self.at + 1 < self.metas().len() {
+            self.at += 1;
+            self.deferred = Some(Dir::Forward);
         }
-        Ok(())
     }
 
-    /// The same backwards, to the previous table's last entry.
-    async fn back(&mut self) -> Result<()> {
-        while !self.is_valid() && self.at > 0 {
-            self.load(self.at - 1).await?;
-            self.iter().last().await?;
+    /// The same backwards, to the previous table.
+    fn back(&mut self) {
+        if !self.on_entry() && self.at > 0 {
+            self.at -= 1;
+            self.deferred = Some(Dir::Reverse);
         }
-        Ok(())
     }
 }
 
@@ -492,9 +575,7 @@ impl<D: Disk> Drop for Scan<D> {
     /// A scan that has gone away is one fewer open, and a store that keeps
     /// reporting scans nobody holds is how an iterator leak hides.
     fn drop(&mut self) {
-        if let Some(metrics) = &self.metrics {
-            metrics.scans_open.add(-1);
-        }
+        self.park();
     }
 }
 
@@ -512,6 +593,27 @@ struct Current {
     value: Vec<u8>,
 }
 
+/// A bound of a scan, in a buffer the scan keeps across rebuilds.
+#[derive(Default)]
+struct Bound {
+    key: Vec<u8>,
+    set: bool,
+}
+
+impl Bound {
+    fn get(&self) -> Option<&[u8]> {
+        self.set.then_some(self.key.as_slice())
+    }
+
+    fn set(&mut self, to: Option<&[u8]>) {
+        self.key.clear();
+        self.set = to.is_some();
+        if let Some(to) = to {
+            self.key.extend_from_slice(to);
+        }
+    }
+}
+
 /// A scan over the tables of a version.
 ///
 /// Forward and reverse, optionally bounded. The bounds are half-open as
@@ -526,7 +628,7 @@ pub struct Scan<D: Disk> {
     /// at once while `current` is `None`, and every other entry point seeks
     /// first.
     heap: Heap,
-    /// The buffers of the key this scan has moved off, kept to be filled
+    /// The buffers of the keys this scan has moved off, kept to be filled
     /// again.
     ///
     /// A step has to copy the user key out of a source before it can touch
@@ -534,7 +636,7 @@ pub struct Scan<D: Disk> {
     /// it cannot borrow and it cannot be skipped. What it can do is reuse the
     /// `Vec` the previous key was in, which is free the moment this scan
     /// steps off it (`advance`).
-    spare: Option<Current>,
+    spare: Vec<Current>,
     /// Kept for their range tombstones, which are not in any source.
     ///
     /// More than one when a scan is reading through an uncommitted batch
@@ -548,18 +650,53 @@ pub struct Scan<D: Disk> {
     /// reference counts, just a number and the fact that sequence numbers
     /// only go up.
     snapshot: u64,
-    lower: Option<Vec<u8>>,
-    upper: Option<Vec<u8>>,
+    lower: Bound,
+    upper: Bound,
+    /// The internal key a seek targets, and the key it is derived from when
+    /// that is not the caller's: two buffers kept rather than two allocated
+    /// a seek.
+    target: Vec<u8>,
+    scratch: Vec<u8>,
     dir: Dir,
     current: Option<Current>,
+    /// What a [`Scan::rebuild`] builds the next sources out of: the block
+    /// cursors of the levels it took apart, and the key buffers of its
+    /// memtable sources.
+    cursors: Vec<(TableFormat, DataCursor)>,
+    mem_keys: Vec<Vec<u8>>,
+    /// Whether this scan is one the store counts as open: from a rebuild to
+    /// the [`Scan::park`] or the drop after it.
+    open: bool,
     /// The store's handles, so a scan can count what it steps onto. `None`
     /// for a scan made without a store, which only the crate's own tests do.
     metrics: Option<Rc<crate::metrics::Metrics>>,
 }
 
 impl<D: Disk> Scan<D> {
-    /// A scan over `version`'s tables and `memtables`, bounded by `lower`
-    /// (included) and `upper` (excluded), positioned nowhere.
+    /// A scan over nothing, for [`Scan::rebuild`] to make one of.
+    pub(crate) fn empty(metrics: Option<Rc<crate::metrics::Metrics>>) -> Self {
+        Scan {
+            iters: Vec::new(),
+            heap: Heap::default(),
+            spare: Vec::new(),
+            memtables: Vec::new(),
+            snapshot: 0,
+            lower: Bound::default(),
+            upper: Bound::default(),
+            target: Vec::new(),
+            scratch: Vec::new(),
+            dir: Dir::Forward,
+            current: None,
+            cursors: Vec::new(),
+            mem_keys: Vec::new(),
+            open: false,
+            metrics,
+        }
+    }
+
+    /// Makes this a scan over `version`'s tables and `memtables`, bounded by
+    /// `lower` (included) and `upper` (excluded), positioned nowhere — in the
+    /// allocations of whatever scan it was before.
     ///
     /// Crate-private: its arguments are a store's internals, and the way to
     /// one from outside is [`crate::Opened::scan`].
@@ -571,18 +708,23 @@ impl<D: Disk> Scan<D> {
     /// this costs the same over fourteen tables as over two hundred and
     /// forty, where it used to open and build an iterator for every table
     /// its bounds reached.
+    ///
+    /// And it allocates nothing once the scan has been built before over as
+    /// many sources: the sources, the heap, the bounds and the key buffers
+    /// are all the old scan's, and each level builds its iterators on a block
+    /// cursor the old scan's levels left. That is what lets an ordered
+    /// comparison through a kept [`crate::Lookup`] allocate nothing.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(crate) fn rebuild(
+        &mut self,
         version: &Rc<Version>,
         tables: &Rc<dyn Opener<D>>,
-        memtables: Vec<Rc<RefCell<Memtable>>>,
+        memtables: impl Iterator<Item = Rc<RefCell<Memtable>>>,
         snapshot: u64,
-        lower: Option<Vec<u8>>,
-        upper: Option<Vec<u8>>,
-        metrics: Option<Rc<crate::metrics::Metrics>>,
-    ) -> Result<Self> {
-        let mut iters: Vec<Source<D>> = Vec::new();
-        let (low, high) = (lower.as_deref(), upper.as_deref());
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<()> {
+        self.park();
         for (level, metas) in version.levels() {
             if level == 0 {
                 // Tested one by one, because L0's overlap and so have no
@@ -590,8 +732,10 @@ impl<D: Disk> Scan<D> {
                 // invalid on its first seek, and is left out so that no seek
                 // opens it to find that out.
                 for (i, meta) in metas.iter().enumerate() {
-                    if meta.overlaps_range(low, high)? {
-                        iters.push(Source::Level(Level::new(version, tables, 0, i, i + 1)));
+                    if meta.overlaps_range(lower, upper)? {
+                        let cursor = self.cursors.pop();
+                        let level = Level::new(version, tables, 0, i, i + 1, cursor);
+                        self.iters.push(Source::Level(level));
                     }
                 }
                 continue;
@@ -602,39 +746,69 @@ impl<D: Disk> Scan<D> {
             // start at or past `upper`. Leaving them out is what stops a step
             // off the end of the stretch opening a table only to find it
             // past the bound.
-            let from = match low {
+            let from = match lower {
                 Some(lower) => crate::version::ending_below(metas, lower)?,
                 None => 0,
             };
-            let to = match high {
+            let to = match upper {
                 Some(upper) => crate::version::starting_below(metas, upper)?,
                 None => metas.len(),
             };
             if from < to {
-                iters.push(Source::Level(Level::new(version, tables, level, from, to)));
+                let cursor = self.cursors.pop();
+                let level = Level::new(version, tables, level, from, to, cursor);
+                self.iters.push(Source::Level(level));
             }
         }
-        for m in &memtables {
+        for m in memtables {
             let cursor = m.borrow().cursor();
-            iters.push(Source::Mem(MemSource {
-                table: Rc::clone(m),
+            self.iters.push(Source::Mem(MemSource {
+                table: Rc::clone(&m),
                 cursor,
-                key: Vec::new(),
+                key: self.mem_keys.pop().unwrap_or_default(),
                 valid: false,
             }));
+            self.memtables.push(m);
         }
-        Ok(Scan {
-            iters,
-            heap: Heap::default(),
-            spare: None,
-            memtables,
-            snapshot,
-            lower,
-            upper,
-            dir: Dir::Forward,
-            current: None,
-            metrics,
-        })
+        self.snapshot = snapshot;
+        self.lower.set(lower);
+        self.upper.set(upper);
+        self.dir = Dir::Forward;
+        if let Some(metrics) = &self.metrics {
+            metrics.scans.add(1);
+            metrics.scans_open.add(1);
+        }
+        self.open = true;
+        Ok(())
+    }
+
+    /// Lets go of everything this scan holds of the store — the version, the
+    /// tables, the memtables, the blocks — and keeps only its own buffers,
+    /// for the next [`Scan::rebuild`].
+    ///
+    /// A scan kept between reads has to hold nothing between them: a kept
+    /// version would keep the sweep off every table it names for as long as
+    /// the caller kept the buffer, and a kept memtable would keep its whole
+    /// arena.
+    pub(crate) fn park(&mut self) {
+        let mut iters = std::mem::take(&mut self.iters);
+        for source in iters.drain(..) {
+            match source {
+                Source::Level(level) => self.cursors.extend(level.into_cursors()),
+                Source::Mem(m) => self.mem_keys.push(m.key),
+            }
+        }
+        self.iters = iters;
+        self.memtables.clear();
+        self.heap.items.clear();
+        if let Some(current) = self.current.take() {
+            self.spare.push(current);
+        }
+        if std::mem::take(&mut self.open)
+            && let Some(metrics) = &self.metrics
+        {
+            metrics.scans_open.add(-1);
+        }
     }
 
     /// Counts one more key the scan has landed on, and the bytes it holds.
@@ -670,74 +844,73 @@ impl<D: Disk> Scan<D> {
         &self.current.as_ref().expect("scan is not on a key").value
     }
 
-    /// Seeks every source to the first entry at or after `target` and builds
-    /// the forward heap over them.
+    /// Seeks every source to the first entry at or after the internal key in
+    /// `self.target` and builds the forward heap over them.
     ///
     /// The two belong together because a heap is good for one direction only:
     /// its top is the least internal key or the greatest, never both. So
     /// every call that repositions the sources wholesale has to say which way
     /// it left them, and this is where that is said. Pebble pairs them for
     /// the same reason, in `switchToMinHeap`.
-    async fn sought_ge(&mut self, target: &[u8]) -> Result<()> {
+    async fn sought_ge(&mut self) -> Result<()> {
         for it in &mut self.iters {
-            it.seek_ge(target).await?;
+            it.seek_ge(&self.target).await?;
         }
         self.dir = Dir::Forward;
-        self.heap = Heap::new(&self.iters, Dir::Forward)?;
-        Ok(())
+        self.heap.rebuild(&self.iters, Dir::Forward)
     }
 
-    /// The same backwards: every source before `target`, greatest on top.
-    async fn sought_lt(&mut self, target: &[u8]) -> Result<()> {
+    /// The same backwards: every source before the target, greatest on top.
+    async fn sought_lt(&mut self) -> Result<()> {
         for it in &mut self.iters {
-            it.seek_lt(target).await?;
+            it.seek_lt(&self.target).await?;
         }
         self.dir = Dir::Reverse;
-        self.heap = Heap::new(&self.iters, Dir::Reverse)?;
-        Ok(())
+        self.heap.rebuild(&self.iters, Dir::Reverse)
     }
 
     /// Positions on the first key at or after `from`, respecting the bounds.
     pub async fn seek_ge(&mut self, from: &[u8]) -> Result<()> {
-        let from = match &self.lower {
-            Some(lower) if lower.as_slice() > from => lower.clone(),
-            _ => from.to_vec(),
+        let from = match self.lower.get() {
+            Some(lower) if lower > from => lower,
+            _ => from,
         };
-        let target = key::search_key(&from);
-        self.sought_ge(&target).await?;
+        key::search_key_into(from, &mut self.target);
+        self.sought_ge().await?;
         self.advance().await
     }
 
     /// Positions on the last key before `bound`, respecting the bounds.
     pub async fn seek_lt(&mut self, bound: &[u8]) -> Result<()> {
-        let bound = match &self.upper {
-            Some(upper) if upper.as_slice() < bound => upper.clone(),
-            _ => bound.to_vec(),
+        let bound = match self.upper.get() {
+            Some(upper) if upper < bound => upper,
+            _ => bound,
         };
-        let target = key::search_key(&bound);
-        self.sought_lt(&target).await?;
+        key::search_key_into(bound, &mut self.target);
+        self.sought_lt().await?;
         self.retreat().await
     }
 
     /// Positions on the first key in range.
     pub async fn first(&mut self) -> Result<()> {
-        let from = self.lower.clone().unwrap_or_default();
-        self.seek_ge(&from).await
+        // The lower bound itself, which the seek puts in place of anything
+        // below it.
+        self.seek_ge(&[]).await
     }
 
     /// Positions on the last key in range.
     pub async fn last(&mut self) -> Result<()> {
-        match self.upper.clone() {
-            Some(upper) => self.seek_lt(&upper).await,
-            None => {
-                for it in &mut self.iters {
-                    it.last().await?;
-                }
-                self.dir = Dir::Reverse;
-                self.heap = Heap::new(&self.iters, Dir::Reverse)?;
-                self.retreat().await
-            }
+        if let Some(upper) = self.upper.get() {
+            key::search_key_into(upper, &mut self.target);
+            self.sought_lt().await?;
+            return self.retreat().await;
         }
+        for it in &mut self.iters {
+            it.last().await?;
+        }
+        self.dir = Dir::Reverse;
+        self.heap.rebuild(&self.iters, Dir::Reverse)?;
+        self.retreat().await
     }
 
     /// Steps to the next key.
@@ -749,8 +922,9 @@ impl<D: Disk> Scan<D> {
         if self.dir == Dir::Reverse {
             // The iterators are all before the current key; going forward
             // means seeking past it.
-            let target = key::search_key(&successor(&current.user));
-            self.sought_ge(&target).await?;
+            successor_into(&current.user, &mut self.scratch);
+            key::search_key_into(&self.scratch, &mut self.target);
+            self.sought_ge().await?;
         }
         // Going forward, `advance` has already left them past the current key.
         self.advance().await
@@ -762,23 +936,50 @@ impl<D: Disk> Scan<D> {
             return Ok(());
         };
         if self.dir == Dir::Forward {
-            let target = key::search_key(&current.user);
-            self.sought_lt(&target).await?;
+            key::search_key_into(&current.user, &mut self.target);
+            self.sought_lt().await?;
         }
         self.retreat().await
+    }
+
+    /// The source on top of the heap, opening the table of any level that
+    /// reaches the top while waiting at one ([`Level::realize`]).
+    ///
+    /// The top is the source whose key the scan takes next, so a level there
+    /// has to say what it really holds rather than the bound it stood in
+    /// with. Opening it moves its key on the way the heap runs — the bound is
+    /// one no entry of the table passes — so putting the heap right is the
+    /// same sift a step is.
+    ///
+    /// Untested, with a reason (§12): taking the top unopened changes no
+    /// answer, because `take_newest_visible` opens a waiting level whose
+    /// bound is at the key being taken, and a key no source turns out to
+    /// hold is one the loop goes round again for. What this saves is that
+    /// turn, and a reader having to know about it.
+    async fn top(&mut self) -> Result<Option<usize>> {
+        while let Some(i) = self.heap.top() {
+            match &mut self.iters[i] {
+                Source::Level(level) if level.is_deferred() => {
+                    level.realize().await?;
+                    self.heap.stepped(&self.iters)?;
+                }
+                _ => return Ok(Some(i)),
+            }
+        }
+        Ok(None)
     }
 
     /// Moves to the next visible key, skipping deletions.
     async fn advance(&mut self) -> Result<()> {
         loop {
-            let Some(w) = self.heap.top() else {
+            let Some(w) = self.top().await? else {
                 self.current = None;
                 return Ok(());
             };
             // Into the buffer the last key vacated, which is owned locally
             // for the rest of this turn of the loop and so conflicts with no
             // borrow of `self`.
-            let mut next = self.spare.take().unwrap_or_default();
+            let mut next = self.spare.pop().unwrap_or_default();
             next.user.clear();
             next.user
                 .extend_from_slice(InternalKey::decode(self.iters[w].key())?.user_key);
@@ -786,36 +987,39 @@ impl<D: Disk> Scan<D> {
                 .take_newest_visible(&next.user, Dir::Forward, &mut next.value)
                 .await?;
 
-            if let Some(upper) = &self.upper
-                && next.user >= *upper
+            if let Some(upper) = self.upper.get()
+                && next.user.as_slice() >= upper
             {
+                self.spare.push(next);
                 self.current = None;
                 return Ok(());
             }
             if let Some((seq, kind)) = chosen
                 && self.visible(&next.user, seq, kind)?
             {
-                self.spare = self.current.replace(next);
+                if let Some(old) = self.current.replace(next) {
+                    self.spare.push(old);
+                }
                 self.stepped_onto();
                 return Ok(());
             }
             // A deletion, so round again — and the buffers go back rather
             // than being dropped.
-            self.spare = Some(next);
+            self.spare.push(next);
         }
     }
 
     /// Moves to the previous visible key, skipping deletions.
     async fn retreat(&mut self) -> Result<()> {
         loop {
-            let Some(w) = self.heap.top() else {
+            let Some(w) = self.top().await? else {
                 self.current = None;
                 return Ok(());
             };
             // Into the buffer the last key vacated, which is owned locally
             // for the rest of this turn of the loop and so conflicts with no
             // borrow of `self`.
-            let mut next = self.spare.take().unwrap_or_default();
+            let mut next = self.spare.pop().unwrap_or_default();
             next.user.clear();
             next.user
                 .extend_from_slice(InternalKey::decode(self.iters[w].key())?.user_key);
@@ -823,22 +1027,25 @@ impl<D: Disk> Scan<D> {
                 .take_newest_visible(&next.user, Dir::Reverse, &mut next.value)
                 .await?;
 
-            if let Some(lower) = &self.lower
-                && next.user < *lower
+            if let Some(lower) = self.lower.get()
+                && next.user.as_slice() < lower
             {
+                self.spare.push(next);
                 self.current = None;
                 return Ok(());
             }
             if let Some((seq, kind)) = chosen
                 && self.visible(&next.user, seq, kind)?
             {
-                self.spare = self.current.replace(next);
+                if let Some(old) = self.current.replace(next) {
+                    self.spare.push(old);
+                }
                 self.stepped_onto();
                 return Ok(());
             }
             // A deletion, so round again — and the buffers go back rather
             // than being dropped.
-            self.spare = Some(next);
+            self.spare.push(next);
         }
     }
 
@@ -899,6 +1106,19 @@ impl<D: Disk> Scan<D> {
             if !matches {
                 break;
             }
+            // A level waiting at a table it has not opened stands in with
+            // that table's bound, which can be at `user` without the table
+            // holding it. Opened, it says what it does hold, and the heap is
+            // looked at again. One whose bound is past `user` is left
+            // waiting: the test above has already told it apart, which is how
+            // a level never needed is never opened.
+            if let Source::Level(level) = &mut self.iters[i]
+                && level.is_deferred()
+            {
+                level.realize().await?;
+                self.heap.stepped(&self.iters)?;
+                continue;
+            }
             // A version written after this scan began is not its business.
             if visible_at(seq_num, self.snapshot) && chosen.is_none_or(|(seq, _)| seq_num > seq) {
                 // Into the buffer the scan already holds, which a later
@@ -922,12 +1142,13 @@ impl<D: Disk> Scan<D> {
         if is_deletion(kind) {
             return Ok(false);
         }
-        // Each level's, from the tables it has opened since it was last
-        // positioned, which take in the one table of the level that can hold
-        // a tombstone over `user` ([`Level::tombstoned`]).
+        // Each level's, from the table it last opened, which is the one
+        // table of the level that can hold a tombstone over `user` (see
+        // [`Level`]).
         for source in &self.iters {
             if let Source::Level(level) = source
-                && covered_by_tombstone(&level.tombstoned, user, seq)?
+                && let Some(table) = level.table()
+                && covered_by_tombstone(std::slice::from_ref(table), user, seq)?
             {
                 return Ok(false);
             }
@@ -977,9 +1198,13 @@ fn visible_at(seq: u64, snapshot: u64) -> bool {
 /// (`mergingIterHeap` in `merging_iter_heap.go`), and this is that structure,
 /// `winnerChild` included.
 ///
-/// Every source in the heap is on an entry: one that runs out leaves, so
+/// Every source in the heap is on an entry, or is a level waiting at a table
+/// with that table's bound for a key ([`Level`]): one that runs out leaves, so
 /// [`Heap::top`] needs no validity check and no comparison is ever made
-/// against a source positioned nowhere.
+/// against a source positioned nowhere. A waiting level's bound is one no
+/// entry of its table passes in the heap's order, so the level reaches the
+/// top no later than its next entry would, and is opened there
+/// ([`Scan::top`]).
 ///
 /// Why a second copy of this rather than the one `crate::compact` already
 /// has. The two merge different things — a compaction merges
@@ -1035,25 +1260,25 @@ enum Winner {
 }
 
 impl Heap {
-    /// Heapifies the sources that are on an entry, ordered for `dir`.
-    fn new<D: Disk>(iters: &[Source<D>], dir: Dir) -> Result<Self> {
-        let items = iters
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.is_valid())
-            .map(|(source, _)| Item {
-                source,
-                winner: Winner::Unknown,
-            })
-            .collect();
-        let mut heap = Heap {
-            items,
-            reverse: dir == Dir::Reverse,
-        };
-        for i in (0..heap.items.len() / 2).rev() {
-            heap.down(i, heap.items.len(), iters)?;
+    /// Heapifies the sources that are on an entry, ordered for `dir`, in
+    /// the heap's own allocation.
+    fn rebuild<D: Disk>(&mut self, iters: &[Source<D>], dir: Dir) -> Result<()> {
+        self.items.clear();
+        self.items.extend(
+            iters
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| it.is_valid())
+                .map(|(source, _)| Item {
+                    source,
+                    winner: Winner::Unknown,
+                }),
+        );
+        self.reverse = dir == Dir::Reverse;
+        for i in (0..self.items.len() / 2).rev() {
+            self.down(i, self.items.len(), iters)?;
         }
-        Ok(heap)
+        Ok(())
     }
 
     /// The source on the extreme internal key — least going forward, greatest
@@ -1189,27 +1414,34 @@ impl<F: crate::env::Fs> crate::Opened<F> {
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Scan<F::Disk>> {
-        // The version as it stands, held for as long as the scan is: the
-        // tables it names are the ones the scan will open as it reaches
-        // them, and holding it is what keeps the sweep off every one of them
-        // (§5, `crate::obsolete::Pinned`).
+        let mut scan = Scan::empty(Some(Rc::clone(&self.metrics)));
+        self.rebuild_scan(&mut scan, extra.into_iter(), lower, upper)?;
+        Ok(scan)
+    }
+
+    /// Makes `scan` a scan of the store as it stands, with `extra` memtables
+    /// merged in ahead of the store's, in the allocations it already has.
+    ///
+    /// The version as it stands is held for as long as the scan is: the
+    /// tables it names are the ones the scan will open as it reaches them,
+    /// and holding it is what keeps the sweep off every one of them (§5,
+    /// `crate::obsolete::Pinned`).
+    pub(crate) fn rebuild_scan(
+        &self,
+        scan: &mut Scan<F::Disk>,
+        extra: impl Iterator<Item = Rc<RefCell<Memtable>>>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<()> {
         let version = Rc::clone(&self.versions().version);
         let tables: Rc<dyn Opener<F::Disk>> = self.tables();
-        let mut memtables = extra;
-        memtables.extend(self.memtables());
-        let scan = Scan::new(
+        scan.rebuild(
             &version,
             &tables,
-            memtables,
+            extra.chain(self.memtables_each()),
             self.last_seq_num(),
-            lower.map(|b| b.to_vec()),
-            upper.map(|b| b.to_vec()),
-            Some(Rc::clone(&self.metrics)),
-        )?;
-        // Counted once it exists, so that a scan whose bounds could not be
-        // read is not one the store reports open with nothing to drop.
-        self.metrics.scans.add(1);
-        self.metrics.scans_open.add(1);
-        Ok(scan)
+            lower,
+            upper,
+        )
     }
 }

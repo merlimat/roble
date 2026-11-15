@@ -1366,17 +1366,17 @@ async fn l0s_sublevels_are_counted_and_not_its_tables() {
 
 /// A `floor` opens one table a level, not every table below its probe.
 ///
-/// What the window in `crate::read` and the lazy levels behind it
-/// (`crate::scan`) are for, and the one thing about them that no answer
-/// shows: a scan that opened more than it read would still find the right
-/// key. So this counts the table cache's lookups across one `floor` of the
-/// last key — which a scan that opened every table its bounds reached
-/// answered by opening every table of the level, since every one of them
-/// starts below it.
+/// What opening a level's tables as the merge reaches them is for
+/// (`crate::scan`), and the one thing about it that no answer shows: a scan
+/// that opened more than it read would still find the right key. So this
+/// counts the table cache's lookups across one `floor` of the last key —
+/// which a scan that opened every table its bounds reached answered by
+/// opening every table of the level, since every one of them starts below
+/// it.
 ///
-/// Two levels, because one cannot tell a window that starts where the
-/// *latest*-starting landing table does from one that starts at the
-/// earliest: with one level they are the same table. L2 holds a single table
+/// Two levels, which was for the window `floor` used to try first: one level
+/// cannot tell a window that starts where the *latest*-starting landing table
+/// does from one that starts at the earliest. L2 holds a single table
 /// spanning the whole range, under an L1 of many narrow ones.
 #[compio::test]
 async fn a_floor_opens_one_table_a_level() {
@@ -1517,4 +1517,71 @@ async fn a_scan_opens_only_the_tables_its_seeks_land_in() {
         "two seeks opened {positioned} tables, where L0's and one a level below \
          it are {reach} each"
     );
+}
+
+/// A level whose landing table lies wholly past the probe is not opened.
+///
+/// L1 holds two narrow tables far from the probe, one below it and one above,
+/// over one wide table in L2 that holds the answers. A `floor` seeks L1
+/// backward into the table below and a `ceiling` forward into the one above;
+/// either way the table's bound in the version already says that every key
+/// in it is beyond the answer L2 gives, so the level waits there rather than
+/// reading a block to find that out (`crate::scan`), and the answer comes
+/// from L2 alone. This is what a window in front of `floor` used to buy, and
+/// what lazy levels without it lost: on a store whose L1 is a few tables
+/// scattered over the keyspace, most probes land a level like that.
+#[compio::test]
+async fn a_level_whose_table_lies_past_the_probe_is_not_opened() {
+    let (options, tag) = metered("deferred-level");
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        options
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    async fn into_l1<F: Fs>(db: &roble::Opened<F>, keys: &[&str]) {
+        let mut batch = Batch::new();
+        for key in keys {
+            batch.put(key.as_bytes(), b"v").expect("put");
+        }
+        db.write(&mut batch, true).await.expect("write");
+        let table = db.flush().await.expect("flush").expect("a table");
+        db.compact(0, &[table]).await.expect("compact into L1");
+    }
+    into_l1(&db, &["k0000", "k0100", "k0300", "k0399"]).await;
+    let wide = db.versions().version.level(1)[0].file_num;
+    db.compact(1, &[wide]).await.expect("compact into L2");
+    into_l1(&db, &["a0", "a1", "a2"]).await;
+    into_l1(&db, &["z0", "z1", "z2"]).await;
+    {
+        let version = &db.versions().version;
+        assert!(version.level(0).is_empty(), "nothing in L0");
+        assert_eq!(version.level(1).len(), 2, "two narrow tables in L1");
+        assert_eq!(version.level(2).len(), 1, "one wide table in L2");
+    }
+
+    let opened = || lookups(reader(), &tag, "table").values().sum::<i64>();
+    for (how, want) in [
+        (Comparison::Floor, b"k0100"),
+        (Comparison::Ceiling, b"k0300"),
+    ] {
+        let before = opened();
+        let found = db
+            .get(b"k0200", how)
+            .await
+            .expect("get")
+            .expect("an answer in L2");
+        assert_eq!(found.key, want, "{how:?}");
+        assert_eq!(
+            opened() - before,
+            1,
+            "a {how:?} answered from L2 should open L2's table and nothing in L1"
+        );
+    }
 }

@@ -492,20 +492,27 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   This is the part with no encina counterpart and the most room to be slow;
   §6 says what it must not do.
 
-  A scan opens **only the tables its seeks and steps land in**: each level
-  below L0 is one lazy iterator over the stretch of its tables the scan's
-  bounds reach, which opens the table a seek lands in and the next one when a
-  step runs off its end, as Pebble's `levelIter` and RocksDB's
-  `LevelIterator` do; each L0 table is a level of its own, one table long.
-  So making a scan costs a binary search a level and opens nothing, and
-  positioning it opens one table a level. The version it holds is what
+  A scan opens **only the tables the merge reaches**: each level below L0
+  is one lazy iterator over the stretch of its tables the scan's bounds
+  reach, as Pebble's `levelIter` and RocksDB's `LevelIterator` are; each L0
+  table is a level of its own, one table long. A seek lands in the one table
+  of a level that can hold its target, and when that table lies wholly past
+  where the level is going — or a step runs off the end of one table into
+  the next — the level does not open it but waits there, standing in the
+  merge with the table's bound from the version, which no entry of the table
+  passes. The table is opened only if that bound reaches the top of the
+  heap. So making a scan costs a binary search a level and opens nothing,
+  and positioning it opens at most one table a level, and none in a level
+  whose landing table cannot hold the answer. The version it holds is what
   keeps the tables it has not reached yet on disk, and the price is
   Pebble's: a scan over a handful of keys keeps every table of its version
   from the sweep for as long as the cursor is open. Range deletions come
-  from the tables each level has opened since it was last positioned, which
-  is enough because a tombstone lies within its own table's bounds — so the
-  one table of a level that can hold a tombstone over the key being decided
-  is one the level has passed through on its way there.
+  from the table each level last opened, as Pebble's come from each level's
+  current file: a tombstone lies within its own table's bounds, and since a
+  level does not open its next table until the merge reaches that table's
+  bound, the table it has open is the one whose tombstones can cover the key
+  being decided. Pebble holds a level on its table the same way, by
+  interleaving the tombstones' bounds among the point keys.
 - **One change at a time to what a store is made of**, and it is enforced
   rather than hoped for (`crate::change`). A flush, a compaction, a MANIFEST
   rotation and the obsolete sweep each take a permit first, and
@@ -735,41 +742,42 @@ pins a version by reference count when an iterator is made (`readState`,
 the table a seek lands in (`levelIter`, `LevelIterator`), so making any
 iterator costs a few allocations however many tables the store holds, and
 neither has a path special to `floor`. A roble scan holds an `Rc<Version>`,
-the sweep keeps every table a held version names (§5), and a level opens the
-table its seek lands in (`crate::scan`).
+the sweep keeps every table a held version names (§5), and a level opens a
+table only when the merge reaches it (`crate::scan`).
 
-Short scans are where that paid. Over the same six-million-record store on
-one pinned core, five rounds alternating against the build before it,
-`scan-short` went from 25,332 to 45,439 a second (**1.79x**, 1.71x to 1.92x a
-round) and YCSB-E from 25,882 to 43,349 (**1.67x**), which is 0.49x to 0.89x and
-0.51x to 0.85x of RocksDB measured in the same session. `get`, which builds no
-scan, was unmoved (1.00x), and so was a full scan (1.03x).
+**Opening only when the merge reaches it is what made `floor`'s window
+redundant**, and opening on landing alone did not. #134 had `floor` and
+`lower` scan a window just below the probe first, inside one table of every
+level, falling back to the half-open scan only when nothing in the window was
+visible; that took `floor` from 66,069 to 210,140 a second (3.18x), 0.93x of
+RocksDB. Lazy levels that opened every table a seek landed in made building
+the half-open scan cheap — 8.3% of a lookup down to 4.0% — but ran `floor` at
+0.77x of the window, because the seek grew from 62% to 73%: L1 held nineteen
+tables scattered over the keyspace at six million records, against L2's 189,
+so a backward seek usually landed in one ending far below the probe and read
+and decoded its last block for a key another level beat. The window had
+skipped that seek by starting past such a table. A level that waits at the
+table instead, with its bound in the heap, skips it for every scan in either
+direction, so the four ordered comparisons are one scan each again and the
+window is gone.
 
-**And a backward comparison still tries a window first**, which lazy levels
-did not make redundant. Before them, `floor` and `lower` scanned a window just
-below the probe first, inside one table of every level, and fell back to the
-half-open scan only when nothing in the window was visible; that took `floor`
-from 66,069 to 210,140 a second on one pinned core (3.18x), 0.93x of RocksDB,
-without touching what may be deleted. What it saved then was building the
-scan. What it saves now is seeking: a half-open scan seeks every level with a
-table starting below the probe, and a level holding a few tables scattered
-over the keyspace — L1 held nineteen at six million records, against L2's 189
-— usually lands in one that ends far below the probe, where a backward seek
-reads and decodes the table's last block for a key another level beats. The
-window starts past such a table, so its scan has nothing in that level to
-seek. Measured without it, lazy levels alone ran `floor` at 0.77x of the
-window on the same store; the profile showed building the scan down from 8.3%
-to 4.0% of a lookup and the seek up from 62% to 73%, with a block's last
-entry (`Cursor::last`) appearing where it had not been. With both, `floor` is
-1.02x of the window alone, and level with RocksDB.
+Measured over the same six-million-record store on one pinned core, five
+rounds alternating against the build with the window: `scan-short` went from
+25,059 to 44,232 a second (**1.77x**) and YCSB-E from 25,540 to 43,448
+(**1.70x**), which is 0.48x to 0.85x and 0.50x to 0.85x of RocksDB measured in
+the same session. `floor`, with no window, was **1.03x** of the window in every
+round, level with RocksDB. `get`, which builds no scan, and a full scan were
+unmoved (1.00x, 1.02x).
 
-The window's answer is exact rather than a guess. A scan bounded to it reads
-every table holding an entry in it and every tombstone that can cover one — a
-range deletion lies inside its own table's bounds (§5) — and never answers
-from below its lower bound, so the greatest visible key in the window, if
-there is one, is the floor. A window that holds nothing visible is one whose
-every key is deleted, and only then does the answer lie further down.
-
+**A kept `Lookup` makes an ordered comparison allocate nothing.** A scan has
+more to build than a point lookup — a source a level and a memtable, a heap,
+its bounds, the key it seeks to, a block cursor a table it opens — and a
+`floor` built one and dropped it on every call, 24 allocations, 30 for a
+`ceiling`. A `Lookup` now keeps one scan parked between calls and rebuilds it
+in its own allocations, so once warm the four ordered comparisons allocate
+nothing, as `Equal` already did (`tests/allocations.rs`). Parked, it holds
+nothing of the store — no version, table or memtable — so keeping the buffer
+keeps no file from the sweep.
 ### `delete_range(start..end)`
 
 A range tombstone, written to the memtable's range-deletion skiplist and then to

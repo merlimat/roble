@@ -702,6 +702,31 @@ impl<D: Disk> OpenTable<D> {
         self.iter_with(Caching::Keep)
     }
 
+    /// The same, on a block cursor kept from another iterator, if it was
+    /// built for this table's format: a cursor assembles the key it is on
+    /// into a buffer, and reusing one is reusing that buffer.
+    pub(crate) fn iter_reusing(
+        self: &Rc<Self>,
+        cursor: Option<(
+            roble_format::TableFormat,
+            roble_format::block::restart::DataCursor,
+        )>,
+    ) -> TableIter<D> {
+        let cursor = match cursor {
+            Some((format, cursor)) if format == self.footer.format => cursor,
+            _ => roble_format::block::restart::DataCursor::new(self.footer.format),
+        };
+        TableIter {
+            caching: Caching::Keep,
+            cursor,
+            table: Rc::clone(self),
+            at: 0,
+            bytes: None,
+            ahead: 0,
+            ahead_back: false,
+        }
+    }
+
     /// The same, saying what its block reads do with what they fetch.
     pub fn iter_with(self: &Rc<Self>, caching: Caching) -> TableIter<D> {
         TableIter {
@@ -725,6 +750,17 @@ impl<D: Disk> TableIter<D> {
     /// The table it reads.
     pub(crate) fn table(&self) -> &Rc<OpenTable<D>> {
         &self.table
+    }
+
+    /// Its block cursor, with the format it was built for, to build another
+    /// iterator on ([`OpenTable::iter_reusing`]).
+    pub(crate) fn into_cursor(
+        self,
+    ) -> (
+        roble_format::TableFormat,
+        roble_format::block::restart::DataCursor,
+    ) {
+        (self.table.footer.format, self.cursor)
     }
 
     /// The encoded internal key it is on.

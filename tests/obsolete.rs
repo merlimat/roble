@@ -606,6 +606,39 @@ async fn a_scan_holds_every_table_of_its_version_until_it_goes() {
     }
 }
 
+/// A `Lookup` kept between reads keeps no table from the sweep.
+///
+/// The four ordered comparisons go through a scan the `Lookup` keeps, parked
+/// between calls so that the next one builds in its allocations rather than
+/// making new ones (`roble::read`). A scan holds the version it was made on,
+/// and the sweep keeps every table a held version names — so a parked scan
+/// that went on holding its version would keep a compaction's inputs on disk
+/// for as long as a caller kept the buffer, which for a buffer kept on
+/// purpose is the life of the process.
+#[compio::test]
+async fn a_kept_lookup_holds_no_table_between_reads() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let retired = in_l0(&db);
+
+    let mut buf = roble::Lookup::new();
+    for how in [Comparison::Floor, Comparison::Ceiling] {
+        db.get_into(b"m", how, &mut buf).await.expect("get_into");
+    }
+
+    db.compact(0, &retired).await.expect("compact");
+
+    let names = listing(env.sim(), &dir).await;
+    for file_num in &retired {
+        let name = files::table_filename(*file_num);
+        assert!(
+            !names.contains(&name),
+            "{name} was kept by a Lookup nothing is reading through: {names:?}"
+        );
+    }
+    drop(buf);
+}
+
 /// A table a point lookup has chosen is not collected before it is read.
 ///
 /// A `get` takes the file numbers of the tables whose bounds contain its key
