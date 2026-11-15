@@ -311,9 +311,12 @@ impl Memtable {
         let height = self.random_height();
         let me = self.arena.len() as u32;
         let value_at = me as usize + LINKS + 4 * height + key.len();
-        self.arena.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        self.arena.extend_from_slice(&(value_at as u32).to_le_bytes());
-        self.arena.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.arena
+            .extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.arena
+            .extend_from_slice(&(value_at as u32).to_le_bytes());
+        self.arena
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.arena.push(height as u8);
         for _ in 0..height {
             self.arena.extend_from_slice(&NIL.to_le_bytes());
