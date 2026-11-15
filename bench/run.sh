@@ -14,68 +14,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Runs every engine over the same workload and prints one table of all of them.
-# See README.md.
+# Runs every engine over the same workloads in one standard environment, and
+# prints a table per scenario. See README.md, "One core, 512 MiB".
 #
-# Five passes, because they answer different questions:
+# **One environment.** Every engine's process is held to one CPU and 512 MiB
+# of memory, page cache included and swap excluded: one shard of a deployment
+# that runs a store per core. roble uses one core by design, compaction
+# included, so a machine-wide run is roble's one core against RocksDB's
+# background threads; and an uncapped run lets the page cache hold any store
+# the machine has room for, so nothing is ever read from a device.
 #
-#   1. Every phase, every engine, in one table. The phases share a cache and
-#      run in order, so whichever of the two scans goes second reads one the
-#      first warmed — which is why `scan-rev` goes first, pointing the bias
-#      against the direction under suspicion.
-#   2. Each scan direction in a process of its own over a freshly loaded store,
-#      so neither reads a cache the other warmed. This is the comparison
-#      DESIGN.md §14 asks for, and the first pass only approximates it.
-#   3. Batch insert against single insert, at the same total number of
-#      records, so the per-commit cost can be told from the per-record cost.
-#   4. The reads under a memory budget, which is the only pass where a random
-#      lookup reaches a device: dropping the page cache cannot hold one cold,
-#      because the lookups fault the store straight back in.
-#   5. The layout: every table of every level, with its size and key range,
-#      which is what a scan number has to be read against.
+# **Two scenarios** inside it, differing only in how much data there is:
 #
-# ENGINES picks which to run; the default is all of them. roble needs nothing
-# installed. encina is fetched from git. RocksDB needs a C++ toolchain and
-# libclang, which is why neither is a default cargo feature:
+#   in-cache        1,400,000 records, about 200 MiB on disk. It fits the
+#                   256 MiB block cache, so once the scans have warmed it the
+#                   reads never leave the process.
+#   beyond-memory   6,000,000 records, about 850 MiB. More than the 512 MiB the
+#                   process may hold, cache and page cache together, so the
+#                   reads that miss the block cache go to the device.
 #
-#   ENGINES="roble" ./run.sh                 # nothing to install
-#   ENGINES="roble encina" ./run.sh          # adds a git fetch
+# Each scenario prints two tables, every phase and YCSB A to F, with each
+# engine's run in a process of its own and each YCSB mix over a store loaded
+# and settled for it alone. That is all this runs: the passes that compared
+# one setting against another — six cores, an uncapped cache, a separate
+# memory budget, the WAL, the batch size, each scan direction alone — are
+# gone, and the binary still does any of them run by hand.
 #
-# Go Pebble is **not** here any more. It had a driver of its own under
-# `harness/bench`, written to this harness's phases and key shape; that is
-# gone, and `cmd/pebble`'s own benchmarks do not replace it, because they
-# build their own keys. See the README.
+#   ENGINES   which engines (roble rocksdb encina). RocksDB needs a C++
+#             toolchain and libclang; encina is fetched from git.
+#   CPU       the core to pin to (3). Not 0, which on a VM usually carries
+#             the network and console interrupts on top of a block queue.
+#   MEM_MB    the memory cap (512), and CACHE_MB the block cache (256).
+#   BENCH_DIR where the stores go (a temporary directory). Never a tmpfs:
+#             its pages count against the cap, and a store there is memory.
+#   KEEP=1    leaves the stores on disk.
 #
-# KEEP=1 leaves the stores on disk instead of removing them, and BENCH_DIR
-# puts them somewhere chosen rather than in a temporary directory — for
-# looking at what a run actually wrote:
+# Anything else is passed to every run after the standard arguments, so it
+# wins over them: `./run.sh --min-seconds 2` for a quick look.
 #
-#   KEEP=1 BENCH_DIR=/tmp/bench ./run.sh --phases load,settle
-#
-# BUDGET_MB is the memory budget the read pass holds the engines to, in MiB
-# (256 by default), and is the knob to raise if an engine cannot finish inside
-# it:
-#
-#   BUDGET_MB=512 ./run.sh --batches 600 --records 10000
-#
-# --cache-mb is passed through, so a single engine can be swept across cache
-# sizes directly; run.sh runs the reads at two of them (see below).
-#   cargo run -p roble-cli -- manifest dump /tmp/bench/all-roble/roble/shard-0000
-#
-# Everything else is passed straight through, so
-#   ./run.sh --shards 8 --batches 2000 --records 500
-# works as it does on any engine alone.
+# The cap needs Linux, cgroup v2 with the memory controller, and either a
+# systemd user session with it delegated or passwordless sudo. Without them
+# this refuses rather than print numbers that look standard and are not;
+# `STANDARD=0` runs uncapped and unpinned anyway, for a smoke test, and says
+# so above every table.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ENGINES="${ENGINES:-roble rocksdb encina}"
+CPU="${CPU:-3}"
+MEM_MB="${MEM_MB:-512}"
+CACHE_MB="${CACHE_MB:-256}"
 
-# Where every store of every pass is written. Printed rather than hidden,
-# because the thing a run leaves behind is often what you wanted to look at:
-# `KEEP=1` leaves it for `ls`, `roble sst dump` and `roble manifest dump`.
-#
-# One directory per pass per engine under it, named `<pass>-<engine>/<engine>`,
-# since each engine makes its store under the `--dir` it is given.
 out="${BENCH_DIR:-$(mktemp -d)}"
 mkdir -p "$out"
 if [ -n "${KEEP:-}" ]; then
@@ -83,294 +72,138 @@ if [ -n "${KEEP:-}" ]; then
 else
   trap 'rm -rf "$out"' EXIT
 fi
+if [ "$(uname -s)" = Linux ] && [ "$(stat -f -c %T "$out")" = tmpfs ]; then
+  echo "run.sh: $out is a tmpfs. Its pages count against the ${MEM_MB} MiB cap, so" >&2
+  echo "a store there is memory, not disk; set BENCH_DIR to a disk-backed path." >&2
+  exit 2
+fi
 echo "writing the stores under $out${KEEP:+ (kept)}"
 
-args=("$@")
+# **The cap, verified rather than assumed.** A `-p MemoryMax=` that systemd
+# accepts and an undelegated controller never applies would give numbers that
+# look capped and are not, so each way of applying it is tried and the scope
+# is asked what limits it actually holds — the cap, no swap, one CPU.
+#
+# A user scope first, which needs no root. Then a system scope through sudo,
+# for a CI runner without a user session, dropping back to this user inside
+# it so the stores are not root's.
+limit=()
+try_limit() {
+  local got
+  # Single-quoted: the reads run inside the scope, where the answer is.
+  # shellcheck disable=SC2016
+  got=$("$@" sh -c 'g=/sys/fs/cgroup$(cut -d: -f3 < /proc/self/cgroup);
+                    echo "$(cat $g/memory.max) $(cat $g/memory.swap.max) $(nproc)"' \
+          2>/dev/null) || return 1
+  [ "$got" = "$((MEM_MB * 1024 * 1024)) 0 1" ]
+}
+if [ "$(uname -s)" = Linux ] && command -v systemd-run > /dev/null && command -v taskset > /dev/null; then
+  user_scope=(systemd-run --user --scope --quiet
+              -p MemoryMax="${MEM_MB}M" -p MemorySwapMax=0 -- taskset -c "$CPU")
+  sudo_scope=(sudo --non-interactive systemd-run --scope --quiet
+              -p MemoryMax="${MEM_MB}M" -p MemorySwapMax=0 --
+              sudo --non-interactive -u "$(id -un)" env PATH="$PATH" taskset -c "$CPU")
+  if try_limit "${user_scope[@]}"; then
+    limit=("${user_scope[@]}")
+  elif try_limit "${sudo_scope[@]}"; then
+    limit=("${sudo_scope[@]}")
+  fi
+fi
+if [ ${#limit[@]} -eq 0 ]; then
+  if [ "${STANDARD:-1}" != 0 ]; then
+    echo "run.sh: cannot hold a process to one CPU and ${MEM_MB} MiB here (see the" >&2
+    echo "header); STANDARD=0 runs uncapped and unpinned, as a smoke test." >&2
+    exit 2
+  fi
+  banner="NOT THE STANDARD: uncapped and unpinned (STANDARD=0)"
+else
+  banner="one CPU (cpu $CPU), ${MEM_MB} MiB, no swap, ${CACHE_MB} MiB block cache"
+fi
 
-# Pebble's own logging goes to stdout; the lines worth reading are the ones the
-# benchmark prints, and the rest is Pebble narrating its compactions.
-run_engine() {
+# Each engine built once, before anything is capped, and copied aside: the
+# feature sets share one output path, and a build is neither part of the
+# measurement nor something to fit in 512 MiB.
+bin="$out/bin"
+mkdir -p "$bin"
+target_dir=$(cargo metadata --format-version 1 --no-deps \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+for engine in $ENGINES; do
+  case "$engine" in
+    roble) cargo build --release --quiet -p roble-bench ;;
+    encina|rocksdb) cargo build --release --quiet -p roble-bench --features "$engine" ;;
+    *) echo "run.sh: unknown engine $engine" >&2; exit 2 ;;
+  esac
+  cp "$target_dir/release/roble-bench" "$bin/roble-bench-$engine"
+done
+
+# One run of one engine, inside the cap, keeping only its tab-separated lines.
+#
+# A run the cap kills is a result, not a reason to stop: it comes out as a
+# skipped row, which `pivot.py` prints under the table, and the next engine
+# runs. `${limit[@]+...}` because bash 3.2, macOS's, calls an empty array
+# unbound under `set -u`, and empty is what `STANDARD=0` makes it.
+run() {
   local engine="$1" dir="$2"
   shift 2
-  case "$engine" in
-    roble)
-      cargo run --release --quiet -p roble-bench -- --dir "$dir" "$@"
-      ;;
-    encina|rocksdb)
-      cargo run --release --quiet -p roble-bench --features "$engine" -- \
-        --engine "$engine" --dir "$dir" "$@"
-      ;;
-    *)
-      echo "run.sh: unknown engine $engine" >&2
-      exit 2
-      ;;
-  esac
+  local status=0
+  ${limit[@]+"${limit[@]}"} "$bin/roble-bench-$engine" --engine "$engine" --dir "$dir" \
+    --tsv "$@" > "$dir.tsv" || status=$?
+  awk -F'\t' 'NF >= 3' "$dir.tsv"
+  if [ "$status" -ne 0 ]; then
+    local why="exited with $status"
+    if [ ${#limit[@]} -gt 0 ]; then
+      why="$why inside the ${MEM_MB} MiB cap"
+      [ "$status" -ne 137 ] || why="killed inside the ${MEM_MB} MiB cap: out of memory"
+    fi
+    printf '%s\trun\tskipped\t%s\n' "$engine" "$why"
+  fi
+  # The lines are all that is read afterwards, so the store goes now rather
+  # than with the others at exit: a scenario holds one store at a time.
+  [ -n "${KEEP:-}" ] || rm -rf "$dir" "$dir.tsv"
 }
 
-# Collects every engine's `--tsv` lines and pivots them into one table.
-#
-# A store goes as soon as the engine that wrote it is done, because otherwise
-# this script's disk footprint is every pass at once rather than one store:
-# nine tables times three engines is twenty-seven stores held to the exit trap
-# for no reason, and at the dataset size the README asks for -- upwards of
-# half a million records a shard, so the load row is not measuring a skiplist
-# -- that is tens of gigabytes and the run dies partway with ENOSPC. `KEEP=1`
-# still keeps everything; it is the flag that says the stores are the point.
-table() {
-  local tag="$1"
-  shift
-  local lines="$out/$tag.tsv"
+# The phases with a question of their own here. `get-cold` reopened the store
+# to read with an empty cache, which the second scenario now asks of every
+# phase; and the default run's own YCSB mix is in the table that has all six.
+PHASES=load,settle,scan-rev,scan,get,floor,scan-short,checkpoint
+
+scenario() {
+  local name="$1" batches="$2"
+  shift 2
+  local common=(--batches "$batches" --records 10000 --reads 1000
+                --cache-mb "$CACHE_MB" --no-wal "${@}")
+  # The standard size, or what was passed instead: an override is printed as
+  # given rather than a count it may have changed.
+  local what="$((batches * 10000)) records"
+  [ $# -eq 0 ] || what="with $*"
+
+  echo
+  echo "=== $name: every phase, $what — $banner ==="
+  echo
+  local lines="$out/$name-phases.tsv"
   : > "$lines"
   for engine in $ENGINES; do
-    # Only the tab-separated lines: a build wrapper or a toolchain can put
-    # its own chatter on stdout, and the pivot should see measurements only.
-    run_engine "$engine" "$out/$tag-$engine" --tsv "$@" \
-      | awk -F'\t' 'NF >= 3' >> "$lines"
-    # Here rather than after the pivot: the pivot reads `$lines`, not the
-    # store, so an engine's store is dead the moment its run returns, and
-    # waiting for its two neighbours would hold three at once for nothing.
-    [ -n "${KEEP:-}" ] || rm -rf "$out/$tag-$engine"
+    run "$engine" "$out/$name-$engine" --phases "$PHASES" "${common[@]}" >> "$lines"
   done
   python3 pivot.py --metrics rate,p50,cpu,size < "$lines"
-}
 
-echo "=== every engine, every phase ==="
-echo
-table all "${args[@]}"
-
-echo
-echo "=== each scan direction on its own, over a store of its own ==="
-echo "(so neither direction reads a cache the other warmed)"
-for dir in scan-rev scan; do
   echo
-  table "$dir" "${args[@]}" --phases "load,settle,$dir"
-done
-
-# The same records, written in the configured batch against one a tenth the
-# size. The load row's rate is records per second either way, so it is
-# directly comparable, and the p50 is one commit of each size.
-#
-# **Both sides batch.** This used to write the small side one record per
-# commit, which separated per-commit cost from per-record cost cleanly and was
-# untenable at any real dataset size: a copy-on-write B+tree writes a new root
-# per commit, so encina spent over an hour on six million of them and 2.2 GiB
-# of disk, to measure a ratio two batch sizes give just as well. A hundredfold
-# spread between them says what a single insert said.
-#
-# The totals are matched by moving the records into the batch count, which
-# needs the two numbers this was asked for; without them it is the defaults.
-batches=200
-records=10000
-for ((i = 0; i < ${#args[@]}; i++)); do
-  case "${args[$i]}" in
-    --batches) batches="${args[$((i + 1))]}" ;;
-    --records) records="${args[$((i + 1))]}" ;;
-  esac
-done
-total=$((batches * records))
-
-small=$((records / 10))
-[ "$small" -gt 0 ] || small=1
-small_batches=$((total / small))
-
-echo
-echo "=== a commit of $records records against one of $small, $total records either way ==="
-echo
-echo "-- batches of $records --"
-table batch "${args[@]}" --phases load --batches "$batches" --records "$records"
-echo
-echo "-- batches of $small --"
-table smallbatch "${args[@]}" --phases load --batches "$small_batches" --records "$small"
-
-# The same insert, with the journal and without it. Within one engine this is
-# an honest comparison even on macOS, because it is that engine's own sync
-# both times; across engines the WAL-on row is not, since Go syncs with
-# F_FULLFSYNC there and compio and RocksDB with fsync (README.md).
-#
-# `--no-wal` is dropped from the passed-through arguments for the first row,
-# since there is no flag that turns the journal back on. encina appears in
-# both rows with the same number: it commits durably either way and has no
-# flag to give it.
-without_no_wal=()
-for ((i = 0; i < ${#args[@]}; i++)); do
-  [ "${args[$i]}" = "--no-wal" ] || without_no_wal+=("${args[$i]}")
-done
-
-echo
-echo "=== insert with the journal against without it ==="
-echo
-echo "-- journal on: every commit synced --"
-table journal-on "${without_no_wal[@]}" --phases load
-echo
-echo "-- journal off: a flush is the only durability point, as Oxia runs it --"
-table journal-off "${without_no_wal[@]}" --phases load --no-wal
-
-# The same reads with the data inside the cache and far outside it, which is
-# how encina's own benchmark frames it. The sizes are picked from the data:
-# the store is about 8.4 MiB a shard at the defaults, so 64 MiB holds every
-# shard and 4 MiB holds an eighth of one.
-#
-# What this does and does not reach: roble, Pebble and RocksDB all read
-# through the operating system's page cache (§8 — direct I/O is the goal and
-# not the state), so the small-cache rows measure the block-cache *miss* path
-# — finding, parsing and copying a block again — and not a trip to a disk. A
-# genuinely disk-bound comparison needs a working set larger than RAM, which
-# is a different run and a much longer one.
-echo
-echo "=== the reads with the data in cache, and with it out ==="
-echo
-echo "-- 64 MiB cache: every shard fits --"
-table cache-in "${args[@]}" --phases load,settle,scan-rev,scan,get,floor,get-cold --cache-mb 64
-echo
-echo "-- 4 MiB cache: an eighth of one shard fits --"
-table cache-out "${args[@]}" --phases load,settle,scan-rev,scan,get,floor,get-cold --cache-mb 4
-
-# The one pass that reaches a disk. Everything above it keeps the store in the
-# page cache, so a small block cache only measures the miss path in RAM — as
-# the encina row in the pass above shows, where bypassing the page cache by
-# design cost it two hundred times rather than the few times a cache miss
-# should.
-#
-# So: load in one process, drop the page cache, read in another. Dropping it
-# needs root, which the benchmark does not have and should not ask for, hence
-# the split and the `--reuse` flag. Without a working `drop_caches` the pass
-# says so and is skipped rather than reporting numbers that look like disk
-# reads and are not.
-drop_caches() {
-  [ "$(uname -s)" = Linux ] || return 1
-  sync
-  sudo --non-interactive sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null
-}
-
-echo
-if drop_caches; then
-  echo "=== the reads from a disk: page cache dropped after the load ==="
+  echo "=== $name: YCSB A to F, $what — $banner ==="
   echo
-  lines="$out/cold-disk.tsv"
+  lines="$out/$name-ycsb.tsv"
   : > "$lines"
   for engine in $ENGINES; do
-    run_engine "$engine" "$out/disk-$engine" "${args[@]}" \
-      --phases load,settle --cache-mb 4 > /dev/null
-    drop_caches || true
-    run_engine "$engine" "$out/disk-$engine" "${args[@]}" --reuse --tsv \
-      --phases scan,get,floor --cache-mb 4 \
-      | awk -F'\t' 'NF >= 3' >> "$lines"
-    # Not before the `--reuse` above, which is the whole point of this pass
-    # writing the store in one process and reading it in another.
-    [ -n "${KEEP:-}" ] || rm -rf "$out/disk-$engine"
+    for w in A B C D E F; do
+      # Only the mix's own row: each run loads and settles a store of its
+      # own, and six load rows an engine would say nothing the table above
+      # does not.
+      run "$engine" "$out/$name-ycsb-$w-$engine" \
+        --phases load,settle,ycsb --workload "$w" "${common[@]}" \
+        | awk -F'\t' '$2 ~ /^ycsb-/ || $3 == "skipped"' >> "$lines"
+    done
   done
-  python3 pivot.py --metrics rate,p50,cpu < "$lines"
-else
-  echo "=== the reads from a disk: skipped ==="
-  echo "(needs Linux and a sudo that can write /proc/sys/vm/drop_caches;"
-  echo " without it a small cache only measures the miss path in RAM)"
-fi
-
-# The reads under a memory budget, which is the one pass that holds a
-# *random* lookup to a device. The pass above does not, and it is worth being
-# exact about why, because its rows look as though it does: it runs `scan`,
-# `get` and `floor` in that order, and the scan reads the whole store back into
-# the page cache in key order, so the lookups after it run warm. Only its
-# `scan` row is cold. At six million records and the 4 MiB cache both passes
-# use, roble's `get` reads 18.5x encina's warm, 17x after `drop_caches` and
-# 1.7x under this pass; `floor` 4.5x, 4.7x and 1.01x. Dropping the cache moves
-# neither ratio. The budget is what moves them.
-#
-# Reordering would not rescue it either. Random reads on their own re-warm a
-# store slowly rather than at once: with the page cache dropped and nothing but
-# YCSB C after it, roble ran at 0.71x its warm rate and RocksDB at 0.33x across
-# a whole ten-second phase, with p99 at 73 and 118 us against 8 and 5 warm. That
-# is a measurement of a restart — a cold store warming up — and not of a store
-# held to a budget, which is what this pass is for.
-#
-# A cgroup gives what emptying the cache cannot. cgroup v2 charges a page to
-# whichever cgroup first faulted it in, so a budget the store does not fit in
-# has the kernel reclaiming it for as long as the phase runs rather than
-# keeping it resident. systemd's user session normally has the memory
-# controller delegated, so unlike `drop_caches` this needs no root.
-#
-# BUDGET_MB sets the budget. It has to clear every engine's own footprint —
-# its block cache, and its open tables' indexes and filters, which since
-# `DEFAULT_OPEN_TABLES` went unlimited are held outside that cache — or the
-# pass measures an engine thrashing against its own cache rather than reading
-# a store too large to cache. 256 MiB clears the 40–70 MiB the three engines
-# want at `--cache-mb 4`.
-budget_mb="${BUDGET_MB:-256}"
-
-# Whether the budget is really in force, rather than quietly ignored. A
-# `-p MemoryMax=` that systemd accepts and an undelegated controller never
-# applies would give numbers that look budgeted and are not, which is the one
-# failure this pass must not have.
-cgroup_budget_works() {
-  [ "$(uname -s)" = Linux ] || return 1
-  command -v systemd-run > /dev/null 2>&1 || return 1
-  local got
-  # Single-quoted on purpose: the substitution has to run in the inner shell,
-  # inside the scope, since the question is what *that* cgroup's budget is.
-  # shellcheck disable=SC2016
-  got=$(systemd-run --user --scope --quiet -p MemoryMax=64M -- \
-          sh -c 'cat /sys/fs/cgroup$(cut -d: -f3 < /proc/self/cgroup)/memory.max' \
-          2>/dev/null | tr -d '[:space:]')
-  [ "$got" = "$((64 * 1024 * 1024))" ]
+  python3 pivot.py --metrics rate,p50,p99 < "$lines"
 }
 
-# The binary, not `cargo run`: this pass puts the command inside the budget,
-# and cargo's own footprint is not the measurement. Every feature set writes
-# the same path, so the build has to be the one immediately before the run
-# that uses it.
-build_engine() {
-  case "$1" in
-    roble) cargo build --release --quiet -p roble-bench ;;
-    encina|rocksdb) cargo build --release --quiet -p roble-bench --features "$1" ;;
-    *) echo "run.sh: unknown engine $1" >&2; exit 2 ;;
-  esac
-}
-
-echo
-if cgroup_budget_works; then
-  echo "=== the reads under a $budget_mb MiB budget: the store cannot stay cached ==="
-  echo
-  target_dir=$(cargo metadata --format-version 1 --no-deps \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-  bin="$target_dir/release/roble-bench"
-  lines="$out/budget.tsv"
-  : > "$lines"
-  for engine in $ENGINES; do
-    build_engine "$engine"
-    sel=()
-    [ "$engine" = roble ] || sel=(--engine "$engine")
-    # The load runs outside the budget on purpose: a constrained writeback
-    # path is a different measurement, and this pass is about the reads.
-    run_engine "$engine" "$out/budget-$engine" "${args[@]}" \
-      --phases load,settle --cache-mb 4 > /dev/null
-    drop_caches || true
-    if ! systemd-run --user --scope --quiet \
-           -p MemoryMax="${budget_mb}M" -p MemoryHigh="$((budget_mb * 3 / 4))M" -- \
-           "$bin" "${sel[@]}" --dir "$out/budget-$engine" "${args[@]}" --reuse \
-             --tsv --phases scan,get,floor --cache-mb 4 \
-         | awk -F'\t' 'NF >= 3' >> "$lines"; then
-      echo "($engine did not finish inside $budget_mb MiB; raise BUDGET_MB)"
-    fi
-    [ -n "${KEEP:-}" ] || rm -rf "$out/budget-$engine"
-  done
-  python3 pivot.py --metrics rate,p50,cpu < "$lines"
-  echo
-  echo "(read the rates, not cpu s: reclaim and MemoryHigh throttling are"
-  echo " charged to the process, so every engine falls well under 100% here)"
-else
-  echo "=== the reads under a memory budget: skipped ==="
-  echo "(needs Linux and a systemd user session with the memory controller"
-  echo " delegated — without it the reads stay in the page cache, and only"
-  echo " the pass above's scan row is a cold measurement)"
-fi
-
-echo
-echo "=== the layout each engine settled into ==="
-for engine in $ENGINES; do
-  echo
-  run_engine "$engine" "$out/layout-$engine" "${args[@]}" \
-    --phases load,settle --layout
-  # The layout has been printed, so the store has said what it had to say.
-  # `KEEP=1` is how you ask to keep it and point `roble sst dump` at it.
-  [ -n "${KEEP:-}" ] || rm -rf "$out/layout-$engine"
-done
+scenario in-cache 140 "$@"
+scenario beyond-memory 600 "$@"
