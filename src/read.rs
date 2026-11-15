@@ -266,12 +266,9 @@ impl<F: Fs> Opened<F> {
             ..
         } = buf;
         // **Bounded on the side the comparison already decides.** A `Floor`
-        // cannot answer above `key`, a `Ceiling` cannot answer below it, and
-        // `scan_with` opens only the tables its bounds reach — so the half of
-        // the store on the wrong side of the probe is never opened at all.
-        // Unbounded, this built a merge over every table in the version for
-        // every one of these lookups, which at six million records is two
-        // hundred and forty-three of them.
+        // cannot answer above `key` and a `Ceiling` cannot answer below it,
+        // so no level of the scan needs a table on the wrong side of the
+        // probe.
         //
         // The other side stays open because nothing here knows how far the
         // answer is: a `Floor` whose neighbourhood is entirely deleted is
@@ -293,13 +290,20 @@ impl<F: Fs> Opened<F> {
         };
 
         // **And bounded on the other side as well, first, where the answer
-        // nearly always is.** Half-open, the scan above still reaches every
-        // table on its side of the probe — half the store, a hundred and
-        // twenty tables at six million records — and building it was more
-        // than half of what a `floor` cost, against a seek that touches one
-        // table a level. So a backward comparison first tries a window just
-        // below the probe that reaches one table a level, and only if nothing
-        // in it is visible does it pay for the half-open scan.
+        // nearly always is.** Half-open, the scan above seeks every level
+        // that has a table starting below the probe, and a level holding only
+        // a few tables scattered over the keyspace — an L1 of nineteen, at
+        // six million records — usually lands in one that ends far below it.
+        // Seeking that table backward reads and decodes its last block for a
+        // key that cannot be the answer, since another level's is nearer.
+        // Building the scan is not the cost any more — its levels open
+        // nothing until a seek lands in them (`crate::scan`) — but those
+        // seeks are: without this, `floor` ran at 0.77x of what it does with
+        // it. So a backward comparison first tries a window just below the
+        // probe, inside one table of every level, and a level whose landing
+        // table ends below the window has nothing in it to seek at all. Only
+        // if nothing in the window is visible does it pay for the half-open
+        // scan.
         //
         // The window's answer is exact, not a guess. A scan bounded to it
         // reads every table that holds an entry in it and every tombstone
@@ -342,7 +346,8 @@ impl<F: Fs> Opened<F> {
     /// table starting below it. The window starts where the latest-starting
     /// of those does, which keeps it inside one table of every level: each
     /// other level's landing table starts no later, and the tables before
-    /// that one end before it starts. L0's tables and the memtables are not
+    /// that one end before it starts. A landing table that ends before the
+    /// window starts is one the window's scan does not seek. L0's tables and the memtables are not
     /// consulted here because the scan takes in whichever of them reach the
     /// window anyway.
     ///
@@ -502,27 +507,6 @@ impl<F: Fs> Opened<F> {
     }
 }
 
-/// The one table of a level below L0 whose range contains `user`, if any.
-///
-/// Those levels hold disjoint ranges in key order (`crate::version`), so at
-/// most one table can contain the key and a binary search finds it. Walking
-/// the level instead is what a lookup used to do, and at six million records
-/// — two hundred tables in a level — it cost `floor` 23 milliseconds against
-/// RocksDB's 4 microseconds, because `floor` is the one comparison a bloom
-/// filter cannot answer and so had nothing to rule a table out with.
-///
-/// The search is for the first table whose largest bound reaches `user`;
-/// that table holds the key if its smallest bound does not start above it.
-fn table_containing<'a>(
-    tables: &'a [crate::version::Table],
-    user: &[u8],
-) -> Result<Option<&'a crate::version::Table>> {
-    match tables.get(crate::version::ending_below(tables, user)?) {
-        Some(meta) if meta.smallest_user_key()? <= user => Ok(Some(meta)),
-        _ => Ok(None),
-    }
-}
-
 impl<F: Fs> Opened<F> {
     /// The file number of every table whose key range contains `user`.
     ///
@@ -542,21 +526,6 @@ impl<F: Fs> Opened<F> {
     /// Order does not matter: every comparison in the callers is by key or by
     /// trailer, never by position in the tree.
     fn tables_containing(&self, user: &[u8], out: &mut Vec<u64>) -> Result<()> {
-        let versions = self.versions();
-        out.clear();
-        for (level, tables) in versions.version.levels() {
-            if level == 0 {
-                // L0's tables overlap, so any number of them can hold the
-                // key and there is no order to search.
-                for meta in tables {
-                    if meta.smallest_user_key()? <= user && meta.largest_user_key()? >= user {
-                        out.push(meta.file_num);
-                    }
-                }
-            } else if let Some(meta) = table_containing(tables, user)? {
-                out.push(meta.file_num);
-            }
-        }
-        Ok(())
+        self.versions().version.tables_containing(user, out)
     }
 }

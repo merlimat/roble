@@ -428,8 +428,8 @@ fn in_l0<F: Fs>(db: &roble::Opened<F>) -> Vec<u64> {
 ///
 /// The version is where a read starts, so a table it no longer names is one
 /// nothing can newly ask for — and that is the whole of the old rule, which
-/// is where it went wrong. A scan holds open readers for the tables of the
-/// version it *began* on, and goes on asking them for blocks; a compaction
+/// is where it went wrong. A scan reads the tables of the version it *began*
+/// on, and goes on asking them for blocks; a compaction
 /// that retired those tables and let the sweep delete them left the scan
 /// reading files that were not there.
 #[compio::test]
@@ -527,19 +527,26 @@ async fn a_sweep_keeps_the_readers_the_version_still_names() {
     );
 }
 
+/// A scan holds every table of the version it was made on, not only the
+/// tables its bounds reach, and lets them all go when it goes.
+///
+/// Pebble's rule and RocksDB's: an iterator pins a version by reference
+/// count, and a version names every table. A scan opens tables only as its
+/// seeks and steps reach them (`roble::scan`), so what it will read is
+/// whatever the version names in its bounds — and finding those again in a
+/// sweep would mean every open scan telling the sweep its bounds. Holding
+/// the version is one reference count instead, and the price is this: a scan
+/// over a handful of keys keeps a compaction's inputs on disk for as long as
+/// the cursor is open, which is what a Pebble iterator does too. The rule
+/// used to be the other one, a scan pinning only the tables it opened, and
+/// this test used to say so.
 #[compio::test]
-async fn a_table_a_scan_cannot_reach_is_collected_while_it_is_open() {
-    // The mirror of the test above, and the reason that one is not the whole
-    // story. A scan pins every table it opens, so a scan that opened every
-    // table in the database would hold every table in the database against
-    // the sweep — a handful of keys keeping a shard's worth of files alive
-    // for as long as the cursor is open. It opens what its bounds can reach
-    // and nothing else.
+async fn a_scan_holds_every_table_of_its_version_until_it_goes() {
     let (env, dir) = load("db-reads").await;
     let db = roble::open(&env, &dir).await.expect("open");
 
-    // The L0 tables that start above the bounds below, which is what makes
-    // this a test rather than a restatement.
+    // The L0 tables that start above the bounds below, which a scan of the
+    // bounds never opens.
     let beyond: Vec<u64> = {
         let versions = db.versions();
         versions
@@ -566,14 +573,12 @@ async fn a_table_a_scan_cannot_reach_is_collected_while_it_is_open() {
     for file_num in &beyond {
         let name = files::table_filename(*file_num);
         assert!(
-            !names.contains(&name),
-            "{name} is outside the scan's bounds and was kept alive by it anyway: \
-             {names:?}"
+            names.contains(&name),
+            "{name} is in the version the scan holds, and was collected: {names:?}"
         );
     }
 
-    // And the scan reads its range to the end, which is the half that says
-    // nothing it *did* need was collected.
+    // The scan reads its range to the end.
     let mut seen = Model::new();
     while scan.is_valid() {
         seen.insert(scan.key().to_vec(), scan.value().to_vec());
@@ -588,4 +593,15 @@ async fn a_table_a_scan_cannot_reach_is_collected_while_it_is_open() {
         seen, expected,
         "the scan should have read every key inside its bounds"
     );
+
+    // And once it has gone, so have they.
+    drop(scan);
+    let removed = db.remove_obsolete_files().await.expect("sweep");
+    for file_num in &beyond {
+        let name = files::table_filename(*file_num);
+        assert!(
+            removed.contains(&name),
+            "{name} should have been collected once the scan went: {removed:?}"
+        );
+    }
 }

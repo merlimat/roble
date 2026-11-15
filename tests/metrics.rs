@@ -1366,18 +1366,18 @@ async fn l0s_sublevels_are_counted_and_not_its_tables() {
 
 /// A `floor` opens one table a level, not every table below its probe.
 ///
-/// What the window in `crate::read` is for, and the one thing about it that
-/// no answer shows: a window wider than it needs to be still finds the right
-/// key, and only opens more tables finding it. So this counts the table
-/// cache's lookups across one `floor` of the last key — which the half-open
-/// scan the window sits in front of answered by opening every table of the
-/// level, since every one of them starts below it.
+/// What the window in `crate::read` and the lazy levels behind it
+/// (`crate::scan`) are for, and the one thing about them that no answer
+/// shows: a scan that opened more than it read would still find the right
+/// key. So this counts the table cache's lookups across one `floor` of the
+/// last key — which a scan that opened every table its bounds reached
+/// answered by opening every table of the level, since every one of them
+/// starts below it.
 ///
 /// Two levels, because one cannot tell a window that starts where the
 /// *latest*-starting landing table does from one that starts at the
 /// earliest: with one level they are the same table. L2 holds a single table
-/// spanning the whole range, under an L1 of many narrow ones, so a window
-/// starting at the earliest would open every table of L1.
+/// spanning the whole range, under an L1 of many narrow ones.
 #[compio::test]
 async fn a_floor_opens_one_table_a_level() {
     let (options, tag) = metered("floor-tables");
@@ -1444,5 +1444,77 @@ async fn a_floor_opens_one_table_a_level() {
         opened <= reach as i64,
         "a floor of the last key opened {opened} tables, where L0's and one a \
          level below it are {reach}"
+    );
+}
+
+/// Making a scan or a snapshot opens no table, and positioning a scan opens at
+/// most one a level.
+///
+/// What a level of a scan is (`crate::scan`): the stretch of a level its
+/// bounds reach, opened a table at a time as its seeks and steps land in
+/// them. A scan used to open every table its bounds reached the moment it
+/// was made, and a snapshot every table of the version, because holding a
+/// table open was how either kept it from the sweep; the version they hold
+/// does that now (`crate::obsolete`). Nothing an answer shows tells the two
+/// apart, so this counts the table cache's lookups instead.
+#[compio::test]
+async fn a_scan_opens_only_the_tables_its_seeks_land_in() {
+    let (options, tag) = metered("scan-tables");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        options
+            .target_file_size(4096)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..400u64 {
+        batch
+            .put(format!("k{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    db.compact(0, &[table]).await.expect("compact into L1");
+
+    let (reach, l1) = {
+        let version = &db.versions().version;
+        let below = version
+            .levels()
+            .filter(|(level, tables)| *level > 0 && !tables.is_empty())
+            .count();
+        (version.level(0).len() + below, version.level(1).len())
+    };
+    assert!(
+        l1 > reach,
+        "L1 has to hold more tables than a seek may open for this to mean \
+         anything: {l1} against {reach}"
+    );
+
+    let opened = || lookups(reader(), &tag, "table").values().sum::<i64>();
+    let before = opened();
+    let mut scan = db.scan().await.expect("scan");
+    let snapshot = db.snapshot().await.expect("snapshot");
+    let mut through = snapshot.scan().expect("a snapshot's scan");
+    assert_eq!(
+        opened() - before,
+        0,
+        "making a scan, a snapshot and a scan of it should open no table"
+    );
+
+    scan.seek_ge(b"k0200").await.expect("seek");
+    assert_eq!(scan.key(), b"k0200");
+    through.seek_lt(b"k0200").await.expect("seek");
+    assert_eq!(through.key(), b"k0199");
+    let positioned = opened() - before;
+    assert!(
+        positioned <= 2 * reach as i64,
+        "two seeks opened {positioned} tables, where L0's and one a level below \
+         it are {reach} each"
     );
 }

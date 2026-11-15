@@ -722,6 +722,11 @@ impl<D: Disk> TableIter<D> {
         self.cursor.is_valid()
     }
 
+    /// The table it reads.
+    pub(crate) fn table(&self) -> &Rc<OpenTable<D>> {
+        &self.table
+    }
+
     /// The encoded internal key it is on.
     ///
     /// # Panics

@@ -116,7 +116,12 @@ pub struct DiskUsage {
 /// handles — `FileFs` is a unit struct and `SimFs` is one `Rc` — and an
 /// implementation that holds real state is expected to do the same: wrap it
 /// in an `Rc` and clone that.
-pub trait Fs: Clone {
+///
+/// `'static` for the same reason, spelled out: a scan outlives the call that
+/// made it and opens tables as it reaches them, so it keeps a handle to the
+/// filesystem behind a trait object (`crate::scan::Opener`), and a trait
+/// object that outlives every borrow cannot hold one.
+pub trait Fs: Clone + 'static {
     /// The disk that [`create`](Self::create) and [`open`](Self::open) return.
     type Disk: Disk;
 

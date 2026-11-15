@@ -465,18 +465,19 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   larger eighth. A store with nobody to hand a flush to never reaches the line
   for any purpose, so it keeps the whole budget for one memtable and writes
   the tables it always did.
-- **Versions are immutable, and what they name is reference counted.** A
-  version is the set of files per level. A flush or a
-  compaction produces a version edit, which is appended to the MANIFEST and
-  then applied; a reader holding an older version is unaffected, so a
-  snapshot costs one reference count, as an encina iterator does. The count
-  is kept per **table** rather than per version, because that is where roble
-  already holds the references: a scan owns an `Rc<OpenTable>` for every
-  table of the version it began on, so keeping those tables alive is keeping
-  that version alive, and the sweep below asks whether a table has a reader
-  rather than whether a version has a holder. Pebble counts the version and
-  collects a file once no live version names it, which is the same guarantee
-  with a second structure to keep in step with the first.
+- **Versions are immutable, and reference counted.** A version is the set of
+  files per level, held as an `Rc<Version>`. A flush or a compaction produces
+  a version edit, which is appended to the MANIFEST and then applied — into a
+  copy when anything else holds the current version, so a reader holding an
+  older version is unaffected, and a scan or a snapshot costs one reference
+  count, as an encina iterator does. The sweep below keeps every table a
+  held version names: when an edit replaces a version something still holds,
+  the store keeps a `Weak` to it (`crate::obsolete::Pinned`), and the sweep
+  takes in the tables of each one still alive. That is Pebble's rule — it
+  counts the version and collects a file once no live version names it —
+  and RocksDB's `SuperVersion`. The count used to be kept per **table**
+  instead, by a scan holding an open reader for every table it might read,
+  which made every scan open all of them up front (§6).
 - **Files are immutable, so there is nothing to lock.** A block is found through
   the table cache (an open reader per file, with its index and filter) and the
   block cache (decoded blocks, keyed by file number and offset). A
@@ -491,15 +492,20 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   This is the part with no encina counterpart and the most room to be slow;
   §6 says what it must not do.
 
-  A scan opens **only the tables its bounds can reach**, and that is not only
-  about the work of building iterators nobody seeks. A scan holds an open
-  reader for every table it opened, and the obsolete sweep may not collect a
-  table a reader is open for (`crate::obsolete`) — so a scan over a handful of
-  keys that opened every table would hold a shard's worth of files against the
-  sweep for as long as the cursor stayed open. A table's bounds take in its
-  range deletions as well as its point keys, which is what makes the test
-  safe: a tombstone reaching inside the bounds belongs to a table whose bounds
-  reach inside them too.
+  A scan opens **only the tables its seeks and steps land in**: each level
+  below L0 is one lazy iterator over the stretch of its tables the scan's
+  bounds reach, which opens the table a seek lands in and the next one when a
+  step runs off its end, as Pebble's `levelIter` and RocksDB's
+  `LevelIterator` do; each L0 table is a level of its own, one table long.
+  So making a scan costs a binary search a level and opens nothing, and
+  positioning it opens one table a level. The version it holds is what
+  keeps the tables it has not reached yet on disk, and the price is
+  Pebble's: a scan over a handful of keys keeps every table of its version
+  from the sweep for as long as the cursor is open. Range deletions come
+  from the tables each level has opened since it was last positioned, which
+  is enough because a tombstone lies within its own table's bounds — so the
+  one table of a level that can hold a tombstone over the key being decided
+  is one the level has passed through on its way there.
 - **One change at a time to what a store is made of**, and it is enforced
   rather than hoped for (`crate::change`). A flush, a compaction, a MANIFEST
   rotation and the obsolete sweep each take a permit first, and
@@ -585,7 +591,8 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
 - **Obsolete files are deleted only after the edit that retired them is
   durable**: at the end of a flush, and at an open, where the MANIFEST just
   replayed is as durable as it gets. A table goes when the current version
-  names it at no level **and no reader is open for it** — the table cache's
+  names it at no level, **no version a scan or a snapshot holds names it,
+  and no reader is open for it** — the table cache's
   own reader is let go of first, as Pebble evicts from its table cache at the
   same point, so that a file waits for whoever is reading it rather than for
   cache pressure; a log goes when its number is below
@@ -713,42 +720,55 @@ range.
 its footer, index, filter and tombstones, and data blocks are fetched one at a
 time by handle.)
 
-**A backward comparison tries a window first.** Building the scan turned out to
-cost more than reading it. Bounded only on the side the comparison decides, a
-`floor` scan still reaches every table that starts below the probe — half the
-store, around a hundred and twenty tables at six million records — and a
-profile on one pinned core put **52.6%** of a `floor` in building that scan and
-**32.7%** in the seek that answered, which touches one table a level. So
-`floor` and `lower` first scan a window just below the probe: in each level
-below L0, the table a backward seek lands in is the last one starting below
-it, and the window starts where the latest-starting of those does, which keeps
-it inside one table of every level. Only if nothing in the window is visible
-does the lookup pay for the half-open scan.
+**Building the scan costs a seek a level, not a table.** It used to cost
+more than reading it. Bounded only on the side the comparison decides, a
+`floor` scan reached every table that starts below the probe — half the
+store, around a hundred and twenty tables at six million records — and opened
+each, built it an iterator and copied it a bound, because holding a table
+open was how a scan kept it from the sweep. A profile on one pinned core put
+**52.6%** of a `floor` in building that scan and **32.7%** in the seek that
+answered, which touches one table a level.
 
-Over the same store on the same pinned core, five rounds alternating, `floor`
-went from **66,069 to 210,140 a second, 3.18x** (3.11x to 3.43x a round), and
-from 0.29x to **0.93x** of RocksDB's 224,823 measured in the same session.
-Building the scan fell from 52.6% of a lookup to 8.7%, the window's own search
-costs 3.0%, and what is left is the seek.
+Pebble and RocksDB avoid the cost the same way, and roble now does too. Each
+pins a version by reference count when an iterator is made (`readState`,
+`SuperVersion`) and gives every level below L0 a lazy iterator that opens only
+the table a seek lands in (`levelIter`, `LevelIterator`), so making any
+iterator costs a few allocations however many tables the store holds, and
+neither has a path special to `floor`. A roble scan holds an `Rc<Version>`,
+the sweep keeps every table a held version names (§5), and a level opens the
+table its seek lands in (`crate::scan`).
 
-The window is exact rather than a guess. A scan bounded to it reads every
-table holding an entry in it and every tombstone that can cover one — a range
-deletion lies inside its own table's bounds (§5) — and never answers from below
-its lower bound, so the greatest visible key in the window, if there is one,
-is the floor. A window that holds nothing visible is one whose every key is
-deleted, and only then does the answer lie further down.
+Short scans are where that paid. Over the same six-million-record store on
+one pinned core, five rounds alternating against the build before it,
+`scan-short` went from 25,332 to 45,439 a second (**1.79x**, 1.71x to 1.92x a
+round) and YCSB-E from 25,882 to 43,349 (**1.67x**), which is 0.49x to 0.89x and
+0.51x to 0.85x of RocksDB measured in the same session. `get`, which builds no
+scan, was unmoved (1.00x), and so was a full scan (1.03x).
 
-Pebble and RocksDB reach the same bound another way, and it is the better
-one. Each pins a version by reference count when an iterator is made
-(`readState`, `SuperVersion`) and gives every level below L0 a lazy iterator
-that opens only the table a seek lands in (`levelIter`, `LevelIterator`), so
-making any iterator costs a few allocations however many tables the store
-holds, and neither has a path special to `floor`. roble pins a table by holding
-it open, so a scan opens up front everything it might read; making runs lazy
-needs the sweep to treat a version a scan still holds as live (`crate::obsolete`),
-and that is the change that would make the window unnecessary and short scans
-cheap as well. The window is the part of it that needed no change to what may
-be deleted.
+**And a backward comparison still tries a window first**, which lazy levels
+did not make redundant. Before them, `floor` and `lower` scanned a window just
+below the probe first, inside one table of every level, and fell back to the
+half-open scan only when nothing in the window was visible; that took `floor`
+from 66,069 to 210,140 a second on one pinned core (3.18x), 0.93x of RocksDB,
+without touching what may be deleted. What it saved then was building the
+scan. What it saves now is seeking: a half-open scan seeks every level with a
+table starting below the probe, and a level holding a few tables scattered
+over the keyspace — L1 held nineteen at six million records, against L2's 189
+— usually lands in one that ends far below the probe, where a backward seek
+reads and decodes the table's last block for a key another level beats. The
+window starts past such a table, so its scan has nothing in that level to
+seek. Measured without it, lazy levels alone ran `floor` at 0.77x of the
+window on the same store; the profile showed building the scan down from 8.3%
+to 4.0% of a lookup and the seek up from 62% to 73%, with a block's last
+entry (`Cursor::last`) appearing where it had not been. With both, `floor` is
+1.02x of the window alone, and level with RocksDB.
+
+The window's answer is exact rather than a guess. A scan bounded to it reads
+every table holding an entry in it and every tombstone that can cover one — a
+range deletion lies inside its own table's bounds (§5) — and never answers
+from below its lower bound, so the greatest visible key in the window, if
+there is one, is the floor. A window that holds nothing visible is one whose
+every key is deleted, and only then does the answer lie further down.
 
 ### `delete_range(start..end)`
 
@@ -782,14 +802,15 @@ the restart point before the current entry. Across blocks, a backward step at
 the start of a block has to load the previous one and walk it to its end,
 where a forward step loads the next and stops at its first entry.
 
-**A snapshot is the number and the files.** A scan opens only the tables its
-bounds reach (§5), so it cannot answer about a key outside them — which is
-right for a scan, since otherwise three records would pin a shard's files
-against the obsolete sweep for as long as the cursor stayed open. A snapshot is
-what a caller says instead when it means to read the whole store at one
-instant: it opens every table of the version and holds the readers, and holding
-them is what keeps the sweep off those files. The version is pinned by
-references that were going to be held anyway rather than by a count of its own.
+**A snapshot is the number and the version.** A scan holds a version too
+(§5), but it is a cursor, bounded, and a lookup is not something a cursor
+does. A snapshot is what a caller says when it means to read the whole store
+at one instant: it holds the version, the memtables and the sequence number,
+and opens nothing when it is made. Holding the version keeps the sweep off
+every table it names; a lookup opens the tables whose bounds contain its key,
+and a scan of the snapshot the tables its seeks land in, as a store's scan
+does. It used to open every table of the version up front, because holding
+the readers was how it kept the files.
 
 That pair — a bounded cursor over one instant, and a lookup for any key at all
 over the same instant — is Oxia's `KeyPrefixIterator` with `Lookup`, which it
@@ -844,9 +865,9 @@ marker and letting the old one go, so no crash can land with no marker at all.
 roble does not rotate at open as Pebble does, which keeps opening a database
 something that does not write to it.
 
-`snapshot()` pins a sequence number and the version with it, by opening every
-table the version names: a table some reader is open for is one the sweep
-leaves alone (§5), so no second structure counts versions. `checkpoint(dir)` writes a
+`snapshot()` pins a sequence number and the version with it, by holding the
+`Rc<Version>`: a table a held version names is one the sweep leaves alone
+(§5). `checkpoint(dir)` writes a
 directory Go Pebble opens: hard links to the live tables, a fresh MANIFEST
 holding one edit that describes the version — the same edit a rotation writes,
 and the same claim — and the two markers. Oxia streams that directory, so it

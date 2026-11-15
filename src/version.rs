@@ -24,6 +24,7 @@
 //! rather than guesses.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use roble_format::key::{InternalKey, Kind};
 use roble_format::manifest::{NUM_LEVELS, NewTable, VersionEdit};
@@ -283,6 +284,47 @@ impl Version {
             .flat_map(|tables| tables.iter().map(|t| t.file_num))
             .collect()
     }
+
+    /// The file number of every table whose key range contains `user`, into
+    /// `out`.
+    ///
+    /// Order does not matter to any caller: every comparison they make is by
+    /// key or by trailer, never by position in the tree.
+    pub(crate) fn tables_containing(&self, user: &[u8], out: &mut Vec<u64>) -> Result<()> {
+        out.clear();
+        for (level, tables) in self.levels() {
+            if level == 0 {
+                // L0's tables overlap, so any number of them can hold the
+                // key and there is no order to search.
+                for meta in tables {
+                    if meta.smallest_user_key()? <= user && meta.largest_user_key()? >= user {
+                        out.push(meta.file_num);
+                    }
+                }
+            } else if let Some(meta) = table_containing(tables, user)? {
+                out.push(meta.file_num);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The one table of a level below L0 whose range contains `user`, if any.
+///
+/// Those levels hold disjoint ranges in key order ([`apply`]), so at most one
+/// table can contain the key and a binary search finds it. Walking the level
+/// instead is what a lookup used to do, and at six million records — two
+/// hundred tables in a level — it cost `floor` 23 milliseconds against
+/// RocksDB's 4 microseconds, because `floor` is the one comparison a bloom
+/// filter cannot answer and so had nothing to rule a table out with.
+///
+/// The search is for the first table whose largest bound reaches `user`;
+/// that table holds the key if its smallest bound does not start above it.
+fn table_containing<'a>(tables: &'a [Table], user: &[u8]) -> Result<Option<&'a Table>> {
+    match tables.get(ending_below(tables, user)?) {
+        Some(meta) if meta.smallest_user_key()? <= user => Ok(Some(meta)),
+        _ => Ok(None),
+    }
 }
 
 /// Everything a MANIFEST establishes: the version, and the counters a store
@@ -300,7 +342,13 @@ pub struct VersionSet {
     /// The highest sequence number the database has committed.
     pub last_seq_num: u64,
     /// Which table is where.
-    pub version: Version,
+    ///
+    /// Shared, because a scan holds the version it was made on rather than
+    /// the tables it might read (`crate::scan`), and that is what keeps the
+    /// obsolete sweep off them (§5, `crate::obsolete`). An edit therefore
+    /// never changes a version anything else holds: [`VersionSet::apply`]
+    /// writes into a copy whenever this is not the only holder.
+    pub version: Rc<Version>,
 }
 
 impl VersionSet {
@@ -342,7 +390,7 @@ impl VersionSet {
             min_unflushed_log_num,
             next_file_num,
             last_seq_num,
-            version,
+            version: Rc::new(version),
         };
         set.check()?;
         Ok(set)
@@ -352,12 +400,18 @@ impl VersionSet {
     ///
     /// The same code the replay uses, so an edit cannot mean one thing when
     /// it is read back and another when it is written.
+    ///
+    /// Into a copy of the version when a reader still holds this one, so
+    /// that what the reader sees does not move under it, and in place when
+    /// nothing does. A store notes the version it is replacing first
+    /// (`crate::obsolete::Pinned`), because the copy is what a reader then
+    /// holds alone.
     pub fn apply(&mut self, edit: &VersionEdit) -> Result<()> {
         let mut comparer = Some(self.comparer_name.clone());
         apply_one(
             edit,
             0,
-            &mut self.version,
+            Rc::make_mut(&mut self.version),
             &mut comparer,
             &mut self.min_unflushed_log_num,
             &mut self.next_file_num,

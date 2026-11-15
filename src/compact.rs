@@ -299,7 +299,7 @@ impl<F: Fs> Opened<F> {
         // the output is a file nothing refers to and the inputs are still the
         // database's.
         let manifest_bytes = self.append_version_edit(&edit, &change).await?;
-        self.versions_mut().apply(&edit)?;
+        self.apply_edit(&edit)?;
         // More may be worth compacting now, and whoever asked to be told is
         // told here rather than waiting for the next flush (§9).
         let _ = self.version_changed();

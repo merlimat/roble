@@ -577,10 +577,11 @@ async fn a_compaction_survives_a_reopen() {
 #[compio::test]
 async fn a_scan_open_across_a_compaction_keeps_reading() {
     // Why a compaction may drop every version but the newest without
-    // consulting a list of registered snapshots: a scan holds the tables it
-    // was made with, so it goes on reading those whatever the compaction
-    // writes and the sweep afterwards deletes. If that were not so, dropping
-    // superseded versions would change an open scan's answers underneath it.
+    // consulting a list of registered snapshots: a scan holds the version it
+    // was made on, so it goes on reading those tables whatever the
+    // compaction writes and the sweep afterwards deletes. If that were not
+    // so, dropping superseded versions would change an open scan's answers
+    // underneath it.
     let (env, dir) = load("db-twin-a").await;
     let db = roble::open(&env, &dir).await.expect("open");
 
@@ -623,6 +624,84 @@ async fn a_scan_open_across_a_compaction_keeps_reading() {
                 .map(|v| v.as_slice()),
             Some(b"two".as_slice()),
             "the scan should still read every key it was opened over"
+        );
+    }
+}
+
+/// A scan that outlives a compaction reads the tables it had not yet opened
+/// when the compaction retired them.
+///
+/// The test above would pass on open readers alone: its two L0 tables are
+/// both opened by the scan's first seek. A level below L0 opens one table at
+/// a time, as the scan reaches it (`roble::scan`), so here the scan stands on
+/// the first table of a level of several when a compaction moves the whole
+/// level down and the sweep runs. Every later table of the level is then one
+/// nothing has open, and the only thing keeping it on disk is the version
+/// the scan holds (`roble::obsolete`). The second half says that was what
+/// kept them: once the scan has gone, the next sweep collects every one.
+#[compio::test]
+async fn a_scan_reads_the_tables_it_had_not_opened_when_a_compaction_retired_them() {
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .target_file_size(4096)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..400u64 {
+        batch
+            .put(format!("k{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    let table = flush_batch(&db, &mut batch).await;
+    db.compact(0, &[table]).await.expect("compact into L1");
+    let level: Vec<u64> = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    assert!(
+        level.len() > 2,
+        "L1 has to hold tables past the one a scan starts on, holds {}",
+        level.len()
+    );
+    let before = contents(&db).await;
+
+    let mut scan = db.scan().await.expect("scan");
+    scan.first().await.expect("first");
+
+    db.compact(1, &level).await.expect("compact L1 into L2");
+    assert!(
+        db.versions().version.level(1).is_empty(),
+        "the whole of L1 went into the compaction"
+    );
+
+    let mut seen = Model::new();
+    while scan.is_valid() {
+        seen.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next().await.expect("next");
+    }
+    assert_eq!(
+        seen, before,
+        "the scan should read the store it was made on to the end"
+    );
+
+    drop(scan);
+    let removed = db.remove_obsolete_files().await.expect("sweep");
+    for file_num in &level {
+        let name = roble_format::files::table_filename(*file_num);
+        assert!(
+            removed.contains(&name),
+            "{name} should have been kept for the scan alone, and collected once it \
+             went: {removed:?}"
         );
     }
 }

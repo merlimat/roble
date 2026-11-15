@@ -317,7 +317,7 @@ async fn roble_scans_where_go_pebble_scans() {
 /// constantly, and the loop after it turns at *every* key in both directions.
 ///
 /// L0 is where the sources are: its tables overlap, so each stays a source of
-/// its own, where a level below L0 is collapsed into one run (`Scan::new`).
+/// its own, where a level below L0 is read as one source (`Scan::new`).
 /// Compaction is off so they stay there, and the last round is left in the
 /// memtable, which is a source whose contents are not fixed and which holds
 /// the newest version of nearly every shared key.
@@ -462,4 +462,129 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
             );
         }
     }
+}
+
+/// A range deletion reaching past the last point key of its table still
+/// hides what lies under it once the level has stepped into the next table,
+/// in both directions, and after a seek that lands back in the same table.
+///
+/// A level below L0 opens one table at a time (`roble::scan`), so by the time
+/// the merge decides about a key from the level below, the level above may
+/// already be on its next table. Pebble keeps a level on a table until the
+/// merge has passed its tombstones, by interleaving their bounds among the
+/// point keys; roble keeps every tombstoned table a level has opened since it
+/// was last positioned. A level that kept only its current table's tombstones
+/// would answer with keys a range deletion hides, and only where a table's
+/// tombstone reaches past its last point key — forward — or starts before its
+/// first — backward — which is the shape built here.
+///
+/// L1 holds two tables, each the output of compacting one flush on its own:
+/// `a` ends in a range deletion past its last point key and `b` starts with
+/// one before its first, and L2 below them holds a key under each deletion
+/// and a key beside it.
+#[compio::test]
+async fn a_tombstone_past_its_tables_last_key_hides_what_is_below_it() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    // L2: a key under each deletion to come, and one beside each.
+    let mut below = Batch::new();
+    for key in ["k25", "k35", "k65", "k75"] {
+        below.put(key.as_bytes(), b"old").expect("put");
+    }
+    db.write(&mut below, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    db.compact(0, &[table]).await.expect("compact into L1");
+    let l1: Vec<u64> = db
+        .versions()
+        .version
+        .level(1)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    db.compact(1, &l1).await.expect("compact into L2");
+
+    // L1: `a`, ending in a deletion past its last point key, and `b`, starting
+    // with one before its first. Compacted one at a time, so each is a table
+    // of its own and both deletions stay, with L2 under them.
+    let builds: [fn(&mut Batch); 2] = [
+        |b: &mut Batch| {
+            for key in ["k00", "k05", "k10"] {
+                b.put(key.as_bytes(), b"a").expect("put");
+            }
+            b.delete_range(b"k20", b"k30").expect("delete range");
+        },
+        |b: &mut Batch| {
+            b.delete_range(b"k60", b"k70").expect("delete range");
+            for key in ["k80", "k90"] {
+                b.put(key.as_bytes(), b"b").expect("put");
+            }
+        },
+    ];
+    for build in builds {
+        let mut batch = Batch::new();
+        build(&mut batch);
+        db.write(&mut batch, true).await.expect("write");
+        let table = db.flush().await.expect("flush").expect("a table");
+        db.compact(0, &[table]).await.expect("compact into L1");
+    }
+    {
+        let versions = db.versions();
+        let (l1, l2) = (versions.version.level(1), versions.version.level(2));
+        assert_eq!(l1.len(), 2, "two tables in L1");
+        assert_eq!(l2.len(), 1, "one table in L2");
+        assert!(
+            l1[0].largest_user_key().expect("largest") == b"k30".as_slice()
+                && l1[1].smallest_user_key().expect("smallest") == b"k60".as_slice(),
+            "each L1 table's bounds should reach past its point keys to its deletion"
+        );
+    }
+
+    let visible: Vec<&str> = vec!["k00", "k05", "k10", "k35", "k75", "k80", "k90"];
+
+    let mut scan = db.scan().await.expect("scan");
+    let mut forward = Vec::new();
+    scan.first().await.expect("first");
+    while scan.is_valid() {
+        forward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
+        scan.next().await.expect("next");
+    }
+    assert_eq!(forward, visible, "forward");
+
+    let mut backward = Vec::new();
+    scan.last().await.expect("last");
+    while scan.is_valid() {
+        backward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
+        scan.prev().await.expect("prev");
+    }
+    backward.reverse();
+    assert_eq!(backward, visible, "backward");
+
+    // A seek into the first table, and then one that lands in it again: the
+    // level reuses the table it is on rather than opening it twice, and has
+    // to gather its tombstones all the same.
+    scan.seek_ge(b"k00").await.expect("seek");
+    scan.seek_ge(b"k20").await.expect("seek again");
+    assert_eq!(
+        scan.is_valid().then(|| scan.key().to_vec()),
+        Some(b"k35".to_vec()),
+        "k25 is under the first table's deletion"
+    );
+    // And the same backward, in the second.
+    scan.seek_lt(b"k99").await.expect("seek");
+    scan.seek_lt(b"k70").await.expect("seek again");
+    assert_eq!(
+        scan.is_valid().then(|| scan.key().to_vec()),
+        Some(b"k35".to_vec()),
+        "k65 is under the second table's deletion"
+    );
 }
