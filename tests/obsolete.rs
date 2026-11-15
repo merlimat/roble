@@ -605,3 +605,111 @@ async fn a_scan_holds_every_table_of_its_version_until_it_goes() {
         );
     }
 }
+
+/// A table a point lookup has chosen is not collected before it is read.
+///
+/// A `get` takes the file numbers of the tables whose bounds contain its key
+/// from the version, and then opens and reads them one at a time, each an
+/// await. A compaction that ran in one of those awaits could retire tables
+/// the lookup had chosen and not opened yet, and its sweep delete them: the
+/// lookup would then open a file that is gone, and a read of a key the store
+/// holds would fail. Holding the version until it has answered is what keeps
+/// those tables (`roble::obsolete`), as a scan's version does.
+///
+/// Swept over every operation a cold lookup makes rather than aimed at one,
+/// as the tests in `tests/change.rs` are: the lookup is suspended before its
+/// `n`th operation, the compaction runs to the end — sweep included — while
+/// it is, and then the lookup carries on. Before its first table is open,
+/// between two, and while `visible` opens them again after the cache has let
+/// go of the retired ones are all among them.
+#[compio::test]
+async fn a_table_a_get_has_chosen_is_not_collected_before_it_reads_it() {
+    async fn ready(env: &SimEnv, dir: &Path) -> (roble::Opened<SimFs>, Vec<u8>, Vec<u8>, Vec<u64>) {
+        let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
+            .await
+            .expect("open");
+        let all = contents(&db).await;
+        let in_l0 = in_l0(&db);
+        // A key that more than one L0 table's bounds contain, so the lookup
+        // chooses tables beside the one it is reading when it is suspended.
+        let (key, value) = {
+            let versions = db.versions();
+            let tables = versions.version.level(0);
+            all.iter()
+                .find(|(k, _)| {
+                    tables
+                        .iter()
+                        .filter(|t| {
+                            t.smallest_user_key().expect("smallest") <= k.as_slice()
+                                && k.as_slice() <= t.largest_user_key().expect("largest")
+                        })
+                        .count()
+                        > 1
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .expect("the fixture should hold a key more than one L0 table contains")
+        };
+        // Reopened, so that the lookup finds no table open and opens each
+        // one it chose itself.
+        drop(db);
+        let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
+            .await
+            .expect("reopen");
+        (db, key, value, in_l0)
+    }
+
+    let total = {
+        let (env, dir) = load("db-reads").await;
+        let (db, key, _, _) = ready(&env, &dir).await;
+        let before = env.sim().ops();
+        db.get(&key, Comparison::Equal).await.expect("get");
+        env.sim().ops() - before
+    };
+    assert!(
+        total >= 4,
+        "a cold lookup of {total} operations is too thin to sweep"
+    );
+
+    let mut suspended = 0;
+    for n in 1..=total {
+        let (env, dir) = load("db-reads").await;
+        let (db, key, value, in_l0) = ready(&env, &dir).await;
+        env.sim().pause_at(n);
+
+        let mut get = std::pin::pin!(db.get(&key, Comparison::Equal));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let first = get.as_mut().poll(&mut cx);
+        if first.is_pending() {
+            suspended += 1;
+            db.compact(0, &in_l0).await.expect("compact");
+        }
+        let found = match first {
+            std::task::Poll::Ready(found) => found,
+            std::task::Poll::Pending => get.await,
+        };
+        let found = found.unwrap_or_else(|e| {
+            panic!("a lookup suspended at {n} of {total} across a compaction failed: {e}")
+        });
+        assert_eq!(
+            found.map(|f| f.value),
+            Some(value),
+            "suspended at {n} of {total}"
+        );
+
+        // And what kept the retired tables was the lookup: with it gone, the
+        // next sweep collects every one.
+        let removed = db.remove_obsolete_files().await.expect("sweep");
+        let names = listing(env.sim(), &dir).await;
+        for file_num in &in_l0 {
+            let name = files::table_filename(*file_num);
+            assert!(
+                !names.contains(&name),
+                "suspended at {n}: {name} outlived the lookup that kept it ({removed:?})"
+            );
+        }
+    }
+    assert!(
+        suspended > 2,
+        "the lookup should have been caught part way through more than twice, was {suspended}"
+    );
+}
