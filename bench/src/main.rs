@@ -543,7 +543,8 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
     let lengths = Lengths::parse(&cfg.scans);
     let mut key = Vec::new();
     let mut counts = [0u64; 5];
-    let mut latencies: [Vec<std::time::Duration>; 5] = std::array::from_fn(|_| Vec::new());
+    // In whole microseconds, as `Report` keeps them (`report::micros`).
+    let mut latencies: [Vec<u32>; 5] = std::array::from_fn(|_| Vec::new());
     let started = Instant::now();
     while more(cfg, report.count, started) {
         let s = (rng.next() as usize) % cfg.shards;
@@ -605,10 +606,10 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
         counts[op.index()] += 1;
         // Capped for the reason `Report::MAX_SAMPLES` is: a ten-second mix at
         // three hundred thousand operations a second would keep tens of
-        // megabytes of `Duration` per operation kind, on a phase whose last
-        // line is the process's peak resident memory.
+        // megabytes per operation kind, on a phase whose last line is the
+        // process's peak resident memory.
         if latencies[op.index()].len() < 1_000_000 {
-            latencies[op.index()].push(took);
+            latencies[op.index()].push(report::micros(took));
         }
         report.count += 1;
     }
@@ -636,10 +637,10 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
                 "{} {} p50 {}us p99 {}us p99.9 {}us max {}us",
                 Op::at(i).name(),
                 counts[i],
-                q(0.50).as_micros(),
-                q(0.99).as_micros(),
-                q(0.999).as_micros(),
-                q(1.0).as_micros()
+                q(0.50),
+                q(0.99),
+                q(0.999),
+                q(1.0)
             ));
         }
         println!("  {}", parts.join(",  "));

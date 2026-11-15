@@ -35,8 +35,23 @@ pub struct Report {
     pub count: u64,
     started: Instant,
     cpu_at_start: Duration,
-    latencies: Vec<Duration>,
+    /// In whole microseconds ([`micros`]).
+    latencies: Vec<u32>,
     only_max: bool,
+}
+
+/// A latency as the samples keep it: whole microseconds, as a `u32`.
+///
+/// Every quantile the bench prints is in whole microseconds, so nothing
+/// finer is ever shown, and truncating keeps the order — the sample at any
+/// rank truncates to the same value whether it is truncated before the sort
+/// or after. Four bytes where a `Duration` takes sixteen: a phase keeps up to
+/// a million samples, and YCSB A keeps three such arrays at once (the mix's
+/// and one per kind of operation), which as `Duration`s was 48 MiB of the
+/// benchmark's own inside every engine's 512 MiB (`run.sh`). A `u32` holds
+/// seventy-one minutes, and a longer operation saturates rather than wraps.
+pub fn micros(took: Duration) -> u32 {
+    took.as_micros().min(u32::MAX as u128) as u32
 }
 
 impl Report {
@@ -103,7 +118,7 @@ impl Report {
 
     pub fn saw(&mut self, took: Duration) {
         if self.latencies.len() < Self::MAX_SAMPLES {
-            self.latencies.push(took);
+            self.latencies.push(micros(took));
         }
     }
 
@@ -112,12 +127,12 @@ impl Report {
         let wall = self.started.elapsed();
         let cpu = crate::cpu_time().saturating_sub(self.cpu_at_start);
         self.latencies.sort_unstable();
-        let us = |q: f64| -> u128 {
+        let us = |q: f64| -> u32 {
             if self.latencies.is_empty() {
                 return 0;
             }
             let i = ((self.latencies.len() - 1) as f64 * q).round() as usize;
-            self.latencies[i].as_micros()
+            self.latencies[i]
         };
         // A dash rather than a number the reader would take for one, and
         // the same dash the aligned output and the TSV both carry so that
@@ -171,5 +186,21 @@ impl Report {
             return;
         }
         println!("{name:<11} {:>10} — {why}", "-");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sample_is_its_whole_microseconds_and_saturates() {
+        // Truncated, as `Duration::as_micros` does, which is what every
+        // quantile printed before samples were kept this way.
+        assert_eq!(micros(Duration::from_nanos(1_999)), 1);
+        assert_eq!(micros(Duration::from_micros(42)), 42);
+        // Past seventy-one minutes it holds at the top rather than wrapping,
+        // which would print a stall as a fast operation.
+        assert_eq!(micros(Duration::from_secs(10_000)), u32::MAX);
     }
 }

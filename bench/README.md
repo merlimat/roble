@@ -814,9 +814,17 @@ not: it is now the largest one.
 scans are 1.36x forward and 1.96x reversed. `settle` still costs roble 1.5x
 RocksDB's CPU, the cooperative compaction's bill (DESIGN.md §9).
 
-**No engine comes near the cap.** Peak resident memory is 246 to 317 MiB, so
-the rest of the 512 MiB is page cache, and the beyond-memory scenario is what
-it says rather than an engine swapping or being killed.
+**The phase table stays well under the cap; the write-heavy mixes did not.**
+In the phase table above, peak resident memory is 246 to 317 MiB, and the rest
+of the 512 MiB is page cache. YCSB A and F, which write half the time, peaked at
+492–510 MiB for roble and 424–441 for RocksDB in later runs, and one capped run
+of roble was killed. Two things were in that. 48 MiB was the benchmark's own:
+three arrays of up to a million latency samples each, kept as 16-byte
+`Duration`s, now kept as whole microseconds in four bytes. The rest of roble's
+excess was its memtable arena doubling to 86 MiB on the way to a 56 MiB flush
+line, now allocated at its budget in one step (DESIGN.md §8). With both, roble
+peaks at 401 MiB in A and 385 in F, against RocksDB's 398 and 385 measured the
+same way. The table above predates both and is left as it was measured.
 
 encina, the copy-on-write B+tree, reads twice as fast as either LSM in cache
 and collapses under writes that commit one at a time: YCSB A runs at 2,361 a
