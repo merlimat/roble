@@ -435,7 +435,15 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   gives them a skiplist of their own; roble keeps them in a list sorted by
   start key, which serves that reason at a memtable's scale — a 4 MiB arena
   holds few tombstones, and they are searched rather than walked. A second
-  skiplist replaces it the day a workload shows it needs one. A store that has
+  skiplist replaces it the day a workload shows it needs one. **A node is
+  one record in the arena** — header, forward links, key — so a hop through
+  the list lands in one place, where it used to touch four: the node, its
+  links, the next node and that node's key. Searching a memtable is what a
+  read pays before it reaches any table, and once a memtable outgrows the CPU's
+  caches each of those four places is a trip to memory: at the 240,000 entries
+  YCSB B leaves in a 64 MiB memtable, it was a third of every operation. A seek
+  is now 1.55x faster at 60,000 entries and 1.23x at 240,000, and YCSB B and D
+  in cache 1.19x and 1.26x (`bench/`, one core and 512 MiB). A store that has
   reached `Options::memtable_size` — 4 MiB, Pebble's `MemTableSize` — writes a
   memtable out on the next write, before that write's batch is applied, and the
   arena is released when its table is written. That is **the only thing that
