@@ -738,6 +738,13 @@ neither has a path special to `floor`. A roble scan holds an `Rc<Version>`,
 the sweep keeps every table a held version names (§5), and a level opens the
 table its seek lands in (`crate::scan`).
 
+Short scans are where that paid. Over the same six-million-record store on
+one pinned core, five rounds alternating against the build before it,
+`scan-short` went from 25,332 to 45,439 a second (**1.79x**, 1.71x to 1.92x a
+round) and YCSB-E from 25,882 to 43,349 (**1.67x**), which is 0.49x to 0.89x and
+0.51x to 0.85x of RocksDB measured in the same session. `get`, which builds no
+scan, was unmoved (1.00x), and so was a full scan (1.03x).
+
 **And a backward comparison still tries a window first**, which lazy levels
 did not make redundant. Before them, `floor` and `lower` scanned a window just
 below the probe first, inside one table of every level, and fell back to the
@@ -753,7 +760,8 @@ window starts past such a table, so its scan has nothing in that level to
 seek. Measured without it, lazy levels alone ran `floor` at 0.77x of the
 window on the same store; the profile showed building the scan down from 8.3%
 to 4.0% of a lookup and the seek up from 62% to 73%, with a block's last
-entry (`Cursor::last`) appearing where it had not been.
+entry (`Cursor::last`) appearing where it had not been. With both, `floor` is
+1.02x of the window alone, and level with RocksDB.
 
 The window's answer is exact rather than a guess. A scan bounded to it reads
 every table holding an entry in it and every tombstone that can cover one — a
