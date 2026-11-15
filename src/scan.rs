@@ -1147,7 +1147,28 @@ impl<F: crate::env::Fs> crate::Opened<F> {
                 // single table has nothing to choose between, so neither
                 // copies a key no run would consult.
                 let several = level > 0 && metas.len() > 1;
-                for meta in metas {
+                // Below L0 the tables a bounded scan reaches are one stretch
+                // of the level, because its tables are disjoint and in key
+                // order: the ones before the stretch end below `lower`, the
+                // ones after it start at or past `upper`. So the stretch is
+                // found rather than every table being tested — a lookup that
+                // bounds its scan to a table a level (`crate::read`) would
+                // otherwise still pay a test for every table in the store.
+                // L0's overlap, so each of those is tested.
+                let (from, to) = if level == 0 {
+                    (0, metas.len())
+                } else {
+                    let from = match lower {
+                        Some(lower) => crate::version::ending_below(metas, lower)?,
+                        None => 0,
+                    };
+                    let to = match upper {
+                        Some(upper) => crate::version::starting_below(metas, upper)?,
+                        None => metas.len(),
+                    };
+                    (from, to.max(from))
+                };
+                for meta in &metas[from..to] {
                     if meta.overlaps_range(lower, upper)? {
                         let smallest = several
                             .then(|| meta.smallest_user_key().map(<[u8]>::to_vec))

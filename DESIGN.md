@@ -713,6 +713,43 @@ range.
 its footer, index, filter and tombstones, and data blocks are fetched one at a
 time by handle.)
 
+**A backward comparison tries a window first.** Building the scan turned out to
+cost more than reading it. Bounded only on the side the comparison decides, a
+`floor` scan still reaches every table that starts below the probe — half the
+store, around a hundred and twenty tables at six million records — and a
+profile on one pinned core put **52.6%** of a `floor` in building that scan and
+**32.7%** in the seek that answered, which touches one table a level. So
+`floor` and `lower` first scan a window just below the probe: in each level
+below L0, the table a backward seek lands in is the last one starting below
+it, and the window starts where the latest-starting of those does, which keeps
+it inside one table of every level. Only if nothing in the window is visible
+does the lookup pay for the half-open scan.
+
+Over the same store on the same pinned core, five rounds alternating, `floor`
+went from **66,069 to 210,140 a second, 3.18x** (3.11x to 3.43x a round), and
+from 0.29x to **0.93x** of RocksDB's 224,823 measured in the same session.
+Building the scan fell from 52.6% of a lookup to 8.7%, the window's own search
+costs 3.0%, and what is left is the seek.
+
+The window is exact rather than a guess. A scan bounded to it reads every
+table holding an entry in it and every tombstone that can cover one — a range
+deletion lies inside its own table's bounds (§5) — and never answers from below
+its lower bound, so the greatest visible key in the window, if there is one,
+is the floor. A window that holds nothing visible is one whose every key is
+deleted, and only then does the answer lie further down.
+
+Pebble and RocksDB reach the same bound another way, and it is the better
+one. Each pins a version by reference count when an iterator is made
+(`readState`, `SuperVersion`) and gives every level below L0 a lazy iterator
+that opens only the table a seek lands in (`levelIter`, `LevelIterator`), so
+making any iterator costs a few allocations however many tables the store
+holds, and neither has a path special to `floor`. roble pins a table by holding
+it open, so a scan opens up front everything it might read; making runs lazy
+needs the sweep to treat a version a scan still holds as live (`crate::obsolete`),
+and that is the change that would make the window unnecessary and short scans
+cheap as well. The window is the part of it that needed no change to what may
+be deleted.
+
 ### `delete_range(start..end)`
 
 A range tombstone, written to the memtable's range-deletion skiplist and then to
