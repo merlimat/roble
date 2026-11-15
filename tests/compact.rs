@@ -1138,6 +1138,143 @@ async fn every_key_and_every_gap_find_their_table_in_a_deep_level() {
     }
 }
 
+/// A backward comparison whose window holds nothing visible, so its answer is
+/// further down — once with every key in it deleted one by one, once with a
+/// range deletion over all of them.
+///
+/// `floor` and `lower` look first in a window below the probe that reaches one
+/// table a level (`crate::read`), and fall back to the half-open scan only
+/// when nothing in the window is visible. Without deletions a window always
+/// holds something, since it starts at a key a table begins with, so the
+/// test above never falls back. Here every key of one L1 table is deleted, and
+/// every probe that lands in it has a window inside the deleted run: the
+/// answer is in the table before, which no window reaches.
+///
+/// The deletions are flushed rather than left in the memtable, which every
+/// scan reads anyway, and flushed as two L0 tables with the higher keys
+/// first. That puts L0's file order against its key order, so a window that
+/// searched L0 as it searches the levels below — as if it were in key order —
+/// would miss one of the two, and answer with keys it deletes.
+#[compio::test]
+async fn a_window_with_nothing_visible_finds_its_answer_below() {
+    for ranged in [false, true] {
+        let (env, dir) = load("db-twin-a").await;
+        let db = roble::open_with(
+            &env,
+            &dir,
+            Options::new()
+                .target_file_size(4096)
+                .disable_automatic_compactions(true),
+        )
+        .await
+        .expect("open");
+
+        let value = vec![b'v'; 200];
+        let mut model = contents(&db).await;
+        let mut batch = Batch::new();
+        for i in 0..400u64 {
+            let key = format!("k{i:04}");
+            batch.put(key.as_bytes(), &value).expect("put");
+            model.insert(key.into_bytes(), value.clone());
+        }
+        let table = flush_batch(&db, &mut batch).await;
+        db.compact(0, &[table]).await.expect("compact into L1");
+
+        // A table from the middle of the level, so there is one before it
+        // for the answer to come from.
+        let level = db.versions().version.level(1).to_vec();
+        assert!(
+            level.len() > 4,
+            "L1 has to hold several tables for one to be in the middle, holds {}",
+            level.len()
+        );
+        let emptied = &level[level.len() / 2];
+        let first = emptied.smallest_user_key().expect("smallest").to_vec();
+        let last = emptied.largest_user_key().expect("largest").to_vec();
+        let doomed: Vec<Vec<u8>> = model
+            .range(first.clone()..=last.clone())
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert!(
+            doomed.len() > 2,
+            "the emptied table has to hold keys to probe, holds {}",
+            doomed.len()
+        );
+
+        // The upper half first, so it is the older of the two L0 tables. The
+        // fixture brings an L0 table of its own, hence counting from it.
+        let in_l0 = db.versions().version.level(0).len();
+        let middle = doomed[doomed.len() / 2].clone();
+        for (from, to) in [(middle.clone(), last.clone()), (first.clone(), middle)] {
+            let mut batch = Batch::new();
+            if ranged {
+                // Ending just past `to`, or at `to` itself where the upper
+                // half begins: the two halves meet without overlapping.
+                let mut end = to.clone();
+                if to == last {
+                    end.push(0);
+                }
+                batch.delete_range(&from, &end).expect("delete range");
+            } else {
+                for key in doomed
+                    .iter()
+                    .filter(|k| from <= **k && (**k < to || to == last))
+                {
+                    batch.delete(key).expect("delete");
+                }
+            }
+            flush_batch(&db, &mut batch).await;
+        }
+        assert_eq!(
+            db.versions().version.level(0).len(),
+            in_l0 + 2,
+            "the deletions as two L0 tables"
+        );
+        for key in &doomed {
+            model.remove(key);
+        }
+
+        // Every deleted key and a probe just above each, all of them inside
+        // the emptied table's range.
+        let mut probes = Vec::new();
+        for key in &doomed {
+            probes.push(key.clone());
+            let mut above = key.clone();
+            above.push(b'a');
+            probes.push(above);
+        }
+        for probe in &probes {
+            for how in [Comparison::Floor, Comparison::Lower] {
+                let want = match how {
+                    Comparison::Floor => model.range(..=probe.clone()).next_back(),
+                    _ => model.range(..probe.clone()).next_back(),
+                }
+                .map(|(k, v)| (k.clone(), v.clone()));
+                assert!(
+                    want.as_ref().is_some_and(|(k, _)| *k < first),
+                    "the answer has to be below the emptied table for the test to mean anything"
+                );
+                let found = db
+                    .get(probe, how)
+                    .await
+                    .expect("get")
+                    .map(|f| (f.key, f.value));
+                assert_eq!(
+                    found,
+                    want,
+                    "{how:?} of {} with the window {}",
+                    String::from_utf8_lossy(probe),
+                    if ranged {
+                        "range-deleted"
+                    } else {
+                        "deleted key by key"
+                    }
+                );
+            }
+        }
+    }
+}
+
 /// A merge whose inputs interleave and repeat the same user keys, against a
 /// `BTreeMap` of what was written.
 ///

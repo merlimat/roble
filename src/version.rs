@@ -159,6 +159,38 @@ impl Table {
     }
 }
 
+/// How many of a level's tables end below `user`: the index of the first
+/// whose largest bound reaches it.
+///
+/// For a level below L0 only. Those hold disjoint ranges in key order
+/// ([`apply`] keeps them so), which makes the tables ending below a key a
+/// prefix of the level and lets a binary search find where it stops.
+pub(crate) fn ending_below(tables: &[Table], user: &[u8]) -> Result<usize> {
+    partition(tables, |t| Ok(t.largest_user_key()? < user))
+}
+
+/// How many of a level's tables start below `user`: the index of the first
+/// whose smallest bound is at or past it. For a level below L0 only, as
+/// [`ending_below`] is.
+pub(crate) fn starting_below(tables: &[Table], user: &[u8]) -> Result<usize> {
+    partition(tables, |t| Ok(t.smallest_user_key()? < user))
+}
+
+/// `partition_point` for a test that can fail, which reading a bound can:
+/// the closure `partition_point` takes has nowhere to put the error.
+fn partition(tables: &[Table], before: impl Fn(&Table) -> Result<bool>) -> Result<usize> {
+    let (mut lo, mut hi) = (0usize, tables.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if before(&tables[mid])? {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
 /// Which tables are in the database, by level.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Version {
@@ -173,7 +205,8 @@ impl Version {
         }
     }
 
-    /// The tables at `level`, ordered by file number.
+    /// The tables at `level`: L0's by file number, since they overlap and
+    /// have no key order, and every other level's by key ([`apply`]).
     pub fn level(&self, level: u32) -> &[Table] {
         &self.levels[level as usize]
     }

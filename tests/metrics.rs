@@ -1363,3 +1363,86 @@ async fn l0s_sublevels_are_counted_and_not_its_tables() {
         "and the table count is still the table count: {seen:?}"
     );
 }
+
+/// A `floor` opens one table a level, not every table below its probe.
+///
+/// What the window in `crate::read` is for, and the one thing about it that
+/// no answer shows: a window wider than it needs to be still finds the right
+/// key, and only opens more tables finding it. So this counts the table
+/// cache's lookups across one `floor` of the last key — which the half-open
+/// scan the window sits in front of answered by opening every table of the
+/// level, since every one of them starts below it.
+///
+/// Two levels, because one cannot tell a window that starts where the
+/// *latest*-starting landing table does from one that starts at the
+/// earliest: with one level they are the same table. L2 holds a single table
+/// spanning the whole range, under an L1 of many narrow ones, so a window
+/// starting at the earliest would open every table of L1.
+#[compio::test]
+async fn a_floor_opens_one_table_a_level() {
+    let (options, tag) = metered("floor-tables");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        options
+            .target_file_size(4096)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+
+    // The wide table: the first key and the last, moved down to L2.
+    let mut batch = Batch::new();
+    batch.put(b"k0000", b"old").expect("put");
+    batch.put(b"k0399", b"old").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    db.compact(0, &[table]).await.expect("compact into L1");
+    let wide = db.versions().version.level(1)[0].file_num;
+    db.compact(1, &[wide]).await.expect("compact into L2");
+
+    // And the narrow ones over the same range, in L1.
+    let value = vec![b'v'; 200];
+    let mut batch = Batch::new();
+    for i in 0..400u64 {
+        batch
+            .put(format!("k{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    db.write(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    db.compact(0, &[table]).await.expect("compact into L1");
+
+    // L0's tables, which overlap and are all taken in, and one from each
+    // level below that holds any.
+    let (reach, l1) = {
+        let version = &db.versions().version;
+        let below = version
+            .levels()
+            .filter(|(level, tables)| *level > 0 && !tables.is_empty())
+            .count();
+        assert_eq!(version.level(2).len(), 1, "one wide table in L2");
+        (version.level(0).len() + below, version.level(1).len())
+    };
+    assert!(
+        l1 > reach,
+        "L1 has to hold more tables than a floor may open for this to mean \
+         anything: {l1} against {reach}"
+    );
+
+    let opened = |r: &BTreeMap<String, i64>| r.values().sum::<i64>();
+    let before = opened(&lookups(reader(), &tag, "table"));
+    let found = db
+        .get(b"k0399", Comparison::Floor)
+        .await
+        .expect("floor")
+        .expect("a key at or below the last one");
+    assert_eq!(found.key, b"k0399");
+    let opened = opened(&lookups(reader(), &tag, "table")) - before;
+    assert!(
+        opened <= reach as i64,
+        "a floor of the last key opened {opened} tables, where L0's and one a \
+         level below it are {reach}"
+    );
+}

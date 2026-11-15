@@ -103,6 +103,9 @@ pub struct Lookup {
     /// One table's candidate, before it is known to be the newest.
     entry_key: Vec<u8>,
     entry_value: Vec<u8>,
+    /// The lower end of the window a backward comparison tries first
+    /// ([`Opened::window_below`]).
+    bound: Vec<u8>,
     /// A block cursor, with the table format it was built for.
     ///
     /// A cursor assembles the prefix-compressed key it is on into a `Vec`, so
@@ -253,6 +256,15 @@ impl<F: Fs> Opened<F> {
     /// rejected; a scan steps instead, and skipping deleted keys is its job
     /// rather than this one's.
     async fn positioned(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
+        // Split so the answer, the probe and the window's bound can be held
+        // at once; they are disjoint parts of the caller's one buffer.
+        let Lookup {
+            key: found_key,
+            value: found_value,
+            target,
+            bound,
+            ..
+        } = buf;
         // **Bounded on the side the comparison already decides.** A `Floor`
         // cannot answer above `key`, a `Ceiling` cannot answer below it, and
         // `scan_with` opens only the tables its bounds reach — so the half of
@@ -267,39 +279,97 @@ impl<F: Fs> Opened<F> {
         let (lower, upper) = match how {
             Comparison::Ceiling => (Some(key), None),
             Comparison::Higher => {
-                successor_into(key, &mut buf.target);
-                (Some(buf.target.as_slice()), None)
+                successor_into(key, target);
+                (Some(target.as_slice()), None)
             }
             // The greatest key at or below `key` is the greatest key strictly
             // below the one after it, and `upper` is exclusive.
             Comparison::Floor => {
-                successor_into(key, &mut buf.target);
-                (None, Some(buf.target.as_slice()))
+                successor_into(key, target);
+                (None, Some(target.as_slice()))
             }
             Comparison::Lower => (None, Some(key)),
             Comparison::Equal => unreachable!("Equal is a point lookup"),
         };
+
+        // **And bounded on the other side as well, first, where the answer
+        // nearly always is.** Half-open, the scan above still reaches every
+        // table on its side of the probe — half the store, a hundred and
+        // twenty tables at six million records — and building it was more
+        // than half of what a `floor` cost, against a seek that touches one
+        // table a level. So a backward comparison first tries a window just
+        // below the probe that reaches one table a level, and only if nothing
+        // in it is visible does it pay for the half-open scan.
+        //
+        // The window's answer is exact, not a guess. A scan bounded to it
+        // reads every table that holds an entry in it and every tombstone
+        // that can cover one — a range deletion lies inside its own table's
+        // bounds (§5) — and never answers from below its lower bound. So it
+        // finds the greatest visible key in the window if there is one, and
+        // that is the floor: anything else visible below the probe is below
+        // the window and smaller. Only a window whose every key is deleted
+        // finds nothing, and then the answer is further down.
+        if let Some(upper) = upper
+            && self.window_below(upper, bound)?
+        {
+            let mut scan = self.scan_range(Some(bound), Some(upper)).await?;
+            scan.seek_lt(upper).await?;
+            if scan.is_valid() {
+                found_key.extend_from_slice(scan.key());
+                found_value.extend_from_slice(scan.value());
+                return Ok(true);
+            }
+        }
+
         let mut scan = self.scan_range(lower, upper).await?;
-        match how {
-            Comparison::Ceiling | Comparison::Higher => {
-                let at = lower
-                    .expect("a lower bound for a forward comparison")
-                    .to_vec();
-                scan.seek_ge(&at).await?
-            }
-            Comparison::Floor | Comparison::Lower => {
-                let at = upper
-                    .expect("an upper bound for a backward comparison")
-                    .to_vec();
-                scan.seek_lt(&at).await?
-            }
-            Comparison::Equal => unreachable!("Equal is a point lookup"),
+        match (lower, upper) {
+            (Some(lower), None) => scan.seek_ge(lower).await?,
+            (None, Some(upper)) => scan.seek_lt(upper).await?,
+            _ => unreachable!("an ordered comparison is bounded on exactly one side"),
         }
         if !scan.is_valid() {
             return Ok(false);
         }
-        buf.key.extend_from_slice(scan.key());
-        buf.value.extend_from_slice(scan.value());
+        found_key.extend_from_slice(scan.key());
+        found_value.extend_from_slice(scan.value());
+        Ok(true)
+    }
+
+    /// The lower end of the window a backward comparison to `upper` tries
+    /// first, into `out`, or `false` when there is no window to try.
+    ///
+    /// In each level below L0, a seek backward from `upper` lands in the last
+    /// table starting below it. The window starts where the latest-starting
+    /// of those does, which keeps it inside one table of every level: each
+    /// other level's landing table starts no later, and the tables before
+    /// that one end before it starts. L0's tables and the memtables are not
+    /// consulted here because the scan takes in whichever of them reach the
+    /// window anyway.
+    ///
+    /// It starts at a key some table begins with, so it nearly always holds
+    /// a key to find. `false` only when no level below L0 has a table
+    /// starting below `upper`, where the half-open scan has nothing below L0
+    /// to open either.
+    fn window_below(&self, upper: &[u8], out: &mut Vec<u8>) -> Result<bool> {
+        let versions = self.versions();
+        let mut latest: Option<&[u8]> = None;
+        for (level, tables) in versions.version.levels() {
+            if level == 0 {
+                continue;
+            }
+            let starting = crate::version::starting_below(tables, upper)?;
+            if starting > 0 {
+                let start = tables[starting - 1].smallest_user_key()?;
+                if latest.is_none_or(|latest| start > latest) {
+                    latest = Some(start);
+                }
+            }
+        }
+        out.clear();
+        let Some(start) = latest else {
+            return Ok(false);
+        };
+        out.extend_from_slice(start);
         Ok(true)
     }
 
@@ -443,22 +513,11 @@ impl<F: Fs> Opened<F> {
 ///
 /// The search is for the first table whose largest bound reaches `user`;
 /// that table holds the key if its smallest bound does not start above it.
-/// Written out rather than `partition_point`, because reading a bound can
-/// fail and a closure has nowhere to put the error.
 fn table_containing<'a>(
     tables: &'a [crate::version::Table],
     user: &[u8],
 ) -> Result<Option<&'a crate::version::Table>> {
-    let (mut lo, mut hi) = (0usize, tables.len());
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if tables[mid].largest_user_key()? < user {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    match tables.get(lo) {
+    match tables.get(crate::version::ending_below(tables, user)?) {
         Some(meta) if meta.smallest_user_key()? <= user => Ok(Some(meta)),
         _ => Ok(None),
     }
