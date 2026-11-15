@@ -93,7 +93,7 @@ use std::process;
 use std::time::{Duration, Instant};
 
 use engine::Store;
-use report::{Output, Report};
+use report::{Latencies, Output, Report};
 
 const USAGE: &str = "\
 usage: roble-bench --dir DIR [--engine roble|encina|rocksdb] [options]
@@ -543,8 +543,7 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
     let lengths = Lengths::parse(&cfg.scans);
     let mut key = Vec::new();
     let mut counts = [0u64; 5];
-    // In whole microseconds, as `Report` keeps them (`report::micros`).
-    let mut latencies: [Vec<u32>; 5] = std::array::from_fn(|_| Vec::new());
+    let mut latencies: [Latencies; 5] = std::array::from_fn(|_| Latencies::default());
     let started = Instant::now();
     while more(cfg, report.count, started) {
         let s = (rng.next() as usize) % cfg.shards;
@@ -601,17 +600,12 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
                 }
             }
         }
-        let took = at.elapsed();
-        report.saw(took);
+        latencies[op.index()].saw(at.elapsed());
         counts[op.index()] += 1;
-        // Capped for the reason `Report::MAX_SAMPLES` is: a ten-second mix at
-        // three hundred thousand operations a second would keep tens of
-        // megabytes per operation kind, on a phase whose last line is the
-        // process's peak resident memory.
-        if latencies[op.index()].len() < 1_000_000 {
-            latencies[op.index()].push(report::micros(took));
-        }
         report.count += 1;
+    }
+    for l in &latencies {
+        report.absorb(l);
     }
     report.finish(size_of(shards).await);
     // A mix's own p50 is two distributions laid on top of each other, so it
@@ -631,8 +625,7 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
             if counts[i] == 0 {
                 continue;
             }
-            latencies[i].sort_unstable();
-            let q = |f: f64| latencies[i][((latencies[i].len() - 1) as f64 * f).round() as usize];
+            let q = |f: f64| latencies[i].us(f);
             parts.push(format!(
                 "{} {} p50 {}us p99 {}us p99.9 {}us max {}us",
                 Op::at(i).name(),

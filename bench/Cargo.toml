@@ -52,6 +52,11 @@ rocksdb = { version = "0.25", default-features = false, features = [
 
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
+# Every latency a phase measures, in nanoseconds, in a fixed 36 KiB however
+# long the phase runs. Without default features it is the histogram alone,
+# and none of the serialization this never writes.
+hdrhistogram = { version = "7.6", default-features = false }
+
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
