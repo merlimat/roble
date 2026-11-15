@@ -1585,3 +1585,63 @@ async fn a_level_whose_table_lies_past_the_probe_is_not_opened() {
         );
     }
 }
+
+/// A `get` the memtable answers opens no table.
+///
+/// A memtable holds only writes no table has taken yet, so its version of a
+/// key is newer than anything a table can hold, and a table no newer than the
+/// best answer so far cannot change it (`crate::read`). So a key written again
+/// since it was flushed is answered without opening the table that holds its
+/// older version — which is the whole cost of a read in a mix of reads and
+/// updates, where the keys being read are the ones being written. It used to
+/// open every table holding the key, after the memtable had already answered.
+///
+/// The table cache's lookups are what is counted, because opening a table is
+/// a lookup there whether or not the table was already open.
+#[compio::test]
+async fn a_get_the_memtable_answers_opens_no_table() {
+    let (options, tag) = metered("memtable-answers");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options.disable_automatic_compactions(true))
+        .await
+        .expect("open");
+
+    // An older version, flushed into a table, and a newer one left in the
+    // memtable.
+    let mut batch = Batch::new();
+    batch.put(b"hot", b"old").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+    let mut batch = Batch::new();
+    batch.put(b"hot", b"new").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+
+    let opened = |r: &BTreeMap<String, i64>| r.values().sum::<i64>();
+    let before = opened(&lookups(reader(), &tag, "table"));
+    let found = db
+        .get(b"hot", Comparison::Equal)
+        .await
+        .expect("get")
+        .expect("the key");
+    assert_eq!(
+        found.value, b"new",
+        "the memtable's version is the newer one"
+    );
+    let after = opened(&lookups(reader(), &tag, "table"));
+    assert_eq!(
+        after - before,
+        0,
+        "a get the memtable answered opened {} tables",
+        after - before
+    );
+
+    // And the table is still there for a key only it holds: what is skipped
+    // is a table too old to matter, not every table.
+    let before = after;
+    db.get(b"a0", Comparison::Equal).await.expect("get");
+    let after = opened(&lookups(reader(), &tag, "table"));
+    assert!(
+        after > before,
+        "a key no memtable holds still has to be looked for in the tables"
+    );
+}

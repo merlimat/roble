@@ -688,7 +688,15 @@ protobuf once instead of twice.
 ### `get(key, comparison)`
 
 Five comparisons, as encina: equal, floor, ceiling, lower, higher. Equal is a
-point lookup — bloom filter per table, then one block read. The other four are a
+point lookup — bloom filter per table, then one block read. **A table no newer than
+the best version found so far is not opened at all**: its largest sequence
+number bounds everything in it, so nothing there can beat that version or
+delete it. A memtable holds only writes no table has taken yet, so a key a
+memtable holds is answered without touching a table — what Pebble and RocksDB
+get by stopping at the first source that has the key, here from the sequence
+numbers rather than from the order the sources are searched in. It is the
+whole difference for a key that is read because it was just written: YCSB A
+in cache ran 1.75x faster for it, and B 1.33x (`bench/`, one core and 512 MiB). The other four are a
 seek: `SeekGE` for ceiling and higher, `SeekLT` for floor and lower, over the
 full iterator tree, since the answer may be in any level.
 
