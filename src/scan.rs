@@ -344,6 +344,9 @@ impl<D: Disk> Level<D> {
             self.iter = None;
             return Ok(());
         }
+        // `>` and not `>=` is not pinned by a test, and need not be (§12): a
+        // table starting at the target has its first entry for an answer
+        // either way, found by the seek below or by the wait.
         if self.metas()[i].smallest_user_key()? > user {
             self.at = i;
             self.deferred = Some(Dir::Forward);
@@ -947,6 +950,12 @@ impl<D: Disk> Scan<D> {
     /// with. Opening it moves its key on the way the heap runs — the bound is
     /// one no entry of the table passes — so putting the heap right is the
     /// same sift a step is.
+    ///
+    /// Untested, with a reason (§12): taking the top unopened changes no
+    /// answer, because `take_newest_visible` opens a waiting level whose
+    /// bound is at the key being taken, and a key no source turns out to
+    /// hold is one the loop goes round again for. What this saves is that
+    /// turn, and a reader having to know about it.
     async fn top(&mut self) -> Result<Option<usize>> {
         while let Some(i) = self.heap.top() {
             match &mut self.iters[i] {
