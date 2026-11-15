@@ -1343,7 +1343,7 @@ Start there; add the pool when a benchmark asks for it.
 
 **What the bet is worth, measured.** Holding the whole process to one CPU is
 the comparison this bet needs, since a rate measured with six cores free is
-roble's one core against RocksDB's six (`bench/README.md`, "One core each").
+roble's one core against RocksDB's six (`bench/README.md`, "One core, 512 MiB").
 Over 6,000,000 records on one core each, roble loads at **1.08x** RocksDB's
 rate for 0.82x its CPU — where with six cores available RocksDB loads 1.85x
 faster than roble. The load comparison was a core-count artifact, and
@@ -1730,6 +1730,10 @@ in both directions.
   are written down rather than merely avoided.
   Compressed against uncompressed is a first-class comparison (§8), as is
   cooperative compaction against offloaded (§9), and the WAL on against off (§4).
+  `run.sh` runs one environment, one CPU and 512 MiB a process, over a store
+  that fits the block cache and one that does not fit in memory at all
+  (`bench/README.md`, "One core, 512 MiB"); those comparisons are runs of the
+  binary by hand rather than passes of its own.
   **Also against encina**, which is not apples-to-apples and is not meant to be:
   a copy-on-write B+tree with no compaction, no tombstones to step over and a
   format chosen to suit its data. That is the point — the gap between roble and

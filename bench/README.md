@@ -21,7 +21,9 @@ something a run today reproduces.
 
 Each run benchmarks one engine in a process of its own, so the CPU time and the
 peak memory it reports belong to that engine alone. `run.sh` runs all of them
-and prints them one after the other.
+in one standard environment — one CPU and 512 MiB each — over two scenarios,
+one whose data fits the block cache and one whose data does not fit in memory
+at all, and prints a table per scenario ("One core, 512 MiB", below).
 
 | engine | what it is here for | how to get it |
 |---|---|---|
@@ -151,17 +153,16 @@ They always run in this order, whatever order `--phases` names them in.
   count checks: that is the phase having worked, not broken.
 - **checkpoint** — a checkpoint of every shard, which is how Oxia moves one.
 
-`run.sh` adds four passes of its own. **A large commit against a small one**
-writes the same total records in batches of `--records` and then in batches a
-tenth the size, so that the per-commit cost can be told from the per-record
-cost; see the warning about it below. **Insert with the journal against without it**, which is the WAL's cost per
-engine. **The reads in cache and out of it**, at 64 MiB and 4 MiB against 34 MiB
-of data — which measures the block-cache *miss* path and not a disk, since all
-three LSMs read through the operating system's page cache (§8: direct I/O is
-the goal and not the state). A genuinely disk-bound comparison needs a working
-set larger than RAM and is a much longer run. **The layout** (`--layout`) prints every table of every level, with its
-size and key range, and flags any level below L0 whose tables overlap — which
-is what a scan number has to be read against.
+`run.sh` runs these phases — all but `get-cold`, whose question the second
+scenario now asks of every phase — with YCSB in a table of its own that has
+all six mixes, in one environment over two scenarios ("One core, 512 MiB",
+below). It used to add passes of its own: a large commit against a small one,
+the journal on against off, the reads at two cache sizes and then under a
+separate memory budget, each scan direction in a process of its own, and the
+layout. Those are gone from it. Each is still an invocation or two of the
+binary — `--phases load` at two `--records`, with and without `--no-wal`,
+`--cache-mb`, `--phases load,settle,scan-rev` on its own, `--layout` — and what
+they found is kept below, under "Reading the numbers".
 
 An engine that cannot do a phase prints a dash and the reason instead of a
 zero, because a zero reads as "it did this and it took no time". encina skips
@@ -217,10 +218,10 @@ store, 50,000 reads, median of three:
 At 64 MiB the store fits in the block cache, every read hits whatever it asks
 for, and the distribution can only change which CPU cache line is warm. At
 4 MiB it decides the hit rate, and `floor`'s p50 falls from 14 us to 3 us. So
-the distribution is worth most on the *reads in cache and out of it* pass
-above, which is the pass that already exists to measure the miss path — and it
-was measuring that path with the one access pattern that makes a miss path
-look like a fair fight.
+the distribution is worth most where the cache cannot hold the store — the
+*beyond-memory* scenario now, the reads-in-cache-and-out pass when this was
+measured — and that pass was measuring the miss path with the one access
+pattern that makes a miss path look like a fair fight.
 
 ### How long a scan is
 
@@ -432,15 +433,26 @@ per-run output comes back instead.
 ## Running
 
 ```sh
-./run.sh --shards 1 --batches 1000 --records 300 --reads 50000 --no-wal
+BENCH_DIR=$HOME/bench-stores ./run.sh            # the standard: three engines, both scenarios
 ```
 
-`ENGINES` picks which to run, so the ones needing a toolchain can be left out:
+`ENGINES` picks which to run, so the ones needing a toolchain can be left out,
+and anything passed goes to every run after the standard arguments, so it wins
+over them:
 
 ```sh
-ENGINES="roble" ./run.sh --no-wal               # nothing to install
-ENGINES="roble encina" ./run.sh --no-wal        # adds a git fetch
+ENGINES="roble" ./run.sh                          # nothing to install
+ENGINES="roble encina" ./run.sh                   # adds a git fetch
+./run.sh --min-seconds 2                          # a quicker look
+STANDARD=0 ./run.sh --batches 20 --min-seconds 1  # a smoke test where the cap cannot apply
 ```
+
+`BENCH_DIR` matters on Linux, where `/tmp` is often a tmpfs: a tmpfs's pages
+count against the cap, so a store there is memory rather than disk, and
+`run.sh` refuses one. `STANDARD=0` is for a machine that cannot apply the cap
+at all, macOS among them, and prints NOT THE STANDARD above every table it
+makes. A full run takes about fifteen minutes on the VM these numbers come
+from.
 
 Or one engine at a time:
 
@@ -478,8 +490,10 @@ and nowhere else.
 scans goes second reads a cache the first one warmed. Reverse runs first
 because reverse is the direction under suspicion: a `scan-rev` that keeps up
 from there is keeping up from behind. For a comparison with neither direction
-favoured, `run.sh` also runs each one in its own process over its own freshly
-loaded store, and those are the numbers to quote.
+favoured, run each in a process of its own over a store of its own
+(`--phases load,settle,scan-rev`, then `--phases load,settle,scan`). `run.sh`
+did that once and no longer does, so its `scan` row is the one that reads a
+cache `scan-rev` warmed.
 
 **Step latencies are sampled**, one step in 64. A scan step costs tens to
 hundreds of nanoseconds and reading a clock costs the same order, so timing
@@ -548,8 +562,8 @@ serialized records, which sit somewhere between the two, so the size column
 here is the incompressible end of the range rather than the answer for any
 particular shard.
 
-**The read columns are page-cache-bound unless something stops them, and
-that was worth a pass of its own.** Every engine here but encina reads through
+**The read columns are page-cache-bound unless something stops them, which
+is what the beyond-memory scenario is for.** Every engine here but encina reads through
 the operating system's page cache (§8 — direct I/O is roble's goal and not its
 state), and at any dataset this harness can load in reasonable time the store
 fits in RAM. So `get` and `floor` measure finding and parsing a block again,
@@ -560,7 +574,7 @@ mostly the page cache. (At a 64 MiB cache the warm ratios are 8.1x and 1.7x,
 because encina's own cache then holds more of its tree.)
 
 **`drop_caches` does not measure that, though not for the reason first given
-here.** The cold-disk pass runs `scan`, `get` and `floor` in that order, and
+here.** The cold-disk pass, since removed, ran `scan`, `get` and `floor` in that order, and
 the scan reads the whole store back into the page cache in key order, so the
 lookups after it run warm: roble's `get` comes out at 17x encina's against
 18.5x warm, and `floor` at 4.7x against 4.5x. Dropping the cache moves neither
@@ -578,23 +592,23 @@ roble ran at 0.71x its warm rate and RocksDB at 0.33x across the whole phase,
 p99 73 and 118 us against 8 and 5. That is what a restart onto a cold store
 looks like, and it is a different question from a store held to a budget.
 
-So `run.sh` has a pass that holds the reads to a `BUDGET_MB` cgroup (256 MiB
-by default) instead. cgroup v2 charges a page to whichever cgroup faulted it
-in, so a budget the store does not fit in has the kernel reclaiming for as
-long as the phase runs. The load stays outside the budget — a constrained
-writeback path is a different measurement — and systemd's user session
-normally has the memory controller delegated, so this needs no root where
-`drop_caches` needs one. The pass verifies the budget is actually applied
-rather than silently ignored, and skips with a reason if it is not.
+So the reads were held to a cgroup budget instead, and now every run is: the
+whole process, load included, held to 512 MiB ("One core, 512 MiB"). cgroup v2
+charges a page to whichever cgroup faulted it in, so a store the cap cannot
+hold has the kernel reclaiming for as long as a phase runs, and systemd's user
+session normally has the memory controller delegated, so this needs no root
+where `drop_caches` needs one. `run.sh` checks the cap is actually applied
+rather than silently ignored, and refuses to run if it is not.
 
-Two things to hold against its numbers. The budget is a chosen number and the
-result is a function of it: the pass says the read columns are
-page-cache-bound, not where an engine lands at a particular deployment's
-budget. And `MemoryHigh` throttling stalls the allocator while reclaim runs,
-with that work charged to the process, so every engine's `cpu s` falls well
-under 100% there — read the rates.
+One thing to hold against those numbers: the cap is a chosen number, and the
+result is a function of it. 512 MiB says what an engine does when its store
+does not fit, not where it lands at a particular deployment's budget. The
+budget pass that came first also set `MemoryHigh`, whose throttling stalled
+the allocator and pulled every engine's `cpu s` well under 100%; the standard
+sets only `MemoryMax`, so reclaim is all that is charged to the process.
 
-**The journal rows are the most platform-dependent numbers here.** Each
+**The journal rows, which `run.sh` no longer prints, were the most
+platform-dependent numbers here.** Each
 engine's own on-against-off ratio is honest about that engine on this machine,
 since it is its own sync both times. Across engines it was once not comparable
 at all on macOS: Pebble paid **36x** for the journal against roble's **1.7x**,
@@ -605,7 +619,8 @@ RocksDB are the same syscall as each other, so their ratios can be compared —
 on Linux, which is what the runner below is for, and where this measurement
 belongs anyway.
 
-**The batch-size pass is read *within* an engine, not across engines**: how
+**The batch-size pass, gone from `run.sh` with the others, was read *within*
+an engine, not across engines**: how
 much of its throughput depends on the caller batching. With `--no-wal` the
 LSMs sync nothing per commit while encina commits durably whatever it is
 asked, so the per-commit cost it shows is a different cost from theirs. Run
@@ -618,7 +633,7 @@ B+tree writes a new root per commit: at 300,000 records encina dropped to
 0.006x of its batched rate, and at six million it spent over an hour and
 2.2 GiB of disk on that one row before it was stopped. A tenfold spread
 between two batch sizes says the same thing in seconds, which is why
-`--records` defaults to 10,000 and the pass halves it ten times rather than
+`--records` defaults to 10,000 and the pass divided it by ten rather than
 going to one. If the single-insert number is what you actually want,
 `--records 1` still gives it — at a dataset size you chose on purpose.
 
@@ -645,7 +660,7 @@ the counts invited the wrong answer and were believed for a day.
 work differently. roble compacts on the thread that owns the store; RocksDB
 uses its own; a rate credits the background one with work it still paid for.
 
-## One core each
+## One core, 512 MiB
 
 The `cpu s` column says what a phase cost. It does not say what the rate would
 have been had the engines been given the same machine, and on a multi-core box
@@ -657,19 +672,45 @@ roble's one core against RocksDB's six.
 Which comparison is the right one depends on how the thing is deployed. roble's
 first consumer shards, one store per thread, so the question that decides a
 design is throughput *per core* — six roble shards on six cores against one
-RocksDB on the same six. Holding the whole process to one CPU asks it directly:
+RocksDB on the same six. Memory is the same argument: a node's memory is split
+between its shards, so a store gets a share of it and not the machine, and an
+uncapped run lets the page cache hold any store the machine has room for — at
+which point no read in it ever leaves memory.
+
+So `run.sh` runs every engine's process as
 
 ```sh
-taskset -c 3 ./run.sh --shards 1 --batches 600 --records 10000 --no-wal
+systemd-run --user --scope -p MemoryMax=512M -p MemorySwapMax=0 -- taskset -c 3 roble-bench ...
 ```
 
-Affinity is inherited by every thread and every child, so the one prefix covers
-the build wrapper, the engine's background threads, and the `systemd-run` scope
-the memory-budget pass runs in — a `--scope` runs in the caller's own context
-rather than under the user manager, which is why it carries. Without `--scope`
-it does not: the same prefix around `systemd-run --user` leaves the command's
-`Cpus_allowed_list` at `0-5`, because the user manager starts it and the user
-manager was never pinned.
+— one CPU, 512 MiB with the page cache counted against it, and no swap — with
+a 256 MiB block cache, over two scenarios that differ only in how much they
+load:
+
+| scenario | records | on disk | what it measures |
+|---|---|---|---|
+| in-cache | 1,400,000 | about 200 MiB | the CPU path: once the scans have warmed the block cache, no read leaves the process |
+| beyond-memory | 6,000,000 | about 850 MiB | the miss path: more than the process may hold, cache and page cache together |
+
+Each prints every phase and YCSB A to F, and nothing else does.
+
+**Swap is off because the VM has some.** Without `MemorySwapMax=0` a capped
+process pages its own memory out rather than being held to the cap, and the
+cap is then a number on paper.
+
+**The cap is checked, not assumed.** `run.sh` asks the scope it would run in
+what it actually holds — the cap, no swap, one CPU — and runs nothing if the
+answer is wrong. A user scope needs a systemd user session with the memory
+controller delegated, which Ubuntu has; a CI runner has no user session, so
+`run.sh` falls back to a system scope through passwordless sudo, dropping back
+to the invoking user inside it so that the stores are not root's.
+
+Affinity is inherited by every thread and every child, which is what lets the
+`taskset` inside the scope pin an engine's background threads as well as its
+own. A `--scope` runs in the caller's own context, so a `taskset` outside one
+would carry in too; without `--scope` it would not, because the user manager
+starts the command and was never pinned — the same prefix around
+`systemd-run --user` leaves the command's `Cpus_allowed_list` at `0-5`.
 
 `taskset` rather than a cgroup, although a cgroup is where `AllowedCPUs=` lives:
 cgroup v2 delegates `cpu`, `memory` and `pids` to a user slice but not `cpuset`,
@@ -681,12 +722,13 @@ clean is the cpuset one.
 
 Pick a CPU that is not also serving interrupts. `/proc/interrupts` on the VM
 these numbers come from pins one virtio block queue to each of the six CPUs and
-puts the network and console queues on CPU 0 as well, which is why the line
-above says 3 and not 0.
+puts the network and console queues on CPU 0 as well, which is why `CPU`
+defaults to 3 and not 0.
 
-### What it found
+### What one core found
 
-Over 6,000,000 records with `--cache-mb 64 --no-wal`, one run per cell. `@1` is
+Measured before the memory cap, which is why there is a six-core column at
+all. Over 6,000,000 records with `--cache-mb 64 --no-wal`, one run per cell. `@1` is
 pinned to CPU 3, `@6` is the whole machine:
 
 ```
@@ -733,6 +775,53 @@ Rust allocator is mimalloc while RocksDB's C++ internals go through glibc
 malloc, so part of that gap is the allocator. And `get-cold` moved 1.74x between
 roble's own two runs — it is the only phase that reaches the device, behind a
 qcow2 on host writeback, and one run of each is not enough to call it.
+
+### What the standard found
+
+The first run of it, on the VM, main at `b19065f`, one run per cell. It took
+fifteen minutes for three engines and both scenarios.
+
+```
+                     in-cache, 1.4M records          beyond-memory, 6M records
+                   roble    rocksdb   r/rdb         roble    rocksdb   r/rdb
+load rate/s    1,129,487    752,623    1.50     1,000,101    900,577    1.11
+settle cpu s        0.66       0.40    1.65          5.61       3.73    1.50
+scan-rev       4,552,198  6,561,805    0.69     2,846,074  1,454,758    1.96
+scan          11,298,004  9,249,795    1.22     7,683,786  5,642,590    1.36
+get              770,055    705,625    1.09        40,828     46,218    0.88
+floor            497,134    278,835    1.78        37,755     42,345    0.89
+scan-short        70,741     57,017    1.24        13,389     15,751    0.85
+ycsb-A           248,336    556,814    0.45        65,913    106,413    0.62
+ycsb-B           463,972    834,329    0.56        42,600     54,858    0.78
+ycsb-C           832,292    797,309    1.04        42,587     52,416    0.81
+ycsb-D           785,141  1,056,555    0.74       104,629    134,450    0.78
+ycsb-E            69,892     57,367    1.22         8,987     10,438    0.86
+ycsb-F           208,808    410,343    0.51        39,175     36,812    1.06
+peak rss MiB         246        261                   306        317
+```
+
+**In cache, roble leads every read but the reverse scan, and loses as soon as
+writes are mixed in.** YCSB C, all reads, is 1.04x; B is the same reads with
+one operation in twenty an update, and it is 0.56x. RocksDB runs B slightly
+faster than C — its writes are close to free — where five percent of writes
+cost roble nearly half its throughput, so a write interleaved with reads costs
+roble many times what it costs RocksDB. A and F, half writes, sit at 0.45x and
+0.51x. That is the gap this standard exposes and the old configuration did
+not: it is now the largest one.
+
+**Past memory, point reads trail and full scans lead.** `get`, `floor` and
+`scan-short` are 0.85x to 0.89x, where every miss goes to the device; the full
+scans are 1.36x forward and 1.96x reversed. `settle` still costs roble 1.5x
+RocksDB's CPU, the cooperative compaction's bill (DESIGN.md §9).
+
+**No engine comes near the cap.** Peak resident memory is 246 to 317 MiB, so
+the rest of the 512 MiB is page cache, and the beyond-memory scenario is what
+it says rather than an engine swapping or being killed.
+
+encina, the copy-on-write B+tree, reads twice as fast as either LSM in cache
+and collapses under writes that commit one at a time: YCSB A runs at 2,361 a
+second, against roble's 248,336. Its column is in `run.sh`'s output and left
+out here, which is about the two LSMs.
 
 ## Columns
 

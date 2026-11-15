@@ -33,8 +33,15 @@ PHASES = [
     "scan",
     "get",
     "floor",
+    "scan-short",
     "get-cold",
     "checkpoint",
+    "ycsb-A",
+    "ycsb-B",
+    "ycsb-C",
+    "ycsb-D",
+    "ycsb-E",
+    "ycsb-F",
 ]
 
 # What each metric is called, which column of the line holds it, and how to
