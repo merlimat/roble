@@ -1217,25 +1217,25 @@ async fn every_key_and_every_gap_find_their_table_in_a_deep_level() {
     }
 }
 
-/// A backward comparison whose probe lands in a table with nothing visible
-/// left in it, so its answer is in the table before — once with every key in
-/// it deleted one by one, once with a range deletion over all of them.
+/// A backward comparison whose window holds nothing visible, so its answer is
+/// further down — once with every key in it deleted one by one, once with a
+/// range deletion over all of them.
 ///
-/// `floor` and `lower` seek backward once and step back over what is
-/// deleted, and a level opens the table before only when it steps off the
-/// start of the one its seek landed in (`roble::scan`). Here every key of
-/// one L1 table is deleted, so every probe that lands in it has to step back
-/// across the whole table and into the one before, where the answer is.
+/// `floor` and `lower` look first in a window below the probe that reaches one
+/// table a level (`crate::read`), and fall back to the half-open scan only
+/// when nothing in the window is visible. Without deletions a window always
+/// holds something, since it starts at a key a table begins with, so the
+/// test above never falls back. Here every key of one L1 table is deleted, and
+/// every probe that lands in it has a window inside the deleted run: the
+/// answer is in the table before, which no window reaches.
 ///
 /// The deletions are flushed rather than left in the memtable, which every
 /// scan reads anyway, and flushed as two L0 tables with the higher keys
-/// first. That puts L0's file order against its key order, so a scan that
-/// read L0 as it reads the levels below — as if it were in key order — would
-/// miss one of the two, and answer with keys it deletes. This was written
-/// for a window `floor` once tried first, which had the same two ways to go
-/// wrong.
+/// first. That puts L0's file order against its key order, so a window that
+/// searched L0 as it searches the levels below — as if it were in key order —
+/// would miss one of the two, and answer with keys it deletes.
 #[compio::test]
-async fn a_floor_in_a_deleted_table_finds_its_answer_below() {
+async fn a_window_with_nothing_visible_finds_its_answer_below() {
     for ranged in [false, true] {
         let (env, dir) = load("db-twin-a").await;
         let db = roble::open_with(
@@ -1341,7 +1341,7 @@ async fn a_floor_in_a_deleted_table_finds_its_answer_below() {
                 assert_eq!(
                     found,
                     want,
-                    "{how:?} of {} with the table {}",
+                    "{how:?} of {} with the window {}",
                     String::from_utf8_lossy(probe),
                     if ranged {
                         "range-deleted"

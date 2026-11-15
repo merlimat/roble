@@ -738,12 +738,29 @@ neither has a path special to `floor`. A roble scan holds an `Rc<Version>`,
 the sweep keeps every table a held version names (§5), and a level opens the
 table its seek lands in (`crate::scan`).
 
-Before that, `floor` and `lower` scanned a window just below the probe first,
-reaching one table a level, and fell back to the half-open scan only when
-nothing in the window was visible. That took `floor` from 66,069 to 210,140 a
-second on one pinned core (3.18x), 0.93x of RocksDB, without touching what may
-be deleted. Lazy levels make the window redundant — the half-open scan now
-opens what the window did — so it is gone, and `positioned` is one scan again.
+**And a backward comparison still tries a window first**, which lazy levels
+did not make redundant. Before them, `floor` and `lower` scanned a window just
+below the probe first, inside one table of every level, and fell back to the
+half-open scan only when nothing in the window was visible; that took `floor`
+from 66,069 to 210,140 a second on one pinned core (3.18x), 0.93x of RocksDB,
+without touching what may be deleted. What it saved then was building the
+scan. What it saves now is seeking: a half-open scan seeks every level with a
+table starting below the probe, and a level holding a few tables scattered
+over the keyspace — L1 held nineteen at six million records, against L2's 189
+— usually lands in one that ends far below the probe, where a backward seek
+reads and decodes the table's last block for a key another level beats. The
+window starts past such a table, so its scan has nothing in that level to
+seek. Measured without it, lazy levels alone ran `floor` at 0.77x of the
+window on the same store; the profile showed building the scan down from 8.3%
+to 4.0% of a lookup and the seek up from 62% to 73%, with a block's last
+entry (`Cursor::last`) appearing where it had not been.
+
+The window's answer is exact rather than a guess. A scan bounded to it reads
+every table holding an entry in it and every tombstone that can cover one — a
+range deletion lies inside its own table's bounds (§5) — and never answers
+from below its lower bound, so the greatest visible key in the window, if
+there is one, is the floor. A window that holds nothing visible is one whose
+every key is deleted, and only then does the answer lie further down.
 
 ### `delete_range(start..end)`
 
