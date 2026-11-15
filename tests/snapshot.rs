@@ -176,10 +176,9 @@ async fn a_lookup_reaches_a_key_a_bounded_scan_cannot() {
 
 #[compio::test]
 async fn a_snapshot_holds_every_table_against_the_sweep() {
-    // The mirror of `a_table_a_scan_cannot_reach_is_collected_while_it_is_open`
-    // in tests/obsolete.rs. A bounded scan lets the tables outside its bounds
-    // go; a snapshot may not let any of them go, because a lookup can still
-    // ask about them.
+    // A snapshot opens nothing when it is made, so the tables a lookup asks
+    // for after the compaction are ones nothing had open when the sweep ran:
+    // only the version the snapshot holds keeps them (roble::obsolete).
     let (env, dir) = load("db-reads").await;
     let db = open_unscheduled(&env, &dir).await;
 

@@ -159,6 +159,10 @@ pub struct Opened<F: Fs> {
     /// which is what keeps the sweep off a file the edit is about to name
     /// (§5, `crate::obsolete`).
     pending: crate::obsolete::Pending,
+    /// The versions a scan or a snapshot still holds after an edit replaced
+    /// them, which is what keeps the sweep off the tables they will open
+    /// (§5, `crate::obsolete`).
+    pinned: crate::obsolete::Pinned,
     /// Whether an append to the MANIFEST has failed, after which this store
     /// records nothing more (`crate::flush`).
     manifest_failed: std::cell::Cell<bool>,
@@ -195,17 +199,11 @@ pub struct Opened<F: Fs> {
     /// Shared rather than owned outright because a scan outlives the call
     /// that made it and counts the keys it steps onto as it goes.
     pub(crate) metrics: std::rc::Rc<crate::metrics::Metrics>,
-    /// How many entries each table is known to hold, learned when it is
-    /// opened, and their total for the tables the version names.
-    ///
-    /// The records a store holds is not a number any MANIFEST records: it is
-    /// in each table's properties block, which is read when the table is
-    /// opened. So rather than opening every table at once — which would make
-    /// an open pay for a metric — a store learns a table's count the first
-    /// time something has reason to read it, and the estimate climbs to the
-    /// truth as the store is used. A flush and a compaction know their own
-    /// outputs outright, so a store that writes is exact from the start.
-    table_entries: std::cell::RefCell<std::collections::BTreeMap<u64, u64>>,
+    /// How the store opens its tables, shared with every scan and snapshot
+    /// it makes, which open theirs as they reach them (`crate::scan`).
+    tables: std::rc::Rc<Tables<F>>,
+    /// The total of the entries the tables the version names are known to
+    /// hold ([`Tables::entries`]).
     records_in_tables: std::cell::Cell<u64>,
     /// What the picker allows L0 and L1 to hold (`crate::pick`).
     l0_compaction_threshold: u64,
@@ -404,11 +402,22 @@ pub async fn open_with<E: Env>(
         metrics.disk_size.set(usage.used_bytes as i64);
     }
 
+    let store_id = options.caches.new_store_id();
+    let readers = std::rc::Rc::new(crate::obsolete::Readers::default());
+    let tables = std::rc::Rc::new(Tables {
+        fs: fs.clone(),
+        dir: dir.to_path_buf(),
+        caches: options.caches.clone(),
+        store_id,
+        metrics: std::rc::Rc::clone(&metrics),
+        readers: std::rc::Rc::clone(&readers),
+        entries: Default::default(),
+    });
     Ok(Opened {
         _lock: lock,
         metrics,
         fs,
-        store_id: options.caches.new_store_id(),
+        store_id,
         caches: options.caches,
         disable_wal: options.disable_wal,
         disable_automatic_compactions: options.disable_automatic_compactions,
@@ -429,13 +438,14 @@ pub async fn open_with<E: Env>(
             filename: manifest_filename,
             marker_iter: manifest_marker_iter,
         }),
-        table_entries: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+        tables,
         records_in_tables: std::cell::Cell::new(0),
         markers: std::cell::RefCell::new(markers),
         memtable_size: options.memtable_size,
         max_manifest_bytes: options.max_manifest_bytes,
-        readers: std::rc::Rc::new(crate::obsolete::Readers::default()),
+        readers,
         pending: Default::default(),
+        pinned: Default::default(),
         manifest_failed: std::cell::Cell::new(false),
         changes: crate::change::Changes::default(),
         l0_compaction_threshold: options.l0_compaction_threshold,
@@ -1072,6 +1082,18 @@ impl<F: Fs> Opened<F> {
         &self.pending
     }
 
+    /// The versions a reader still holds after an edit replaced them
+    /// (`crate::obsolete`).
+    pub(crate) fn pinned(&self) -> &crate::obsolete::Pinned {
+        &self.pinned
+    }
+
+    /// How this store opens its tables, for a scan or a snapshot to open
+    /// theirs with as they reach them.
+    pub(crate) fn tables(&self) -> std::rc::Rc<Tables<F>> {
+        std::rc::Rc::clone(&self.tables)
+    }
+
     /// Lets go of the table cache's reader for one of this store's tables.
     pub(crate) fn forget_reader(&self, file_num: u64) {
         self.caches.forget_table(self.store_id, file_num);
@@ -1344,7 +1366,8 @@ impl<F: Fs> Opened<F> {
             return;
         };
         if self
-            .table_entries
+            .tables
+            .entries
             .borrow_mut()
             .insert(file_num, entries)
             .is_none()
@@ -1363,7 +1386,7 @@ impl<F: Fs> Opened<F> {
             return;
         }
         let live = self.versions().version.table_file_nums();
-        let mut known = self.table_entries.borrow_mut();
+        let mut known = self.tables.entries.borrow_mut();
         known.retain(|file_num, _| live.contains(file_num));
         self.records_in_tables
             .set(known.values().copied().sum::<u64>());
@@ -1422,6 +1445,18 @@ impl<F: Fs> Opened<F> {
     /// The version set, for a flush to add to.
     pub(crate) fn versions_mut(&self) -> std::cell::RefMut<'_, VersionSet> {
         self.versions.borrow_mut()
+    }
+
+    /// Applies an edit a flush or a compaction has made durable.
+    ///
+    /// The one place a version stops being current, and so the one place a
+    /// reader can be left holding one the store no longer does: noting it
+    /// here is what keeps the sweep off the tables that reader has still to
+    /// open (`crate::obsolete::Pinned`).
+    pub(crate) fn apply_edit(&self, edit: &VersionEdit) -> Result<()> {
+        let mut versions = self.versions.borrow_mut();
+        self.pinned.retiring(&versions.version);
+        versions.apply(edit)
     }
 
     /// Freezes the memtable a flush is about to write out, puts a fresh one
@@ -1510,26 +1545,13 @@ impl<F: Fs> Opened<F> {
         &self,
         file_num: u64,
     ) -> Result<std::rc::Rc<crate::table::OpenTable<F::Disk>>> {
-        if let Some(held) = self.caches.table(self.store_id, file_num) {
-            self.metrics.cache_lookups[crate::metrics::TABLE_HIT].add(1);
+        if let Some(held) = self.tables.cached(file_num) {
             return Ok(held);
         }
-        self.metrics.cache_lookups[crate::metrics::TABLE_MISS].add(1);
-        let path = self.dir.join(roble_format::files::table_filename(file_num));
-        let disk = self.fs.open(&path, Access::ReadOnly).await?;
-        let table = std::rc::Rc::new(
-            crate::table::OpenTable::open_metered(
-                file_num,
-                disk,
-                self.caches.blocks(self.store_id),
-                Some(std::rc::Rc::clone(&self.metrics)),
-                Some(std::rc::Rc::clone(&self.readers)),
-            )
-            .await?,
-        );
-        self.saw_table_entries(file_num, table.entries);
-        self.caches
-            .hold_table(self.store_id, file_num, std::rc::Rc::clone(&table));
+        let (table, learned) = self.tables.opened(file_num).await?;
+        if learned {
+            self.recount_records();
+        }
         Ok(table)
     }
 
@@ -1569,6 +1591,88 @@ impl<F: Fs> Opened<F> {
             }
         }
         Ok(out)
+    }
+}
+
+/// How a store opens its tables: through the table cache, and from its
+/// directory when the cache does not hold one.
+///
+/// Apart from [`Opened`] and shared by `Rc`, because a scan outlives the
+/// call that made it and opens tables as it reaches them (`crate::scan`), so
+/// it needs everything opening one takes without a borrow of the store. Each
+/// field is a handle the store holds as well.
+pub(crate) struct Tables<F: Fs> {
+    fs: F,
+    dir: PathBuf,
+    caches: crate::cache::Caches<F>,
+    store_id: u64,
+    metrics: std::rc::Rc<crate::metrics::Metrics>,
+    readers: std::rc::Rc<crate::obsolete::Readers>,
+    /// How many entries each table is known to hold, learned when it is
+    /// opened.
+    ///
+    /// The records a store holds is not a number any MANIFEST records: it is
+    /// in each table's properties block, which is read when the table is
+    /// opened. So rather than opening every table at once — which would make
+    /// an open pay for a metric — a store learns a table's count the first
+    /// time something has reason to read it, and the estimate climbs to the
+    /// truth as the store is used. A flush and a compaction know their own
+    /// outputs outright, so a store that writes is exact from the start.
+    ///
+    /// Here rather than on the store so that a scan's opening teaches it too.
+    /// A count a scan learns joins the estimate at the store's next recount,
+    /// since a scan cannot reach the version to make one.
+    entries: std::cell::RefCell<std::collections::BTreeMap<u64, u64>>,
+}
+
+impl<F: Fs> Tables<F> {
+    /// The table, if the cache holds it.
+    fn cached(&self, file_num: u64) -> Option<std::rc::Rc<crate::table::OpenTable<F::Disk>>> {
+        let held = self.caches.table(self.store_id, file_num)?;
+        self.metrics.cache_lookups[crate::metrics::TABLE_HIT].add(1);
+        Some(held)
+    }
+
+    /// Opens a table the cache does not hold and holds it there, saying
+    /// whether its count of entries is one the store did not know.
+    async fn opened(
+        &self,
+        file_num: u64,
+    ) -> Result<(std::rc::Rc<crate::table::OpenTable<F::Disk>>, bool)> {
+        self.metrics.cache_lookups[crate::metrics::TABLE_MISS].add(1);
+        let path = self.dir.join(roble_format::files::table_filename(file_num));
+        let disk = self.fs.open(&path, Access::ReadOnly).await?;
+        let table = std::rc::Rc::new(
+            crate::table::OpenTable::open_metered(
+                file_num,
+                disk,
+                self.caches.blocks(self.store_id),
+                Some(std::rc::Rc::clone(&self.metrics)),
+                Some(std::rc::Rc::clone(&self.readers)),
+            )
+            .await?,
+        );
+        let learned = match table.entries {
+            Some(entries) if self.metrics.recording() => self
+                .entries
+                .borrow_mut()
+                .insert(file_num, entries)
+                .is_none(),
+            _ => false,
+        };
+        self.caches
+            .hold_table(self.store_id, file_num, std::rc::Rc::clone(&table));
+        Ok((table, learned))
+    }
+}
+
+impl<F: Fs> crate::scan::Opener<F::Disk> for Tables<F> {
+    fn held(&self, file_num: u64) -> Option<std::rc::Rc<crate::table::OpenTable<F::Disk>>> {
+        self.cached(file_num)
+    }
+
+    fn open(&self, file_num: u64) -> crate::scan::Opening<'_, F::Disk> {
+        Box::pin(async move { Ok(self.opened(file_num).await?.0) })
     }
 }
 

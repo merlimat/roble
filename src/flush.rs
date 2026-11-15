@@ -253,7 +253,7 @@ impl<F: Fs> Opened<F> {
         // 4. Bookkeeping a replay would redo anyway. The memtable and the
         //    log were swapped in step 1; all that is left is to stop holding
         //    the one a table now holds.
-        self.versions_mut().apply(&edit)?;
+        self.apply_edit(&edit)?;
         self.thaw();
 
         // 5. A MANIFEST that has outgrown its limit is replaced by one

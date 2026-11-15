@@ -1366,18 +1366,17 @@ async fn l0s_sublevels_are_counted_and_not_its_tables() {
 
 /// A `floor` opens one table a level, not every table below its probe.
 ///
-/// What the window in `crate::read` is for, and the one thing about it that
-/// no answer shows: a window wider than it needs to be still finds the right
-/// key, and only opens more tables finding it. So this counts the table
-/// cache's lookups across one `floor` of the last key — which the half-open
-/// scan the window sits in front of answered by opening every table of the
-/// level, since every one of them starts below it.
+/// What opening a level's tables as a seek lands in them is for
+/// (`crate::scan`), and the one thing about it that no answer shows: a scan
+/// that opened more than it read would still find the right key. So this
+/// counts the table cache's lookups across one `floor` of the last key — which
+/// a scan that opened every table its bounds reached answered by opening every
+/// table of the level, since every one of them starts below it.
 ///
-/// Two levels, because one cannot tell a window that starts where the
-/// *latest*-starting landing table does from one that starts at the
-/// earliest: with one level they are the same table. L2 holds a single table
-/// spanning the whole range, under an L1 of many narrow ones, so a window
-/// starting at the earliest would open every table of L1.
+/// Two levels, which was for the window `floor` used to try first: one level
+/// cannot tell a window that starts where the *latest*-starting landing table
+/// does from one that starts at the earliest. L2 holds a single table
+/// spanning the whole range, under an L1 of many narrow ones.
 #[compio::test]
 async fn a_floor_opens_one_table_a_level() {
     let (options, tag) = metered("floor-tables");

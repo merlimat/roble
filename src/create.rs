@@ -131,7 +131,7 @@ pub(crate) async fn create<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Resul
         // is numbered is a rule about opening a database, not a fact about
         // this one, so it belongs in `crate::open` and not in these bytes.
         last_seq_num: 0,
-        version: Version::new(),
+        version: std::rc::Rc::new(Version::new()),
     };
     let edit = crate::rotate::snapshot_edit(&versions, versions.next_file_num);
 

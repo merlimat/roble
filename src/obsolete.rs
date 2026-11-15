@@ -21,14 +21,15 @@
 //! never as a list of what must stay, and the fall-through is to keep:
 //!
 //! - A **table** goes when the current version names it at no level, **no
-//!   reader is open for it**, and **no compaction is in the middle of
-//!   writing it**. The version is where every read starts, so a table it
-//!   does not name is one nothing can newly ask for — but a scan that began
-//!   before the version changed holds open readers of its own, and those are
-//!   exactly the reads that would find the file gone (see [`Readers`]); and a
-//!   compaction's output is on disk before the edit that claims it, which is
-//!   this rule's description of a file a crash left behind and is not one
-//!   (see [`Pending`]).
+//!   version a reader still holds names it**, **no reader is open for it**,
+//!   and **no compaction is in the middle of writing it**. The version is
+//!   where every read starts, so a table it does not name is one nothing can
+//!   newly ask for — but a scan that began before the version changed reads
+//!   the version it began on, opening its tables as it reaches them, and
+//!   those are exactly the reads that would find the file gone (see
+//!   [`Pinned`] and [`Readers`]); and a compaction's output is on disk before
+//!   the edit that claims it, which is this rule's description of a file a
+//!   crash left behind and is not one (see [`Pending`]).
 //! - A **log** goes when its number is below `min_unflushed_log_num`. That
 //!   counter is the MANIFEST's statement that every record in the logs below
 //!   it is in a table, and it is durable before any file is touched.
@@ -68,6 +69,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::rc::{Rc, Weak};
 
 use roble_format::files::{self, FileType, MARKER_MANIFEST};
 
@@ -75,7 +77,7 @@ use crate::change::Change;
 use crate::env::Fs;
 use crate::error::Result;
 use crate::open::Opened;
-use crate::version::VersionSet;
+use crate::version::{Version, VersionSet};
 
 /// What the database still refers to.
 pub(crate) struct Live {
@@ -145,16 +147,62 @@ fn is_obsolete(name: &str, live: &Live) -> bool {
     }
 }
 
+/// The versions a reader still holds now that a newer one has replaced them
+/// (§5).
+///
+/// A scan holds the version it was made on, an `Rc<Version>`, and opens a
+/// level's tables only as its seeks and steps reach them (`crate::scan`). So
+/// the tables it will read are the ones that version names, not the ones it
+/// has open, and the sweep has to keep every one of them: Pebble's
+/// reference-counted versions, and RocksDB's `SuperVersion`.
+///
+/// The reference count is the `Rc`'s own, and nothing is counted per table:
+/// making a scan costs one increment however many tables the version holds.
+/// What this keeps is the other half, a [`Weak`] to each version that was
+/// replaced while something still held it, which is the only moment a
+/// version can leave the store's hands with a holder outside them. Noted
+/// there and nowhere else ([`Pinned::retiring`]), it needs no scan to
+/// register itself and no drop to unregister: a holder that clones the `Rc`
+/// later clones one already noted, and one that drops it is seen at the next
+/// sweep as a `Weak` with nothing behind it.
+#[derive(Default)]
+pub(crate) struct Pinned {
+    versions: RefCell<Vec<Weak<Version>>>,
+}
+
+impl Pinned {
+    /// Takes note of `version` as it stops being current, if anything other
+    /// than the version set holds it.
+    ///
+    /// Called with the version set's own reference still in place, which is
+    /// the one `1` is. A version nothing else holds is about to be dropped or
+    /// written over (`crate::version::VersionSet::apply`), and has no reader
+    /// to keep anything for.
+    pub(crate) fn retiring(&self, version: &Rc<Version>) {
+        if Rc::strong_count(version) > 1 {
+            self.versions.borrow_mut().push(Rc::downgrade(version));
+        }
+    }
+
+    /// Every table some version a reader still holds names, letting go of the
+    /// note of each version nothing holds any more.
+    pub(crate) fn tables(&self) -> BTreeSet<u64> {
+        let mut versions = self.versions.borrow_mut();
+        versions.retain(|v| v.strong_count() > 0);
+        versions
+            .iter()
+            .filter_map(Weak::upgrade)
+            .flat_map(|v| v.table_file_nums())
+            .collect()
+    }
+}
+
 /// How many readers are open for each table (§5).
 ///
-/// This is the reference counting §5 asks for, counted per table rather than
-/// per version. A scan owns an `Rc<OpenTable>` for every table of the
-/// version it began on, so keeping those tables is keeping that version, and
-/// a table counted here is one some reader can still ask for a block of.
-/// Pebble arrives at the same guarantee from the other side — it reference
-/// counts the version itself and collects a file once no live version names
-/// it — but roble already holds the references where they matter, so
-/// counting them needs no second structure to keep in step with the first.
+/// A table counted here is one some reader can still ask for a block of: a
+/// lookup between opening a table and reading it, or the table cache, which
+/// the sweep lets go of first (`Opened::sweep`). A scan's tables are kept by
+/// the version it holds ([`Pinned`]), which takes in the ones it has open.
 ///
 /// Every count is one `OpenTable`'s whole life: taken when one is built and
 /// given back when it is dropped, both in `crate::table`, so nothing here
@@ -268,9 +316,9 @@ impl Drop for Writing<'_> {
 /// Deletes every obsolete file among `names`, and says which it deleted.
 ///
 /// A table that `in_use` names is left where it is, however obsolete: the
-/// file is unreachable to anything starting from the version, and still open
-/// to a reader that started before it changed, or still being written by a
-/// compaction whose edit has not landed. Nothing is lost by waiting — the
+/// file is unreachable to anything starting from the version, and still
+/// named by the version a reader started on, or still open to one, or still
+/// being written by a compaction whose edit has not landed. Nothing is lost by waiting — the
 /// next sweep finds it again, as it does every file this leaves behind.
 pub(crate) async fn remove_obsolete<F: Fs>(
     fs: &F,
@@ -335,6 +383,10 @@ impl<F: Fs> Opened<F> {
             Live::of(&versions, manifest_num, &names)?
         };
         let mut in_use = self.release_dead_readers(&live);
+        // The tables of every version a scan or a snapshot still holds,
+        // which it opens as it reaches them rather than all at once
+        // (`Pinned`).
+        in_use.extend(self.pinned().tables());
         // The outputs of a compaction that is running beside this sweep,
         // which the permit cannot speak for because the compaction writes
         // them without it (§9, `Pending`).
