@@ -814,9 +814,20 @@ not: it is now the largest one.
 scans are 1.36x forward and 1.96x reversed. `settle` still costs roble 1.5x
 RocksDB's CPU, the cooperative compaction's bill (DESIGN.md §9).
 
-**No engine comes near the cap.** Peak resident memory is 246 to 317 MiB, so
-the rest of the 512 MiB is page cache, and the beyond-memory scenario is what
-it says rather than an engine swapping or being killed.
+**The phase table stays well under the cap; the write-heavy mixes did not.**
+In the phase table above, peak resident memory is 246 to 317 MiB, and the rest
+of the 512 MiB is page cache. YCSB A and F, which write half the time, peaked at
+492–510 MiB for roble and 424–441 for RocksDB in later runs, and one capped run
+of roble was killed. Two things were in that. 48 MiB was the benchmark's own:
+three arrays of up to a million 16-byte latency samples, now a histogram of
+36 KiB for each (the latency columns, below). The rest of roble's excess was
+its memtable arena doubling to 86 MiB on the way to a 56 MiB flush line, now
+allocated at its budget in one step (DESIGN.md §8). With both, in cache, roble
+peaks at 392 MiB in A, 321 in B and 361 in F, against RocksDB's 389, 291 and
+374; past memory, at 377 in A against RocksDB's 424. Those are medians of
+three, because a peak moves between runs of the same build — by up to 20 MiB
+for either engine in A, and for roble by up to 50 under the cap. The table
+above predates both and is left as it was measured.
 
 encina, the copy-on-write B+tree, reads twice as fast as either LSM in cache
 and collapses under writes that commit one at a time: YCSB A runs at 2,361 a
@@ -830,7 +841,9 @@ out here, which is about the two LSMs.
   wall clock.
 - **p50 / p99 / max us** — one operation: a sampled step for the scans, a
   lookup for get and floor, one scan for scan-short, one operation for ycsb,
-  one shard's checkpoint.
+  one shard's checkpoint. In microseconds to a tenth, read from a histogram of
+  every operation the phase timed, kept in nanoseconds to two significant
+  digits: exact below 256 ns, and at most 0.8% high above.
 
   **`load` reports `max` alone and a dash for the other two**, because its
   latency is per *commit* where its count and its rate are per *record*. At

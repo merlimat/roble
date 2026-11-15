@@ -62,9 +62,9 @@ def _num(value, fmt):
 
 METRICS = {
     "rate": ("rate/s", 3, lambda v: _num(v, lambda x: f"{float(x):,.0f}")),
-    "p50": ("p50 us", 4, lambda v: _num(v, lambda x: f"{int(x):,}")),
-    "p99": ("p99 us", 5, lambda v: _num(v, lambda x: f"{int(x):,}")),
-    "max": ("max us", 6, lambda v: _num(v, lambda x: f"{int(x):,}")),
+    "p50": ("p50 us", 4, lambda v: _num(v, lambda x: f"{float(x):,.1f}")),
+    "p99": ("p99 us", 5, lambda v: _num(v, lambda x: f"{float(x):,.1f}")),
+    "max": ("max us", 6, lambda v: _num(v, lambda x: f"{float(x):,.1f}")),
     "cpu": ("cpu s", 7, lambda v: _num(v, lambda x: f"{float(x):.2f}")),
     "size": ("size MiB", 8, lambda v: _num(v, lambda x: f"{float(x):.1f}")),
 }
