@@ -322,7 +322,10 @@ pub async fn open_with<E: Env>(
     }
 
     // 7. Replay the logs the version edits leave unflushed.
-    let mut memtable = crate::memtable::Memtable::new(versions.last_seq_num.wrapping_add(1));
+    let mut memtable = crate::memtable::Memtable::with_budget(
+        versions.last_seq_num.wrapping_add(1),
+        options.memtable_size as usize,
+    );
     let replayed = replay_logs(
         &fs,
         dir,
@@ -1483,9 +1486,12 @@ impl<F: Fs> Opened<F> {
         // where it is: a write that started after this one returned would be
         // in flight on the memtable the next lines take away (§5).
         self.writers.settled().await;
-        let fresh = std::rc::Rc::new(std::cell::RefCell::new(crate::memtable::Memtable::new(
-            self.last_seq_num().wrapping_add(1),
-        )));
+        let fresh = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::memtable::Memtable::with_budget(
+                self.last_seq_num().wrapping_add(1),
+                self.memtable_size as usize,
+            ),
+        ));
         let old = std::mem::replace(&mut *self.memtable.borrow_mut(), fresh);
         *self.frozen.borrow_mut() = Some(old);
         if let Some(log) = log {
