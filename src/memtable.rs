@@ -22,11 +22,23 @@
 //! match Oxia), and the size it has filled is a number this can answer exactly
 //! rather than estimate. A map of separately allocated entries can do neither.
 //!
-//! **Links are indices, not pointers.** Nodes live in a `Vec` and link to each
-//! other by index, so the whole structure is safe code — `roble` denies
-//! `unsafe` outside the two places §10 names, and a skiplist is the classic
-//! reason to want it. Indices cost a bounds check where a pointer would not,
-//! and buy a structure that cannot dangle.
+//! **A node is one record in the arena, and links are offsets to records.**
+//! A node's header, its forward links and its key sit together, key last, and
+//! a link is the byte offset of the record it points to. So a hop through the
+//! list lands on one record, whose links and key are usually in the cache
+//! line the hop already fetched — the layout of Pebble's `arenaskl` and
+//! RocksDB's `InlineSkipList`, for the same reason. Kept apart, as they were
+//! for a while — the nodes' bookkeeping in one `Vec`, the links in a second
+//! and the bytes in the arena — a hop touched four places: the node, its
+//! links, the next node, and that node's key. Once a memtable is larger than
+//! the CPU's caches each of the four is a trip to memory, and at the 240,000
+//! entries YCSB B leaves in a 64 MiB memtable, searching it was a third of
+//! every operation (`bench/`).
+//!
+//! Offsets rather than pointers keep the whole structure safe code — `roble`
+//! denies `unsafe` outside the two places §10 names, and a skiplist is the
+//! classic reason to want it. An offset costs a bounds check where a pointer
+//! would not, and buys a structure that cannot dangle.
 //!
 //! **Heights come from a seeded generator.** A skiplist's shape is random, and
 //! a store whose shape depends on the thread's luck does not replay (§9). The
@@ -54,17 +66,22 @@ const BRANCHING: u64 = 4;
 /// The index that means "no node".
 const NIL: u32 = u32::MAX;
 
-/// A node's bookkeeping. The bytes themselves are in the arena.
-#[derive(Clone, Copy, Debug)]
-struct Node {
-    key_at: u32,
-    key_len: u32,
-    value_at: u32,
-    value_len: u32,
-    /// Where this node's forward links start in the link array.
-    links_at: u32,
-    height: u8,
-}
+/// Where each field of a node's record is, from the record's start.
+///
+/// A record is `key_len`, `value_at` and `value_len` as little-endian `u32`s,
+/// then the height as one byte, then that many forward links as `u32`s, then
+/// the key, then — until the value is replaced — the value. Unaligned on
+/// purpose: a record is as long as its fields and no longer, and an unaligned
+/// load costs nothing on any machine this runs on.
+///
+/// The value is reached through `value_at` rather than found after the key
+/// because a replaced value is appended at the end of the arena (see
+/// [`Memtable::insert`]), and the record has to be able to point there.
+const KEY_LEN: usize = 0;
+const VALUE_AT: usize = 4;
+const VALUE_LEN: usize = 8;
+const HEIGHT: usize = 12;
+const LINKS: usize = 13;
 
 /// Compares two encoded internal keys.
 ///
@@ -92,9 +109,15 @@ pub struct Memtable {
     /// searched, not walked — and a second skiplist can replace it the day a
     /// workload shows it needs one.
     ranges: Vec<Tombstone>,
+    /// Every node's record, in the order they were inserted, and every
+    /// replacement value after them.
     arena: Vec<u8>,
-    nodes: Vec<Node>,
-    links: Vec<u32>,
+    /// How many nodes there are.
+    count: usize,
+    /// The bytes of the keys and values it was given, which is what
+    /// [`Memtable::bytes`] reports and not the arena's length: the arena also
+    /// holds each record's header and links.
+    given: usize,
     /// The head's forward links, one per level.
     head: [u32; MAX_HEIGHT],
     /// The tallest node so far.
@@ -139,8 +162,8 @@ impl Memtable {
         Memtable {
             ranges: Vec::new(),
             arena: Vec::new(),
-            nodes: Vec::new(),
-            links: Vec::new(),
+            count: 0,
+            given: 0,
             head: [NIL; MAX_HEIGHT],
             height: 1,
             // A zero seed would leave the generator stuck, so it is nudged.
@@ -154,12 +177,12 @@ impl Memtable {
 
     /// How many entries it holds.
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.count
     }
 
     /// Whether it holds none.
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.count == 0
     }
 
     /// How many bytes the arena holds.
@@ -170,7 +193,7 @@ impl Memtable {
     ///
     /// Range deletions are counted too, from where they are actually held.
     pub fn bytes(&self) -> usize {
-        self.arena.len()
+        self.given
             + self
                 .ranges
                 .iter()
@@ -178,16 +201,32 @@ impl Memtable {
                 .sum::<usize>()
     }
 
-    /// The key of node `i`.
+    /// The `u32` at `at` in the arena.
+    fn u32_at(&self, at: usize) -> u32 {
+        u32::from_le_bytes(self.arena[at..at + 4].try_into().expect("4 bytes"))
+    }
+
+    fn set_u32_at(&mut self, at: usize, to: u32) {
+        self.arena[at..at + 4].copy_from_slice(&to.to_le_bytes());
+    }
+
+    /// Node `i`'s height.
+    fn height_of(&self, i: u32) -> usize {
+        self.arena[i as usize + HEIGHT] as usize
+    }
+
+    /// The key of node `i`, which follows its links.
     fn key(&self, i: u32) -> &[u8] {
-        let n = &self.nodes[i as usize];
-        &self.arena[n.key_at as usize..(n.key_at + n.key_len) as usize]
+        let at = i as usize;
+        let from = at + LINKS + 4 * self.height_of(i);
+        &self.arena[from..from + self.u32_at(at + KEY_LEN) as usize]
     }
 
     /// The value of node `i`.
     fn value(&self, i: u32) -> &[u8] {
-        let n = &self.nodes[i as usize];
-        &self.arena[n.value_at as usize..(n.value_at + n.value_len) as usize]
+        let at = i as usize;
+        let from = self.u32_at(at + VALUE_AT) as usize;
+        &self.arena[from..from + self.u32_at(at + VALUE_LEN) as usize]
     }
 
     /// Node `i`'s forward link at `level`, or the head's when `i` is `NIL`.
@@ -195,9 +234,8 @@ impl Memtable {
         if i == NIL {
             return self.head[level];
         }
-        let n = &self.nodes[i as usize];
-        debug_assert!(level < n.height as usize);
-        self.links[n.links_at as usize + level]
+        debug_assert!(level < self.height_of(i));
+        self.u32_at(i as usize + LINKS + 4 * level)
     }
 
     fn set_link(&mut self, i: u32, level: usize, to: u32) {
@@ -205,8 +243,8 @@ impl Memtable {
             self.head[level] = to;
             return;
         }
-        let at = self.nodes[i as usize].links_at as usize + level;
-        self.links[at] = to;
+        debug_assert!(level < self.height_of(i));
+        self.set_u32_at(i as usize + LINKS + 4 * level, to);
     }
 
     /// A height for a new node: one, with a one-in-four chance of each step up.
@@ -264,28 +302,30 @@ impl Memtable {
         if next != NIL && order(self.key(next), key) == Ordering::Equal {
             let value_at = self.arena.len() as u32;
             self.arena.extend_from_slice(value);
-            let n = &mut self.nodes[next as usize];
-            n.value_at = value_at;
-            n.value_len = value.len() as u32;
+            self.given += value.len();
+            self.set_u32_at(next as usize + VALUE_AT, value_at);
+            self.set_u32_at(next as usize + VALUE_LEN, value.len() as u32);
             return Ok(());
         }
 
         let height = self.random_height();
-        let key_at = self.arena.len() as u32;
+        let me = self.arena.len() as u32;
+        let value_at = me as usize + LINKS + 4 * height + key.len();
+        self.arena
+            .extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.arena
+            .extend_from_slice(&(value_at as u32).to_le_bytes());
+        self.arena
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.arena.push(height as u8);
+        for _ in 0..height {
+            self.arena.extend_from_slice(&NIL.to_le_bytes());
+        }
         self.arena.extend_from_slice(key);
-        let value_at = self.arena.len() as u32;
         self.arena.extend_from_slice(value);
-        let links_at = self.links.len() as u32;
-        self.links.extend(std::iter::repeat_n(NIL, height));
-        let me = self.nodes.len() as u32;
-        self.nodes.push(Node {
-            key_at,
-            key_len: key.len() as u32,
-            value_at,
-            value_len: value.len() as u32,
-            links_at,
-            height: height as u8,
-        });
+        debug_assert_eq!(self.arena.len(), value_at + value.len());
+        self.count += 1;
+        self.given += key.len() + value.len();
 
         // Above the old height, `predecessors` left its array untouched, and
         // it starts as `NIL` — the head. So a node taller than any so far
@@ -536,6 +576,19 @@ mod tests {
     use super::*;
     use roble_format::key::Kind;
 
+    impl Memtable {
+        /// Every node's height, in key order.
+        fn heights(&self) -> Vec<u8> {
+            let mut out = Vec::with_capacity(self.count);
+            let mut at = self.link(NIL, 0);
+            while at != NIL {
+                out.push(self.height_of(at) as u8);
+                at = self.link(at, 0);
+            }
+            out
+        }
+    }
+
     fn filled(seed: u64, n: u64) -> Memtable {
         let mut t = Memtable::new(seed);
         for i in 0..n {
@@ -558,14 +611,14 @@ mod tests {
         );
 
         let mut at_height = [0usize; MAX_HEIGHT + 1];
-        for n in &t.nodes {
-            at_height[n.height as usize] += 1;
+        for h in t.heights() {
+            at_height[h as usize] += 1;
         }
         assert!(
-            at_height[1] > t.nodes.len() / 2,
+            at_height[1] > t.len() / 2,
             "most nodes should be height one, got {} of {}",
             at_height[1],
-            t.nodes.len()
+            t.len()
         );
         for (h, count) in at_height.iter().enumerate().take(5).skip(2) {
             assert!(*count > 0, "no nodes of height {h}");
@@ -587,13 +640,13 @@ mod tests {
         // is the same whatever the shape, so only the shape can show this.
         let a = filled(42, 500);
         let b = filled(42, 500);
-        let heights_a: Vec<u8> = a.nodes.iter().map(|n| n.height).collect();
-        let heights_b: Vec<u8> = b.nodes.iter().map(|n| n.height).collect();
+        let heights_a = a.heights();
+        let heights_b = b.heights();
         assert_eq!(heights_a, heights_b, "same seed, same shape");
         assert_eq!(a.height, b.height);
 
         let c = filled(43, 500);
-        let heights_c: Vec<u8> = c.nodes.iter().map(|n| n.height).collect();
+        let heights_c = c.heights();
         assert_ne!(
             heights_a, heights_c,
             "a different seed should build a different shape"
