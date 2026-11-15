@@ -37,6 +37,8 @@
 //! and `seek_ge`/`next`/`prev` over a snapshot arrive with the table cache
 //! that can hold an open reader.
 
+use std::rc::Rc;
+
 use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
 
@@ -230,12 +232,28 @@ impl<F: Fs> Opened<F> {
 
     /// A point lookup.
     async fn equal(&self, user: &[u8], buf: &mut Lookup) -> Result<bool> {
+        // **The version is held until the lookup has answered**, so that no
+        // table chosen from it can be collected before it is read. The
+        // tables are opened one at a time below, each an await, and a
+        // compaction that ran in one of them could retire a table this has
+        // chosen and not opened yet; the sweep after it keeps the tables of
+        // every version still held, and of no other (`crate::obsolete`). An
+        // `Rc` taken and given back, and nothing allocated: what the sweep
+        // reads is the note the compaction makes when it replaces a version
+        // something holds (`crate::obsolete::Pinned`), not one made here.
+        let version = Rc::clone(&self.versions().version);
         // The range check both halves need, done once. They narrow it
         // differently from here — `newest_for` consults each table's filter
         // and `visible` must not, since a filter is built from point keys and
         // a range tombstone is not one — but which tables *contain* the key
         // is one question with one answer.
-        self.tables_containing(user, &mut buf.file_nums)?;
+        //
+        // Only file numbers leave the version, which is what keeps a lookup
+        // from allocating per table: what this replaced carried a clone of
+        // every table's metadata out instead, two `Vec`s of bounds a table,
+        // and a store settling into more tables made every lookup allocate
+        // more — 28 per `get` at four tables and 122 at twenty-six, measured.
+        version.tables_containing(user, &mut buf.file_nums)?;
         let Some(found) = self.newest_for(user, buf).await? else {
             return Ok(false);
         };
@@ -504,28 +522,5 @@ impl<F: Fs> Opened<F> {
             }
         }
         Ok(true)
-    }
-}
-
-impl<F: Fs> Opened<F> {
-    /// The file number of every table whose key range contains `user`.
-    ///
-    /// The comparison happens **here**, while the version is still borrowed,
-    /// and only file numbers leave. What it replaced carried a clone of every
-    /// table's metadata out instead, and a table's two bounds are `Vec<u8>`
-    /// fields: a point lookup allocated twice per table in the database, for
-    /// tables whose range cannot hold the key as much as for the one that
-    /// does, and twice over because both halves of the lookup asked. A store
-    /// settling into more tables made every lookup allocate more — 28 per
-    /// `get` at four tables and 122 at twenty-six, measured, growing by about
-    /// four per table added.
-    ///
-    /// The borrow is why the clone was there: the callers `.await` on opening
-    /// a table, and a `Ref` cannot be held across that. A file number can.
-    ///
-    /// Order does not matter: every comparison in the callers is by key or by
-    /// trailer, never by position in the tree.
-    fn tables_containing(&self, user: &[u8], out: &mut Vec<u64>) -> Result<()> {
-        self.versions().version.tables_containing(user, out)
     }
 }
