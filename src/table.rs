@@ -621,17 +621,30 @@ async fn fetch<D: Disk>(
         .map_err(|_| Error::Corrupt(format!("block length {} too large", handle.length)))?;
     debug_assert_eq!(len, handle.length as usize + TRAILER_SIZE);
     let timer = metrics.and_then(|m| m.read_duration.start());
-    let raw = read_exact(disk, handle.offset, len, Default::default()).await?;
+    let mut raw = read_exact(disk, handle.offset, len, Default::default()).await?;
     drop(timer);
     if let Some(m) = metrics {
         m.read.add(raw.len());
     }
-    Ok(Rc::new(
-        match decode_fetched(&raw, handle.offset, checksum)? {
-            Decoded::Borrowed(b) => b.to_vec(),
-            Decoded::Owned(v) => v,
-        },
-    ))
+    let block = match decode_fetched(&raw, handle.offset, checksum)? {
+        // **The read is the block, less its trailer**, so the buffer it was
+        // read into is the one kept. A stored block's bytes are the first
+        // `length` of its span, and an uncompressed one is those bytes as they
+        // are — which is every block roble writes. This used to copy them out
+        // to drop the five trailing bytes: a second block-sized allocation and
+        // a 16 KiB copy on every miss, for a buffer then thrown away.
+        Decoded::Borrowed(block) => {
+            debug_assert!(
+                std::ptr::eq(block.as_ptr(), raw.as_ptr()),
+                "an uncompressed block is the start of the read it came in"
+            );
+            let kept = block.len();
+            raw.truncate(kept);
+            raw
+        }
+        Decoded::Owned(decompressed) => decompressed,
+    };
+    Ok(Rc::new(block))
 }
 
 /// A position in one table that survives between calls.

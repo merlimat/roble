@@ -1111,6 +1111,19 @@ uncompressed, and its values are small records with shared structure, so the
 disk-space cost may be smaller than it looks. Reading Snappy and Zstd is
 required regardless, for files Go wrote (§3).
 
+**As built, an uncompressed block is kept in the buffer it was read into** —
+which for a while it was not. A miss copied the block out of its read to drop
+the five-byte trailer, so the read path paid the very copy and allocation that
+the paragraph above credits uncompressed blocks with avoiding: two block-sized
+allocations and a 16 KiB copy per miss, found by counting what each kind of
+lookup allocates rather than by any timing. Keeping the read buffer took `get`
+from 255,830 to 281,456 a second (1.10x) and `floor` from 204,016 to 219,310
+(1.075x), on one pinned core over a store several times the cache, where a
+miss is the common case. A miss still allocates three times per block: the
+buffer itself, which the cache then owns; the `Rc` the cache shares it
+through; and the I/O runtime's box for the operation, which is compio's
+(`tests/missed_block_memory.rs`).
+
 **Memtables** are arenas of a configured size, 4 MiB to match Oxia. A store's
 memory is its memtables plus its share of the thread's caches plus its
 compaction buffers, and the budget covers all three. The first of the three is
