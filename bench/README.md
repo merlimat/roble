@@ -93,6 +93,10 @@ They always run in this order, whatever order `--phases` names them in.
   in the next.
 - **scan-rev**, then **scan** — steps every record of every shard, backward and
   then forward. Reverse goes first on purpose: see *Reading the numbers*.
+  After `settle` they step over tables. Without it, and with a load that fits
+  in one memtable — `--phases load,scan-rev,scan --batches 20` at the default
+  64 MiB, where `levels` prints nothing — they step over the memtable instead,
+  which is how its step back is measured.
 - **get** — `--reads` keys drawn by `--distribution` (below), every one
   present. Oxia's `Get` with
   `ComparisonEqual`, and the one comparison a bloom filter can answer.

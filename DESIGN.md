@@ -835,6 +835,15 @@ scan over a store in cache, and held it to 0.63x RocksDB's; keeping the
 entries doubled it, to 1.39x, and past memory from 0.63x to 1.22x. Pebble's
 `blockIter` and RocksDB's `DataBlockIter` keep the same entries.
 
+**The memtable steps back by a link.** A skiplist's links run forwards, so a
+step back over the memtable searched from the top for the predecessor of a
+copy of the current key: a descent and an allocation per entry, three
+quarters of a reverse scan over a memtable of 200,000 entries. Each record
+also holds the record before it at level zero, as Pebble's `arenaskl` does,
+and a step back follows that. The scan went from 5.0M entries a second to
+7.4M, 1.47x, for four bytes a record; forward scans, loads and YCSB A did not
+move (`bench/`, one core and 512 MiB).
+
 **A snapshot is the number and the version.** A scan holds a version too
 (§5), but it is a cursor, bounded, and a lookup is not something a cursor
 does. A snapshot is what a caller says when it means to read the whole store

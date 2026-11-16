@@ -90,10 +90,10 @@ async fn a_memtable_filling_up_holds_its_budget_and_not_twice_it() {
     const WRITTEN: u64 = BUDGET * 3 / 4;
     /// The value size roble is built for: Oxia's records are small.
     const VALUE: usize = 256;
-    /// What a record costs the arena beyond its key and value: a 13-byte
+    /// What a record costs the arena beyond its key and value: a 17-byte
     /// header and four bytes for each level it stands in, a third of a level
     /// over one on average.
-    const BOOKKEEPING: f64 = 13.0 + 4.0 * 4.0 / 3.0;
+    const BOOKKEEPING: f64 = 17.0 + 4.0 * 4.0 / 3.0;
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("db");
