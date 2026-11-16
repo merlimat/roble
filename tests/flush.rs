@@ -300,6 +300,98 @@ async fn a_table_written_in_several_chunks_reads_back_whole() {
     }
 }
 
+/// A fresh store with compaction left to the caller, for a flush's table to
+/// be the only one there is.
+async fn created(env: &SimEnv) -> roble::Opened<SimFs> {
+    roble::open_with(
+        env,
+        Path::new("/db"),
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("create")
+}
+
+async fn put<F: Fs>(db: &roble::Opened<F>, key: &[u8], value: &[u8]) {
+    let mut batch = Batch::new();
+    batch.put(key, value).expect("put");
+    db.write(&mut batch, true).await.expect("write");
+}
+
+#[compio::test]
+async fn a_flush_writes_only_the_newest_version_of_a_key() {
+    // Three writes of one key, three sequence numbers. A table holding all
+    // three spans all three; one holding only the newest starts and ends at
+    // the last. The bounds are what the MANIFEST records, so they are what a
+    // lookup skips the table on (`crate::read`), and they are the table's
+    // own: a flush counts only the entries it writes.
+    let env = SimEnv::new();
+    let db = created(&env).await;
+    for value in [&b"first"[..], b"second", b"third"] {
+        put(&db, b"/k", value).await;
+    }
+    let file_num = db.flush().await.expect("flush").expect("a table");
+    let (smallest, largest) = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .find(|t| t.file_num == file_num)
+        .map(|t| (t.smallest_seq_num, t.largest_seq_num))
+        .expect("the table should be in L0");
+    assert_eq!(
+        smallest, largest,
+        "the table should hold one version of /k, not every one written"
+    );
+
+    // And it is the newest, from the table's blocks once the memtable that
+    // could still answer is gone.
+    drop(db);
+    let db = open_unscheduled(&env, Path::new("/db")).await;
+    assert_eq!(
+        db.get(b"/k", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"third".to_vec()),
+    );
+}
+
+#[compio::test]
+async fn a_snapshot_between_two_versions_still_reads_the_older_after_a_flush() {
+    // The flush leaves the older version out of its table, and that is safe
+    // only because nothing can ask the table for it: a snapshot made before
+    // the flush holds the memtable the older version is in, not the table
+    // written from it. This is the case that argument has to survive — a
+    // snapshot that sees the older version and not the newer.
+    let env = SimEnv::new();
+    let db = created(&env).await;
+    put(&db, b"/k", b"older").await;
+    let snap = db.snapshot().await.expect("snapshot");
+    put(&db, b"/k", b"newer").await;
+    db.flush().await.expect("flush").expect("a table");
+
+    assert_eq!(
+        snap.lookup(b"/k").await.expect("lookup"),
+        Some(b"older".to_vec()),
+        "the snapshot should read the version it was made with"
+    );
+    let mut scan = snap.scan().expect("scan");
+    scan.first().await.expect("first");
+    assert!(scan.is_valid(), "the snapshot's scan should find /k");
+    assert_eq!(scan.value(), b"older", "and so should its scan");
+    assert_eq!(
+        db.get(b"/k", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"newer".to_vec()),
+        "while the store reads the newer"
+    );
+}
+
 #[compio::test]
 async fn flushing_nothing_writes_nothing() {
     let (env, dir) = load("db-reads").await;
