@@ -888,6 +888,20 @@ largest key of `#72057594037927935 rangedel`. Folding the sentinel into the
 sequence range produces a table claiming a sequence number above anything the
 MANIFEST ever committed, which is what §6's version check refuses.
 
+**A flush writes the newest version of each key and leaves the rest out**, as a
+compaction does and for the same reason: nothing can ask the table for an older
+one. A read of the store as it stands wants the newest, and a scan or snapshot
+made before the flush holds the memtable itself rather than the table written
+from it, so a flushed table is only ever read at a sequence number past every
+entry in it — the snapshot that could sit between two versions is one that
+never reads the table. Pebble keeps a version for each snapshot open across
+its flush, because its snapshots read the current tables at an old sequence
+number; roble's hold what they were made with, which is what lets it keep
+none. Under a skewed workload this is most of a memtable: with YCSB's Zipf
+draws about two of every three updates land on a key the same memtable already
+holds, and writing those cost the flush their encoding, checksums and bytes
+and the compaction after it the reading of them back only to drop them.
+
 `flush()` **freezes** the memtable — nothing more is added to it, and writes go
 to a fresh one and, with a WAL, a fresh log — then writes it as a table, appends
 the version edit carrying the new minimum unflushed log number, and syncs: the

@@ -397,6 +397,22 @@ async fn build_table<D: Disk>(
     // bounds the MANIFEST records are the table's real ones.
     let mut bounds = Bounds::default();
 
+    // The user key last written, so that every older version of it can be
+    // left out: the first version the walk meets of a key is its newest,
+    // because trailers sort descending, and nothing can ask a table for any
+    // other. A read of the store as it stands wants the newest, and a scan
+    // or snapshot made before this flush holds the memtable itself, not the
+    // table written from it — so a table written now is only ever read at a
+    // sequence number past all of its entries. That is the reasoning
+    // `crate::compact` drops versions on, and it holds here for the same
+    // reason. Under a skewed workload it is most of what a memtable holds:
+    // YCSB's Zipf draws put two of every three updates on a key updated
+    // earlier in the same memtable, and writing those cost the flush the
+    // encoding, the checksums and the bytes, and the compaction after it the
+    // reading of them back only to drop them.
+    let mut written = Vec::new();
+    let mut written_any = false;
+
     let mut cursor = {
         let held = memtable.borrow();
         let mut cursor = held.cursor();
@@ -410,9 +426,14 @@ async fn build_table<D: Disk>(
             while cursor.is_valid() {
                 let encoded = cursor.key(&held);
                 let key = InternalKey::decode(encoded)?;
-                writer.add(key, cursor.value(&held))?;
-                bounds.saw_key(encoded)?;
-                bounds.saw_seq(key.seq_num);
+                if !written_any || key.user_key != written.as_slice() {
+                    writer.add(key, cursor.value(&held))?;
+                    bounds.saw_key(encoded)?;
+                    bounds.saw_seq(key.seq_num);
+                    written.clear();
+                    written.extend_from_slice(key.user_key);
+                    written_any = true;
+                }
                 cursor.next(&held);
                 did += 1;
                 if did == unit {

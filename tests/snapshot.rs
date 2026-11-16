@@ -297,11 +297,14 @@ async fn a_lookup_steps_past_a_newer_version_in_the_memtable() {
 
 #[compio::test]
 async fn a_lookup_takes_the_newest_version_a_table_holds() {
-    // The table's iterator rather than the memtable's cursor, over a table
-    // holding two versions of one key. The snapshot cannot be *between* them
-    // here, and no snapshot ever can be: every entry in a table it holds was
-    // written before it was made. So this says the other half — that the
-    // newest of the versions in a table is the one that answers.
+    // The table's iterator rather than the memtable's cursor. A snapshot can
+    // never be *between* two versions in a table it holds: every entry in
+    // such a table was written before the snapshot was made. That is also
+    // why a flush keeps only the newest version of each key, so the table
+    // here holds the second write and not the first — and this says the
+    // answer comes from it. A table holding several versions of a key is one
+    // Pebble flushed with a snapshot of its own open; the golden
+    // `valueblocks` table is one, and the format crate reads it.
     let (env, dir) = load("db-reads").await;
     let db = open_unscheduled(&env, &dir).await;
 
