@@ -124,8 +124,9 @@ pub struct Memtable {
     height: usize,
     rng: u64,
     /// What the store will let this memtable hold before it is written out,
-    /// or zero for one that has no budget — a batch's index. The arena grows
-    /// to it in one step rather than by doubling ([`Memtable::make_room`]).
+    /// in keys and values, or zero for one that has no budget — a batch's
+    /// index. The arena grows to what that takes in one step rather than by
+    /// doubling ([`Memtable::make_room`]).
     budget: usize,
 }
 
@@ -187,17 +188,18 @@ impl Memtable {
         }
     }
 
-    /// An empty memtable that a store will fill to `budget` bytes.
+    /// An empty memtable that a store will fill to `budget` bytes of keys and
+    /// values.
     ///
-    /// The budget is what a store's memtables are written out at, so it is
-    /// how large this one's arena will get, and the arena goes there in one
-    /// step once it is past [`GROW_TO_BUDGET_PAST`]. Grown by doubling the way
-    /// a `Vec` grows, the arena reallocated at each power of two and held the
-    /// old copy and the new at once while it moved: a 64 MiB store's memtable
-    /// passed 43 MiB on its way to its 56 MiB flush line, took an 86 MiB
-    /// allocation, and held 129 MiB for the copy — the largest single thing a
-    /// store held at its peak in YCSB A, and a 64 MiB memtable kept in an
-    /// 86 MiB one afterwards (`bench/`).
+    /// The budget is what a store's memtables are written out at, so it says
+    /// how large this one's arena will get ([`Memtable::whole`]), and the
+    /// arena goes there in one step once it is past [`GROW_TO_BUDGET_PAST`].
+    /// Grown by doubling the way a `Vec` grows, the arena reallocated at each
+    /// power of two and held the old copy and the new at once while it moved:
+    /// a 64 MiB store's memtable passed 43 MiB on its way to its 56 MiB flush
+    /// line, took an 86 MiB allocation, and held 129 MiB for the copy — the
+    /// largest single thing a store held at its peak in YCSB A, and a 64 MiB
+    /// memtable kept in an 86 MiB one afterwards (`bench/`).
     pub fn with_budget(seed: u64, budget: usize) -> Self {
         Memtable {
             budget,
@@ -208,18 +210,44 @@ impl Memtable {
     /// Room in the arena for `more` bytes, before they are appended.
     ///
     /// Below [`GROW_TO_BUDGET_PAST`], and for a memtable with no budget,
-    /// nothing: the append grows the arena as a `Vec` grows. Past it and
-    /// within the budget, the arena is grown to the whole budget at once, so
-    /// it moves once and small, and never holds more than its budget. Past
-    /// the budget — a store with nothing to write its memtable out to fills
-    /// the whole budget, and the arena's bookkeeping takes it over — the
-    /// ordinary growth resumes: growing by exactly what each write needs
-    /// would move it on every write.
+    /// nothing: the append grows the arena as a `Vec` grows. Past it, the
+    /// arena is grown at once to all it will hold ([`Memtable::whole`]), so
+    /// it moves once and small. Past that — a batch larger than the
+    /// allowance, or records that change shape partway — the ordinary growth
+    /// resumes: growing by exactly what each write needs would move it on
+    /// every write.
     fn make_room(&mut self, more: usize) {
         let needed = self.arena.len() + more;
-        if needed > self.arena.capacity() && needed > GROW_TO_BUDGET_PAST && needed <= self.budget {
-            self.arena.reserve_exact(self.budget - self.arena.len());
+        if needed <= self.arena.capacity() || needed <= GROW_TO_BUDGET_PAST {
+            return;
         }
+        let whole = self.whole();
+        if needed <= whole {
+            self.arena.reserve_exact(whole - self.arena.len());
+        }
+    }
+
+    /// How large the arena gets before the store writes this memtable out.
+    ///
+    /// Larger than the budget, because the budget counts keys and values and
+    /// the arena holds each record's header and links as well — thirteen
+    /// bytes and four per level, about eighteen on average. Reserved at the
+    /// budget alone, the arena of a 64 MiB store holding 36-byte keys and
+    /// 128-byte values filled its 64 MiB at 58 MiB of keys and values, short
+    /// of where the store wrote it out, and doubled to 128 MiB for the last
+    /// few megabytes: a 64 MiB copy every memtable, and the largest thing the
+    /// store held (`bench/`).
+    ///
+    /// So the bookkeeping is counted at the rate the records so far have
+    /// paid it, which a megabyte of them measures well, on top of the budget
+    /// plus an eighth ([`FLUSH_RESERVE`]): a store writes a memtable out by
+    /// the time it holds its budget, and the batch that crosses that line
+    /// goes in whole (§5). Pages are resident only once written, so the part
+    /// of this a memtable never reaches costs address space and nothing else.
+    fn whole(&self) -> usize {
+        let allowed = (self.budget + self.budget / FLUSH_RESERVE as usize) as u128;
+        let whole = allowed * self.arena.len() as u128 / self.given.max(1) as u128;
+        whole.try_into().unwrap_or(usize::MAX)
     }
 
     /// How many entries it holds.
@@ -707,6 +735,56 @@ mod tests {
         // The generator is a xorshift, which is stuck at zero for ever.
         let t = filled(0, 500);
         assert!(t.height > 1, "a zero seed produced a flat list");
+    }
+
+    #[test]
+    fn a_budgeted_arena_moves_once_on_its_way_past_the_budget() {
+        // The bench's records, a 36-byte key and a 128-byte value, whose
+        // header and links add about a tenth; and small ones, an 8-byte value
+        // under a 16-byte key, where they add over half. The arena reserved
+        // at the budget alone passed it at 3.6 MiB of keys and values in the
+        // first and 2.5 MiB in the second, and doubled.
+        let budget = 4 << 20;
+        let past = budget + budget / (2 * FLUSH_RESERVE as usize);
+        for (key_len, value_len) in [(36, 128), (16, 8)] {
+            let mut t = Memtable::with_budget(1, budget);
+            let value = vec![7u8; value_len];
+            // Every move of an arena already past a megabyte, which is a copy
+            // of all of it with the old and the new both held meanwhile.
+            let mut moves = Vec::new();
+            let mut i = 0u64;
+            // To the budget and then partway into the batch that may cross
+            // it, which is what a store puts in a memtable (§5).
+            while t.bytes() < past {
+                let user = format!("{i:0key_len$}");
+                let before = t.arena.capacity();
+                t.insert(&key::encode(user.as_bytes(), i, Kind::Set), &value)
+                    .expect("insert");
+                if t.arena.capacity() != before && before >= GROW_TO_BUDGET_PAST {
+                    moves.push((before, t.arena.capacity()));
+                }
+                i += 1;
+            }
+            assert_eq!(
+                moves.len(),
+                1,
+                "{key_len}+{value_len}: the arena moved {moves:?} past a megabyte, \
+                 to hold {} for {} of keys and values",
+                t.arena.len(),
+                t.bytes()
+            );
+            // And it was not simply handed far more than it holds: what it
+            // reserved is the budget and an eighth at the rate these records
+            // pay for their bookkeeping.
+            let rate = t.arena.len() as f64 / t.bytes() as f64;
+            let allowed = (budget + budget / FLUSH_RESERVE as usize) as f64;
+            let reserved = t.arena.capacity();
+            assert!(
+                reserved as f64 <= allowed * rate * 1.01,
+                "{key_len}+{value_len}: reserved {reserved} for {} of arena",
+                t.arena.len()
+            );
+        }
     }
 
     #[test]
