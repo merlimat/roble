@@ -1586,6 +1586,47 @@ async fn a_level_whose_table_lies_past_the_probe_is_not_opened() {
     }
 }
 
+/// A key flushed into two L0 tables is sought in the newer one only.
+///
+/// L0 is kept oldest first, and a lookup that walked it that way found the
+/// older version, then the newer one, and paid a block read and a seek for
+/// each; newest first, the newer version is found first and the older table
+/// is too old to change the answer, so it is not opened.
+#[compio::test]
+async fn a_get_opens_only_the_newest_l0_table_holding_the_key() {
+    let (options, tag) = metered("newest-l0-first");
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, options.disable_automatic_compactions(true))
+        .await
+        .expect("open");
+
+    for value in [&b"old"[..], b"new"] {
+        let mut batch = Batch::new();
+        batch.put(b"hot", value).expect("put");
+        db.write(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush").expect("a table");
+    }
+
+    let opened = |r: &BTreeMap<String, i64>| r.values().sum::<i64>();
+    let before = opened(&lookups(reader(), &tag, "table"));
+    let found = db
+        .get(b"hot", Comparison::Equal)
+        .await
+        .expect("get")
+        .expect("the key");
+    assert_eq!(
+        found.value, b"new",
+        "the newer flush holds the newer version"
+    );
+    let after = opened(&lookups(reader(), &tag, "table"));
+    assert_eq!(
+        after - before,
+        1,
+        "a key in two L0 tables opened {} of them",
+        after - before
+    );
+}
+
 /// A `get` the memtable answers opens no table.
 ///
 /// A memtable holds only writes no table has taken yet, so its version of a

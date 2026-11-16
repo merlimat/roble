@@ -33,7 +33,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::rc::Rc;
 
 use crate::env::Fs;
@@ -69,6 +69,42 @@ pub const DEFAULT_OPEN_TABLES: usize = usize::MAX;
 /// much larger value block cannot be budgeted the same way.
 pub const DEFAULT_BLOCK_BYTES: usize = 32 << 20;
 
+/// The hash the caches' indexes use: a rotate, an exclusive or and a
+/// multiply per word, which is all a key made of a store id, a file number
+/// and an offset needs.
+///
+/// `HashMap`'s default is SipHash, built to withstand keys chosen to collide,
+/// and these are numbers roble hands out itself. It was nearly 2% of a point
+/// lookup over a store in cache, which hashes twice per table it reads: the
+/// table, then the block. This is rustc's `FxHasher`, finished with its
+/// rotate so that the well-mixed high bits reach the low ones the map takes
+/// its bucket from.
+#[derive(Default, Clone, Copy)]
+struct WordHasher(u64);
+
+impl Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0xf135_7aea_2e62_a9c5);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
+}
+
+/// Builds [`WordHasher`]s for a `HashMap`.
+type WordHash = BuildHasherDefault<WordHasher>;
+
 struct Slot<K, V> {
     key: K,
     value: V,
@@ -80,7 +116,7 @@ struct Slot<K, V> {
 /// A CLOCK cache with a budget expressed in whatever unit `cost` is.
 pub struct Clock<K: Eq + Hash + Clone, V: Clone> {
     slots: Vec<Option<Slot<K, V>>>,
-    index: HashMap<K, usize>,
+    index: HashMap<K, usize, WordHash>,
     free: Vec<usize>,
     hand: usize,
     used: usize,
@@ -96,7 +132,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
     pub fn new(budget: usize) -> Self {
         Clock {
             slots: Vec::new(),
-            index: HashMap::new(),
+            index: HashMap::default(),
             free: Vec::new(),
             hand: 0,
             used: 0,
@@ -448,6 +484,27 @@ impl<F: Fs> Default for Caches<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_keys_spread_over_the_low_bits_the_map_buckets_by() {
+        // The map takes a key's bucket from the low bits of its hash, so a
+        // hash that left them alike would put every block of a table in a
+        // few buckets — a map that still answers, and slowly. A thousand
+        // blocks of consecutive tables, sixteen kilobytes apart, should
+        // land in most of a thousand buckets.
+        use std::hash::BuildHasher;
+        let build = WordHash::default();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1000u64 {
+            let key = BlockKey {
+                store: 1,
+                file_num: 7 + i / 50,
+                offset: (i % 50) * 16 * 1024,
+            };
+            seen.insert(build.hash_one(key) & 1023);
+        }
+        assert!(seen.len() > 600, "only {} of 1024 buckets", seen.len());
+    }
 
     /// The default table cache keeps everything, which is what makes it a
     /// bound nobody trips over rather than a cliff somebody falls off.

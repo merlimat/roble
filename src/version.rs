@@ -295,14 +295,22 @@ impl Version {
     /// flushes and compactions both count each tombstone's (`crate::flush`,
     /// `Bounds::saw_seq`).
     ///
-    /// Order does not matter to any caller: every comparison they make is by
-    /// key or by trailer, never by position in the tree.
+    /// **Newest first**, by that sequence number. No answer depends on the
+    /// order — every comparison a caller makes is by key or by trailer — but
+    /// what a lookup opens does: it leaves a table unopened once it holds a
+    /// version newer than anything the table could, so the sooner it meets
+    /// the newest version the more it skips. L0 is kept by file number,
+    /// oldest first, and listed that way a key written into each of the last
+    /// few flushes was sought in every one of them, a block read and a seek
+    /// apiece, where newest first it is sought in one and the rest of L0 and
+    /// every level below are skipped. RocksDB searches L0 the same way and
+    /// stops at the first table that has the key.
     pub(crate) fn tables_containing(&self, user: &[u8], out: &mut Vec<(u64, u64)>) -> Result<()> {
         out.clear();
         for (level, tables) in self.levels() {
             if level == 0 {
                 // L0's tables overlap, so any number of them can hold the
-                // key and there is no order to search.
+                // key and there is no key order to search them in.
                 for meta in tables {
                     if meta.smallest_user_key()? <= user && meta.largest_user_key()? >= user {
                         out.push((meta.file_num, meta.largest_seq_num));
@@ -312,6 +320,12 @@ impl Version {
                 out.push((meta.file_num, meta.largest_seq_num));
             }
         }
+        // By sequence number rather than by level and then file number,
+        // which is nearly the same order and not quite: a table a
+        // compaction wrote into a lower level can be newer than one still in
+        // L0, and a database Pebble compacted within L0 can hold a table
+        // whose file number is newer than its contents.
+        out.sort_unstable_by_key(|&(_, seq)| std::cmp::Reverse(seq));
         Ok(())
     }
 }
