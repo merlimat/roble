@@ -794,18 +794,24 @@ impl<F: Fs> Opened<F> {
         // hangs off a write and not off a clock (§10).
         self.flush_failed.set(false);
 
-        for entry in iter_kinds(batch.as_bytes())? {
-            self.metrics.write_operations[entry].add(1);
+        // Only when something is recording. Each of these would do nothing
+        // with what it was handed otherwise, but the handing was not free: the
+        // batch read a second time into a list, and every memtable's bytes
+        // summed, on every write of a store nobody was metering.
+        if self.metrics.recording() {
+            for entry in iter_kinds(batch.as_bytes())? {
+                self.metrics.write_operations[entry].add(1);
+            }
+            self.metrics
+                .write_size
+                .record(batch.as_bytes().len() as u64);
+            self.metrics.write_bytes.add(batch.as_bytes().len() as u64);
+            self.metrics.write_entries.record(batch.count() as u64);
+            self.metrics
+                .memtable_size
+                .set(self.unflushed_bytes() as i64);
+            self.saw_records();
         }
-        self.metrics
-            .write_size
-            .record(batch.as_bytes().len() as u64);
-        self.metrics.write_bytes.add(batch.as_bytes().len() as u64);
-        self.metrics.write_entries.record(batch.count() as u64);
-        self.metrics
-            .memtable_size
-            .set(self.unflushed_bytes() as i64);
-        self.saw_records();
         Ok(())
     }
 
@@ -949,6 +955,13 @@ impl<F: Fs> Opened<F> {
             return Ok(());
         }
         loop {
+            // A level cannot have more layers than tables, so one with fewer
+            // tables than the line is not past it, and counting the layers —
+            // a list of L0's tables built, sorted and compared pairwise — is
+            // only for the store that might be. This runs on every write.
+            if (self.versions().version.level(0).len() as u64) < self.l0_stop_writes_threshold {
+                return Ok(());
+            }
             // In layers, which is what the line is counted in: a store
             // holding twelve tables a read crosses in one seek is not deep
             // (§9, `crate::pick::l0_depth`).

@@ -684,6 +684,62 @@ async fn a_write_drains_an_l0_it_opened_onto() {
 }
 
 #[compio::test]
+async fn a_write_drains_an_l0_exactly_at_the_line() {
+    // Every table in L0 spans the same keys, so each is a layer of its own
+    // and L0 is exactly as many layers deep as it has tables. A write skips
+    // counting the layers when there are fewer tables than the line, because
+    // there cannot be more layers than tables; at the line itself it may
+    // not, and the write has to find L0 too deep and drain it.
+    const TABLES: u64 = 4;
+    let (env, dir) = load("db-twin-a").await;
+    let db = roble::open_with(&env, &dir, opened(true, 64 << 20))
+        .await
+        .expect("open");
+    let mut model = contents(&db).await;
+    let before = db.versions().version.level(0).len() as u64;
+    for round in 0..TABLES {
+        let mut batch = Batch::new();
+        for key in [&b"a-first"[..], b"z-last"] {
+            let value = format!("round {round}");
+            batch.put(key, value.as_bytes()).expect("put");
+            model.insert(key.to_vec(), value.into_bytes());
+        }
+        db.write(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush").expect("a table");
+    }
+    drop(db);
+
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .l0_compaction_threshold(100)
+            .l0_stop_writes_threshold(before + TABLES),
+    )
+    .await
+    .expect("reopen");
+    let tables = db.versions().version.level(0).len() as u64;
+    assert_eq!(
+        (tables, l0_depth(&db)),
+        (before + TABLES, before + TABLES),
+        "the setup should leave L0 one layer per table, at the line"
+    );
+
+    put(&db, 500, true).await.expect("write");
+    model.insert(key_at(500), VALUE.to_vec());
+    assert!(
+        l0_depth(&db) < before + TABLES,
+        "a write at the line should have drained L0, and it is {} layers deep",
+        l0_depth(&db)
+    );
+    assert_eq!(
+        contents(&db).await,
+        model,
+        "and the drain changed an answer"
+    );
+}
+
+#[compio::test]
 async fn a_store_that_owns_its_compactions_is_not_stopped_by_l0() {
     // A caller that turned compaction off owns L0's depth as well. A write
     // that waited here would be waiting for a merge nobody was going to run,

@@ -135,6 +135,10 @@ pub struct Memtable {
     /// index. The arena grows to what that takes in one step rather than by
     /// doubling ([`Memtable::make_room`]).
     budget: usize,
+    /// Where `apply` builds each entry's internal key before inserting it,
+    /// kept so that a write does not allocate one: the key is copied into the
+    /// arena at once and the buffer is free again for the next.
+    key: Vec<u8>,
 }
 
 /// How large an arena grows the ordinary way before it goes straight to its
@@ -186,6 +190,7 @@ impl Memtable {
             head: [NIL; MAX_HEIGHT],
             height: 1,
             budget: 0,
+            key: Vec::new(),
             // A zero seed would leave the generator stuck, so it is nudged.
             rng: if seed == 0 {
                 0x9e37_79b9_7f4a_7c15
@@ -517,8 +522,11 @@ impl Memtable {
                             kind.name()
                         )));
                     }
-                    let key = key::encode(entry.key, seq, kind);
-                    self.insert(&key, entry.value.unwrap_or(&[]))?;
+                    let mut key = std::mem::take(&mut self.key);
+                    key::encode_into(entry.key, seq, kind, &mut key);
+                    let inserted = self.insert(&key, entry.value.unwrap_or(&[]));
+                    self.key = key;
+                    inserted?;
                 }
             }
             seq += 1;

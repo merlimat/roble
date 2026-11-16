@@ -200,6 +200,18 @@ pub fn encode(user_key: &[u8], seq_num: u64, kind: Kind) -> Vec<u8> {
     encode_with_trailer(user_key, (seq_num << 8) | kind.to_byte() as u64)
 }
 
+/// [`encode`], into a buffer the caller keeps rather than a fresh one.
+///
+/// A memtable builds one of these for every entry a write applies and copies
+/// it into its arena straight away, so a fresh `Vec` per entry was an
+/// allocation per write with nothing to keep.
+pub fn encode_into(user_key: &[u8], seq_num: u64, kind: Kind, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(user_key.len() + TRAILER_LEN);
+    out.extend_from_slice(user_key);
+    out.extend_from_slice(&((seq_num << 8) | kind.to_byte() as u64).to_le_bytes());
+}
+
 /// Encodes an internal key with a trailer given whole.
 pub fn encode_with_trailer(user_key: &[u8], trailer: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(user_key.len() + TRAILER_LEN);
@@ -268,6 +280,19 @@ impl<'a> InternalKey<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_into_writes_what_encode_returns_over_what_was_there() {
+        let mut out = b"left over from the last key, and longer".to_vec();
+        for (user, seq, kind) in [
+            (&b"k"[..], 7, Kind::Set),
+            (b"", 0, Kind::Delete),
+            (b"/a/b", 1 << 40, Kind::RangeDelete),
+        ] {
+            encode_into(user, seq, kind, &mut out);
+            assert_eq!(out, encode(user, seq, kind), "{user:?} {seq} {kind:?}");
+        }
+    }
 
     /// Every kind, its byte and its name, pinned one row at a time.
     ///
