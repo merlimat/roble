@@ -656,7 +656,7 @@ async fn fetch<D: Disk>(
 /// Stepping off either end of a block moves to the next or previous one, so a
 /// caller sees one sequence rather than a sequence of blocks. Reverse is
 /// dearer than forward for the reason §4 gives: within a block, stepping back
-/// rescans from a restart point.
+/// rescans from a restart point, once an interval.
 ///
 /// Rebuilding the block from those bytes on every step — `self` to the `Rc`
 /// to the `Vec` to the data, and twice a record, once to move the cursor and

@@ -32,8 +32,10 @@
 //! - **Stepping backwards is a rescan, not a reverse decode.** There is no way
 //!   to walk entries backwards, so [`Cursor::prev`] finds the restart point
 //!   before the current entry and scans forward to the entry that ends where
-//!   the current one begins. Reverse iteration is therefore dearer than
-//!   forward, which is the cost §4 says to measure.
+//!   the current one begins. It keeps every entry that scan decodes, so the
+//!   rescan happens once per restart interval rather than once per step
+//!   ([`Behind`]), and a reverse scan decodes each entry about twice where a
+//!   forward one decodes it once.
 //! - **The search is for the *last* restart at or before the target**, not the
 //!   first one after it. Landing one interval late skips entries that belong to
 //!   the answer, and a scan that starts too early is merely slower.
@@ -176,6 +178,76 @@ pub struct Cursor {
     key: Vec<u8>,
     value: Range<usize>,
     valid: bool,
+    /// The entries from the current one's restart point up to it, while the
+    /// cursor got there by scanning back.
+    ///
+    /// Boxed, and only once the cursor first scans back: every level of a
+    /// merge holds two cursors, and one that only ever goes forward has no
+    /// use for it.
+    behind: Option<Box<Behind>>,
+    /// How many times it has rescanned an interval, for the tests that pin
+    /// how seldom that is.
+    #[cfg(test)]
+    rescans: usize,
+}
+
+/// The entries of one restart interval, decoded on the way to the current
+/// one, so that stepping back through them decodes nothing.
+///
+/// A step back has to rescan from the restart point before the current
+/// entry, because prefix compression only runs forwards. Done on every step,
+/// that rescan decoded half an interval of entries on average to move by one,
+/// and it was two thirds of a reverse scan over a store in cache: 4.4 million
+/// keys a second where the forward scan did 10.8. The rescan already decodes
+/// every entry between the restart point and the one it is looking for, so
+/// keeping them makes each further step back within the interval a copy of a
+/// key it has already assembled, which took the same scan to 10.0 million,
+/// past RocksDB's 7.2 on the same machine. Pebble's `blockIter` keeps the
+/// same thing (`cached`, `cachedBuf`), and RocksDB's `DataBlockIter` its
+/// `prev_entries_`.
+///
+/// A stack, with the cursor's entry on top: the rescan pushes each entry it
+/// passes, which leaves the one it stops on there, and a step back pops it to
+/// reveal the one before.
+///
+/// It answers a step back only while its top is the entry the cursor is on.
+/// A step forward leaves it alone: it stays in the same block, so the next
+/// step back finds the top somewhere other than the cursor and rescans, and a
+/// forward scan pays nothing for any of this. Moving to another block is
+/// different, because an offset there can equal the top's and be another
+/// entry, so `first` and a seek empty it and `last` fills it afresh.
+#[derive(Clone, Debug, Default)]
+struct Behind {
+    entries: Vec<Kept>,
+    /// Each kept entry's whole key, end to end; an entry's runs from its
+    /// `key_at` to the next one's, or to the end for the top.
+    keys: Vec<u8>,
+}
+
+/// One entry a rescan decoded.
+#[derive(Clone, Debug)]
+struct Kept {
+    pos: usize,
+    end: usize,
+    value: Range<usize>,
+    key_at: usize,
+}
+
+impl Behind {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.keys.clear();
+    }
+
+    fn push(&mut self, pos: usize, end: usize, value: &Range<usize>, key: &[u8]) {
+        self.entries.push(Kept {
+            pos,
+            end,
+            value: value.clone(),
+            key_at: self.keys.len(),
+        });
+        self.keys.extend_from_slice(key);
+    }
 }
 
 impl Cursor {
@@ -238,8 +310,16 @@ impl Cursor {
         Ok(())
     }
 
+    /// Empties what is kept behind, for a move that may be into another block.
+    fn forget(&mut self) {
+        if let Some(behind) = &mut self.behind {
+            behind.clear();
+        }
+    }
+
     /// Positions on the first entry.
     pub fn first(&mut self, block: &Block<'_>) -> Result<()> {
+        self.forget();
         let parts = parts_of(block);
         if parts.entries.is_empty() {
             self.valid = false;
@@ -256,13 +336,37 @@ impl Cursor {
             return Ok(());
         }
         // From the final restart point, which is the cheapest place to start,
-        // and forward to the end.
-        self.place(&parts, parts.restart_offset(parts.num_restarts - 1)?, false)?;
-        while self.end < parts.entries.len() {
+        // and forward to the end — keeping what it passes, since a cursor
+        // sent to the last entry is usually about to step back from it.
+        self.scan_back(
+            &parts,
+            parts.restart_offset(parts.num_restarts - 1)?,
+            parts.entries.len(),
+        )
+    }
+
+    /// Decodes forward from the restart entry at `from` until an entry ends
+    /// at or past `until`, keeping each one behind, and stays on the last.
+    fn scan_back(&mut self, parts: &Parts<'_>, from: usize, until: usize) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.rescans += 1;
+        }
+        self.behind.get_or_insert_default().clear();
+        self.place(parts, from, false)?;
+        self.keep();
+        while self.end < until {
             let pos = self.end;
-            self.place(&parts, pos, true)?;
+            self.place(parts, pos, true)?;
+            self.keep();
         }
         Ok(())
+    }
+
+    /// Keeps the entry the cursor is on, on top of those behind it.
+    fn keep(&mut self) {
+        let behind = self.behind.get_or_insert_default();
+        behind.push(self.pos, self.end, &self.value, &self.key);
     }
 
     /// Steps to the next entry, becoming invalid at the end of the block.
@@ -282,10 +386,26 @@ impl Cursor {
 
     /// Steps to the previous entry, becoming invalid before the first.
     ///
-    /// This rescans from the restart point before the current entry, because
-    /// prefix compression only runs forwards.
+    /// Within an interval a rescan has decoded, the previous entry is the one
+    /// kept under this one ([`Behind`]). Otherwise this rescans from the
+    /// restart point before the current entry, because prefix compression
+    /// only runs forwards, and keeps what it decodes for the steps after.
     pub fn prev(&mut self, block: &Block<'_>) -> Result<()> {
         if !self.valid {
+            return Ok(());
+        }
+        if let Some(behind) = &mut self.behind
+            && behind.entries.len() > 1
+            && behind.entries.last().is_some_and(|top| top.pos == self.pos)
+        {
+            let gone = behind.entries.pop().expect("two or more kept");
+            behind.keys.truncate(gone.key_at);
+            let to = behind.entries.last().expect("one or more kept");
+            self.key.clear();
+            self.key.extend_from_slice(&behind.keys[to.key_at..]);
+            self.pos = to.pos;
+            self.end = to.end;
+            self.value = to.value.clone();
             return Ok(());
         }
         let target = self.pos;
@@ -314,11 +434,7 @@ impl Cursor {
             return Ok(());
         };
 
-        self.place(&parts, parts.restart_offset(restart)?, false)?;
-        while self.end < target {
-            let pos = self.end;
-            self.place(&parts, pos, true)?;
-        }
+        self.scan_back(&parts, parts.restart_offset(restart)?, target)?;
         // Untested, with a reason (§12). Overshooting means a restart
         // offset that does not fall on an entry boundary, and the scan from
         // it decodes whatever is at that offset as an entry — which the
@@ -340,6 +456,7 @@ impl Cursor {
     ///
     /// Becomes invalid when every key in the block is smaller.
     pub fn seek_ge(&mut self, block: &Block<'_>, target: &[u8]) -> Result<()> {
+        self.forget();
         let parts = parts_of(block);
         if parts.entries.is_empty() {
             self.valid = false;
@@ -650,6 +767,149 @@ mod tests {
                     assert_eq!(c.key(), &keys[i - 1][..], "backward from {i}");
                 } else {
                     assert!(!c.is_valid(), "before the first entry");
+                }
+            }
+        }
+    }
+
+    /// How many entries the cursor keeps behind it.
+    fn kept(c: &Cursor) -> usize {
+        c.behind.as_ref().map_or(0, |b| b.entries.len())
+    }
+
+    /// `n` internal keys, `k00`, `k01` and so on, in order.
+    fn numbered(n: usize) -> Vec<Vec<u8>> {
+        named("k", n)
+    }
+
+    /// `n` internal keys, `{prefix}00` and on.
+    fn named(prefix: &str, n: usize) -> Vec<Vec<u8>> {
+        let users: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("{prefix}{i:02}").into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = users.iter().map(|u| u.as_slice()).collect();
+        internal(&refs)
+    }
+
+    #[test]
+    fn stepping_back_rescans_once_an_interval() {
+        // What brings a reverse scan near a forward one: the rescan a step
+        // back needs happens once per restart interval, and each step after
+        // it within the interval takes an entry the rescan kept.
+        let keys = numbered(20);
+        let bytes = build(&keys, 4, false);
+        let block = Block::new(&bytes).expect("block");
+        let mut c = block.cursor();
+
+        // `last` scans the final interval, 16 to 19, and keeps it, so the
+        // three steps back to its restart entry rescan nothing.
+        c.last(&block).expect("last");
+        assert_eq!(c.key(), &keys[19][..]);
+        assert_eq!((c.rescans, kept(&c)), (1, 4));
+        for i in (16..19).rev() {
+            c.prev(&block).expect("prev");
+            assert_eq!(c.key(), &keys[i][..]);
+            assert_eq!((c.rescans, kept(&c)), (1, i - 15), "at {i}");
+        }
+        // Nothing is kept behind a restart entry, so the next step back
+        // rescans the interval before: 12 to 15.
+        c.prev(&block).expect("prev");
+        assert_eq!(c.key(), &keys[15][..]);
+        assert_eq!((c.rescans, kept(&c)), (2, 4));
+
+        // A step forward costs nothing and leaves them, no longer on top of
+        // the cursor, so the step back after it rescans.
+        c.next(&block).expect("next");
+        assert_eq!(c.key(), &keys[16][..]);
+        assert_eq!(c.rescans, 2);
+        c.prev(&block).expect("prev");
+        assert_eq!(c.key(), &keys[15][..]);
+        assert_eq!((c.rescans, kept(&c)), (3, 4));
+    }
+
+    #[test]
+    fn a_cursor_moved_to_another_block_forgets_what_it_kept_in_the_last() {
+        // Two blocks laid out alike, so that an offset in one is an offset in
+        // the other: what the cursor kept in the first must not answer a step
+        // back in the second because the cursor stands at the same offset.
+        let (a, b) = (named("a", 20), named("b", 20));
+        let (bytes_a, bytes_b) = (build(&a, 4, false), build(&b, 4, false));
+        let block_a = Block::new(&bytes_a).expect("block");
+        let block_b = Block::new(&bytes_b).expect("block");
+        for how in ["first", "seek"] {
+            let mut c = block_a.cursor();
+            c.last(&block_a).expect("last");
+            if how == "first" {
+                c.first(&block_b).expect("first");
+                for _ in 0..19 {
+                    c.next(&block_b).expect("next");
+                }
+            } else {
+                c.seek_ge(&block_b, &b[19]).expect("seek_ge");
+            }
+            assert_eq!(c.key(), &b[19][..], "{how}");
+            c.prev(&block_b).expect("prev");
+            assert_eq!(c.key(), &b[18][..], "after {how}");
+        }
+    }
+
+    #[test]
+    fn a_walk_that_turns_back_and_forth_lands_where_the_keys_say() {
+        // A step back takes the entry kept under the current one, which is
+        // only the right one while the cursor is where the rescan left it.
+        // Every other move has to forget what was kept, or the step back
+        // after it lands on an entry from where the cursor used to be.
+        //
+        // `l` last, `f` first, `s` a seek to the twelfth key, `n` next,
+        // `p` prev; the walk runs off the end once and stays off.
+        let keys = numbered(23);
+        let values: Vec<Vec<u8>> = (0..keys.len())
+            .map(|i| format!("v{i}").into_bytes())
+            .collect();
+        let walk = "lpppnppnnpppppnpfnnnnnpppnnnnnnnnnpppppppppspppnppplnnppp";
+        for interval in [1usize, 2, 3, 4, 16] {
+            for same_prefix in [false, true] {
+                let mut b = BlockBuilder::new(interval);
+                for (k, v) in keys.iter().zip(&values) {
+                    b.add(k, v, usize::MAX, None, same_prefix);
+                }
+                let bytes = b.finish().to_vec();
+                let block = Block::new(&bytes).expect("block");
+                let mut c = block.cursor();
+                let mut at: Option<usize> = None;
+                for (step, m) in walk.chars().enumerate() {
+                    match m {
+                        'l' => {
+                            c.last(&block).expect("last");
+                            at = Some(keys.len() - 1);
+                        }
+                        'f' => {
+                            c.first(&block).expect("first");
+                            at = Some(0);
+                        }
+                        's' => {
+                            c.seek_ge(&block, &keys[11]).expect("seek_ge");
+                            at = Some(11);
+                        }
+                        'n' => {
+                            c.next(&block).expect("next");
+                            at = at.and_then(|i| (i + 1 < keys.len()).then_some(i + 1));
+                        }
+                        'p' => {
+                            c.prev(&block).expect("prev");
+                            at = at.and_then(|i| i.checked_sub(1));
+                        }
+                        _ => unreachable!(),
+                    }
+                    let why = format!("step {step} ({m}), interval {interval}");
+                    match at {
+                        Some(i) => {
+                            assert!(c.is_valid(), "{why}");
+                            assert_eq!(c.key(), &keys[i][..], "{why}");
+                            assert_eq!(c.value(&block), &values[i][..], "{why}");
+                        }
+                        None => assert!(!c.is_valid(), "{why}"),
+                    }
                 }
             }
         }
