@@ -232,6 +232,46 @@ fn a_seek_can_be_stepped_away_from_in_either_direction() {
 }
 
 #[test]
+fn a_step_back_retraces_a_step_forward_as_keys_go_in_between() {
+    // A step back follows the link each node keeps to the one before it, and
+    // an insert has to keep that right for two nodes: the new one, and the
+    // one after it, which used to point back at the new one's predecessor.
+    // So the keys go in scattered — each lands between two already there, or
+    // before the first, or after the last — and after every insert the walk
+    // backwards has to be the walk forwards reversed.
+    //
+    // A cursor left on the key after the new one is stepped back as well,
+    // which is what a scan open across a write does (`MemSource` in
+    // scan.rs): it has to land on the new key and not skip it.
+    const N: u64 = 211;
+    let mut table = Memtable::new(3);
+    for i in 0..N {
+        // A stride coprime with N, so every key goes in once.
+        let n = i * 89 % N;
+        let k = key::encode(format!("k{n:03}").as_bytes(), n, Kind::Set);
+
+        let mut after = table.cursor();
+        after.seek_ge(&table, &k).expect("seek_ge");
+        let was_after = after.is_valid().then(|| after.key(&table).to_vec());
+        table.insert(&k, b"v").expect("insert");
+        if let Some(was_after) = was_after {
+            after.prev(&table);
+            assert!(
+                after.is_valid() && after.key(&table) == &k[..],
+                "stepping back from {:?} skipped k{n:03}, just inserted before it",
+                String::from_utf8_lossy(&was_after)
+            );
+        }
+
+        let forwards = forward(&table);
+        let mut backwards = backward(&table);
+        backwards.reverse();
+        assert_eq!(forwards.len() as u64, i + 1, "after k{n:03}: forwards");
+        assert_eq!(backwards, forwards, "after inserting k{n:03}");
+    }
+}
+
+#[test]
 fn inserting_a_key_twice_replaces_its_value() {
     // Pebble gives every write its own sequence number, so this never happens
     // there — which is exactly why the behaviour has to be decided and stated

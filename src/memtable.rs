@@ -45,9 +45,14 @@
 //! generator is part of the memtable, seeded when it is made, so the same
 //! inserts in the same order build the same list every time.
 //!
-//! Reverse iteration searches rather than steps, because the links only run
-//! forwards — the same trade as a block's restart array (§4), and the reason
-//! reverse is dearer here too.
+//! **Level zero is linked backwards as well.** Each record also holds the
+//! offset of the one before it at level zero, so a step back is one hop, as
+//! a step forward is. Without it a step back was a search from the top for
+//! the predecessor of a copy of the current key — a descent and an
+//! allocation for every entry a reverse scan steps over, which is the
+//! direction Oxia's `KeyRangeScanReverse` steps in. Pebble's `arenaskl` keeps
+//! a back link at every level, for its lock-free insert, and steps back by
+//! level zero's; with one writer, level zero's is the only one roble needs.
 
 use std::cmp::Ordering;
 
@@ -69,8 +74,9 @@ const NIL: u32 = u32::MAX;
 /// Where each field of a node's record is, from the record's start.
 ///
 /// A record is `key_len`, `value_at` and `value_len` as little-endian `u32`s,
-/// then the height as one byte, then that many forward links as `u32`s, then
-/// the key, then — until the value is replaced — the value. Unaligned on
+/// then its back link — the record before it at level zero, as a `u32` — then
+/// the height as one byte, then that many forward links as `u32`s, then the
+/// key, then — until the value is replaced — the value. Unaligned on
 /// purpose: a record is as long as its fields and no longer, and an unaligned
 /// load costs nothing on any machine this runs on.
 ///
@@ -80,8 +86,9 @@ const NIL: u32 = u32::MAX;
 const KEY_LEN: usize = 0;
 const VALUE_AT: usize = 4;
 const VALUE_LEN: usize = 8;
-const HEIGHT: usize = 12;
-const LINKS: usize = 13;
+const BACK: usize = 12;
+const HEIGHT: usize = 16;
+const LINKS: usize = 17;
 
 /// Compares two encoded internal keys.
 ///
@@ -230,8 +237,8 @@ impl Memtable {
     /// How large the arena gets before the store writes this memtable out.
     ///
     /// Larger than the budget, because the budget counts keys and values and
-    /// the arena holds each record's header and links as well — thirteen
-    /// bytes and four per level, about eighteen on average. Reserved at the
+    /// the arena holds each record's header and links as well — seventeen
+    /// bytes and four per level, about twenty-two on average. Reserved at the
     /// budget alone, the arena of a 64 MiB store holding 36-byte keys and
     /// 128-byte values filled its 64 MiB at 58 MiB of keys and values, short
     /// of where the store wrote it out, and doubled to 128 MiB for the last
@@ -322,6 +329,11 @@ impl Memtable {
         self.set_u32_at(i as usize + LINKS + 4 * level, to);
     }
 
+    /// The node before `i` at level zero, `NIL` meaning the head.
+    fn back(&self, i: u32) -> u32 {
+        self.u32_at(i as usize + BACK)
+    }
+
     /// A height for a new node: one, with a one-in-four chance of each step up.
     fn random_height(&mut self) -> usize {
         // xorshift64*, so the shape is a function of the seed alone.
@@ -394,6 +406,7 @@ impl Memtable {
             .extend_from_slice(&(value_at as u32).to_le_bytes());
         self.arena
             .extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.arena.extend_from_slice(&prev[0].to_le_bytes());
         self.arena.push(height as u8);
         for _ in 0..height {
             self.arena.extend_from_slice(&NIL.to_le_bytes());
@@ -419,6 +432,12 @@ impl Memtable {
             let after = self.link(before, level);
             self.set_link(me, level, after);
             self.set_link(before, level, me);
+        }
+        // Its own back link went in with the record. The node after it at
+        // level zero, if there is one, now comes after it instead.
+        let after = self.link(me, 0);
+        if after != NIL {
+            self.set_u32_at(after as usize + BACK, me);
         }
         if height > self.height {
             self.height = height;
@@ -603,18 +622,12 @@ impl MemtableCursor {
         self.place(table.link(self.at, 0));
     }
 
-    /// Steps backward.
-    ///
-    /// A search, not a step: the links only run forwards. This is why reverse
-    /// iteration over a memtable costs a descent per entry where forward costs
-    /// a pointer hop.
+    /// Steps backward, by the node's back link: one hop, as a step forward is.
     pub fn prev(&mut self, table: &Memtable) {
         if !self.valid {
             return;
         }
-        let key = table.key(self.at).to_vec();
-        let prev = table.predecessors(&key);
-        self.place(prev[0]);
+        self.place(table.back(self.at));
     }
 
     /// Positions on the first entry at or after `target`.
@@ -740,7 +753,7 @@ mod tests {
     #[test]
     fn a_budgeted_arena_moves_once_on_its_way_past_the_budget() {
         // The bench's records, a 36-byte key and a 128-byte value, whose
-        // header and links add about a tenth; and small ones, an 8-byte value
+        // header and links add about an eighth; and small ones, an 8-byte value
         // under a 16-byte key, where they add over half. The arena reserved
         // at the budget alone passed it at 3.6 MiB of keys and values in the
         // first and 2.5 MiB in the second, and doubled.
