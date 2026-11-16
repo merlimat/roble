@@ -1178,7 +1178,7 @@ across every memtable it has is `Options::memtable_size` plus one batch (§4,
 
 **A store's memtable is allocated at its budget, not grown to it.** The arena
 grows as a `Vec` does while it is under a megabyte, and the first time it needs
-more it goes to the whole budget in one step. Grown by doubling all the way, it
+more it goes in one step to all it will hold. Grown by doubling all the way, it
 reallocated at every power of two and held the old copy and the new while it
 moved: a 64 MiB memtable passed 43 MiB on its way to its 56 MiB flush line,
 took an 86 MiB allocation and held 129 MiB for the copy, which made it the
@@ -1190,6 +1190,21 @@ the memtable holds; and below a megabyte nothing changes, so an idle store's
 memtable — Oxia runs hundreds — is not handed its budget for a few writes.
 With the benchmark's own samples made smaller as well, roble's peak in YCSB A
 and F in cache went from 47–68 MiB over RocksDB's to within 3 (`bench/`).
+
+**All it will hold is more than the budget**, because the budget counts keys
+and values and the arena also holds every record's header and links, about
+eighteen bytes a record. Reserved at the budget alone, a 64 MiB store's arena
+of 36-byte keys and 128-byte values was full at 58 MiB of keys and values,
+before the flush took it, and doubled to 128 MiB for the last few: a 64 MiB
+copy every memtable of a load. mimalloc keeps freed memory for a second before
+it returns it, so the copies and the arena before were all still resident at
+the load's peak, 239 MiB against 134 MiB live — and since a block that large
+goes back into whole 32 MiB chunks that any small allocation in between can
+claim, one unused 270 KiB allocation per phase took that peak to 265 MiB. So
+the arena now reserves the budget plus an eighth, for the batch that crosses
+it (§5), at the rate the records of its first megabyte paid for bookkeeping.
+The load's peak fell to 141–149 MiB, and YCSB C's in cache to 229 MiB, or 233
+with the pad (`bench/`).
 
 ### Where a warm scan step goes
 

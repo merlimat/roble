@@ -19,7 +19,9 @@
 //! `Vec` grows, the arena reallocated at each power of two and held the old
 //! copy and the new together while it moved — at 64 MiB, an 86 MiB allocation
 //! and 129 MiB held for a moment, by a memtable whose budget is 64. Grown
-//! straight to its budget once it is past a megabyte, it moves once and small.
+//! straight to all it will hold once it is past a megabyte — the budget and the
+//! batch that crosses it, with each record's header and links — it moves once
+//! and small.
 //!
 //! The counter is a global allocator, which is per test binary, and its
 //! numbers are only this test's if nothing else is allocating beside it — so
@@ -88,6 +90,10 @@ async fn a_memtable_filling_up_holds_its_budget_and_not_twice_it() {
     const WRITTEN: u64 = BUDGET * 3 / 4;
     /// The value size roble is built for: Oxia's records are small.
     const VALUE: usize = 256;
+    /// What a record costs the arena beyond its key and value: a 13-byte
+    /// header and four bytes for each level it stands in, a third of a level
+    /// over one on average.
+    const BOOKKEEPING: f64 = 13.0 + 4.0 * 4.0 / 3.0;
 
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("db");
@@ -134,9 +140,15 @@ async fn a_memtable_filling_up_holds_its_budget_and_not_twice_it() {
             "the writes have to be in the memtable for this to measure it"
         );
 
-        // The budget, and a little over for what writing allocates beside the
-        // arena. Doubling put the arena's copy at 8 + 16 = 24 MiB here.
-        let allowed = BUDGET + (BUDGET >> 3);
+        // What the arena reserves, which is the budget and an eighth for the
+        // batch that crosses it, at what these records cost it; then the
+        // megabyte and a half it moved from, and a little for what writing
+        // allocates beside it. Doubling put the arena's copy at 8 + 16 =
+        // 24 MiB here when it was reserved at the budget, and would put it at
+        // over 38 MiB now.
+        let rate = (entry as f64 + BOOKKEEPING) / entry as f64;
+        let arena = ((BUDGET + (BUDGET >> 3)) as f64 * rate) as u64;
+        let allowed = arena + (2 << 20);
         assert!(
             held <= allowed,
             "filling {which}, {} MiB of budget, to {} MiB held {:.1} MiB at its peak, over \
