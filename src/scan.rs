@@ -81,6 +81,12 @@ use roble_format::block::restart::DataCursor;
 /// the memtable is still being written to, so a scan has to ignore what
 /// arrived after it began. That is what `snapshot` is for, and it is the only
 /// place it is needed.
+///
+/// A level is some 260 bytes and a memtable source 48, which is the size
+/// difference clippy's `large_enum_variant` objects to. Boxing the level would
+/// put a pointer between the merge and the source it steps on every key, to
+/// save a few hundred bytes in a vector of one source per level.
+#[allow(clippy::large_enum_variant)]
 enum Source<D: Disk> {
     Level(Level<D>),
     Mem(MemSource),

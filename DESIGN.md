@@ -826,6 +826,15 @@ the restart point before the current entry. Across blocks, a backward step at
 the start of a block has to load the previous one and walk it to its end,
 where a forward step loads the next and stops at its first entry.
 
+**The rescan happens once per restart interval, not once per step.** It
+decodes every entry from the restart point to the one before the cursor, and
+the cursor keeps them, so each later step back within the interval copies a
+key it has already assembled; walking to the end of a block keeps the last
+interval the same way. Rescanning on every step was two thirds of a reverse
+scan over a store in cache, and held it to 0.63x RocksDB's; keeping the
+entries doubled it, to 1.39x, and past memory from 0.63x to 1.22x. Pebble's
+`blockIter` and RocksDB's `DataBlockIter` keep the same entries.
+
 **A snapshot is the number and the version.** A scan holds a version too
 (§5), but it is a cursor, bounded, and a lookup is not something a cursor
 does. A snapshot is what a caller says when it means to read the whole store
