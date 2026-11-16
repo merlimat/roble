@@ -199,3 +199,67 @@ async fn a_warm_ordered_lookup_allocates_nothing() {
         made as f64 / lookups as f64
     );
 }
+
+/// A warm write into a memtable with room allocates **nothing** either, with
+/// the WAL off and nothing recording — Oxia's configuration.
+///
+/// Its bytes go into the memtable's arena, which past its first megabyte has
+/// the whole budget (`crate::memtable`), and everything else a write does is
+/// bookkeeping: whether there is room, whether L0 is too deep to accept more,
+/// what the metrics would count. None of that has anything to keep, and two
+/// pieces of it allocated every time — L0's depth was counted by building
+/// and sorting a list of its tables, and the batch was read a second time
+/// into a list for counters nothing was recording. The fixture's L0 holds
+/// tables, so the first would show here.
+#[compio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_warm_write_allocates_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, dir) = fixture("db-reads");
+    let db = roble::open_with(
+        &roble::DefaultEnv,
+        &dir,
+        // Compactions left on, which is what makes a write look at L0's
+        // depth at all; nothing here spawns one, and L0 is far from the line.
+        roble::Options::new()
+            .disable_wal(true)
+            .memtable_size(4 << 20),
+    )
+    .await
+    .expect("open the database Go wrote");
+    assert!(
+        !db.versions().version.level(0).is_empty(),
+        "the fixture should hold tables in L0, for a write to count their depth"
+    );
+
+    const RUNS: usize = 2_000;
+    let keys: Vec<Vec<u8>> = (0..1_000 + RUNS)
+        .map(|i| format!("w{i:06}").into_bytes())
+        .collect();
+    let value = [b'v'; 100];
+    let mut batch = roble_format::batch::Batch::new();
+
+    // Warm: past the megabyte at which the arena takes its budget, and the
+    // batch's buffer at its size.
+    for _ in 0..12 {
+        for key in &keys[..1_000] {
+            batch.clear();
+            batch.put(key, &value).expect("put");
+            db.write(&mut batch, false).await.expect("write");
+        }
+    }
+
+    let before = ALLOCS.load(Relaxed);
+    for key in &keys[1_000..] {
+        batch.clear();
+        batch.put(key, &value).expect("put");
+        db.write(&mut batch, false).await.expect("write");
+    }
+    let made = ALLOCS.load(Relaxed) - before;
+    assert_eq!(
+        made,
+        0,
+        "{RUNS} warm writes allocated {made} times, {:.3} each",
+        made as f64 / RUNS as f64
+    );
+}
