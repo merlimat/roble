@@ -227,6 +227,28 @@ the distribution is worth most where the cache cannot hold the store — the
 measured — and that pass was measuring the miss path with the one access
 pattern that makes a miss path look like a fair fight.
 
+### Reading over a range deletion
+
+`--delete-range LO:HI` range-deletes records LO to HI of every shard, as
+fractions of the records loaded, before `get` and `floor` run. Oxia deletes
+ranges, and so would redwood's index, whose keys arrive mostly in timestamp
+order with an occasional large range deleted. A range tombstone is read-path
+work an LSM keeps paying until a compaction drops it (DESIGN.md §6), so a run
+without one measures none of that work.
+
+- The probes are drawn as before, so the share of them that land in the range
+  is about its share of the records.
+- `get` of a deleted record has to find nothing.
+- `floor` of one has to land on the live key below the range.
+- An engine that answers either wrongly fails the run, as a wrong value does.
+
+The keys sort by bucket first, so a range of records is one deletion per
+bucket. By default the deletions come after `settle`, which leaves the
+tombstones in a memtable above every table. `--delete-before-settle` makes
+them before it, so that `settle` flushes and compacts them with the records
+they delete. Only `get` and `floor` account for the deleted records, so the
+other read phases and `ycsb` are refused alongside it.
+
 ### How long a scan is
 
 `--scans` takes `[{zipf,uniform}:]min[-max]`, which is `pebble bench ycsb`'s

@@ -704,7 +704,14 @@ memtable holds is answered without touching a table — what Pebble and RocksDB
 get by stopping at the first source that has the key, here from the sequence
 numbers rather than from the order the sources are searched in. It is the
 whole difference for a key that is read because it was just written: YCSB A
-in cache ran 1.75x faster for it, and B 1.33x (`bench/`, one core and 512 MiB). The other four are a
+in cache ran 1.75x faster for it, and B 1.33x (`bench/`, one core and 512 MiB).
+**Nor is a table searched that a covering range tombstone makes too old.** The
+lookup takes the newest tombstone covering the key from the memtables, and
+then from each table it opens, newest first and before that table's filter;
+a table no newer than it holds only versions it deletes. So a get of a
+deleted key reads no data block for it, as RocksDB stops at its
+`max_covering_tombstone_seq` and Pebble's `getIter` at the first covering
+tombstone. The other four are a
 seek: `SeekGE` for ceiling and higher, `SeekLT` for floor and lower, over the
 full iterator tree, since the answer may be in any level.
 
@@ -813,7 +820,9 @@ range are older — and the version's sequence numbers for one in a memtable or
 L0, whose tables below are checked to be older than it. So a floor or a scan
 crossing a deleted range costs a seek a level, where it once stepped and read
 through every key of the range. A memtable's keys are still stepped: it
-records no sequence numbers to skip them by, and holds a memtable's worth.
+records no sequence numbers to skip them by, and holds a memtable's worth. A
+point lookup of a deleted key stops at the tombstone in the same way, reading
+no block of the tables it makes too old (`get` above).
 
 ### Iterators
 

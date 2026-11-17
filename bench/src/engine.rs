@@ -66,6 +66,10 @@ pub trait Store: Sized {
     /// commits it, durably if `sync`.
     async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize, sync: bool);
 
+    /// Deletes every key in `start..end` as one range deletion, and commits
+    /// it, durably if `sync`.
+    async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool);
+
     /// Leaves the store in a shape the read phases can be compared over, and
     /// says how many pieces of work it did.
     ///
@@ -288,6 +292,21 @@ impl Store for Roble {
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
     }
 
+    async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) {
+        let mut batch = self.db.indexed_batch();
+        batch
+            .delete_range(start, end)
+            .unwrap_or_else(|e| fail(&format!("delete range: {e}")));
+        batch
+            .commit(if sync {
+                roble::Durability::Sync
+            } else {
+                roble::Durability::NoSync
+            })
+            .await
+            .unwrap_or_else(|e| fail(&format!("commit: {e}")));
+    }
+
     async fn settle(&self) -> u64 {
         self.db
             .flush()
@@ -500,6 +519,15 @@ impl Store for Encina {
             .unwrap_or_else(|e| fail(&format!("write: {e}")));
     }
 
+    async fn delete_range(&self, start: &[u8], end: &[u8], _sync: bool) {
+        let mut batch = encina::WriteBatch::new();
+        batch.delete_range(start, end);
+        self.db
+            .write(&mut batch)
+            .await
+            .unwrap_or_else(|e| fail(&format!("delete range: {e}")));
+    }
+
     /// encina does nothing in the background, so there is nothing to settle.
     async fn settle(&self) -> u64 {
         0
@@ -674,6 +702,18 @@ impl Store for Rocks {
         self.db
             .write_opt(batch, &write)
             .unwrap_or_else(|e| fail(&format!("write: {e}")));
+    }
+
+    async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) {
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(start, end);
+        // As `write_batch` sets them, and for its reason.
+        let mut write = rocksdb::WriteOptions::default();
+        write.set_sync(sync);
+        write.disable_wal(!sync);
+        self.db
+            .write_opt(batch, &write)
+            .unwrap_or_else(|e| fail(&format!("delete range: {e}")));
     }
 
     async fn settle(&self) -> u64 {
