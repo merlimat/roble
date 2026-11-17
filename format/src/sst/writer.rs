@@ -313,7 +313,7 @@ impl TableWriter {
         // Uncompressed is roble's default and keeps a cached block the bytes
         // that came off the disk (DESIGN.md §8).
         let block_type = 0u8;
-        let checksum = ChecksumType::Crc32c.compute(block, block_type)?;
+        let checksum = ChecksumType::Crc32c.compute(block, block_type);
         self.buf.extend_from_slice(block);
         self.buf.push(block_type);
         self.buf.extend_from_slice(&checksum.to_le_bytes());

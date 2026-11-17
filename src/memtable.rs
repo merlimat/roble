@@ -515,9 +515,9 @@ impl Memtable {
     /// it — never interleaved, since a reader that walks point keys must not
     /// meet a tombstone among them (§6).
     pub fn apply(&mut self, repr: &[u8], base: u64) -> Result<u64> {
-        let mut reader = roble_format::batch::Batch::read(repr)?;
+        let reader = roble_format::batch::Batch::read(repr)?;
         let mut seq = base;
-        while let Some(entry) = reader.next() {
+        for entry in reader {
             let entry = entry?;
             match entry.kind {
                 Kind::RangeDelete => {

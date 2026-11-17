@@ -124,9 +124,9 @@ fn manifest_dump_reports_every_edit_the_decoder_finds() {
     let bytes = std::fs::read(&path).expect("read");
 
     // Count edits with the pinned decoder, independently of the command.
-    let mut reader = RecordReader::new(&bytes, 0);
+    let reader = RecordReader::new(&bytes, 0);
     let mut edits = Vec::new();
-    while let Some(rec) = reader.next() {
+    for rec in reader {
         edits.push(VersionEdit::decode(&rec.expect("record")).expect("edit"));
     }
     assert!(edits.len() > 1, "the fixture should hold several edits");

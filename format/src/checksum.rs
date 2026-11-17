@@ -60,26 +60,14 @@ impl ChecksumType {
         }
     }
 
-    /// Computes the cooked crc32c over exactly `data`.
-    ///
-    /// Record framing checksums a byte range directly, with no trailing block
-    /// type, so it needs the raw form rather than [`ChecksumType::compute`].
-    pub fn compute_raw(self, data: &[u8]) -> u32 {
-        let c = crc_fast::checksum(Crc32Iscsi, data) as u32;
-        c.rotate_right(15).wrapping_add(0xa282_ead8)
-    }
-
     /// Computes the checksum over `data` and the block type byte.
-    pub fn compute(self, data: &[u8], block_type: u8) -> Result<u32> {
+    pub fn compute(self, data: &[u8], block_type: u8) -> u32 {
         match self {
             ChecksumType::Crc32c => {
                 let mut d = crc_fast::Digest::new(Crc32Iscsi);
                 d.update(data);
                 d.update(&[block_type]);
-                let c = d.finalize() as u32;
-                // internal/crc: Value() = (c>>15 | c<<17) + 0xa282ead8, which
-                // is a rotation, since 15 + 17 == 32.
-                Ok(c.rotate_right(15).wrapping_add(0xa282_ead8))
+                cook(d.finalize() as u32)
             }
             ChecksumType::XxHash64 => {
                 // block.go: uint32(xxhash.Sum64(block || blockType)) — the low
@@ -87,8 +75,49 @@ impl ChecksumType {
                 let mut buf = Vec::with_capacity(data.len() + 1);
                 buf.extend_from_slice(data);
                 buf.push(block_type);
-                Ok(twox_hash::XxHash64::oneshot(0, &buf) as u32)
+                twox_hash::XxHash64::oneshot(0, &buf) as u32
             }
         }
+    }
+}
+
+/// The cooked crc32c over exactly `data`.
+///
+/// What record framing checksums: a byte range with no trailing block type,
+/// and always crc32c, whatever a table's footer says. A function rather than
+/// a method on [`ChecksumType`], because it never was a choice between the
+/// two — as a method it took `self` and ignored it, so asking an xxhash64
+/// for it handed back a crc32c.
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
+    cook(crc_fast::checksum(Crc32Iscsi, data) as u32)
+}
+
+/// internal/crc: Value() = (c>>15 | c<<17) + 0xa282ead8, which is a
+/// rotation, since 15 + 17 == 32.
+fn cook(c: u32) -> u32 {
+    c.rotate_right(15).wrapping_add(0xa282_ead8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each type computes its own checksum. `compute_raw`, which this
+    /// replaced, took the type and ignored it, so an xxhash64 table asked
+    /// for one got a crc32c.
+    #[test]
+    fn each_checksum_type_computes_its_own() {
+        let data = b"a block's bytes";
+        let crc = ChecksumType::Crc32c.compute(data, 0);
+        let xx = ChecksumType::XxHash64.compute(data, 0);
+        assert_ne!(crc, xx);
+        assert_eq!(
+            xx,
+            twox_hash::XxHash64::oneshot(0, b"a block's bytes\0") as u32
+        );
+        // And the record checksum is the crc32c of the bytes alone, with no
+        // block type after them.
+        assert_ne!(crc32c(data), crc);
+        assert_eq!(crc32c(b""), cook(0));
     }
 }

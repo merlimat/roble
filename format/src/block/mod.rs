@@ -71,7 +71,7 @@ pub fn decode_fetched(
     let block_type = trailer[0];
     let stored = u32::from_le_bytes(trailer[1..5].try_into().expect("4 bytes"));
 
-    let computed = checksum.compute(data, block_type)?;
+    let computed = checksum.compute(data, block_type);
     // A fuzzer that has to forge a CRC never gets past it (format/fuzz).
     if computed != stored && !cfg!(fuzzing) {
         return Err(Error::ChecksumMismatch {
@@ -309,16 +309,47 @@ impl<'a> BlockIter<'a> {
     /// Decodes the next entry, or `None` at the end of the block.
     ///
     /// Borrows `self` for the key, which lives in the iterator's buffer, so an
-    /// entry cannot outlive the step that produced it.
+    /// entry cannot outlive the step that produced it — which is also why
+    /// this is not [`Iterator::next`]: an iterator's items cannot borrow it.
+    ///
+    /// Fused: after an error, every call returns `None`, as at the end. The
+    /// entry that failed has no length to step over, so there is nowhere
+    /// further to read from.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Result<RawEntry<'a, '_>>> {
         if self.pos >= self.entries.len() {
             return None;
         }
-        Some(self.next_inner())
+        // The lengths are checked before the key is assembled, and the
+        // iterator is fused there: the entry handed back borrows `self`, so
+        // nothing can be changed once it exists.
+        let (header, shared, unshared, need) = match self.lengths() {
+            Ok(lengths) => lengths,
+            Err(e) => {
+                self.pos = self.entries.len();
+                return Some(Err(e));
+            }
+        };
+        let src = &self.entries[self.pos..];
+        // Prefix compression: the key is the previous key's first `shared`
+        // bytes followed by `unshared` fresh ones, so it has to be assembled
+        // rather than borrowed.
+        self.key.truncate(shared);
+        self.key.extend_from_slice(&src[header..header + unshared]);
+
+        let value = &src[header + unshared..need];
+        self.pos += need;
+        Some(Ok(RawEntry {
+            key: &self.key,
+            value,
+        }))
     }
 
-    fn next_inner(&mut self) -> Result<RawEntry<'a, '_>> {
+    /// Decodes the next entry's header and checks its lengths against the
+    /// block and the previous key: its header length, how much of the
+    /// previous key it shares, how many bytes of key it adds, and its whole
+    /// length.
+    fn lengths(&self) -> Result<(usize, usize, usize, usize)> {
         let src = &self.entries[self.pos..];
         let (shared, n1) = varint::uvarint32(src)?;
         let (unshared, n2) = varint::uvarint32(&src[n1..])?;
@@ -341,18 +372,7 @@ impl<'a> BlockIter<'a> {
                 self.key.len()
             ));
         }
-        // Prefix compression: the key is the previous key's first `shared`
-        // bytes followed by `unshared` fresh ones, so it has to be assembled
-        // rather than borrowed.
-        self.key.truncate(shared);
-        self.key.extend_from_slice(&src[header..header + unshared]);
-
-        let value = &src[header + unshared..need];
-        self.pos += need;
-        Ok(RawEntry {
-            key: &self.key,
-            value,
-        })
+        Ok((header, shared, unshared, need))
     }
 }
 
@@ -433,6 +453,32 @@ mod tests {
             b.add(k, v, 0, None, false);
         }
         b.finish().to_vec()
+    }
+
+    /// An entry that fails to decode has no length to step over, so the
+    /// iterator cannot go on past it. It used to hand back the same error on
+    /// every call, which a loop that logged and carried on would never leave.
+    #[test]
+    fn a_block_iterator_stops_after_an_error() {
+        // A good entry, then one that shares bytes with a key longer than
+        // the one before it (shared = 9 > 1), then the restart array.
+        let mut bytes = vec![0, 1, 0, b'a', 9, 1, 0, b'b'];
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let block = Block::new(&bytes).expect("the restart array is sound");
+        let mut it = block.iter();
+        assert_eq!(
+            it.next()
+                .expect("an entry")
+                .expect("the first is sound")
+                .key,
+            b"a"
+        );
+        it.next()
+            .expect("an entry")
+            .expect_err("the second shares more than there is");
+        assert!(it.next().is_none(), "and nothing follows the error");
+        assert!(it.next().is_none(), "however often it is asked");
     }
 
     /// A handle is two varints read from a table, so nothing stops one from

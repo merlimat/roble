@@ -153,9 +153,9 @@ fn robles_batch_repr_is_byte_identical_to_go_pebbles() {
 #[test]
 fn roble_reads_every_batch_go_pebble_wrote() {
     for (name, (count, repr)) in go_batches() {
-        let mut r = Batch::read(&repr).unwrap_or_else(|e| panic!("{name}: read: {e}"));
+        let r = Batch::read(&repr).unwrap_or_else(|e| panic!("{name}: read: {e}"));
         let mut seen = 0u32;
-        while let Some(e) = r.next() {
+        for e in r {
             e.unwrap_or_else(|e| panic!("{name}: entry {seen}: {e}"));
             seen += 1;
         }

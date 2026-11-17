@@ -158,7 +158,7 @@ async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
     let mut patched = bytes[..at].to_vec();
     patched.extend_from_slice(&index);
     patched.push(0); // no compression
-    let sum = footer.checksum.compute(&index, 0).expect("checksum");
+    let sum = footer.checksum.compute(&index, 0);
     patched.extend_from_slice(&sum.to_le_bytes());
 
     // The footer as it was, with the index handle pointing at the new block.

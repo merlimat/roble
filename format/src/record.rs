@@ -43,7 +43,6 @@
 //! whose log number is exactly one more than the expected one is Pebble's EOF
 //! trailer and ends the stream cleanly.
 
-use crate::checksum::ChecksumType;
 use crate::error::{Error, Result};
 
 /// `blockSize`: the framing's fixed block.
@@ -267,7 +266,7 @@ impl RecordWriter {
                 .map_err(|_| Error::Corrupt(format!("chunk payload of {n} bytes")))?;
             self.out[at + 4..at + 6].copy_from_slice(&size.to_le_bytes());
             // The CRC starts at the type byte, not at the size.
-            let crc = ChecksumType::Crc32c.compute_raw(&self.out[at + 6..]);
+            let crc = crate::checksum::crc32c(&self.out[at + 6..]);
             self.out[at..at + 4].copy_from_slice(&crc.to_le_bytes());
 
             // Pebble zero-fills eagerly: once a block cannot hold another
@@ -285,6 +284,35 @@ impl RecordWriter {
         }
     }
 }
+
+/// The records, up to a clean end of stream.
+///
+/// A clean end is a zero-filled block tail or Pebble's EOF trailer, which is
+/// what a crash leaves behind. Anything else is an error: a torn record in
+/// the middle of a file is corruption, not an ending (DESIGN.md §6). Fused:
+/// after an error or the end it yields nothing more.
+impl Iterator for RecordReader<'_> {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.next_inner() {
+            Ok(Some(rec)) => Some(Ok(rec)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl std::iter::FusedIterator for RecordReader<'_> {}
 
 /// Reads a framed stream.
 #[derive(Debug)]
@@ -313,29 +341,6 @@ impl<'a> RecordReader<'a> {
     /// How many bytes have been consumed, which is where a torn tail begins.
     pub fn offset(&self) -> usize {
         self.pos
-    }
-
-    /// Reads the next record, or `None` at a clean end of stream.
-    ///
-    /// A clean end is a zero-filled block tail or Pebble's EOF trailer, which
-    /// is what a crash leaves behind. Anything else is an error: a torn record
-    /// in the middle of a file is corruption, not an ending (DESIGN.md §6).
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<Result<Vec<u8>>> {
-        if self.done {
-            return None;
-        }
-        match self.next_inner() {
-            Ok(Some(rec)) => Some(Ok(rec)),
-            Ok(None) => {
-                self.done = true;
-                None
-            }
-            Err(e) => {
-                self.done = true;
-                Some(Err(e))
-            }
-        }
     }
 
     fn next_inner(&mut self) -> Result<Option<Vec<u8>>> {
@@ -420,7 +425,7 @@ impl<'a> RecordReader<'a> {
             }
 
             let covered = &self.buf[self.pos + 6..self.pos + header_len + size];
-            let computed = ChecksumType::Crc32c.compute_raw(covered);
+            let computed = crate::checksum::crc32c(covered);
             // A fuzzer that has to forge a CRC never gets past it (format/fuzz).
             if computed != crc && !cfg!(fuzzing) {
                 return Err(Error::ChecksumMismatch {
@@ -466,9 +471,9 @@ mod tests {
             w.write_record(r).expect("write");
         }
         let bytes = w.finish();
-        let mut rd = RecordReader::new(&bytes, log_num);
+        let rd = RecordReader::new(&bytes, log_num);
         let mut got: Vec<Vec<u8>> = Vec::new();
-        while let Some(r) = rd.next() {
+        for r in rd {
             got.push(r.expect("record"));
         }
         assert_eq!(got, records, "{format:?}");
@@ -629,10 +634,10 @@ mod tests {
         // record and a clean end: the first record is fine, the remainder is
         // either absent or an error, never wrong data.
         for cut in 1..bytes.len() {
-            let mut rd = RecordReader::new(&bytes[..cut], 1);
+            let rd = RecordReader::new(&bytes[..cut], 1);
             let mut records = Vec::new();
             let mut errored = false;
-            while let Some(r) = rd.next() {
+            for r in rd {
                 match r {
                     Ok(rec) => records.push(rec),
                     Err(_) => errored = true,
@@ -691,7 +696,7 @@ mod tests {
         }
         out.extend_from_slice(payload);
         // Covers the type byte onwards, as the reader computes it.
-        let crc = ChecksumType::Crc32c.compute_raw(&out[6..]);
+        let crc = crate::checksum::crc32c(&out[6..]);
         out[0..4].copy_from_slice(&crc.to_le_bytes());
         out
     }
@@ -864,9 +869,9 @@ mod resume_tests {
         );
 
         // And the result still reads back as the records that went in.
-        let mut reader = RecordReader::new(&joined, 9);
+        let reader = RecordReader::new(&joined, 9);
         let mut back = Vec::new();
-        while let Some(r) = reader.next() {
+        for r in reader {
             back.push(r.expect("record"));
         }
         assert_eq!(back, payloads);
@@ -891,9 +896,9 @@ mod resume_tests {
         }
         assert_eq!(joined, whole);
 
-        let mut reader = RecordReader::new(&joined, 0);
+        let reader = RecordReader::new(&joined, 0);
         let mut back = Vec::new();
-        while let Some(r) = reader.next() {
+        for r in reader {
             back.push(r.expect("record"));
         }
         assert_eq!(back, payloads);
