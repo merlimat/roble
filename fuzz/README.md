@@ -5,12 +5,14 @@ The engine half of DESIGN.md §12's fuzzing. The format crate's targets
 the path the engine actually takes through a whole database. It reads a
 table through `OpenTable` rather than `Table::open`, replays the MANIFEST and
 the logs, and trusts what each told it about the others. `model` feeds the
-store nothing but valid calls and checks that it answers them correctly.
+store nothing but valid calls and checks that it answers them correctly, and
+`crash` makes the disk under it fail.
 
 | Target         | Input                                   | What fails it            |
 |----------------|-----------------------------------------|--------------------------|
 | `open_corrupt` | a golden database, plus damage to its files | a panic, abort or hang   |
 | `model`        | options, and a sequence of operations   | any answer a `BTreeMap` would not give, or any error |
+| `crash`        | options, a sequence of operations, and what goes wrong | a store that does not open, or comes back as no prefix of what it was told |
 
 The input picks one of the databases in `tests/golden`, read-write or
 read-only, and a list of changes to its files: bytes overwritten or flipped,
@@ -35,6 +37,16 @@ against what was durable, which with the WAL off is the last flush. Nothing
 is allowed to fail: the filesystem is healthy and every call is one a caller
 may make.
 
+`crash` is `tests/failure.rs` with the scenario as the input as well as the
+fault. The same writes, flushes and compactions run with the WAL on or off,
+and one operation fails or withholds its buffer; then the machine may crash,
+and the recovery may itself be failed partway. The store must open and read,
+and come back as it was after some number of the batches it was given: no
+fewer than a synced write or a flush made durable, no more than were tried,
+and with the WAL off one that a flush was asked to make. A recovery that
+failed partway must leave what a clean one finds. A careless caller, one
+that carries on past an error, is held only to the store opening.
+
 Checksums are skipped under `cfg(fuzzing)` as for the format targets
 (format/fuzz/README.md), so damage reaches the parsers behind them.
 
@@ -43,8 +55,9 @@ Checksums are skipped under `cfg(fuzzing)` as for the format targets
 ```sh
 cargo +nightly fuzz run open_corrupt -- -max_total_time=300 -malloc_limit_mb=256 -timeout=10
 cargo +nightly fuzz run model -- -max_total_time=300 -malloc_limit_mb=256 -timeout=10
+cargo +nightly fuzz run crash -- -max_total_time=300 -malloc_limit_mb=256 -timeout=10
 ```
 
-No seeding is needed: both targets read the golden databases themselves,
-and an empty input is an undamaged database, or one opened and closed. CI runs it beside the format targets
-(`.github/workflows/fuzz.yml`).
+No seeding is needed: the targets read the golden databases themselves, and
+an empty input is an undamaged database, or one opened and closed. CI runs
+them beside the format targets (`.github/workflows/fuzz.yml`).

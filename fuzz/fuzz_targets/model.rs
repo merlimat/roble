@@ -31,14 +31,14 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use roble::sim::SimEnv;
-use roble::{Comparison, Db, Disk, Fs, Options, Scan, Snapshot, WriteBuf};
+use roble::{Comparison, Db, Fs, Options, Scan, Snapshot};
 use roble_format::batch::Batch;
+use roble_fuzz::{fixtures, install};
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -164,34 +164,6 @@ impl How {
     }
 }
 
-type Files = Vec<(String, Vec<u8>)>;
-
-/// The golden databases, read once.
-fn fixtures() -> &'static [Files] {
-    static FIXTURES: OnceLock<Vec<Files>> = OnceLock::new();
-    FIXTURES.get_or_init(|| {
-        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/golden");
-        let mut dbs: Vec<PathBuf> = std::fs::read_dir(&golden)
-            .expect("tests/golden")
-            .map(|e| e.expect("entry").path())
-            .filter(|p| p.is_dir())
-            .collect();
-        dbs.sort();
-        dbs.iter()
-            .map(|db| {
-                std::fs::read_dir(db)
-                    .expect("a golden database")
-                    .map(|e| {
-                        let e = e.expect("entry");
-                        let name = e.file_name().into_string().expect("UTF-8 name");
-                        (name, std::fs::read(e.path()).expect("read"))
-                    })
-                    .collect()
-            })
-            .collect()
-    })
-}
-
 fn options(c: &Config) -> Options<roble::sim::SimFs> {
     let mut o = Options::new()
         .create_if_missing(true)
@@ -310,15 +282,7 @@ async fn run(case: Case) {
     let fs = env.sim();
     let dir = PathBuf::from("/db");
     if let Some(files) = all.get(usize::from(case.fixture) % (all.len() + 1)) {
-        fs.mkdir_all(&dir).await.expect("mkdir");
-        for (name, bytes) in files {
-            let disk = fs.create(&dir.join(name)).await.expect("create");
-            let (r, _) = disk.write(WriteBuf::new(bytes.clone()), 0, ()).await;
-            r.expect("write");
-            disk.sync(()).await.expect("sync");
-            disk.close().await.expect("close");
-        }
-        fs.sync_dir(&dir).await.expect("sync dir");
+        install(fs, &dir, files).await;
     }
 
     let config = &case.config;
