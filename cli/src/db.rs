@@ -75,15 +75,19 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
         // staying up.
         DbCommand::Put { key, value } => {
             let db = open(dir, true).await?;
-            db.put(&key, &value, true).await.at(dir)?;
+            db.put(&key, &value, roble::Durability::Sync)
+                .await
+                .at(dir)?;
         }
         DbCommand::Delete { key } => {
             let db = open(dir, false).await?;
-            db.delete(&key, true).await.at(dir)?;
+            db.delete(&key, roble::Durability::Sync).await.at(dir)?;
         }
         DbCommand::DeleteRange { start, end } => {
             let db = open(dir, false).await?;
-            db.delete_range(&start, &end, true).await.at(dir)?;
+            db.delete_range(&start, &end, roble::Durability::Sync)
+                .await
+                .at(dir)?;
         }
         DbCommand::Get { key, hexdump } => {
             let found = reading(dir, async |db| {
@@ -411,7 +415,11 @@ async fn open(dir: &Path, create: bool) -> Result<Db> {
     if !create {
         a_database_in(dir)?;
     }
-    let options = Options::default().create_if_missing(create);
+    // No background tasks: a command does one thing and exits, and its
+    // `compact` is the merge, not a race with the store's own.
+    let options = Options::default()
+        .create_if_missing(create)
+        .background_tasks(false);
     roble::open_with(&DefaultEnv, dir, options).await.at(dir)
 }
 

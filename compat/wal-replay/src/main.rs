@@ -96,9 +96,13 @@ async fn main() {
     // whose directory is certain to exist: `--created` is handed a path that
     // is not there yet, which is the whole point of it.
     let before = if swept { names_in(&dir) } else { Vec::new() };
+    // No background tasks: this program does one thing and hands the
+    // directory to Pebble, so its flushes and merges are the ones it asks
+    // for and nothing else is writing when it exits.
     let mut options = roble::Options::new()
         .disable_wal(no_wal)
-        .create_if_missing(created);
+        .create_if_missing(created)
+        .background_tasks(false);
     if settle {
         // Allowances a test-sized database can actually cross, so the picker
         // has something to do.
@@ -128,7 +132,7 @@ async fn main() {
             .put(b"alpha", b"from-nothing")
             .unwrap_or_else(|e| fail(&format!("put: {e}")));
         batch
-            .commit(true)
+            .commit(roble::Durability::Sync)
             .await
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
         db.flush()
@@ -171,7 +175,11 @@ async fn main() {
         fail("the batch could not read back its own first key");
     }
     batch
-        .commit(!no_wal)
+        .commit(if no_wal {
+            roble::Durability::NoSync
+        } else {
+            roble::Durability::Sync
+        })
         .await
         .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
@@ -183,7 +191,11 @@ async fn main() {
         .unwrap_or_else(|e| fail(&format!("put: {e}")));
     wrote.push((big_key, big_value));
     batch
-        .commit(!no_wal)
+        .commit(if no_wal {
+            roble::Durability::NoSync
+        } else {
+            roble::Durability::Sync
+        })
         .await
         .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
@@ -202,7 +214,11 @@ async fn main() {
         fail("the batch did not read back its own delete");
     }
     batch
-        .commit(!no_wal)
+        .commit(if no_wal {
+            roble::Durability::NoSync
+        } else {
+            roble::Durability::Sync
+        })
         .await
         .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
@@ -241,7 +257,7 @@ async fn main() {
             wrote.push((k, value.clone()));
         }
         batch
-            .commit(true)
+            .commit(roble::Durability::Sync)
             .await
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
         db.flush()
@@ -317,7 +333,7 @@ async fn main() {
                 wrote.push((k, v));
             }
             batch
-                .commit(true)
+                .commit(roble::Durability::Sync)
                 .await
                 .unwrap_or_else(|e| fail(&format!("commit: {e}")));
             db.flush()

@@ -59,6 +59,11 @@ pub const MARKER_MANIFEST: &str = "manifest";
 pub const MARKER_FORMAT_VERSION: &str = "format-version";
 
 /// What a file in a database directory is.
+///
+/// Not `#[non_exhaustive]`, and on purpose: roble's obsolete-file sweep
+/// matches it exhaustively, so a new kind of file is a compile error there
+/// that asks whether it can be deleted, rather than a `_` arm that decides
+/// without asking. A new kind of file is a new Pebble format anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileType {
     /// An sstable, `NNNNNN.sst`.

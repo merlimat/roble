@@ -169,6 +169,17 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   F 50/50 read and read-modify-write. D and F are YCSB's
                   definitions and not `pebble bench ycsb`'s, which has D on
                   the default distribution and F as all inserts
+  --delete-range LO:HI  range-delete records LO..HI of every shard, as
+                  fractions of the records loaded (0.45:0.55), after settle and
+                  before the read phases, so the tombstones are in a memtable.
+                  get then has to find nothing for a deleted record and floor
+                  the live key below the range. One deletion per bucket, since
+                  a bucket's records are what lie together in key order. Only
+                  get and floor account for it, so --phases has to leave out
+                  scan, scan-rev, scan-short, get-cold and ycsb
+  --delete-before-settle  make the --delete-range deletions before settle
+                  instead, so that settle flushes and compacts them with the
+                  records they delete
   --phases LIST   comma-separated subset of
                   load,settle,scan-rev,scan,get,floor,scan-short,get-cold,
                   ycsb,checkpoint. **ycsb writes**, so it runs last and a
@@ -265,8 +276,14 @@ async fn run_phases<S: Store>(cfg: &Config, path: &Path, out: Output) {
     if cfg.wants("load") {
         load(cfg, &shards, out).await;
     }
+    if cfg.delete_before_settle {
+        delete(cfg, &shards).await;
+    }
     if cfg.wants("settle") {
         settle(&shards, out).await;
+    }
+    if !cfg.delete_before_settle {
+        delete(cfg, &shards).await;
     }
     // What shape the load and the settle left, because a scan's cost is
     // mostly how many iterators it has to merge: one table in one level is
@@ -406,7 +423,63 @@ async fn scan<S: Store>(cfg: &Config, shards: &[S], reverse: bool, out: Output) 
     report.finish(size_of(shards).await);
 }
 
-/// Looks up random keys, every one of which has an answer.
+/// Range-deletes the records `--delete-range` names, in every shard.
+///
+/// One deletion per bucket: a range of record numbers is not a range of keys,
+/// since the keys sort by bucket first (`key_into`), but within one bucket it
+/// is — from the bucket's first record at or past the range's start to its
+/// first one at or past the range's end.
+async fn delete<S: Store>(cfg: &Config, shards: &[S]) {
+    let Some(deleted) = cfg.deleted() else {
+        return;
+    };
+    let started = Instant::now();
+    let mut deletions = 0;
+    for (s, store) in shards.iter().enumerate() {
+        for span in deleted_spans(&deleted) {
+            store
+                .delete_range(&key_for(s, span.start), &key_for(s, span.end), cfg.wal)
+                .await;
+            deletions += 1;
+        }
+    }
+    if !cfg.tsv {
+        println!(
+            "deleted records {}..{} of every shard {} settle: {deletions} range deletions in {:.3}s",
+            deleted.start,
+            deleted.end,
+            if cfg.delete_before_settle {
+                "before"
+            } else {
+                "after"
+            },
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// For each bucket the deleted records fall in, the records whose keys bound
+/// them: from its first record at or past `deleted.start` to its first at or
+/// past `deleted.end`, which need not exist to be a key.
+fn deleted_spans(deleted: &std::ops::Range<usize>) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let (start, end) = (deleted.start, deleted.end);
+    (0..BUCKETS)
+        .map(move |bucket| {
+            let first = |i: usize| i + (bucket + BUCKETS - i % BUCKETS) % BUCKETS;
+            first(start)..first(end)
+        })
+        .filter(|span| !span.is_empty())
+}
+
+/// The record a floor probe of deleted record `i` lands on: the last one of
+/// its bucket below the deleted range, which starts at `start`.
+fn live_below(i: usize, start: usize) -> usize {
+    start - 1 - (start - 1 - i % BUCKETS) % BUCKETS
+}
+
+/// Looks up random keys, every one of which has an answer — unless
+/// `--delete-range` deleted it, and then `get` has to find nothing and `floor`
+/// the live key below the deleted range.
 ///
 /// `get` is Oxia's `Get` with `ComparisonEqual`, and the one comparison a
 /// bloom filter can answer. Each engine reads it the best way it offers —
@@ -427,11 +500,14 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
     // allocations and not the harness's.
     let mut key = Vec::new();
     let mut probe = Vec::new();
+    let mut below = Vec::new();
     let keys = Keys::new(cfg.distribution, total);
+    let deleted = cfg.deleted();
     let started = Instant::now();
     while more(cfg, report.count, started) {
         let s = (rng.next() as usize) % cfg.shards;
         let i = keys.next(&mut rng);
+        let gone = deleted.as_ref().filter(|d| d.contains(&i));
         key_into(s, i, &mut key);
         probe.clear();
         probe.reserve(key.len() + 1);
@@ -451,7 +527,14 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
                     String::from_utf8_lossy(&probe)
                 ))
             });
-            if answer != key {
+            let want = match gone {
+                Some(d) => {
+                    key_into(s, live_below(i, d.start), &mut below);
+                    &below
+                }
+                None => &key,
+            };
+            if answer != *want {
                 fail(&format!(
                     "{name} answered {:?}, not the key below the probe",
                     String::from_utf8_lossy(&answer)
@@ -463,6 +546,16 @@ async fn lookups<S: Store>(cfg: &Config, shards: &[S], floor: bool, out: Output)
         let at = Instant::now();
         let len = shards[s].get(&probe).await;
         report.saw(at.elapsed());
+        if gone.is_some() {
+            if len.is_some() {
+                fail(&format!(
+                    "{name} found {:?}, which --delete-range deleted",
+                    String::from_utf8_lossy(&probe)
+                ));
+            }
+            report.count += 1;
+            continue;
+        }
         // Checked against the value this record was written with, not merely
         // for being there: a read that answered without producing the value
         // would otherwise be the fastest engine in the table.
@@ -800,6 +893,9 @@ fn level_shape<S: Store>(shards: &[S]) -> String {
 
 // -------------------------------------------------------- the keys and values
 
+/// How many buckets a shard's records are spread over (`key_into`).
+const BUCKETS: usize = 64;
+
 /// The key of record `i` in shard `s`.
 ///
 /// Oxia's shape, with roble's one constraint on it: the keys are raw and
@@ -821,7 +917,7 @@ pub fn key_for(s: usize, i: usize) -> Vec<u8> {
 /// `get`, that was most of the number.
 pub fn key_into(s: usize, i: usize, out: &mut Vec<u8>) {
     use std::io::Write;
-    let bucket = i % 64;
+    let bucket = i % BUCKETS;
     out.clear();
     // Enough for the whole key and the `~` a floor probe appends, so neither
     // the write nor the push grows the buffer.
@@ -838,7 +934,11 @@ pub fn key_into(s: usize, i: usize, out: &mut Vec<u8>) {
 /// same generator fills them in every engine, so all the stores hold the same
 /// bytes.
 pub fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
-    let mut rng = Rng::new(cfg.seed ^ ((s as u64) << 40) ^ (i as u64));
+    // `i << 1`, not `i`: `Rng::new` sets bit 0, so a bare `i` gave records 2k
+    // and 2k+1 one value between them. With keys in record order the two sit
+    // side by side, and Snappy halved RocksDB's store while roble, which
+    // writes no compression, kept it whole.
+    let mut rng = Rng::new(cfg.seed ^ ((s as u64) << 40) ^ ((i as u64) << 1));
     // `--value-chunk` is the dial between incompressible and compressible: a
     // value is one random chunk repeated to fill it, so a chunk the size of
     // the value gives Snappy nothing to find, and a smaller one gives it an
@@ -1289,11 +1389,13 @@ impl Lengths {
 /// therefore see `total - this` records and no more, and that is what lets
 /// the phase check the count it got back.
 fn sorted_position(i: usize, total: usize) -> usize {
-    let bucket = i % 64;
+    let bucket = i % BUCKETS;
     // How many records fall in the buckets before this one: bucket `b` holds
-    // every `i` with `i % 64 == b`.
-    let before: usize = (0..bucket).map(|b| (total + 63 - b) / 64).sum();
-    before + i / 64
+    // every `i` with `i % BUCKETS == b`.
+    let before: usize = (0..bucket)
+        .map(|b| (total + BUCKETS - 1 - b) / BUCKETS)
+        .sum();
+    before + i / BUCKETS
 }
 
 /// Draws the record a read phase probes next.
@@ -1411,10 +1513,17 @@ pub struct Config {
     reuse: bool,
     tsv: bool,
     phases: Option<Vec<String>>,
+    /// The records `--delete-range` deletes, as fractions of those loaded.
+    delete: Option<(f64, f64)>,
+    delete_before_settle: bool,
 }
 
 impl Config {
     fn parse() -> Self {
+        Self::parse_from(std::env::args().skip(1).collect())
+    }
+
+    fn parse_from(args: Vec<String>) -> Self {
         let mut cfg = Config {
             dir: PathBuf::new(),
             engine: "roble".to_string(),
@@ -1438,8 +1547,9 @@ impl Config {
             reuse: false,
             tsv: false,
             phases: None,
+            delete: None,
+            delete_before_settle: false,
         };
-        let args: Vec<String> = std::env::args().skip(1).collect();
         let mut saw_dir = false;
         let mut i = 0;
         while i < args.len() {
@@ -1471,6 +1581,22 @@ impl Config {
                 "--scans" => cfg.scans = value(arg).to_string(),
                 "--workload" => cfg.workload = value(arg).to_string(),
                 "--min-seconds" => cfg.min_seconds = number(value(arg)) as f64,
+                "--delete-range" => {
+                    let spec = value(arg);
+                    let fraction = |f: &str| {
+                        f.parse::<f64>().unwrap_or_else(|_| {
+                            fail(&format!("--delete-range {spec}: {f:?} is not a fraction"))
+                        })
+                    };
+                    let (lo, hi) = spec
+                        .split_once(':')
+                        .unwrap_or_else(|| fail(&format!("--delete-range {spec}: not LO:HI")));
+                    cfg.delete = Some((fraction(lo), fraction(hi)));
+                }
+                "--delete-before-settle" => {
+                    cfg.delete_before_settle = true;
+                    took_value = false;
+                }
                 "--phases" => {
                     cfg.phases = Some(
                         value(arg)
@@ -1525,7 +1651,37 @@ impl Config {
                  leave settle out of --phases",
             );
         }
+        if let Some((lo, hi)) = cfg.delete {
+            if !(0.0..=1.0).contains(&lo) || !(0.0..=1.0).contains(&hi) || lo >= hi {
+                fail("--delete-range LO:HI needs 0 <= LO < HI <= 1");
+            }
+            // So that every bucket keeps a record below the range, which is
+            // what a floor probe inside it answers with.
+            if cfg.deleted().is_some_and(|d| d.start < BUCKETS) {
+                fail(&format!(
+                    "--delete-range has to start past the first {BUCKETS} records, \
+                     so that a floor inside it has a record below it to find"
+                ));
+            }
+            for phase in ["scan", "scan-rev", "scan-short", "get-cold", "ycsb"] {
+                if cfg.wants(phase) {
+                    fail(&format!(
+                        "{phase} expects every record loaded, and --delete-range deletes some: \
+                         leave it out of --phases"
+                    ));
+                }
+            }
+        } else if cfg.delete_before_settle {
+            fail("--delete-before-settle says when to make the --delete-range deletions: give one");
+        }
         cfg
+    }
+
+    /// The records `--delete-range` deletes in every shard, if it was given.
+    fn deleted(&self) -> Option<std::ops::Range<usize>> {
+        let total = (self.batches * self.records) as f64;
+        self.delete
+            .map(|(lo, hi)| (lo * total) as usize..(hi * total) as usize)
     }
 
     fn wants(&self, phase: &str) -> bool {
@@ -1696,6 +1852,52 @@ mod tests {
         }
     }
 
+    /// `--delete-range`'s deletions, one per bucket, cover exactly the records
+    /// it names, and a floor probe of each deleted one lands where
+    /// `live_below` says: on the greatest live key below the probe.
+    #[test]
+    fn deleted_spans_cover_the_deleted_records_and_live_below_is_the_floor() {
+        for (total, deleted) in [
+            (1000, 300..700),
+            (1000, 64..65),
+            (1003, 100..1003),
+            (5000, 64..4999),
+        ] {
+            let keys: Vec<(Vec<u8>, usize)> = (0..total).map(|i| (key_for(0, i), i)).collect();
+            let spans: Vec<(Vec<u8>, Vec<u8>)> = deleted_spans(&deleted)
+                .map(|span| (key_for(0, span.start), key_for(0, span.end)))
+                .collect();
+            let gone = |key: &[u8]| {
+                spans
+                    .iter()
+                    .any(|(lo, hi)| lo.as_slice() <= key && key < hi.as_slice())
+            };
+            for (key, i) in &keys {
+                assert_eq!(
+                    gone(key),
+                    deleted.contains(i),
+                    "record {i}, deleting {deleted:?} of {total}"
+                );
+            }
+            let mut live: Vec<&Vec<u8>> = keys
+                .iter()
+                .filter(|(k, _)| !gone(k))
+                .map(|(k, _)| k)
+                .collect();
+            live.sort();
+            for i in deleted.clone() {
+                let mut probe = key_for(0, i);
+                probe.push(b'~');
+                let floor = live.iter().rev().find(|k| k.as_slice() <= probe.as_slice());
+                assert_eq!(
+                    floor.map(|k| k.as_slice()),
+                    Some(key_for(0, live_below(i, deleted.start)).as_slice()),
+                    "floor of deleted record {i}, deleting {deleted:?} of {total}"
+                );
+            }
+        }
+    }
+
     /// A scan length stays in its range, and the zipf spec makes short scans
     /// the common case — which is the shape YCSB E has and the reason the
     /// lengths are *not* scrambled.
@@ -1845,6 +2047,18 @@ mod tests {
         }
         assert!(!Workload::parse("D").pebble_agrees);
         assert!(!Workload::parse("F").pebble_agrees);
+    }
+
+    /// Every record gets a value of its own. When two neighbouring records
+    /// shared one, an engine that compresses stored half the bytes of one
+    /// that does not, but only with keys in record order — which made roble's
+    /// ordered-key reads look twice as slow as RocksDB's.
+    #[test]
+    fn records_do_not_share_values() {
+        let cfg = Config::parse_from(vec!["--dir".into(), "unused".into()]);
+        let values: std::collections::HashSet<Vec<u8>> =
+            (0..10_000).map(|i| value_for(&cfg, 0, i)).collect();
+        assert_eq!(values.len(), 10_000);
     }
 
     /// Both skewed draws stay inside the keyspace at its edges, where the

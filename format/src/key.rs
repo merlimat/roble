@@ -52,6 +52,7 @@ pub const OBSOLETE_MASK: u8 = 191;
 
 /// What an internal key does to the key space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// `DELETE`, 0.
     Delete,

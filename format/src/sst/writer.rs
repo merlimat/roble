@@ -344,7 +344,7 @@ impl TableWriter {
             (crate::block::Compression::None, block)
         };
         let block_type = algorithm.to_byte();
-        let checksum = ChecksumType::Crc32c.compute(stored, block_type)?;
+        let checksum = ChecksumType::Crc32c.compute(stored, block_type);
         self.buf.extend_from_slice(stored);
         self.buf.push(block_type);
         self.buf.extend_from_slice(&checksum.to_le_bytes());

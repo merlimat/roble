@@ -179,12 +179,13 @@ impl<F: Fs> Db<F> {
     /// version and asking again at once is a spin rather than a retry.
     pub(crate) async fn run(&self, plan: Plan<'_>) -> Result<Vec<u64>> {
         let result = self
+            .store
             .metrics
             .compaction_errors
             .saw(self.run_inner(plan).await);
         if let Err(e) = &result {
             tracing::warn!(
-                store = %self.dir.display(),
+                store = %self.store.dir.display(),
                 error = %e,
                 "compaction failed"
             );
@@ -196,7 +197,7 @@ impl<F: Fs> Db<F> {
     /// The compaction proper: the merge with no permit held, then the
     /// outputs and the edit that claims them with it.
     async fn run_inner(&self, plan: Plan<'_>) -> Result<Vec<u64>> {
-        let _timer = self.metrics.compaction.start();
+        let _timer = self.store.metrics.compaction.start();
         let Plan {
             output_level,
             inputs,
@@ -205,8 +206,8 @@ impl<F: Fs> Db<F> {
         } = &plan;
         let output_level = *output_level;
 
-        self.metrics.compaction_tables[0].add(inputs.len() as u64);
-        self.metrics.compaction_io[0].add(inputs.iter().map(|(_, m)| m.size).sum());
+        self.store.metrics.compaction_tables[0].add(inputs.len() as u64);
+        self.store.metrics.compaction_io[0].add(inputs.iter().map(|(_, m)| m.size).sum());
         let mut tables = Vec::new();
         for (_, meta) in inputs {
             tables.push(self.open_table(meta.file_num).await?);
@@ -268,8 +269,8 @@ impl<F: Fs> Db<F> {
                     written.push((file_num, entries));
                     let mut new_table = bounds.into_new_table(output_level, file_num)?;
                     new_table.size = size;
-                    self.metrics.compaction_tables[1].add(1);
-                    self.metrics.compaction_io[1].add(new_table.size);
+                    self.store.metrics.compaction_tables[1].add(1);
+                    self.store.metrics.compaction_io[1].add(new_table.size);
                     self.finish_table(disk).await?;
                     new_tables.push(new_table);
                 }
@@ -318,9 +319,9 @@ impl<F: Fs> Db<F> {
             let _ = self.rotate_inner(&change).await;
         }
         let _ = self.sweep(&change).await;
-        self.metrics.saw_version(&self.version_set().version);
+        self.store.metrics.saw_version(&self.version_set().version);
         self.measure_disk().await;
-        self.metrics.compactions.add(1);
+        self.store.metrics.compactions.add(1);
         self.saw_debt();
         for (file_num, entries) in written {
             self.saw_table_entries(file_num, Some(entries));
@@ -432,7 +433,10 @@ impl<F: Fs> Db<F> {
     /// table was one write — the file is on disk, incomplete, for as long as
     /// the merge takes to fill it (§5).
     async fn create_table(&self, file_num: u64) -> Result<F::Disk> {
-        let path = self.dir.join(roble_format::files::table_filename(file_num));
+        let path = self
+            .store
+            .dir
+            .join(roble_format::files::table_filename(file_num));
         self.fs().create(&path).await
     }
 
@@ -445,18 +449,18 @@ impl<F: Fs> Db<F> {
             .await;
         result?;
         *at += written as u64;
-        self.metrics.written.add(written);
+        self.store.metrics.written.add(written);
         Ok(buf.into_vec())
     }
 
     /// Makes a finished output table durable, and its name with it.
     async fn finish_table(&self, disk: F::Disk) -> Result<()> {
         {
-            let _timer = self.metrics.sync_duration.start();
+            let _timer = self.store.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
         }
         disk.close().await?;
-        self.fs().sync_dir(&self.dir).await?;
+        self.fs().sync_dir(&self.store.dir).await?;
         Ok(())
     }
 }

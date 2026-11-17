@@ -620,7 +620,10 @@ async fn a_range_reads_what_a_btreemap_range_reads_for_every_kind_of_bound() {
         batch.put(key, b"v").expect("put");
         model.insert(key.to_vec(), b"v".to_vec());
     }
-    batch.commit(false).await.expect("commit");
+    batch
+        .commit(roble::Durability::NoSync)
+        .await
+        .expect("commit");
 
     let (b, d) = (&b"b"[..], &b"d"[..]);
     for lower in [Unbounded, Included(b), Excluded(b)] {
@@ -1066,10 +1069,7 @@ async fn a_scan_over_keys_out_of_order_ends_rather_than_skipping_round_a_tombsto
             (handle.offset + handle.length) as usize,
         );
         if (start..end).contains(&at) {
-            let sum = footer
-                .checksum
-                .compute(&bytes[start..end], bytes[end])
-                .expect("checksum");
+            let sum = footer.checksum.compute(&bytes[start..end], bytes[end]);
             bytes[end + 1..end + 5].copy_from_slice(&sum.to_le_bytes());
             fixed = true;
         }

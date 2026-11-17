@@ -300,9 +300,15 @@ async fn a_flush_hands_the_merge_to_whoever_is_waiting_for_one() {
     // The fixture arrives four layers deep, so five is the line this flush
     // crosses: a store that already wanted a compaction could not show whose
     // the merge was.
-    let db = roble::open_with(&env, &dir, Options::new().l0_compaction_threshold(5))
-        .await
-        .expect("open");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .background_tasks(false)
+            .l0_compaction_threshold(5),
+    )
+    .await
+    .expect("open");
     let mut model = contents(&db).await;
     assert_eq!(
         l0_depth(&db),
@@ -349,7 +355,9 @@ async fn a_compaction_that_failed_is_not_asked_for_again_until_the_version_moves
     let db = roble::open_with(
         &env,
         &dir,
-        Options::new().disable_automatic_compactions(true),
+        Options::new()
+            .background_tasks(false)
+            .disable_automatic_compactions(true),
     )
     .await
     .expect("open");
@@ -398,6 +406,7 @@ async fn a_task_waits_for_a_merge_already_running_rather_than_standing_down() {
         &env,
         &dir,
         Options::new()
+            .background_tasks(false)
             .disable_automatic_compactions(true)
             .compaction_unit(1),
     )
@@ -464,7 +473,9 @@ async fn a_store_that_says_it_is_finished_stops_making_its_tasks_wait() {
     let db = roble::open_with(
         &env,
         &dir,
-        Options::new().disable_automatic_compactions(true),
+        Options::new()
+            .background_tasks(false)
+            .disable_automatic_compactions(true),
     )
     .await
     .expect("open");

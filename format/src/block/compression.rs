@@ -34,6 +34,7 @@ use crate::varint;
 /// The algorithm named by a block's trailer byte
 /// (`block.CompressionIndicator`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     /// 0, stored as-is: every block of L0, and any block compression did
     /// not shrink enough to keep.
@@ -116,7 +117,10 @@ impl Compression {
 /// `ZstdCompression` (`sstable/block/compression.go`), the last at level 3;
 /// any level is accepted here, since the level is not recorded anywhere a
 /// reader looks.
+///
+/// `#[non_exhaustive]`: MinLZ joins it when the pin reaches Pebblev6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Codec {
     /// Every block stored as built, which keeps a cached block the bytes
     /// that came off the disk (DESIGN.md §8).

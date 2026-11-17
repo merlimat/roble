@@ -91,9 +91,9 @@ async fn replay(fs: &SimFs, dir: &Path, name: &str) -> VersionSet {
         .await
         .expect("open the manifest");
     let bytes = roble::__private::read_all(&disk, ()).await.expect("read");
-    let mut reader = RecordReader::new(&bytes, file_num as u32);
+    let reader = RecordReader::new(&bytes, file_num as u32);
     let mut edits = Vec::new();
-    while let Some(record) = reader.next() {
+    for record in reader {
         edits.push(VersionEdit::decode(&record.expect("a record")).expect("an edit"));
     }
     VersionSet::replay(&edits).expect("replay")

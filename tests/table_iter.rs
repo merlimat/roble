@@ -64,6 +64,7 @@ fn expected(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
                 Value::InPlace(b) => b.to_vec(),
                 Value::ValueHandle(h) => table.resolve_value(&value_blocks, h)?,
                 Value::BlobHandle(_) => panic!("a blob handle is above roble's pin"),
+                other => panic!("a value the golden tables do not hold: {other:?}"),
             };
             // Re-encoded with the **raw** trailer, obsolete bit included.
             // `InternalKey` splits that bit out into a field of its own, so
@@ -158,7 +159,7 @@ async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
     let mut patched = bytes[..at].to_vec();
     patched.extend_from_slice(&index);
     patched.push(0); // no compression
-    let sum = footer.checksum.compute(&index, 0).expect("checksum");
+    let sum = footer.checksum.compute(&index, 0);
     patched.extend_from_slice(&sum.to_le_bytes());
 
     // The footer as it was, with the index handle pointing at the new block.
@@ -198,6 +199,25 @@ fn put_uvarint(dst: &mut Vec<u8>, mut v: u64) {
         v >>= 7;
     }
     dst.push(v as u8);
+}
+
+#[compio::test]
+async fn a_table_and_its_iterator_print_which_table_they_are() {
+    // What `{:?}` shows: which table, and how much of it is in memory, not
+    // the blocks themselves (`tests/debug.rs` has the public types).
+    let (_env, table) = open(FIXTURES[0]).await;
+    let printed = format!("{table:?}");
+    assert!(
+        printed.contains("OpenTable") && printed.contains("file_num"),
+        "{printed}"
+    );
+
+    let mut it = table.iter();
+    it.first().await.expect("first");
+    let printed = format!("{it:?}");
+    assert!(printed.contains("block: 0"), "{printed}");
+    let entry = it.entry().await.expect("entry");
+    assert!(format!("{entry:?}").starts_with("Entry"));
 }
 
 #[compio::test]
@@ -398,7 +418,7 @@ async fn an_empty_table_has_nowhere_to_go_but_still_holds_its_tombstones() {
 async fn a_table_written_with_another_comparer_is_refused() {
     let bytes = std::fs::read(sst_path("refuse-comparer")).expect("read fixture");
     let (_env, opened) = try_open_bytes(bytes).await;
-    let err = opened.err().expect("a foreign comparer must be refused");
+    let err = opened.expect_err("a foreign comparer must be refused");
     let text = format!("{err}");
     assert!(
         text.contains("oxia-slash-spans") && text.contains("leveldb.BytewiseComparator"),

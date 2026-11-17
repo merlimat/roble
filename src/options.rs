@@ -42,6 +42,9 @@ pub struct Options<F: Fs = crate::FileFs> {
     /// Whether a flush leaves the compaction the picker chose for the
     /// caller to run.
     pub(crate) disable_automatic_compactions: bool,
+    /// Whether a store opened to write runs its flushes and merges in tasks
+    /// of its own.
+    pub(crate) background_tasks: bool,
     /// How many bytes a memtable holds before a write writes it out.
     pub(crate) memtable_size: u64,
     /// How large the MANIFEST may grow before a flush replaces it.
@@ -74,6 +77,7 @@ impl<F: Fs> Default for Options<F> {
             disable_wal: false,
             create_if_missing: false,
             disable_automatic_compactions: false,
+            background_tasks: true,
             memtable_size: crate::memtable::MEMTABLE_SIZE,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
@@ -148,18 +152,35 @@ impl<F: Fs> Options<F> {
         self
     }
 
-    /// Leaves compaction entirely to the caller.
+    /// Stops the store from compacting on its own.
     ///
-    /// Pebble's `DisableAutomaticCompactions`, and wanted for the same two
-    /// reasons: a test that drives compaction by hand needs the store to
-    /// hold still, and a caller that would rather compact when it knows it
-    /// is idle needs the store not to decide for it. `compact_once` is
-    /// still there for both.
+    /// Pebble's `DisableAutomaticCompactions`. A flush no longer runs the
+    /// merge the picker chose, a write no longer waits for one at L0's
+    /// depth, and the store spawns no task to run them: what a test that
+    /// drives compaction by hand needs, so that the store holds still.
     ///
     /// A store with this set still *reports* that it has fallen behind, in
     /// `roble.compaction.debt`. It simply does nothing about it.
+    ///
+    /// Not part of the API: the only way left to compact is `compact_once`,
+    /// which is not part of it either.
+    #[doc(hidden)]
     pub fn disable_automatic_compactions(mut self, disable: bool) -> Self {
         self.disable_automatic_compactions = disable;
+        self
+    }
+
+    /// Whether the store flushes and compacts in tasks of its own: true by
+    /// default.
+    ///
+    /// Not part of the API. Off, nothing is spawned, and the store flushes
+    /// and merges inside the writes that need it, as it does for any work
+    /// its tasks are not there to take: what a test that counts operations
+    /// or drives the store by hand needs, and what the CLI and the
+    /// benchmark's inline mode run.
+    #[doc(hidden)]
+    pub fn background_tasks(mut self, on: bool) -> Self {
+        self.background_tasks = on;
         self
     }
 
@@ -222,9 +243,9 @@ impl<F: Fs> Options<F> {
     /// starts *wanting* L0 compacted. Between the two a flush runs the merge
     /// and nothing waits; at this one a write does.
     ///
-    /// A store with [`Self::disable_automatic_compactions`] set ignores this
-    /// entirely, because it owns L0's depth too: a write that waited for a
-    /// merge nobody was going to run would wait for ever.
+    /// A store told not to compact on its own ignores this entirely, because
+    /// then L0's depth is not its to manage: a write that waited for a merge
+    /// nobody was going to run would wait for ever.
     pub fn l0_stop_writes_threshold(mut self, tables: u64) -> Self {
         self.l0_stop_writes_threshold = tables;
         self
@@ -303,5 +324,33 @@ impl<F: Fs> Options<F> {
     pub fn metric_attributes(mut self, attributes: &[KeyValue]) -> Self {
         self.metric_attributes.extend_from_slice(attributes);
         self
+    }
+}
+
+// Written out rather than derived: the caches are a handle whose own line
+// says what they hold, and a meter provider has nothing worth printing
+// beyond whether there is one.
+impl<F: Fs> std::fmt::Debug for Options<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Options");
+        d.field("caches", &self.caches)
+            .field("disable_wal", &self.disable_wal)
+            .field("create_if_missing", &self.create_if_missing)
+            .field(
+                "disable_automatic_compactions",
+                &self.disable_automatic_compactions,
+            )
+            .field("background_tasks", &self.background_tasks)
+            .field("memtable_size", &self.memtable_size)
+            .field("max_manifest_bytes", &self.max_manifest_bytes)
+            .field("l0_compaction_threshold", &self.l0_compaction_threshold)
+            .field("l0_stop_writes_threshold", &self.l0_stop_writes_threshold)
+            .field("lbase_max_bytes", &self.lbase_max_bytes)
+            .field("compaction_unit", &self.compaction_unit)
+            .field("target_file_size", &self.target_file_size);
+        #[cfg(feature = "opentelemetry")]
+        d.field("metered", &self.meter.is_some())
+            .field("metric_attributes", &self.metric_attributes);
+        d.finish()
     }
 }

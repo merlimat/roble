@@ -381,6 +381,7 @@ fn reads_back(codec: roble_format::block::Codec) {
         Codec::None => Compression::None,
         Codec::Snappy => Compression::Snappy,
         Codec::Zstd(_) => Compression::Zstd,
+        other => panic!("no block type known for {other:?}"),
     };
     for h in table.data_block_handles().expect("index") {
         assert_eq!(

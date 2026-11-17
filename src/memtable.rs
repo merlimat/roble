@@ -179,6 +179,17 @@ pub(crate) const MEMTABLE_SIZE: u64 = 4 << 20;
 /// without one there is nothing to make room for.
 pub(crate) const FLUSH_RESERVE: u64 = 8;
 
+/// How much it holds, not what.
+impl std::fmt::Debug for Memtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Memtable")
+            .field("len", &self.len())
+            .field("bytes", &self.bytes())
+            .field("range_deletions", &self.ranges.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Memtable {
     /// An empty memtable whose shape is determined by `seed`.
     pub fn new(seed: u64) -> Self {
@@ -504,9 +515,9 @@ impl Memtable {
     /// it — never interleaved, since a reader that walks point keys must not
     /// meet a tombstone among them (§6).
     pub fn apply(&mut self, repr: &[u8], base: u64) -> Result<u64> {
-        let mut reader = roble_format::batch::Batch::read(repr)?;
+        let reader = roble_format::batch::Batch::read(repr)?;
         let mut seq = base;
-        while let Some(entry) = reader.next() {
+        for entry in reader {
             let entry = entry?;
             match entry.kind {
                 Kind::RangeDelete => {

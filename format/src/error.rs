@@ -22,6 +22,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// What went wrong while decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The input ended before the structure did.
     Truncated {

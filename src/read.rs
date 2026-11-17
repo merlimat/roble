@@ -41,6 +41,7 @@ use std::rc::Rc;
 
 use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
+use roble_format::rangedel::Tombstone;
 
 use crate::env::Fs;
 use crate::error::Result;
@@ -230,6 +231,15 @@ struct Candidate {
     kind: Kind,
 }
 
+/// The sequence number of the newest of `tombstones` that covers `user`.
+fn covering_seq(tombstones: &[Tombstone], user: &[u8]) -> Option<u64> {
+    tombstones
+        .iter()
+        .filter(|t| t.start.as_slice() <= user && user < t.end.as_slice())
+        .map(|t| t.seq_num)
+        .max()
+}
+
 impl<F: Fs> Db<F> {
     /// Reads the key `how` says, or `None` if there is none.
     ///
@@ -252,7 +262,7 @@ impl<F: Fs> Db<F> {
     /// its buffers have reached the sizes the data needs, a lookup in a steady
     /// state allocates nothing at all.
     pub async fn get_into(&self, key: &[u8], how: Comparison, buf: &mut GetBuf) -> Result<bool> {
-        let _timer = self.metrics.get.start();
+        let _timer = self.store.metrics.get.start();
         buf.key.clear();
         buf.value.clear();
         let result = match how {
@@ -262,9 +272,10 @@ impl<F: Fs> Db<F> {
             Comparison::Equal => self.equal(key, buf).await,
             _ => self.positioned(key, how, buf).await,
         };
-        let found = self.metrics.read_errors.saw(result)?;
+        let found = self.store.metrics.read_errors.saw(result)?;
         if found {
-            self.metrics
+            self.store
+                .metrics
                 .read_bytes
                 .add((buf.key.len() + buf.value.len()) as u64);
         } else {
@@ -361,7 +372,7 @@ impl<F: Fs> Db<F> {
         // Through the scan the buffer keeps, rebuilt in its own allocations
         // and parked again however the seek went, so that it never holds the
         // store between two lookups.
-        let scan = scan.get::<F>(&self.metrics);
+        let scan = scan.get::<F>(&self.store.metrics);
         let found = async {
             self.rebuild_scan(scan, std::iter::empty(), lower, upper)?;
             match (lower, upper) {
@@ -381,7 +392,8 @@ impl<F: Fs> Db<F> {
         found
     }
 
-    /// The newest entry any table holds for `user`.
+    /// The newest entry any table holds for `user`, or `None` if a range
+    /// tombstone newer than it was met on the way.
     ///
     /// Newest by sequence number, across every level: an entry's level says
     /// nothing a trailer does not already say, and trailers are what the
@@ -401,15 +413,23 @@ impl<F: Fs> Db<F> {
         } = buf;
         key::search_key_into(user, target);
         let mut best: Option<Candidate> = None;
+        // The newest range tombstone seen so far that covers `user`. Every
+        // version older than it is deleted, so a table holding nothing newer
+        // is not searched — and, once one is known, an entry's block is not
+        // read only for `visible` to throw it away, which is what RocksDB's
+        // `max_covering_tombstone_seq` and Pebble's `getIter` save too.
+        let mut covered: Option<u64> = None;
 
         // The memtables first — the one writes go to, and the one a flush is
         // writing out if there is one. Anything either holds was written
         // after every table was, so when one holds the key, every table is
         // then skipped by the sequence-number check below. The comparison is
         // by trailer either way: the order is what makes the skip possible,
-        // not what makes the answer right.
+        // not what makes the answer right. The same is true of a tombstone a
+        // memtable holds: it is newer than every table, so it skips them all.
         for held in self.memtables_each() {
             let memtable = held.borrow();
+            covered = covered.max(covering_seq(memtable.tombstones(), user));
             let mut cursor = memtable.cursor();
             cursor.seek_ge(&memtable, target)?;
             if cursor.is_valid() {
@@ -447,10 +467,34 @@ impl<F: Fs> Db<F> {
             // a table whose newest entry ties the best so far holds nothing
             // that could win, so the two read alike and differ only in
             // whether that table is opened for nothing.
-            if best.as_ref().is_some_and(|b| largest_seq <= b.trailer >> 8) {
+            //
+            // **Nor is a table a covering tombstone makes too old.** Its every
+            // entry is no newer than its largest sequence number, so at or
+            // below the tombstone's it is deleted. `<=` here rests on what
+            // `visible`'s `>` does — a point key and a tombstone never share a
+            // sequence number — and it is what lets the table holding the
+            // tombstone go unsearched when the tombstone is the newest thing
+            // in it.
+            //
+            // Asked twice: once before the table is opened, for a tombstone
+            // already seen, and once after, for one the table holds itself.
+            // `tables` comes newest first, so a tombstone met in one is no
+            // newer than the tables already searched.
+            let too_old = |covered: Option<u64>, best: &Option<Candidate>| {
+                best.as_ref().is_some_and(|b| largest_seq <= b.trailer >> 8)
+                    || covered.is_some_and(|c| largest_seq <= c)
+            };
+            if too_old(covered, &best) {
                 continue;
             }
             let table = self.open_table(file_num).await?;
+            // From the tombstones an open table already holds, and before its
+            // filter: a filter is built from point keys, and a tombstone is
+            // not one.
+            covered = covered.max(covering_seq(&table.tombstones, user));
+            if too_old(covered, &best) {
+                continue;
+            }
             // The filter is consulted only here: it answers about one key, and
             // the ordered comparisons are asking about a range (§6).
             //
@@ -487,6 +531,16 @@ impl<F: Fs> Db<F> {
                 std::mem::swap(value, entry_value);
                 best = Some(candidate);
             }
+        }
+        // A version older than the newest covering tombstone is deleted,
+        // whichever source each came from. A table can hold a tombstone newer
+        // than a version an earlier one gave — L0's tables overlap — so this
+        // is decided once every source has been asked, not as each answers.
+        if best
+            .as_ref()
+            .is_some_and(|b| covered.is_some_and(|c| c > b.trailer >> 8))
+        {
+            return Ok(None);
         }
         Ok(best)
     }

@@ -54,6 +54,7 @@ fn render(table: &Table<'_>, key: InternalKey<'_>, value: Value<'_>) -> String {
             table.resolve_value(&blocks, h).expect("resolve value")
         }
         Value::BlobHandle(_) => panic!("a blob handle is above roble's pin"),
+        other => panic!("a value this harness does not render: {other:?}"),
     };
     const LEAD: usize = 8;
     let head = &resolved[..resolved.len().min(LEAD)];

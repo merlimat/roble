@@ -400,6 +400,42 @@ impl<F: Fs> Clone for Caches<F> {
     }
 }
 
+/// What each cache holds against its budget: the numbers that say whether
+/// it is the right size.
+impl<F: Fs> std::fmt::Debug for Caches<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (tables, blocks) = (self.tables.borrow(), self.blocks.borrow());
+        f.debug_struct("Caches")
+            .field("tables_held", &tables.len())
+            .field("open_tables", &tables.budget)
+            .field("block_bytes_held", &blocks.used())
+            .field("block_bytes", &blocks.budget)
+            .field("blocks_held", &blocks.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which store a view is for, and what the cache it draws on holds.
+impl std::fmt::Debug for BlockCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockCache")
+            .field("store", &self.store)
+            .field("clock", &*self.clock.borrow())
+            .finish()
+    }
+}
+
+/// What it holds against its budget, not the entries themselves.
+impl<K: Eq + Hash + Clone, V: Clone> std::fmt::Debug for Clock<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Clock")
+            .field("len", &self.len())
+            .field("used", &self.used)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<F: Fs> Caches<F> {
     /// Caches holding `open_tables` readers and `block_bytes` of blocks.
     pub fn new(open_tables: usize, block_bytes: usize) -> Self {

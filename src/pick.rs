@@ -39,9 +39,9 @@
 //! the latency spike units of work exist to avoid; now it merges a slice at
 //! a time and the thread comes back between them, and the permit comes back
 //! with it (§9): a merge holds a claim on its inputs and nothing else, so
-//! the flush that scheduled it does not wait for it to finish. What still
-//! has no trigger is an *idle* store draining its backlog, which needs a
-//! task of its own — and now needs only that.
+//! the flush that scheduled it does not wait for it to finish. An *idle*
+//! store drains its backlog in its own merge task, which asks the picker
+//! again whenever the version changes (`Db::compaction_wanted`).
 //!
 //! **The score is a fraction, not a float.** Two levels are compared by
 //! cross-multiplying, which is exact; a float would be deterministic in
@@ -246,13 +246,14 @@ impl<F: Fs> Db<F> {
 
     /// Restates the debt, for whatever is recording.
     pub(crate) fn saw_debt(&self) {
-        self.metrics.saw_debt(self.compaction_debt());
+        self.store.metrics.saw_debt(self.compaction_debt());
     }
 
     /// Runs the compaction the picker chooses, if there is one.
     ///
     /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.
+    #[doc(hidden)]
     pub async fn compact_once(&self) -> Result<Vec<u64>> {
         self.writable()?;
         let Some(plan) = self.plan_picked().await? else {

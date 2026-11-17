@@ -263,22 +263,6 @@ impl<'a> Reader<'a> {
         self.remaining
     }
 
-    /// Decodes the next entry, or `None` at the end.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<Result<Entry<'a>>> {
-        if self.rest.is_empty() {
-            if self.remaining != 0 {
-                let missing = self.remaining;
-                self.remaining = 0;
-                return Some(Error::corrupt(format!(
-                    "batch header promised {missing} more entries than it holds"
-                )));
-            }
-            return None;
-        }
-        Some(self.next_inner())
-    }
-
     fn next_inner(&mut self) -> Result<Entry<'a>> {
         let kind = Kind::from_byte(self.rest[0])?;
         let mut at = 1;
@@ -296,6 +280,36 @@ impl<'a> Reader<'a> {
         Ok(Entry { kind, key, value })
     }
 }
+
+/// The entries, in the order they were added.
+///
+/// Fused: after an error it yields nothing more, as at the end. An entry
+/// that failed to decode has no length to step over, so whatever follows it
+/// cannot be found.
+impl<'a> Iterator for Reader<'a> {
+    type Item = Result<Entry<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            if self.remaining != 0 {
+                let missing = self.remaining;
+                self.remaining = 0;
+                return Some(Error::corrupt(format!(
+                    "batch header promised {missing} more entries than it holds"
+                )));
+            }
+            return None;
+        }
+        let entry = self.next_inner();
+        if entry.is_err() {
+            self.rest = &[];
+            self.remaining = 0;
+        }
+        Some(entry)
+    }
+}
+
+impl std::iter::FusedIterator for Reader<'_> {}
 
 fn read_str(src: &[u8]) -> Result<(&[u8], usize)> {
     let (len, n) = varint::uvarint(src)?;
@@ -341,9 +355,9 @@ mod tests {
         b.delete_sized(b"/f", 300).expect("delete sized");
         assert_eq!(b.count(), 5);
 
-        let mut r = Batch::read(b.as_bytes()).expect("read");
+        let r = Batch::read(b.as_bytes()).expect("read");
         let mut got = Vec::new();
-        while let Some(e) = r.next() {
+        for e in r {
             let e = e.expect("entry");
             got.push((e.kind, e.key.to_vec(), e.value.map(<[u8]>::to_vec)));
         }
@@ -389,14 +403,32 @@ mod tests {
         b.put(b"/a", b"1").expect("put");
         let mut repr = b.as_bytes().to_vec();
         repr[COUNT_OFFSET..HEADER_LEN].copy_from_slice(&9u32.to_le_bytes());
-        let mut r = Batch::read(&repr).expect("read");
+        let r = Batch::read(&repr).expect("read");
         let mut err = None;
-        while let Some(e) = r.next() {
+        for e in r {
             if let Err(e) = e {
                 err = Some(e);
             }
         }
         assert!(err.is_some(), "a short batch must not read as complete");
+    }
+
+    /// An entry that fails to decode has no length to step over, so the
+    /// reader cannot go on past it. It used to hand back the same error on
+    /// every call, which a loop that logged and carried on would never leave.
+    #[test]
+    fn a_reader_stops_after_an_entry_it_cannot_decode() {
+        let mut b = Batch::new();
+        b.put(b"/a", b"1").expect("put");
+        b.put(b"/b", b"2").expect("put");
+        let mut repr = b.as_bytes().to_vec();
+        repr[HEADER_LEN] = 0xff; // no kind has this byte
+        let mut r = Batch::read(&repr).expect("read");
+        r.next()
+            .expect("an entry")
+            .expect_err("a kind no batch writes");
+        assert!(r.next().is_none(), "and nothing follows the error");
+        assert_eq!(r.remaining(), 0, "nor is anything said to be left");
     }
 
     #[test]
@@ -405,8 +437,8 @@ mod tests {
         b.put(b"/some/key", b"some value").expect("put");
         let full = b.as_bytes().to_vec();
         for cut in HEADER_LEN..full.len() {
-            let mut r = Batch::read(&full[..cut]).expect("header survives");
-            while let Some(e) = r.next() {
+            let r = Batch::read(&full[..cut]).expect("header survives");
+            for e in r {
                 if e.is_err() {
                     break;
                 }
