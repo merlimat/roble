@@ -223,14 +223,14 @@ impl<F: Fs> Options<F> {
         self
     }
 
-    /// How many tables L0 may hold before the picker wants it compacted
+    /// How deep L0 may grow, in layers, before the picker wants it compacted
     /// (`crate::pick`).
     pub fn l0_compaction_threshold(mut self, tables: u64) -> Self {
         self.l0_compaction_threshold = tables;
         self
     }
 
-    /// How many tables L0 may hold before a write waits for it to drain
+    /// How deep L0 may grow, in layers, before a write waits for it to drain
     /// (§9, `crate::pick`).
     ///
     /// Pebble's `L0StopWritesThreshold`, and the same default of twelve.
