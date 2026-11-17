@@ -17,7 +17,9 @@ path = "src/main.rs"
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
 compio = "0.19.2"
-roble = { path = "..", version = "0.0.0-dev" }
+# Exact: the CLI calls roble's #[doc(hidden)] inspection methods, which may
+# change in any release, so it builds only against the roble it shipped with.
+roble = { path = "..", version = "=0.0.0-dev" }
 roble-format = { path = "../format", version = "0.0.0-dev" }
 
 [dev-dependencies]
