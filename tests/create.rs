@@ -244,6 +244,36 @@ async fn an_unfinished_creation_is_finished() {
 }
 
 #[compio::test]
+async fn an_unfinished_creation_is_finished_on_a_real_disk() {
+    // The leftovers are recognised by name, so the names a real directory
+    // lists are the ones that matter: anything `FileFs` shows that `SimFs`
+    // does not would make every leftover look like a database.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("db");
+    let db = roble::open_with(
+        &roble::DefaultEnv,
+        &dir,
+        Options::new().create_if_missing(true),
+    )
+    .await
+    .expect("create");
+    drop(db);
+    std::fs::remove_file(dir.join("marker.manifest.000001.MANIFEST-000001")).expect("remove");
+
+    roble::open_with(
+        &roble::DefaultEnv,
+        &dir,
+        Options::new().create_if_missing(true),
+    )
+    .await
+    .expect("the leftovers of a creation are finished");
+    assert!(
+        dir.join("marker.manifest.000001.MANIFEST-000001").exists(),
+        "a database in it again"
+    );
+}
+
+#[compio::test]
 async fn creation_will_not_write_over_a_log_that_holds_a_write() {
     // The same files, but a write reached the log before the marker went
     // missing. That is a database, whatever it lacks, and creating one in
@@ -273,29 +303,42 @@ async fn creation_will_not_write_over_a_log_that_holds_a_write() {
 
 #[compio::test]
 async fn creation_will_not_write_over_a_database_missing_its_marker() {
-    // A database Pebble wrote, with tables, logs and a later iteration of
-    // the format marker, whose manifest marker is gone. Nothing a creation
-    // leaves looks like this, so it is not written into.
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-reads");
+    // A database whose writes were flushed: they are in a table, and the log
+    // a creation would find empty holds none of them. What tells it from a
+    // creation's leftovers is the table, a name no creation writes, and
+    // creating over it would orphan the table and lose the write.
     let env = SimEnv::new();
     let dir = PathBuf::from("/db");
+    let db = roble::open_with(&env, &dir, creating())
+        .await
+        .expect("create");
+    let mut batch = Batch::new();
+    batch.put(b"key", b"value").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+    drop(db);
     let fs: &SimFs = env.sim();
-    fs.mkdir_all(&dir).await.expect("mkdir");
-    for entry in std::fs::read_dir(&src).expect("read fixture") {
-        let entry = entry.expect("entry");
-        let name = entry.file_name().into_string().expect("UTF-8 name");
-        if name.starts_with("marker.manifest.") {
-            continue;
-        }
-        let bytes = std::fs::read(entry.path()).expect("read file");
-        let disk = fs.create(&dir.join(&name)).await.expect("create");
-        let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
-        result.expect("write");
-        disk.sync(()).await.expect("sync");
-        disk.close().await.expect("close");
-    }
-    fs.sync_dir(&dir).await.expect("sync dir");
+    let names = listing(fs, &dir).await;
+    let manifest_marker = names
+        .iter()
+        .find(|n| n.starts_with("marker.manifest."))
+        .expect("a manifest marker")
+        .clone();
+    fs.remove(&dir.join(manifest_marker)).await.expect("remove");
     let before = listing(fs, &dir).await;
+    assert!(
+        before.iter().any(|n| n.ends_with(".sst")),
+        "the write should be in a table: {before:?}"
+    );
+    // So that it is the table that refuses this, and not a log with a write
+    // in it, which the test above is for.
+    if before.iter().any(|n| n == "000002.log") {
+        let log = fs
+            .open(&dir.join("000002.log"), roble::Access::ReadOnly)
+            .await
+            .expect("open log");
+        assert_eq!(log.len().await.expect("len"), 0, "the flushed log");
+    }
 
     let err = roble::open_with(&env, &dir, creating())
         .await
