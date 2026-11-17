@@ -79,7 +79,7 @@ impl<F: Fs> Db<F> {
         self.fs().mkdir_all(dir).await?;
 
         let (tables, edit, manifest_num) = {
-            let versions = self.versions();
+            let versions = self.version_set();
             // The MANIFEST takes the next number the store had to give, and
             // the edit says the number after it is next. Nothing in the
             // checkpoint has to agree with the store it came from — it is a

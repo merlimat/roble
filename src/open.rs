@@ -1115,13 +1115,13 @@ impl<F: Fs> Db<F> {
             // tables than the line is not past it, and counting the layers —
             // a list of L0's tables built, sorted and compared pairwise — is
             // only for the store that might be. This runs on every write.
-            if (self.versions().version.level(0).len() as u64) < self.l0_stop_writes_threshold {
+            if (self.version_set().version.level(0).len() as u64) < self.l0_stop_writes_threshold {
                 return Ok(());
             }
             // In layers, which is what the line is counted in: a store
             // holding twelve tables a read crosses in one seek is not deep
             // (§9, `crate::pick::l0_depth`).
-            let in_l0 = crate::pick::l0_depth(&self.versions().version);
+            let in_l0 = crate::pick::l0_depth(&self.version_set().version);
             if in_l0 < self.l0_stop_writes_threshold {
                 return Ok(());
             }
@@ -1588,7 +1588,7 @@ impl<F: Fs> Db<F> {
         if !self.metrics.recording() {
             return;
         }
-        let live = self.versions().version.table_file_nums();
+        let live = self.version_set().version.table_file_nums();
         let mut known = self.tables.entries.borrow_mut();
         known.retain(|file_num, _| live.contains(file_num));
         self.records_in_tables
@@ -1733,8 +1733,22 @@ impl<F: Fs> Db<F> {
         })
     }
 
-    /// What the MANIFEST says, as it stands.
-    pub fn versions(&self) -> std::cell::Ref<'_, VersionSet> {
+    /// What the MANIFEST says, as it stands: a copy, for roble's own tests
+    /// and tools, which read counters and tables [`Db::levels`] does not show.
+    ///
+    /// Owned rather than a borrow of the store's own, so that a caller can
+    /// hold it across an `.await` while a flush or a compaction applies an
+    /// edit. Cheap: the version inside is shared, not copied.
+    #[doc(hidden)]
+    pub fn versions(&self) -> VersionSet {
+        self.versions.borrow().clone()
+    }
+
+    /// The store's own version set, borrowed.
+    ///
+    /// Never held across an `.await`: an edit applied meanwhile would find
+    /// it borrowed.
+    pub(crate) fn version_set(&self) -> std::cell::Ref<'_, VersionSet> {
         self.versions.borrow()
     }
 

@@ -386,7 +386,7 @@ impl<F: Fs> Db<F> {
         // The borrow is released before the await: a `RefCell` held across
         // one is a panic waiting for the next reader.
         let live = {
-            let versions = self.versions();
+            let versions = self.version_set();
             Live::of(&versions, manifest_num, &names)?
         };
         let mut in_use = self.release_dead_readers(&live);

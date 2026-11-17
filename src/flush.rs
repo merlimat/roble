@@ -176,7 +176,7 @@ impl<F: Fs> Db<F> {
                 let log_num = if self.wal_disabled() {
                     None
                 } else {
-                    let log_num = self.versions().next_file_num;
+                    let log_num = self.version_set().next_file_num;
                     let log_path = self.dir.join(roble_format::files::log_filename(log_num));
                     let log_disk = self.fs().create(&log_path).await?;
                     log_disk.sync(Default::default()).await?;
@@ -193,7 +193,7 @@ impl<F: Fs> Db<F> {
         // it until the edit lands, and a flush that fails leaves it free for
         // the next one. The log's was spent by the freeze above, which is
         // why this reads the counter again rather than adding to it.
-        let table_num = self.versions().next_file_num;
+        let table_num = self.version_set().next_file_num;
 
         // 2. The table, then the directory, so its name is durable too. The
         //    file is created before the walk because the walk writes into it:
@@ -274,7 +274,7 @@ impl<F: Fs> Db<F> {
         //    next flush will find again (§6). Reporting a flush that worked
         //    as one that did not would be the larger lie.
         let _ = self.sweep(change).await;
-        self.metrics.saw_version(&self.versions().version);
+        self.metrics.saw_version(&self.version_set().version);
         self.metrics
             .memtable_size
             .set(self.unflushed_bytes() as i64);
