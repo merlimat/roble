@@ -20,7 +20,8 @@
 
 use std::path::Path;
 
-use roble_format::sst::{TableWriter, WriterOptions};
+use roble_format::block::{Codec, Compression};
+use roble_format::sst::{Table, TableWriter, WriterOptions};
 use roble_format::{InternalKey, Kind, dump_table};
 
 struct Fixture {
@@ -29,6 +30,8 @@ struct Fixture {
     entries: Vec<(Vec<u8>, u64, Kind, Vec<u8>)>,
     /// `(start, end, seq_num)`, fragmented and in order.
     tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    /// What the data and index blocks are compressed with.
+    compression: Codec,
 }
 
 fn oxia_key(shard: u32, i: u32) -> Vec<u8> {
@@ -53,6 +56,7 @@ fn fixtures() -> Vec<Fixture> {
             })
             .collect(),
         tombstones: Vec::new(),
+        compression: Codec::None,
     });
 
     // Every point kind roble writes, including a value of zero length and one
@@ -70,6 +74,7 @@ fn fixtures() -> Vec<Fixture> {
             (b"/g".to_vec(), 106, Kind::Set, vec![b'x'; 5000]),
         ],
         tombstones: Vec::new(),
+        compression: Codec::None,
     });
 
     // Many small blocks, so the index has to be right rather than incidental.
@@ -87,6 +92,7 @@ fn fixtures() -> Vec<Fixture> {
             })
             .collect(),
         tombstones: Vec::new(),
+        compression: Codec::None,
     });
 
     // The same user key at several sequence numbers. This is the case that
@@ -123,6 +129,7 @@ fn fixtures() -> Vec<Fixture> {
         block_size: 4096,
         entries: dups,
         tombstones: Vec::new(),
+        compression: Codec::None,
     });
 
     // Long shared prefixes, which is what Oxia's keys look like, so prefix
@@ -141,6 +148,7 @@ fn fixtures() -> Vec<Fixture> {
             })
             .collect(),
         tombstones: Vec::new(),
+        compression: Codec::None,
     });
 
     // Range deletions written by roble, for Go Pebble to read. This covers
@@ -172,6 +180,7 @@ fn fixtures() -> Vec<Fixture> {
             (oxia_key(13, 30), oxia_key(13, 40), 60),
             (oxia_key(13, 40), oxia_key(13, 50), 50),
         ],
+        compression: Codec::None,
     });
 
     // A table with range deletions and no point key at all, which a flush
@@ -198,7 +207,47 @@ fn fixtures() -> Vec<Fixture> {
             (oxia_key(14, 10), oxia_key(14, 20), 30),
             (oxia_key(14, 30), oxia_key(14, 40), 20),
         ],
+        compression: Codec::None,
     });
+
+    // Compressed tables, one per codec roble writes. The values alternate
+    // between runs that compress well — a serialized record, as Oxia's are —
+    // and runs of noise that do not, so each table mixes compressed data
+    // blocks with ones the 12% rule stored as built, and a reader has to
+    // branch per block as Pebble's does. Tombstones too, whose block is never
+    // compressed whatever the table's codec.
+    for (name, compression) in [
+        ("snappy", Codec::Snappy),
+        ("zstd", Codec::Zstd(Codec::ZSTD_DEFAULT_LEVEL)),
+    ] {
+        let mut noise = 0x9e37_79b9_7f4a_7c15u64;
+        out.push(Fixture {
+            name,
+            block_size: 1024,
+            entries: (0..400u32)
+                .map(|i| {
+                    let value = if (i / 40) % 2 == 0 {
+                        format!(
+                            r#"{{"user":{i},"name":"user-{i}","status":"active","tags":["a","b"]}}"#
+                        )
+                        .into_bytes()
+                    } else {
+                        (0..64)
+                            .map(|_| {
+                                noise ^= noise << 13;
+                                noise ^= noise >> 7;
+                                noise ^= noise << 17;
+                                noise as u8
+                            })
+                            .collect()
+                    };
+                    (oxia_key(15, i), 20_000 + u64::from(i), Kind::Set, value)
+                })
+                .collect(),
+            tombstones: vec![(oxia_key(15, 500), oxia_key(15, 600), 30_000)],
+            compression,
+        });
+    }
 
     out
 }
@@ -215,7 +264,12 @@ fn main() {
         "fixture", "entries", "bytes", "blocks"
     );
     for f in fixtures() {
-        let mut w = TableWriter::new(WriterOptions::default().block_size(f.block_size));
+        let mut w = TableWriter::new(
+            WriterOptions::default()
+                .block_size(f.block_size)
+                .compression(f.compression),
+        )
+        .expect("writer");
         for (user_key, seq_num, kind, value) in &f.entries {
             w.add(
                 InternalKey {
@@ -243,6 +297,24 @@ fn main() {
             .unwrap_or_else(|e| panic!("{}: finish: {e}", f.name));
 
         let dump = dump_table(&bytes).unwrap_or_else(|e| panic!("{}: dump: {e}", f.name));
+
+        // A compressed fixture whose blocks all fell back to uncompressed
+        // would pass the diff while testing nothing, and so would one whose
+        // blocks all compressed: the point is the mix.
+        if f.compression != Codec::None {
+            let table = Table::open(&bytes).expect("reopen");
+            let kinds: Vec<Compression> = table
+                .data_block_handles()
+                .expect("index")
+                .into_iter()
+                .map(|h| table.block_compression(h).expect("trailer"))
+                .collect();
+            assert!(
+                kinds.iter().any(|&c| c != Compression::None) && kinds.contains(&Compression::None),
+                "{}: wants compressed and uncompressed data blocks, got {kinds:?}",
+                f.name
+            );
+        }
         std::fs::write(dir.join(format!("{}.sst", f.name)), &bytes).expect("write sst");
         std::fs::write(dir.join(format!("{}.dump", f.name)), &dump).expect("write dump");
 

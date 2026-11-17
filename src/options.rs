@@ -28,6 +28,7 @@ use crate::metrics::{KeyValue, NanoMeter};
 
 use crate::cache::Caches;
 use crate::env::Fs;
+use roble_format::block::Codec;
 
 /// How a store is opened.
 pub struct Options<F: Fs = crate::FileFs> {
@@ -60,6 +61,9 @@ pub struct Options<F: Fs = crate::FileFs> {
     /// How large a table a compaction aims to write into L0; each level
     /// below it twice as large.
     pub(crate) target_file_size: u64,
+    /// What a compaction compresses the data and index blocks of the tables
+    /// it writes with.
+    pub(crate) compression: Codec,
     /// Where the store's metrics go, if anywhere (`crate::metrics`).
     pub(crate) meter: Option<NanoMeter>,
     /// Attributes added to every series, after `roble.store`.
@@ -81,6 +85,7 @@ impl<F: Fs> Default for Options<F> {
             lbase_max_bytes: crate::pick::LBASE_MAX_BYTES,
             compaction_unit: crate::work::COMPACTION_UNIT,
             target_file_size: crate::compact::TARGET_FILE_SIZE,
+            compression: Codec::Snappy,
             meter: None,
             metric_attributes: Vec::new(),
         }
@@ -274,6 +279,23 @@ impl<F: Fs> Options<F> {
     /// below it twice as large (`crate::compact`).
     pub fn target_file_size(mut self, bytes: u64) -> Self {
         self.target_file_size = bytes;
+        self
+    }
+
+    /// What the tables a compaction writes — L1 and below — compress their
+    /// data and index blocks with. Snappy by default.
+    ///
+    /// A flush always writes L0 uncompressed. Both halves are Oxia's
+    /// configuration (DESIGN.md §1): L0 tables are the ones written most
+    /// often and read for the shortest time, so not worth the CPU, while the
+    /// levels below hold nearly all the data. Snappy is the cheapest codec Go
+    /// Pebble reads — a quarter to a third of Zstd's CPU to compress a block
+    /// that compresses, and about a thirteenth of Zstd 3's on one that does not —
+    /// and on compressible values it saves most of the space Zstd would. Changing this
+    /// changes only tables written from now on; a store reads every table
+    /// whatever it was written with.
+    pub fn compression(mut self, codec: Codec) -> Self {
+        self.compression = codec;
         self
     }
 

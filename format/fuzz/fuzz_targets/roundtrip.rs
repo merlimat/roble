@@ -119,7 +119,8 @@ fn table(case: TableCase) {
         WriterOptions::default()
             .block_size(usize::from(case.block_size))
             .filter_bits_per_key(case.filter.then_some(10)),
-    );
+    )
+    .expect("a writer");
     for (k, seq, kind, v) in &points {
         let ikey = InternalKey {
             user_key: k,

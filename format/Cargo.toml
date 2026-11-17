@@ -11,10 +11,17 @@ description = "Encodes and decodes Pebble's on-disk formats. No I/O, no async, n
 # carry-less multiply on top of the CRC instructions: 2-4x the crc32c crate at
 # block and WAL chunk sizes. Default features add a C FFI and a panic handler.
 crc-fast = { version = "1.10", default-features = false, features = ["std"] }
-ruzstd = "0.9"
 # Snappy for L1+ blocks, which is what Oxia configures (DESIGN.md §3).
 snap = "1.1.1"
 twox-hash = "2.1"
+# libzstd, for Zstd blocks both ways. The pure-Rust ruzstd this replaced
+# decodes, but its encoder implements only its fastest level, which is not
+# the Zstd Pebble or RocksDB write, and a measurement of Zstd's cost against
+# Snappy's needs the real one on both sides. Without default features: no
+# legacy-format decoding and no dictionary builder, neither of which a
+# Pebble block can ask for. It builds the bundled libzstd, so this crate now
+# needs a C compiler where it did not before.
+zstd = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true

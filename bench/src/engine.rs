@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use roble_format::files as roble_files;
 
 use crate::report::Report;
-use crate::{Config, fail, key_for, value_for};
+use crate::{Compression, Config, fail, key_for, value_for};
 
 /// One table of one level, as an engine describes its own.
 ///
@@ -240,6 +240,14 @@ impl Store for Roble {
                     .create_if_missing(true)
                     .caches(caches.clone())
                     .memtable_size(cfg.memtable_mb * 1024 * 1024)
+                    .compression(match cfg.compression {
+                        None | Some(Compression::Snappy) => roble::Codec::Snappy,
+                        Some(Compression::None) => roble::Codec::None,
+                        Some(Compression::Zstd(level)) => roble::Codec::Zstd(level),
+                        Some(Compression::Lz4) => {
+                            fail("roble does not write lz4: Go Pebble cannot read it")
+                        }
+                    })
                     // Oxia's configuration: its replication log is the source
                     // of truth, so the store need only be durable at a flush.
                     .disable_wal(!cfg.wal)
@@ -312,43 +320,31 @@ impl Store for Roble {
             .flush()
             .await
             .unwrap_or_else(|e| fail(&format!("flush: {e}")));
-        // roble compacts cooperatively on the thread that owns the store
-        // (§9), so this is the caller's to drive and its cost is counted here
-        // rather than in a background total — partly by doing the merges and
-        // partly by handing the thread to the task beside this shard, which
-        // is doing them too. A merge it has already claimed comes back here
-        // as an empty answer rather than an error, so those are waited out
-        // rather than counted, and what this returns is the share this call
-        // merged itself.
-        // The guard is a clock and not a count, because the two things this
-        // loop does happen at wildly different rates. A merge it performs
-        // itself is one iteration of real work; a merge the task beside this
-        // shard has already claimed comes back empty and costs one yield, and
-        // the loop spins through those for as long as that merge takes. At
-        // six million records it passed a hundred thousand yields waiting on
-        // work that was proceeding perfectly well, and a count tuned for
-        // merges called that a stuck picker.
+        // The store merges on a task of its own (§9), so this waits for it,
+        // as RocksDB's `wait_for_compact` below does, and does none of the
+        // work itself: its cost lands in `cpu s` wherever the task ran.
+        //
+        // Waited, not polled. This used to merge beside the store's task and,
+        // whenever that task had claimed the picker's choice, yield and ask
+        // again: at six million records, 680,000 times a run with every merge
+        // the task's, and some 0.75 s of the phase's CPU spent watching.
+        //
+        // The guard is a clock, for a picker that keeps choosing work nobody
+        // finishes — which is what a failing compaction looks like from
+        // here, since the task logs the error and waits for the version to
+        // change before trying again.
         let started = Instant::now();
-        let mut ran = 0;
         while self.db.pick().is_some() {
-            let merged = self
-                .db
-                .compact_once()
-                .await
-                .unwrap_or_else(|e| fail(&format!("compact: {e}")));
-            if merged.is_empty() {
-                if started.elapsed() > Duration::from_secs(600) {
-                    fail(&format!(
-                        "the picker never settled: ten minutes of compaction after {ran} merges \
-                         of this call's own, and it still has work to choose"
-                    ));
-                }
-            } else {
-                ran += 1;
+            if started.elapsed() > Duration::from_secs(600) {
+                fail(
+                    "the picker never settled: ten minutes and it still has work to choose; \
+                     a background compaction may be failing (see its warnings)",
+                );
             }
+            self.db.compaction_settled().await;
             yield_now().await;
         }
-        ran
+        1
     }
 
     fn levels(&self) -> Option<[usize; 7]> {
@@ -674,7 +670,20 @@ impl Store for Rocks {
             // merge nobody will run would wait for ever.
             options.set_disable_auto_compactions(!cfg.compactions);
             options.set_block_based_table_factory(&table);
-            options.set_compression_type(rocksdb::DBCompressionType::Snappy);
+            // Every level, L0 included, which is RocksDB's own way and not
+            // Oxia's: roble leaves L0 uncompressed.
+            let compression = cfg.compression.unwrap_or(Compression::Snappy);
+            options.set_compression_type(match compression {
+                Compression::None => rocksdb::DBCompressionType::None,
+                Compression::Snappy => rocksdb::DBCompressionType::Snappy,
+                Compression::Lz4 => rocksdb::DBCompressionType::Lz4,
+                Compression::Zstd(_) => rocksdb::DBCompressionType::Zstd,
+            });
+            if let Compression::Zstd(level) = compression {
+                // RocksDB's defaults for the window and strategy; only the
+                // level is ours.
+                options.set_compression_options(-14, level, 0, 0);
+            }
             let db = rocksdb::DB::open(&options, &at)
                 .unwrap_or_else(|e| fail(&format!("open {}: {e}", at.display())));
             shards.push(Rocks {

@@ -337,7 +337,10 @@ async fn the_last_level_is_never_picked() {
         Options::new()
             .disable_automatic_compactions(true)
             .l0_compaction_threshold(1)
-            .lbase_max_bytes(1),
+            .lbase_max_bytes(1)
+            // Uncompressed: the sizes this test needs are of values of one
+            // repeated byte, which compressed would be a fraction of them.
+            .compression(roble::Codec::None),
     )
     .await
     .expect("open");

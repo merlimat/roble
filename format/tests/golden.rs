@@ -305,14 +305,29 @@ fn a_handle_past_the_end_of_u64_is_refused_by_block_compression() {
 /// What roble wrote has to read back as what it was handed: the cheap half of
 /// the round trip, with no Go toolchain in the loop. The expensive half — Go
 /// Pebble reading it — is `compat/sst-roundtrip`.
+/// Once per codec roble writes: the blocks differ, the entries must not.
 #[test]
 fn roble_reads_back_what_roble_wrote() {
-    use roble_format::block::Value;
+    use roble_format::block::Codec;
+    for codec in [
+        Codec::None,
+        Codec::Snappy,
+        Codec::Zstd(Codec::ZSTD_DEFAULT_LEVEL),
+        Codec::Zstd(1),
+        Codec::Zstd(19),
+    ] {
+        reads_back(codec);
+    }
+}
+
+fn reads_back(codec: roble_format::block::Codec) {
+    use roble_format::block::{Codec, Compression, Value};
     use roble_format::sst::{TableWriter, WriterOptions};
     use roble_format::{InternalKey, Kind};
 
     // Small blocks so the index is exercised rather than a single block.
-    let mut w = TableWriter::new(WriterOptions::default().block_size(512));
+    let mut w = TableWriter::new(WriterOptions::default().block_size(512).compression(codec))
+        .expect("writer");
 
     let mut expected = Vec::new();
     for i in 0..300u64 {
@@ -357,6 +372,25 @@ fn roble_reads_back_what_roble_wrote() {
         table.data_block_handles().expect("index").len() > 1,
         "the fixture is meant to span several data blocks"
     );
+    // The codec reached the blocks, and the property names it as Pebble's
+    // profile would.
+    let expected_type = match codec {
+        Codec::None => Compression::None,
+        Codec::Snappy => Compression::Snappy,
+        Codec::Zstd(_) => Compression::Zstd,
+        other => panic!("no block type known for {other:?}"),
+    };
+    for h in table.data_block_handles().expect("index") {
+        assert_eq!(
+            table.block_compression(h).expect("trailer"),
+            expected_type,
+            "{codec:?}"
+        );
+    }
+    assert_eq!(
+        table.properties().string("rocksdb.compression"),
+        Some(codec.property_name())
+    );
 
     let mut got = Vec::new();
     table
@@ -392,7 +426,7 @@ fn the_writer_refuses_what_roble_does_not_write() {
         obsolete,
     };
     for kind in [Kind::Merge, Kind::RangeKeySet, Kind::Excise] {
-        let mut w = TableWriter::new(WriterOptions::default());
+        let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
         assert!(
             w.add(key(kind, false), b"v").is_err(),
             "{} should be refused",
@@ -401,11 +435,11 @@ fn the_writer_refuses_what_roble_does_not_write() {
     }
     // The obsolete bit is never set, because setting it wrongly makes a Go
     // reader skip a live key.
-    let mut w = TableWriter::new(WriterOptions::default());
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     assert!(w.add(key(Kind::Set, true), b"v").is_err());
 
     // Out-of-order keys are caught at write time, not discovered at read time.
-    let mut w = TableWriter::new(WriterOptions::default());
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     w.add(key(Kind::Set, false), b"v").expect("first key");
     let earlier = InternalKey {
         user_key: b"/a",
@@ -423,7 +457,7 @@ fn the_writer_refuses_what_roble_does_not_write() {
     );
 
     // As does a sequence number past the largest the trailer holds.
-    let mut w = TableWriter::new(WriterOptions::default());
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     let too_large = InternalKey {
         seq_num: roble_format::key::SEQ_NUM_MAX + 1,
         ..key(Kind::Set, false)
@@ -552,7 +586,7 @@ fn the_filter_is_written_unless_turned_off() {
         (WriterOptions::default(), true),
         (WriterOptions::default().filter_bits_per_key(None), false),
     ] {
-        let mut w = TableWriter::new(opts);
+        let mut w = TableWriter::new(opts).expect("writer");
         w.add(key, b"v").expect("add");
         let bytes = w.finish().expect("finish");
         let table = Table::open(&bytes).expect("open");
@@ -579,7 +613,7 @@ fn the_filter_is_written_unless_turned_off() {
 fn a_table_with_no_point_key_answers_every_read() {
     use roble_format::sst::{TableWriter, WriterOptions};
 
-    let mut w = TableWriter::new(WriterOptions::default());
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     w.add_range_deletion(b"/oxia/a", b"/oxia/z", 5)
         .expect("tombstone");
     let bytes = w.finish().expect("finish");

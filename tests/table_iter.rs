@@ -132,7 +132,7 @@ async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
     use roble_format::block::BlockBuilder;
     use roble_format::{FOOTER_LEN, InternalKey, Kind};
 
-    let mut w = TableWriter::new(WriterOptions::default());
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     for (i, k) in [b"/oxia/a", b"/oxia/b"].iter().enumerate() {
         let key = InternalKey {
             user_key: &k[..],
@@ -376,7 +376,7 @@ async fn stepping_back_and_forth_returns_to_the_same_place() {
 /// reason the table exists.
 #[compio::test]
 async fn an_empty_table_has_nowhere_to_go_but_still_holds_its_tombstones() {
-    let mut w = TableWriter::new(WriterOptions::default());
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     w.add_range_deletion(b"/oxia/a", b"/oxia/z", 5)
         .expect("tombstone");
     let bytes = w.finish().expect("finish");
