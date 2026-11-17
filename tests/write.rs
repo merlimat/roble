@@ -61,7 +61,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 
 /// Everything the database shows, in order.
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -241,7 +241,7 @@ async fn a_scan_does_not_see_a_write_that_came_after_it() {
     batch.put(b"m3", b"first").expect("put");
     db.write(&mut batch, false).await.expect("write");
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let started_on = scan.key().to_vec();
     assert!(

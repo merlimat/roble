@@ -63,7 +63,7 @@ pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
 pub use open::{Db, open, open_read_only, open_with};
 pub use options::Options;
 pub use pick::Pick;
-pub use read::{Comparison, Found, Lookup};
+pub use read::{Comparison, Found, GetBuf};
 pub use scan::Scan;
 pub use snapshot::Snapshot;
 pub use version::{Table, Version, VersionSet};

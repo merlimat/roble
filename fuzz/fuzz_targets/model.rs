@@ -223,7 +223,7 @@ fn bounded(model: &Model, lower: &Option<Vec<u8>>, upper: &Option<Vec<u8>>) -> M
 
 /// Moves `scan` and checks every position against what `view` says it
 /// should be on.
-async fn drive<D: Disk>(scan: &mut Scan<D>, view: &Model, moves: &[Move]) {
+async fn drive<F: Fs>(scan: &mut Scan<F>, view: &Model, moves: &[Move]) {
     let pair = |(k, v): (&Vec<u8>, &Vec<u8>)| (k.clone(), v.clone());
     let mut at: Option<(Vec<u8>, Vec<u8>)> = None;
     for m in moves.iter().take(32) {
@@ -267,7 +267,7 @@ async fn drive<D: Disk>(scan: &mut Scan<D>, view: &Model, moves: &[Move]) {
 }
 
 /// Every entry, forward and then backward.
-async fn whole<D: Disk>(mut scan: Scan<D>) -> Vec<(Vec<u8>, Vec<u8>)> {
+async fn whole<F: Fs>(mut scan: Scan<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut forward = Vec::new();
     scan.first().await.expect("first");
     while scan.is_valid() {
@@ -293,7 +293,7 @@ fn entries(model: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 async fn verify<F: Fs>(db: &Db<F>, model: &Model, what: &str) {
-    let scan = db.scan().await.expect("scan");
+    let scan = db.range(..).expect("scan");
     assert_eq!(whole(scan).await, entries(model), "{what}");
 }
 
@@ -327,7 +327,7 @@ async fn run(case: Case) {
         .expect("open");
     // What the store holds before anything is done to it is taken from the
     // store: the golden databases are checked against Pebble elsewhere.
-    let scan = db.scan().await.expect("scan");
+    let scan = db.range(..).expect("scan");
     let mut model: Model = whole(scan).await.into_iter().collect();
     // What a reopen comes back to: everything with the WAL on, and with it
     // off the last flush.
@@ -406,16 +406,18 @@ async fn run(case: Case) {
             } => {
                 let (lo, hi) = bounds(lower, upper);
                 let mut scan = db
-                    .scan_range(lo.as_deref(), hi.as_deref())
-                    .await
-                    .expect("scan_range");
+                    .range((
+                        lo.as_deref().map_or(Bound::Unbounded, Bound::Included),
+                        hi.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+                    ))
+                    .expect("range");
                 drive(&mut scan, &bounded(&model, &lo, &hi), moves).await;
             }
             Step::Snapshot => {
                 if snapshots.len() == 4 {
                     snapshots.remove(0);
                 }
-                snapshots.push((db.snapshot().await.expect("snapshot"), model.clone()));
+                snapshots.push((db.snapshot().expect("snapshot"), model.clone()));
             }
             Step::ReadSnapshot {
                 which,
@@ -429,19 +431,25 @@ async fn run(case: Case) {
                 }
                 let (snap, seen) = &snapshots[usize::from(*which) % snapshots.len()];
                 assert_eq!(
-                    whole(snap.scan().expect("scan")).await,
+                    whole(snap.range(..).expect("scan")).await,
                     entries(seen),
                     "a snapshot disagrees with the model as it was"
                 );
                 let (lo, hi) = bounds(lower, upper);
                 let mut scan = snap
-                    .scan_range(lo.as_deref(), hi.as_deref())
-                    .expect("scan_range");
+                    .range((
+                        lo.as_deref().map_or(Bound::Unbounded, Bound::Included),
+                        hi.as_deref().map_or(Bound::Unbounded, Bound::Excluded),
+                    ))
+                    .expect("range");
                 drive(&mut scan, &bounded(seen, &lo, &hi), moves).await;
                 for p in lookups.iter().take(8) {
                     let p = p.bytes();
                     assert_eq!(
-                        snap.lookup(&p).await.expect("lookup"),
+                        snap.get(&p, roble::Comparison::Equal)
+                            .await
+                            .expect("get")
+                            .map(|found| found.value),
                         seen.get(&p).cloned(),
                         "a snapshot's lookup of {p:?}"
                     );

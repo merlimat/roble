@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use roble::sim::SimEnv;
-use roble::{Comparison, Disk, Fs, Db, Options, WriteBuf};
+use roble::{Comparison, Db, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 
 #[derive(Arbitrary, Debug)]
@@ -170,7 +170,7 @@ fn mutate(files: &mut Files, m: &Mutation) {
 /// Reads the whole store every way there is, stopping at the first error.
 async fn read<F: Fs>(db: &Db<F>) -> roble::Result<()> {
     let mut keys = Vec::new();
-    let mut scan = db.scan().await?;
+    let mut scan = db.range(..)?;
     scan.first().await?;
     while scan.is_valid() {
         keys.push(scan.key().to_vec());

@@ -21,6 +21,7 @@
 //! does not do (§5, `tests/obsolete.rs`).
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
@@ -63,7 +64,7 @@ async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
 }
 
 /// Everything a scan walks, forwards.
-async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
+async fn walk<F: Fs>(scan: &mut roble::Scan<F>) -> Model {
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -74,7 +75,7 @@ async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
 }
 
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    walk(&mut db.scan().await.expect("scan")).await
+    walk(&mut db.range(..).expect("scan")).await
 }
 
 /// What the directory holds, sorted.
@@ -108,7 +109,7 @@ async fn a_snapshot_reads_what_it_saw_and_not_what_came_after() {
         .map(|(k, v)| (k.clone(), v.clone()))
         .expect("the fixture should hold something");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
 
     write(&db, |b| {
         b.put(&key, b"written after the snapshot").expect("put");
@@ -117,19 +118,23 @@ async fn a_snapshot_reads_what_it_saw_and_not_what_came_after() {
     .await;
 
     assert_eq!(
-        snap.lookup(&key).await.expect("lookup"),
+        snap.get(&key, roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(old),
         "the snapshot should hold the value it was made with"
     );
     assert_eq!(
-        snap.lookup(b"a-key-that-did-not-exist")
+        snap.get(b"a-key-that-did-not-exist", roble::Comparison::Equal)
             .await
-            .expect("lookup"),
+            .expect("get")
+            .map(|found| found.value),
         None,
         "and should not see a key written after it"
     );
     assert_eq!(
-        walk(&mut snap.scan().expect("scan")).await,
+        walk(&mut snap.range(..).expect("scan")).await,
         before,
         "nor should a scan over it"
     );
@@ -143,6 +148,54 @@ async fn a_snapshot_reads_what_it_saw_and_not_what_came_after() {
             .map(|f| f.value),
         Some(b"new".to_vec()),
     );
+}
+
+/// Every comparison a snapshot's `get` takes answers what the store's
+/// answered when the snapshot was made, however the store changes after.
+///
+/// The probes are each key, the least key after it, and keys below and above
+/// everything, so every comparison is asked both where it lands on the probe
+/// and where it has to step off it.
+#[compio::test]
+async fn a_snapshot_gets_under_every_comparison_what_the_store_had() {
+    use roble::Comparison::{Ceiling, Equal, Floor, Higher, Lower};
+
+    let (env, dir) = load("db-reads").await;
+    let db = open_unscheduled(&env, &dir).await;
+    let keys: Vec<Vec<u8>> = contents(&db).await.into_keys().collect();
+    assert!(keys.len() > 1, "the fixture should hold several keys");
+    let mut probes = vec![Vec::new(), vec![0xff; 8]];
+    for key in &keys {
+        probes.push(key.clone());
+        probes.push([key.as_slice(), &[0]].concat());
+    }
+
+    let mut expected = Vec::new();
+    for probe in &probes {
+        for how in [Equal, Floor, Ceiling, Lower, Higher] {
+            let found = db.get(probe, how).await.expect("get");
+            expected.push((probe.clone(), how, found));
+        }
+    }
+    let snap = db.snapshot().expect("snapshot");
+
+    write(&db, |b| {
+        for key in &keys {
+            b.put(&[key.as_slice(), &[0]].concat(), b"after")
+                .expect("put");
+        }
+        b.delete(&keys[0]).expect("delete");
+        b.put(&keys[1], b"overwritten").expect("put");
+    })
+    .await;
+
+    for (probe, how, found) in expected {
+        assert_eq!(
+            snap.get(&probe, how).await.expect("get"),
+            found,
+            "{how:?} of {probe:?}"
+        );
+    }
 }
 
 #[compio::test]
@@ -160,15 +213,19 @@ async fn a_lookup_reaches_a_key_a_bounded_scan_cannot() {
         .cloned()
         .expect("the fixture should hold a key at or above \"g\"");
 
-    let snap = db.snapshot().await.expect("snapshot");
-    let seen = walk(&mut snap.scan_range(Some(b"a"), Some(b"g")).expect("scan")).await;
+    let snap = db.snapshot().expect("snapshot");
+    let seen = walk(&mut snap.range(&b"a"[..]..&b"g"[..]).expect("scan")).await;
 
     assert!(
         !seen.contains_key(&outside),
         "the scan's bounds should have kept {outside:?} out of it"
     );
     assert_eq!(
-        snap.lookup(&outside).await.expect("lookup").as_ref(),
+        snap.get(&outside, roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value)
+            .as_ref(),
         all.get(&outside),
         "and the lookup should find it anyway"
     );
@@ -205,7 +262,7 @@ async fn a_snapshot_holds_every_table_against_the_sweep() {
         .collect();
     assert!(!high.is_empty(), "and with keys in them");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     db.compact(0, &beyond).await.expect("compact");
 
     let names = listing(env.sim(), &dir).await;
@@ -220,7 +277,11 @@ async fn a_snapshot_holds_every_table_against_the_sweep() {
 
     for key in &high {
         assert_eq!(
-            snap.lookup(key).await.expect("lookup").as_ref(),
+            snap.get(key, roble::Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|found| found.value)
+                .as_ref(),
             all.get(key),
             "the snapshot should still read {key:?} out of the table the \
              compaction retired"
@@ -264,15 +325,19 @@ async fn a_snapshot_holds_the_tables_of_every_level() {
         );
     }
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     assert_eq!(
-        walk(&mut snap.scan().expect("scan")).await,
+        walk(&mut snap.range(..).expect("scan")).await,
         all,
         "a scan over the snapshot should read the whole store"
     );
     for (key, value) in &all {
         assert_eq!(
-            snap.lookup(key).await.expect("lookup").as_ref(),
+            snap.get(key, roble::Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|found| found.value)
+                .as_ref(),
             Some(value),
             "and a lookup should find {key:?}, which is in L1"
         );
@@ -285,11 +350,14 @@ async fn a_lookup_steps_past_a_newer_version_in_the_memtable() {
     let db = open_unscheduled(&env, &dir).await;
 
     write(&db, |b| b.put(b"/k", b"first").expect("put")).await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     write(&db, |b| b.put(b"/k", b"second").expect("put")).await;
 
     assert_eq!(
-        snap.lookup(b"/k").await.expect("lookup"),
+        snap.get(b"/k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"first".to_vec()),
         "the newer version is above the snapshot, so the one below it answers"
     );
@@ -312,9 +380,12 @@ async fn a_lookup_takes_the_newest_version_a_table_holds() {
     write(&db, |b| b.put(b"/k", b"second").expect("put")).await;
     db.flush().await.expect("flush");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     assert_eq!(
-        snap.lookup(b"/k").await.expect("lookup"),
+        snap.get(b"/k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"second".to_vec()),
     );
 }
@@ -329,7 +400,7 @@ async fn a_deletion_after_the_snapshot_does_not_hide_the_value() {
         b.put(b"/ranged", b"r").expect("put");
     })
     .await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     write(&db, |b| {
         b.delete(b"/point").expect("delete");
         b.delete_range(b"/ranged", b"/ranged0")
@@ -338,12 +409,18 @@ async fn a_deletion_after_the_snapshot_does_not_hide_the_value() {
     .await;
 
     assert_eq!(
-        snap.lookup(b"/point").await.expect("lookup"),
+        snap.get(b"/point", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"p".to_vec()),
         "a point delete above the snapshot is not its business"
     );
     assert_eq!(
-        snap.lookup(b"/ranged").await.expect("lookup"),
+        snap.get(b"/ranged", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"r".to_vec()),
         "nor is a range deletion above it"
     );
@@ -374,10 +451,22 @@ async fn a_deletion_before_the_snapshot_hides_the_value() {
             .expect("delete range");
     })
     .await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
 
-    assert_eq!(snap.lookup(b"/point").await.expect("lookup"), None);
-    assert_eq!(snap.lookup(b"/ranged").await.expect("lookup"), None);
+    assert_eq!(
+        snap.get(b"/point", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
+        None
+    );
+    assert_eq!(
+        snap.get(b"/ranged", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
+        None
+    );
 }
 
 #[compio::test]
@@ -403,14 +492,20 @@ async fn a_tombstone_in_a_table_whose_filter_rejects_the_key_still_applies() {
     .await;
     db.flush().await.expect("flush");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     assert_eq!(
-        snap.lookup(b"/k").await.expect("lookup"),
+        snap.get(b"/k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         None,
         "the tombstone is in a table the filter would have skipped"
     );
     assert_eq!(
-        snap.lookup(b"/zzz").await.expect("lookup"),
+        snap.get(b"/zzz", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"z".to_vec()),
         "and the point key in that same table is still readable"
     );
@@ -422,7 +517,7 @@ async fn a_snapshots_scan_is_bounded_the_way_a_stores_is() {
     let db = open_unscheduled(&env, &dir).await;
 
     let all = contents(&db).await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
 
     for (lower, upper) in [
         (None, None),
@@ -437,7 +532,15 @@ async fn a_snapshots_scan_is_bounded_the_way_a_stores_is() {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(
-            walk(&mut snap.scan_range(lower, upper).expect("scan")).await,
+            walk(
+                &mut snap
+                    .range((
+                        lower.map_or(Unbounded, Included),
+                        upper.map_or(Unbounded, Excluded),
+                    ))
+                    .expect("scan")
+            )
+            .await,
             expected,
             "bounds {lower:?}..{upper:?}"
         );

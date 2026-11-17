@@ -56,14 +56,16 @@
 //! passes while keeping that term; this removes it, and folds the second pass
 //! into the heap that replaced the first.
 
+use std::borrow::Cow;
 use std::future::Future;
+use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::rc::Rc;
 
 use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
 
-use crate::env::Disk;
+use crate::env::{Disk, Fs};
 use crate::error::Result;
 use crate::read::successor_into;
 use std::cell::RefCell;
@@ -577,7 +579,7 @@ impl<D: Disk> Source<D> {
     }
 }
 
-impl<D: Disk> Drop for Scan<D> {
+impl<F: Fs> Drop for Scan<F> {
     /// A scan that has gone away is one fewer open, and a store that keeps
     /// reporting scans nobody holds is how an iterator leak hides.
     fn drop(&mut self) {
@@ -624,8 +626,8 @@ impl Bound {
 ///
 /// Forward and reverse, optionally bounded. The bounds are half-open as
 /// Pebble's are: `lower` is included and `upper` is not.
-pub struct Scan<D: Disk> {
-    iters: Vec<Source<D>>,
+pub struct Scan<F: Fs> {
+    iters: Vec<Source<F::Disk>>,
     /// The sources arranged so that the next key is the top of a heap rather
     /// than the winner of a look at every one of them.
     ///
@@ -678,7 +680,7 @@ pub struct Scan<D: Disk> {
     metrics: Option<Rc<crate::metrics::Metrics>>,
 }
 
-impl<D: Disk> Scan<D> {
+impl<F: Fs> Scan<F> {
     /// A scan over nothing, for [`Scan::rebuild`] to make one of.
     pub(crate) fn empty(metrics: Option<Rc<crate::metrics::Metrics>>) -> Self {
         Scan {
@@ -705,7 +707,7 @@ impl<D: Disk> Scan<D> {
     /// allocations of whatever scan it was before.
     ///
     /// Crate-private: its arguments are a store's internals, and the way to
-    /// one from outside is [`crate::Db::scan`].
+    /// one from outside is [`crate::Db::range`].
     ///
     /// Opens nothing. Each level below L0 becomes one [`Level`] over the
     /// stretch of its tables the bounds reach, found by two binary searches
@@ -719,12 +721,12 @@ impl<D: Disk> Scan<D> {
     /// many sources: the sources, the heap, the bounds and the key buffers
     /// are all the old scan's, and each level builds its iterators on a block
     /// cursor the old scan's levels left. That is what lets an ordered
-    /// comparison through a kept [`crate::Lookup`] allocate nothing.
+    /// comparison through a kept [`crate::GetBuf`] allocate nothing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rebuild(
         &mut self,
         version: &Rc<Version>,
-        tables: &Rc<dyn Opener<D>>,
+        tables: &Rc<dyn Opener<F::Disk>>,
         memtables: impl Iterator<Item = Rc<RefCell<Memtable>>>,
         snapshot: u64,
         lower: Option<&[u8]>,
@@ -1391,20 +1393,41 @@ impl Heap {
     }
 }
 
-impl<F: crate::env::Fs> crate::Db<F> {
-    /// A scan over every key in the database.
-    pub async fn scan(&self) -> Result<Scan<F::Disk>> {
-        self.scan_range(None, None).await
-    }
+/// One end of a scan's range, borrowed from the caller's key unless it had to
+/// be moved to that key's successor.
+pub(crate) type Edge<'k> = Option<Cow<'k, [u8]>>;
 
-    /// A scan bounded below by `lower` (included) and above by `upper`
-    /// (excluded), as Pebble's bounds are.
-    pub async fn scan_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-    ) -> Result<Scan<F::Disk>> {
-        self.scan_with(Vec::new(), lower, upper).await
+/// `range` as the bounds a scan is built with: Pebble's, an included lower
+/// and an excluded upper.
+///
+/// An excluded lower or an included upper becomes the key's successor, the
+/// least key after it, which is the only case that allocates.
+pub(crate) fn bounds<'k>(range: &impl RangeBounds<&'k [u8]>) -> (Edge<'k>, Edge<'k>) {
+    let lower = match range.start_bound() {
+        std::ops::Bound::Included(key) => Some(Cow::Borrowed(*key)),
+        std::ops::Bound::Excluded(key) => Some(Cow::Owned(crate::read::successor(key))),
+        std::ops::Bound::Unbounded => None,
+    };
+    let upper = match range.end_bound() {
+        std::ops::Bound::Included(key) => Some(Cow::Owned(crate::read::successor(key))),
+        std::ops::Bound::Excluded(key) => Some(Cow::Borrowed(*key)),
+        std::ops::Bound::Unbounded => None,
+    };
+    (lower, upper)
+}
+
+impl<F: crate::env::Fs> crate::Db<F> {
+    /// A scan over the keys in `range`, in either direction.
+    ///
+    /// `db.range(..)` covers every key, and `db.range(&b"/a/"[..]..&b"/b/"[..])`
+    /// the keys from `/a/` up to but not including `/b/`. Making one does no
+    /// I/O: it opens nothing until a seek lands in a table. Position it with
+    /// [`Scan::first`] or [`Scan::seek_ge`] and step with [`Scan::next`] to
+    /// read forwards, or with [`Scan::last`] or [`Scan::seek_lt`] and
+    /// [`Scan::prev`] to read backwards.
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<Scan<F>> {
+        let (lower, upper) = bounds(&range);
+        self.scan_with(Vec::new(), lower.as_deref(), upper.as_deref())
     }
 
     /// The same, with `extra` memtables merged in ahead of the store's.
@@ -1414,12 +1437,12 @@ impl<F: crate::env::Fs> crate::Db<F> {
     /// they carry rather than because of where they are in this list. The
     /// store's are both of them, so a scan made in the middle of a flush
     /// reads the memtable being written out as well as the one in front.
-    pub(crate) async fn scan_with(
+    pub(crate) fn scan_with(
         &self,
         extra: Vec<Rc<RefCell<Memtable>>>,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
-    ) -> Result<Scan<F::Disk>> {
+    ) -> Result<Scan<F>> {
         let mut scan = Scan::empty(Some(Rc::clone(&self.metrics)));
         self.rebuild_scan(&mut scan, extra.into_iter(), lower, upper)?;
         Ok(scan)
@@ -1434,7 +1457,7 @@ impl<F: crate::env::Fs> crate::Db<F> {
     /// `crate::obsolete::Pinned`).
     pub(crate) fn rebuild_scan(
         &self,
-        scan: &mut Scan<F::Disk>,
+        scan: &mut Scan<F>,
         extra: impl Iterator<Item = Rc<RefCell<Memtable>>>,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,

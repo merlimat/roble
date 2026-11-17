@@ -20,6 +20,7 @@
 //! the words.
 
 use std::io::{self, BufWriter, Write};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -116,10 +117,11 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
             loop {
                 let scanned: Result<()> = async {
                     let db = open_read_only(dir).await?;
-                    let mut scan = db
-                        .scan_range(start.as_deref(), end.as_deref())
-                        .await
-                        .at(dir)?;
+                    let bounds = (
+                        start.as_deref().map_or(Unbounded, Included),
+                        end.as_deref().map_or(Unbounded, Excluded),
+                    );
+                    let mut scan = db.range(bounds).at(dir)?;
                     match &from {
                         Some(key) => scan.seek_ge(key).await,
                         None => scan.first().await,

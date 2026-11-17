@@ -54,7 +54,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -601,7 +601,7 @@ async fn a_scan_open_across_a_compaction_keeps_reading() {
     }
     let b = flush_batch(&db, &mut second).await;
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let started_on = scan.key().to_vec();
 
@@ -675,7 +675,7 @@ async fn a_scan_reads_the_tables_it_had_not_opened_when_a_compaction_retired_the
     );
     let before = contents(&db).await;
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
 
     db.compact(1, &level).await.expect("compact L1 into L2");
@@ -1073,7 +1073,7 @@ async fn two_levels_of_several_tables_each_answer_what_a_btreemap_would() {
     assert_eq!(contents(&db).await, model, "a forward scan lost its way");
 
     let mut backward = Model::new();
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.last().await.expect("last");
     while scan.is_valid() {
         backward.insert(scan.key().to_vec(), scan.value().to_vec());

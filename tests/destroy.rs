@@ -146,7 +146,7 @@ async fn destroy_lets_go_of_the_table_readers() {
         .await
         .expect("open");
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     drop(scan);
     assert!(

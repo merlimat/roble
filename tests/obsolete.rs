@@ -84,7 +84,7 @@ fn tables(names: &[String]) -> Vec<u64> {
 }
 
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -440,7 +440,7 @@ async fn a_table_a_scan_is_reading_is_not_collected() {
 
     // Opened before the compaction, and so holding readers for exactly the
     // tables the compaction is about to retire.
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
 
     db.compact(0, &retired).await.expect("compact");
@@ -480,7 +480,7 @@ async fn the_table_goes_once_the_scan_does() {
     let db = roble::open(&env, &dir).await.expect("open");
     let retired = in_l0(&db);
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     db.compact(0, &retired).await.expect("compact");
     drop(scan);
@@ -573,7 +573,7 @@ async fn a_scan_holds_every_table_of_its_version_until_it_goes() {
 
     // Opened before the compaction, and bounded well below the tables it is
     // about to retire.
-    let mut scan = db.scan_range(Some(b"a"), Some(b"g")).await.expect("scan");
+    let mut scan = db.range(&b"a"[..]..&b"g"[..]).expect("scan");
     scan.first().await.expect("first");
 
     db.compact(0, &beyond).await.expect("compact");
@@ -615,9 +615,9 @@ async fn a_scan_holds_every_table_of_its_version_until_it_goes() {
     }
 }
 
-/// A `Lookup` kept between reads keeps no table from the sweep.
+/// A `GetBuf` kept between reads keeps no table from the sweep.
 ///
-/// The four ordered comparisons go through a scan the `Lookup` keeps, parked
+/// The four ordered comparisons go through a scan the `GetBuf` keeps, parked
 /// between calls so that the next one builds in its allocations rather than
 /// making new ones (`roble::read`). A scan holds the version it was made on,
 /// and the sweep keeps every table a held version names — so a parked scan
@@ -630,7 +630,7 @@ async fn a_kept_lookup_holds_no_table_between_reads() {
     let db = roble::open(&env, &dir).await.expect("open");
     let retired = in_l0(&db);
 
-    let mut buf = roble::Lookup::new();
+    let mut buf = roble::GetBuf::new();
     for how in [Comparison::Floor, Comparison::Ceiling] {
         db.get_into(b"m", how, &mut buf).await.expect("get_into");
     }
@@ -642,7 +642,7 @@ async fn a_kept_lookup_holds_no_table_between_reads() {
         let name = files::table_filename(*file_num);
         assert!(
             !names.contains(&name),
-            "{name} was kept by a Lookup nothing is reading through: {names:?}"
+            "{name} was kept by a GetBuf nothing is reading through: {names:?}"
         );
     }
     drop(buf);

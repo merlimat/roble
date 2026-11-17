@@ -124,7 +124,7 @@ pub trait Store: Sized {
     ///
     /// A length and not the value, because **every engine here can produce a
     /// value without handing back an owned copy** and they do it differently:
-    /// roble reads into a `Lookup` the caller keeps, Pebble's `Get` borrows
+    /// roble reads into a `GetBuf` the caller keeps, Pebble's `Get` borrows
     /// the value from the block it is in and hands back a closer, RocksDB has
     /// `get_pinned`, and encina passes the borrowed value to a closure. An
     /// owned return would charge some of them for an allocation the
@@ -215,8 +215,8 @@ pub struct Roble {
     /// A `Cell` and not a `RefCell`: it is moved out for the call and back
     /// after, so there is no borrow to hold across the await inside. Clippy
     /// refuses that borrow, and is right to — it is the hazard that decided
-    /// a `Lookup` belongs to the caller in the first place.
-    lookup: std::cell::Cell<roble::Lookup>,
+    /// a `GetBuf` belongs to the caller in the first place.
+    lookup: std::cell::Cell<roble::GetBuf>,
 }
 
 impl Store for Roble {
@@ -289,7 +289,7 @@ impl Store for Roble {
 
             shards.push(Roble {
                 db,
-                lookup: std::cell::Cell::new(roble::Lookup::new()),
+                lookup: std::cell::Cell::new(roble::GetBuf::new()),
             });
         }
         shards
@@ -403,8 +403,7 @@ impl Store for Roble {
     async fn scan(&self, reverse: bool, report: &mut Report) -> u64 {
         let mut c = self
             .db
-            .scan()
-            .await
+            .range(..)
             .unwrap_or_else(|e| fail(&format!("scan: {e}")));
         if reverse {
             c.last().await
@@ -428,8 +427,7 @@ impl Store for Roble {
     async fn scan_from(&self, from: &[u8], count: u64) -> u64 {
         let mut c = self
             .db
-            .scan()
-            .await
+            .range(..)
             .unwrap_or_else(|e| fail(&format!("scan: {e}")));
         c.seek_ge(from)
             .await

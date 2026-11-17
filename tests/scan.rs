@@ -25,6 +25,7 @@
 //! text.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
@@ -86,7 +87,7 @@ fn probe_key(n: u64) -> Vec<u8> {
 
 /// Everything a scan returns, which is also the model's starting point.
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -128,7 +129,7 @@ fn write_round(batch: &mut Batch, model: &mut Model, round: u64) {
 }
 
 /// What the scan is on, spelled so that a failure reads.
-fn on_key<D: Disk>(scan: &Scan<D>) -> Option<(String, String)> {
+fn on_key<F: Fs>(scan: &Scan<F>) -> Option<(String, String)> {
     scan.is_valid().then(|| {
         (
             String::from_utf8_lossy(scan.key()).into_owned(),
@@ -148,7 +149,7 @@ fn model_at(entries: &[(Vec<u8>, Vec<u8>)], place: Option<usize>) -> Option<(Str
 }
 
 /// Where a scan is, as the harness spells it.
-fn where_it_is<D: Disk>(scan: &Scan<D>) -> String {
+fn where_it_is<F: Fs>(scan: &Scan<F>) -> String {
     if !scan.is_valid() {
         return "none".to_string();
     }
@@ -172,13 +173,23 @@ async fn roble_scans_where_go_pebble_scans() {
 
     // The four whole-database walks.
     for (name, lower, upper, forward) in [
-        ("forward", None, None, true),
-        ("reverse", None, None, false),
-        ("bounded-forward", Some(&b"b2"[..]), Some(&b"d3"[..]), true),
-        ("bounded-reverse", Some(&b"b2"[..]), Some(&b"d3"[..]), false),
+        ("forward", Unbounded, Unbounded, true),
+        ("reverse", Unbounded, Unbounded, false),
+        (
+            "bounded-forward",
+            Included(&b"b2"[..]),
+            Excluded(&b"d3"[..]),
+            true,
+        ),
+        (
+            "bounded-reverse",
+            Included(&b"b2"[..]),
+            Excluded(&b"d3"[..]),
+            false,
+        ),
     ] {
         out.push_str(&format!("{name}\n"));
-        let mut scan = db.scan_range(lower, upper).await.expect("scan");
+        let mut scan = db.range((lower, upper)).expect("scan");
         if forward {
             scan.first().await.expect("first");
         } else {
@@ -196,10 +207,7 @@ async fn roble_scans_where_go_pebble_scans() {
 
     // Seeks that fall outside the bounds, which a walk never makes.
     {
-        let mut scan = db
-            .scan_range(Some(&b"b2"[..]), Some(&b"d3"[..]))
-            .await
-            .expect("scan");
+        let mut scan = db.range(&b"b2"[..]..&b"d3"[..]).expect("scan");
         out.push_str("bounded-seeks\n");
         for (name, seek_ge, key) in [
             ("below", true, &b"a0"[..]),
@@ -224,7 +232,7 @@ async fn roble_scans_where_go_pebble_scans() {
         .collect();
     assert!(!probes.is_empty(), "no probes in {}", path.display());
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     for probe in &probes {
         out.push_str(&format!("from {}\n", hex(probe)));
 
@@ -362,7 +370,7 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
     probes.push(Vec::new());
     probes.push(vec![0xff]);
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     let mut rng = Rng(20_261_113);
     let mut place: Option<usize> = None;
     let mut forward = true;
@@ -552,7 +560,7 @@ async fn a_tombstone_past_its_tables_last_key_hides_what_is_below_it() {
 
     let visible: Vec<&str> = vec!["k00", "k05", "k10", "k35", "k75", "k80", "k90"];
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     let mut forward = Vec::new();
     scan.first().await.expect("first");
     while scan.is_valid() {
@@ -588,4 +596,57 @@ async fn a_tombstone_past_its_tables_last_key_hides_what_is_below_it() {
         Some(b"k35".to_vec()),
         "k65 is under the second table's deletion"
     );
+}
+
+/// Every kind of bound `range` takes, on either side, reads what
+/// `BTreeMap::range` reads, forwards and backwards.
+///
+/// A scan is built with Pebble's bounds, an included lower and an excluded
+/// upper, so an excluded lower and an included upper are each turned into the
+/// key's successor. The keys `b\0` and `d\0` are the ones that successor
+/// lands on: the first is the least key after `b`, and so inside a range that
+/// excludes `b`; the second is the least key after `d`, and so outside one
+/// that includes `d`.
+#[compio::test]
+async fn a_range_reads_what_a_btreemap_range_reads_for_every_kind_of_bound() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(&env, &dir, Options::new().create_if_missing(true))
+        .await
+        .expect("open");
+    let mut model = Model::new();
+    let mut batch = db.batch();
+    for key in [&b"a"[..], b"b", b"b\0", b"c", b"d", b"d\0", b"e"] {
+        batch.put(key, b"v").expect("put");
+        model.insert(key.to_vec(), b"v".to_vec());
+    }
+    batch.commit(false).await.expect("commit");
+
+    let (b, d) = (&b"b"[..], &b"d"[..]);
+    for lower in [Unbounded, Included(b), Excluded(b)] {
+        for upper in [Unbounded, Included(d), Excluded(d)] {
+            let expected: Vec<Vec<u8>> = model
+                .range::<[u8], _>((lower, upper))
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            let mut scan = db.range((lower, upper)).expect("range");
+            let mut forward = Vec::new();
+            scan.first().await.expect("first");
+            while scan.is_valid() {
+                forward.push(scan.key().to_vec());
+                scan.next().await.expect("next");
+            }
+            assert_eq!(forward, expected, "forward over {lower:?}..{upper:?}");
+
+            let mut backward = Vec::new();
+            scan.last().await.expect("last");
+            while scan.is_valid() {
+                backward.push(scan.key().to_vec());
+                scan.prev().await.expect("prev");
+            }
+            backward.reverse();
+            assert_eq!(backward, expected, "backward over {lower:?}..{upper:?}");
+        }
+    }
 }

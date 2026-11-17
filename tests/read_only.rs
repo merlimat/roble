@@ -223,7 +223,7 @@ async fn a_reader_opens_beside_the_writer_and_reads_what_it_wrote() {
     assert_eq!(get(&ro, b"a").await.expect("get"), Some(b"1".to_vec()));
     assert_eq!(get(&ro, b"c").await.expect("get"), Some(b"3".to_vec()));
 
-    let mut scan = ro.scan().await.expect("scan");
+    let mut scan = ro.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut seen = Vec::new();
     while scan.is_valid() {
