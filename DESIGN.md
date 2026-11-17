@@ -1717,8 +1717,8 @@ let mut batch = db.indexed_batch();    // readable through itself
 batch.put(b"/users/alice", b"...")?;
 batch.delete_range(b"/sessions/", b"/sessions0")?;
 let seen = batch.get(b"/users/alice", Comparison::Equal).await?;
-batch.commit(false).await?;            // appended to the WAL, not synced
-db.put(b"/users/bob", b"...", true).await?;   // one write, no index, synced
+batch.commit(Durability::NoSync).await?;   // appended to the WAL, not synced
+db.put(b"/users/bob", b"...", Durability::Sync).await?;   // one write, no index, synced
 db.flush().await?;                     // a table; the logs it covers can go
 
 let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
@@ -1754,7 +1754,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `Flush`, `Close`, `Delete`, `DiskSpaceUsage` | `flush`, `close`, `destroy`, `disk_usage` |
 | `pebble.Open` of a shard's path, new or returning | `open_with` with `create_if_missing` (§6) |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
-| `SyncData`, `UseWAL` | `Sync` on commit, and `disable_wal` in `Options` (§4) |
+| `SyncData`, `UseWAL` | `Durability` on every write and commit, and `disable_wal` in `Options` (§4) |
 | Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina ([METRICS.md](METRICS.md)) |
 
 ## 12. Testing

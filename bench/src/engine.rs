@@ -279,7 +279,11 @@ impl Store for Roble {
                 .unwrap_or_else(|e| fail(&format!("put: {e}")));
         }
         batch
-            .commit(sync)
+            .commit(if sync {
+                roble::Durability::Sync
+            } else {
+                roble::Durability::NoSync
+            })
             .await
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
     }

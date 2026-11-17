@@ -866,38 +866,68 @@ impl<F: Fs> std::fmt::Debug for Db<F> {
     }
 }
 
+/// Whether a write is durable when it returns, or only written.
+///
+/// Pebble's `pebble.Sync` and `pebble.NoSync`. A write is appended to the
+/// log either way; [`Durability::Sync`] also syncs the log before the write
+/// returns, so it survives the machine going away and not just the store.
+///
+/// With the WAL off ([`crate::Options::disable_wal`]) there is no log to
+/// sync, and [`Durability::Sync`] is refused with [`Error::Unsupported`]
+/// rather than ignored: nothing but [`Db::flush`] makes a write durable
+/// then, and saying otherwise would be the silent half of a data loss (§4).
+///
+/// Every write names one. The [`Default`] is [`Durability::Sync`], the
+/// choice that loses nothing, for a caller that keeps one in a struct of
+/// its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Synced to disk before the write returns.
+    #[default]
+    Sync,
+    /// Written to the log, and synced later or not at all.
+    NoSync,
+}
+
+impl Durability {
+    /// Whether the log is to be synced.
+    pub(crate) fn syncs(self) -> bool {
+        self == Durability::Sync
+    }
+}
+
 impl<F: Fs> Db<F> {
     /// Sets `key` to `value`.
     ///
     /// A batch of that one write, appended to the log and then applied to
-    /// the memtable. `sync` decides whether it is durable when this returns
-    /// or merely written: without it the write survives the store going away
-    /// but not the machine. With the WAL off there is no log to sync, and
-    /// `sync` is refused rather than ignored, since nothing but
-    /// [`Db::flush`] can make a write durable then (§4).
+    /// the memtable, and durable when this returns if `durability` says so.
     ///
     /// Several writes that have to land together, or that are read back
     /// before they do, go in an [`Db::indexed_batch`] instead. This one
     /// builds no index, which is about 90 ns a write cheaper.
-    pub async fn put(&self, key: &[u8], value: &[u8], sync: bool) -> Result<()> {
+    pub async fn put(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.put(key, value)?;
-        self.write_raw(&mut batch, sync).await
+        self.write_raw(&mut batch, durability.syncs()).await
     }
 
-    /// Deletes `key`, durably if `sync` says so, as [`Db::put`] writes.
-    pub async fn delete(&self, key: &[u8], sync: bool) -> Result<()> {
+    /// Deletes `key`, as [`Db::put`] writes.
+    pub async fn delete(&self, key: &[u8], durability: Durability) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.delete(key)?;
-        self.write_raw(&mut batch, sync).await
+        self.write_raw(&mut batch, durability.syncs()).await
     }
 
-    /// Deletes every key in `start..end`, durably if `sync` says so, as
-    /// [`Db::put`] writes.
-    pub async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) -> Result<()> {
+    /// Deletes every key in `start..end`, as [`Db::put`] writes.
+    pub async fn delete_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        durability: Durability,
+    ) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.delete_range(start, end)?;
-        self.write_raw(&mut batch, sync).await
+        self.write_raw(&mut batch, durability.syncs()).await
     }
 
     /// Appends a batch to the log, syncs it if asked, and then applies it to
@@ -913,7 +943,7 @@ impl<F: Fs> Db<F> {
     /// saying otherwise would be the silent half of a data loss.
     ///
     /// What [`IndexedBatch::commit`](crate::IndexedBatch::commit) and
-    /// [`Db::put`] go through. It takes the format's own batch, which roble's
+    /// [`Db::put`] go through, with `sync` for [`Durability::Sync`]. It takes the format's own batch, which roble's
     /// tests build directly; a caller builds an [`Db::indexed_batch`].
     #[doc(hidden)]
     pub async fn write_raw(
