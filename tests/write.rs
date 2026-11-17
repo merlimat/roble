@@ -623,16 +623,26 @@ async fn single_writes_on_the_store_read_back_as_a_model_would() {
     let db = roble::open(&env, &dir).await.expect("open");
     let mut model = contents(&db).await;
 
-    db.put(b"/a", b"1", false).await.expect("put");
-    db.put(b"/b", b"2", true).await.expect("put");
-    db.put(b"/c", b"3", false).await.expect("put");
-    db.put(b"/d", b"4", false).await.expect("put");
+    db.put(b"/a", b"1", roble::Durability::NoSync)
+        .await
+        .expect("put");
+    db.put(b"/b", b"2", roble::Durability::Sync)
+        .await
+        .expect("put");
+    db.put(b"/c", b"3", roble::Durability::NoSync)
+        .await
+        .expect("put");
+    db.put(b"/d", b"4", roble::Durability::NoSync)
+        .await
+        .expect("put");
     for (k, v) in [(b"/a", b"1"), (b"/b", b"2"), (b"/c", b"3"), (b"/d", b"4")] {
         model.insert(k.to_vec(), v.to_vec());
     }
-    db.delete(b"/a", false).await.expect("delete");
+    db.delete(b"/a", roble::Durability::NoSync)
+        .await
+        .expect("delete");
     model.remove(&b"/a"[..]);
-    db.delete_range(b"/b", b"/d", true)
+    db.delete_range(b"/b", b"/d", roble::Durability::Sync)
         .await
         .expect("delete_range");
     model.retain(|k, _| !(k.as_slice() >= &b"/b"[..] && k.as_slice() < &b"/d"[..]));
@@ -651,9 +661,11 @@ async fn single_writes_on_the_store_read_back_as_a_model_would() {
         .await
         .expect("open without the WAL");
     for refused in [
-        no_wal.put(b"/e", b"5", true).await,
-        no_wal.delete(b"/d", true).await,
-        no_wal.delete_range(b"/a", b"/z", true).await,
+        no_wal.put(b"/e", b"5", roble::Durability::Sync).await,
+        no_wal.delete(b"/d", roble::Durability::Sync).await,
+        no_wal
+            .delete_range(b"/a", b"/z", roble::Durability::Sync)
+            .await,
     ] {
         assert!(
             matches!(refused, Err(roble::Error::Unsupported(_))),

@@ -168,7 +168,7 @@ async fn a_later_entry_wins_over_an_earlier_one() {
 
     // And the committed batch agrees with what reading it through itself
     // said, which is the only claim that matters.
-    batch.commit(true).await.expect("commit");
+    batch.commit(roble::Durability::Sync).await.expect("commit");
     assert_eq!(
         db.get(b"k", Comparison::Equal)
             .await
@@ -358,7 +358,7 @@ async fn committing_applies_exactly_what_the_batch_read_back() {
             .expect("delete_range");
         expected = walk(&mut batch.range(..).expect("scan")).await;
 
-        batch.commit(true).await.expect("commit");
+        batch.commit(roble::Durability::Sync).await.expect("commit");
         assert_eq!(
             store_contents(&db).await,
             expected,
@@ -431,7 +431,7 @@ async fn put_with_indexes_what_it_wrote() {
         "the value written in place should be in the index too"
     );
 
-    batch.commit(true).await.expect("commit");
+    batch.commit(roble::Durability::Sync).await.expect("commit");
     assert_eq!(
         db.get(b"marshalled", Comparison::Equal)
             .await
@@ -639,7 +639,10 @@ async fn a_batch_larger_than_a_megabyte_reads_back_and_commits() {
         .expect("get")
         .expect("the batch's own last key, read through its index");
     assert_eq!(found.value, value);
-    batch.commit(false).await.expect("commit");
+    batch
+        .commit(roble::Durability::NoSync)
+        .await
+        .expect("commit");
 
     let found = db
         .get(b"big000000", Comparison::Equal)
