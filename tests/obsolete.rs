@@ -187,7 +187,7 @@ async fn a_flush_retires_the_log_it_replaced() {
 
     let mut batch = Batch::new();
     batch.put(b"retire", b"the log").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let before = listing(env.sim(), &dir).await;
     db.flush().await.expect("flush").expect("a table");
@@ -238,7 +238,7 @@ async fn the_log_holding_unflushed_writes_is_not_deleted() {
         // zero, where the two readings agree.
         let mut batch = Batch::new();
         batch.put(b"flushed", b"yes").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
         assert_eq!(
             db.current_log(),
@@ -249,7 +249,7 @@ async fn the_log_holding_unflushed_writes_is_not_deleted() {
         // Now a write that only the log holds.
         let mut batch = Batch::new();
         batch.put(b"unflushed", b"yes").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
 
         let removed = db.remove_obsolete_files().await.expect("remove");
         assert!(
@@ -310,7 +310,7 @@ async fn a_file_roble_does_not_own_is_left_alone() {
     let db = roble::open(&env, &dir).await.expect("open");
     let mut batch = Batch::new();
     batch.put(b"a-write", b"to flush").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     let after = listing(env.sim(), &dir).await;
@@ -344,7 +344,7 @@ async fn an_interrupted_flush_leaves_a_table_the_next_open_collects() {
         let db = roble::open(&env, &dir).await.expect("open");
         let mut batch = Batch::new();
         batch.put(b"cut", b"here").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let before = env.sim().ops();
         db.flush().await.expect("flush").expect("a table");
         env.sim().ops() - before
@@ -362,7 +362,7 @@ async fn an_interrupted_flush_leaves_a_table_the_next_open_collects() {
             let db = roble::open(&env, &dir).await.expect("open");
             let mut batch = Batch::new();
             batch.put(b"cut", b"here").expect("put");
-            db.write(&mut batch, true).await.expect("write");
+            db.write_raw(&mut batch, true).await.expect("write");
             expected = contents(&db).await;
 
             env.sim().fail_at(n);
@@ -526,7 +526,7 @@ async fn a_sweep_keeps_the_readers_the_version_still_names() {
     // belongs to.
     let mut batch = Batch::new();
     batch.put(b"swept", b"yes").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     assert_eq!(

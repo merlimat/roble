@@ -136,7 +136,7 @@ async fn a_rotated_manifest_replays_to_the_same_database() {
     let mut batch = Batch::new();
     batch.put(b"rotate-me", b"please").expect("put");
     batch.delete_range(b"b2", b"b4").expect("delete_range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     let before = shape(&db.versions());
@@ -199,7 +199,7 @@ async fn a_rotation_survives_being_reopened() {
         let db = roble::open(&env, &dir).await.expect("open");
         let mut batch = Batch::new();
         batch.put(b"across", b"the rotation").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
         rotated = db.rotate_manifest().await.expect("rotate");
         expected = contents(&db).await;
@@ -208,7 +208,7 @@ async fn a_rotation_survives_being_reopened() {
         // is the thing an in-memory update left half-done would break.
         let mut batch = Batch::new();
         batch.put(b"after", b"the rotation").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
     }
 
@@ -281,7 +281,7 @@ async fn a_flush_rotates_a_manifest_that_outgrows_its_limit() {
         batch
             .put(format!("grow-{rounds:04}").as_bytes(), b"v")
             .expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
         rounds += 1;
         assert!(rounds < 500, "the MANIFEST never rotated");
@@ -343,7 +343,7 @@ async fn a_rotation_cut_at_any_point_leaves_the_database_openable() {
             let db = roble::open(&env, &dir).await.expect("open");
             let mut batch = Batch::new();
             batch.put(b"cut", b"here").expect("put");
-            db.write(&mut batch, true).await.expect("write");
+            db.write_raw(&mut batch, true).await.expect("write");
             expected = contents(&db).await;
             was = db.manifest_filename();
 

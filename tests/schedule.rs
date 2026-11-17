@@ -88,7 +88,7 @@ fn levels<F: Fs>(db: &roble::Db<F>) -> Vec<usize> {
 async fn write_and_flush<F: Fs>(db: &roble::Db<F>, key: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, b"value").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 }
 
@@ -223,7 +223,7 @@ async fn a_store_that_keeps_flushing_settles_by_itself() {
             batch.put(&key, &value).expect("put");
             model.insert(key, value);
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
 
         let held = l0_depth(&db);
@@ -315,7 +315,7 @@ async fn a_flush_hands_the_merge_to_whoever_is_waiting_for_one() {
     // a layer above it rather than beside it (§9).
     let mut batch = Batch::new();
     batch.put(b"a1handed", b"over").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     model.insert(b"a1handed".to_vec(), b"over".to_vec());
 
     let worker = async {
@@ -377,7 +377,7 @@ async fn a_compaction_that_failed_is_not_asked_for_again_until_the_version_moves
     // A flush is what moves the version on, and so what makes it a retry.
     let mut batch = Batch::new();
     batch.put(b"moved", b"on").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     assert!(

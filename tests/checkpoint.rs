@@ -90,7 +90,7 @@ async fn write_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, keys: usize, sync: b
         batch.put(&key, b"value").expect("put");
         written.insert(key, b"value".to_vec());
     }
-    db.write(&mut batch, sync).await.expect("write");
+    db.write_raw(&mut batch, sync).await.expect("write");
     written
 }
 

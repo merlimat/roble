@@ -76,7 +76,7 @@ async fn a_batch_reads_back_what_it_holds() {
     let existing: Vec<Vec<u8>> = store.keys().cloned().collect();
     assert!(existing.len() > 6, "the fixture should have keys to shadow");
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.put(b"batch-only", b"new").expect("put");
     batch.put(&existing[0], b"shadowed").expect("put");
     batch.delete(&existing[1]).expect("delete");
@@ -135,7 +135,7 @@ async fn a_later_entry_wins_over_an_earlier_one() {
     let (env, dir) = load("db-reads").await;
     let db = roble::open(&env, &dir).await.expect("open");
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.put(b"k", b"first").expect("put");
     batch.put(b"k", b"second").expect("put");
     batch.put(b"k", b"third").expect("put");
@@ -192,7 +192,7 @@ async fn a_range_deletion_in_a_batch_covers_the_store() {
         .collect();
     assert!(covered.len() >= 2, "the range should cover something");
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.delete_range(&start, &end).expect("delete_range");
 
     for k in &covered {
@@ -244,7 +244,7 @@ async fn reading_through_a_batch_agrees_with_the_model() {
     uncommitted
         .put(b"in-the-memtable", b"not in a table")
         .expect("put");
-    db.write(&mut uncommitted, true).await.expect("write");
+    db.write_raw(&mut uncommitted, true).await.expect("write");
 
     let store = store_contents(&db).await;
     assert!(
@@ -254,7 +254,7 @@ async fn reading_through_a_batch_agrees_with_the_model() {
     let keys: Vec<Vec<u8>> = store.keys().cloned().collect();
 
     let mut model = store.clone();
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
 
     // A spread of writes: new keys before, between and after what the store
     // holds; shadows; deletes; a range.
@@ -349,7 +349,7 @@ async fn committing_applies_exactly_what_the_batch_read_back() {
         let db = roble::open(&env, &dir).await.expect("open");
         let keys: Vec<Vec<u8>> = store_contents(&db).await.into_keys().collect();
 
-        let mut batch = db.batch();
+        let mut batch = db.indexed_batch();
         batch.put(b"committed", b"yes").expect("put");
         batch.put(&keys[0], b"shadowed").expect("put");
         batch.delete(&keys[1]).expect("delete");
@@ -384,13 +384,13 @@ async fn a_batch_sees_a_write_that_happened_while_it_was_open() {
     let (env, dir) = load("db-reads").await;
     let db = roble::open(&env, &dir).await.expect("open");
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.put(b"mine", b"from the batch").expect("put");
 
     let mut other = Batch::new();
     other.put(b"theirs", b"from the store").expect("put");
     other.put(b"mine", b"from the store").expect("put");
-    db.write(&mut other, true).await.expect("write");
+    db.write_raw(&mut other, true).await.expect("write");
 
     assert_eq!(
         batch
@@ -417,7 +417,7 @@ async fn put_with_indexes_what_it_wrote() {
     let (env, dir) = load("db-reads").await;
     let db = roble::open(&env, &dir).await.expect("open");
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch
         .put_with(b"marshalled", 5, |buf| buf.copy_from_slice(b"value"))
         .expect("put_with");
@@ -446,7 +446,7 @@ async fn put_with_indexes_what_it_wrote() {
 async fn an_empty_batch_reads_like_the_store() {
     let (env, dir) = load("db-reads").await;
     let db = roble::open(&env, &dir).await.expect("open");
-    let batch = db.batch();
+    let batch = db.indexed_batch();
     assert!(batch.is_empty());
     assert_eq!(batch.count(), 0);
     assert_eq!(
@@ -472,7 +472,7 @@ async fn the_bytes_a_batch_hands_out_are_the_ones_the_format_crate_builds() {
     let db = roble::open(&env, &dir).await.expect("open");
 
     let long = vec![b'v'; 300];
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.put(b"/users/alice", b"a").expect("put");
     batch.delete(b"/users/bob").expect("delete");
     batch.put(b"/users/carol", &long).expect("put");
@@ -524,12 +524,12 @@ async fn a_batch_hands_out_a_header_whose_sequence_number_is_still_zero() {
     let db = roble::open(&env, &dir).await.expect("open");
 
     assert_eq!(
-        db.batch().as_bytes(),
+        db.indexed_batch().as_bytes(),
         &[0u8; 12][..],
         "Go Pebble's repr for an empty batch is twelve zero bytes"
     );
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.put(b"/a", b"1").expect("put");
     batch.delete(b"/b").expect("delete");
     let repr = batch.as_bytes();
@@ -569,7 +569,7 @@ async fn a_batch_settles_a_put_against_its_own_range_deletion() {
     );
 
     // put, then delete_range over it: the deletion is later, so it wins.
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.put(key, b"written-first").expect("put");
     batch.delete_range(start, end).expect("delete_range");
     assert_eq!(
@@ -579,7 +579,7 @@ async fn a_batch_settles_a_put_against_its_own_range_deletion() {
     );
 
     // delete_range, then put: the put is later, so the key comes back.
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch.delete_range(start, end).expect("delete_range");
     batch.put(key, b"written-second").expect("put");
     assert_eq!(
@@ -595,7 +595,7 @@ async fn a_batch_settles_a_put_against_its_own_range_deletion() {
     // And the scan, which settles the same question its own way, agrees with
     // both — the two paths must not drift.
     for (first_put, want) in [(true, None), (false, Some(b"written-second".to_vec()))] {
-        let mut batch = db.batch();
+        let mut batch = db.indexed_batch();
         if first_put {
             batch.put(key, b"written-first").expect("put");
             batch.delete_range(start, end).expect("delete_range");
@@ -626,7 +626,7 @@ async fn a_batch_larger_than_a_megabyte_reads_back_and_commits() {
 
     let value = vec![b'v'; 200];
     let n = 10_000u64;
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     for i in 0..n {
         batch
             .put(format!("big{i:06}").as_bytes(), &value)

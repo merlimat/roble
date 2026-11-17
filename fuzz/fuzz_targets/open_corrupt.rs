@@ -204,7 +204,7 @@ async fn write<F: Fs>(db: &Db<F>) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch.put(b"/oxia/fuzz", b"value")?;
     batch.delete_range(b"/oxia/a", b"/oxia/m")?;
-    db.write(&mut batch, true).await?;
+    db.write_raw(&mut batch, true).await?;
     db.flush().await?;
     // Bounded, so a picker that keeps finding work is a slow input rather
     // than a hang — a store that never runs out is its own bug, but not

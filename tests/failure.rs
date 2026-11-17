@@ -118,13 +118,13 @@ async fn scenario(env: &SimEnv, dir: &Path, wal: bool) -> roble::Result<()> {
         batch.put(key, b"written")?;
         // Asking for a sync with no log to sync is refused, and rightly: a
         // store should not promise a durability it has no way to keep.
-        db.write(&mut batch, wal).await?;
+        db.write_raw(&mut batch, wal).await?;
         db.flush().await?;
         db.compact_once().await?;
     }
     let mut tail = Batch::new();
     tail.put(WRITTEN[2], b"written")?;
-    db.write(&mut tail, wal).await?;
+    db.write_raw(&mut tail, wal).await?;
     Ok(())
 }
 
@@ -434,7 +434,7 @@ async fn careless(env: &SimEnv, dir: &Path, wal: bool) -> roble::Result<usize> {
     for key in &WRITTEN[..2] {
         let mut batch = Batch::new();
         batch.put(key, b"written")?;
-        let _ = db.write(&mut batch, wal).await;
+        let _ = db.write_raw(&mut batch, wal).await;
         // Both called, and neither allowed to end the run.
         let failed = [db.flush().await.err(), db.compact_once().await.err()];
         refused += failed
@@ -445,7 +445,7 @@ async fn careless(env: &SimEnv, dir: &Path, wal: bool) -> roble::Result<usize> {
     }
     let mut tail = Batch::new();
     tail.put(WRITTEN[2], b"written")?;
-    let _ = db.write(&mut tail, wal).await;
+    let _ = db.write_raw(&mut tail, wal).await;
     Ok(refused)
 }
 

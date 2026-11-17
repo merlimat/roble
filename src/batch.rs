@@ -58,7 +58,7 @@ use crate::scan::Scan;
 
 /// A batch of writes, readable through itself.
 ///
-/// Built by [`Db::batch`], read with [`IndexedBatch::get`] and
+/// Built by [`Db::indexed_batch`], read with [`IndexedBatch::get`] and
 /// [`IndexedBatch::range`], and applied to the store by
 /// [`IndexedBatch::commit`].
 pub struct IndexedBatch<'a, F: Fs = crate::FileFs> {
@@ -279,13 +279,18 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     /// with sequence numbers of their own, and reading them through this
     /// index again would find every one of them twice.
     pub async fn commit(mut self, sync: bool) -> Result<()> {
-        self.db.write(&mut self.repr, sync).await
+        self.db.write_raw(&mut self.repr, sync).await
     }
 }
 
 impl<F: Fs> Db<F> {
     /// A batch that can be read back through itself before it commits.
-    pub fn batch(&self) -> IndexedBatch<'_, F> {
+    ///
+    /// Every write in it is indexed as it is added, so that [`IndexedBatch::get`]
+    /// and [`IndexedBatch::range`] see it alongside the store. A single write
+    /// that is never read back is cheaper through [`Db::put`],
+    /// [`Db::delete`] or [`Db::delete_range`].
+    pub fn indexed_batch(&self) -> IndexedBatch<'_, F> {
         IndexedBatch::new(self)
     }
 }

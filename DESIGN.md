@@ -1693,11 +1693,12 @@ this trait is the same seam it already relies on.
 let caches = Caches::new(DEFAULT_OPEN_TABLES, 512 << 20);   // open tables, block bytes
 let db = open_with(&DefaultEnv, "data/shard-3", Options::new().caches(caches)).await?;
 
-let mut batch = db.batch();            // indexed: readable through itself
+let mut batch = db.indexed_batch();    // readable through itself
 batch.put(b"/users/alice", b"...")?;
 batch.delete_range(b"/sessions/", b"/sessions0")?;
 let seen = batch.get(b"/users/alice", Comparison::Equal).await?;
 batch.commit(false).await?;            // appended to the WAL, not synced
+db.put(b"/users/bob", b"...", true).await?;   // one write, no index, synced
 db.flush().await?;                     // a table; the logs it covers can go
 
 let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
@@ -1721,7 +1722,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 
 | Oxia `kvstore` | roble |
 |---|---|
-| `NewWriteBatch`, `Put`, `Delete`, `DeleteRange`, `Commit` | `db.batch()`, `put`, `delete`, `delete_range`, `commit` |
+| `NewWriteBatch`, `Put`, `Delete`, `DeleteRange`, `Commit` | `db.indexed_batch()`, `put`, `delete`, `delete_range`, `commit` |
 | `PutMarshalable` | `put_with(key, len, \|buf\| …)` |
 | batch `Get`, `FindLower`, `KeyRangeScan`, `RangeScan` | indexed batch iterators (§6) |
 | batch `Count`, `Size`, `Checksum` | `count`, `len`, `as_bytes` — the Pebble repr, so a checksum over it matches Go |

@@ -228,7 +228,7 @@ async fn a_store_without_a_provider_records_nothing() {
 
     let mut batch = Batch::new();
     batch.put(b"a", b"b").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     assert!(
@@ -249,7 +249,7 @@ async fn writes_are_counted_by_what_they_did() {
     batch.put(b"k3", b"v").expect("put");
     batch.delete(b"k1").expect("delete");
     batch.delete_range(b"k2", b"k3").expect("delete_range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let seen = collected(reader(), &tag);
     assert_eq!(
@@ -336,7 +336,7 @@ async fn a_flush_and_a_compaction_report_what_they_moved() {
             .put(format!("m{i:02}").as_bytes(), b"value")
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
     let after_flush = by_attr(reader(), &tag, "roble.level.tables", "roble.level");
@@ -416,7 +416,7 @@ async fn the_bytes_a_write_amplification_needs_are_both_there() {
                 .put(format!("w{:03}", round * 10 + i).as_bytes(), &value)
                 .expect("put");
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         tables.push(db.flush().await.expect("flush").expect("a table"));
     }
     db.compact(0, &tables).await.expect("compact");
@@ -461,7 +461,7 @@ async fn what_oxia_graphs_from_pebble_is_there() {
                 .put(format!("o{:03}", round * 10 + i).as_bytes(), &value)
                 .expect("put");
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         tables.push(db.flush().await.expect("flush").expect("a table"));
     }
     db.get(b"o000", Comparison::Equal).await.expect("get");
@@ -526,7 +526,7 @@ async fn the_debt_is_what_the_levels_hold_above_their_allowances() {
             .put(format!("a{i:03}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
     // Two L0 layers against an allowance of one: one layer's worth of debt.
@@ -549,7 +549,7 @@ async fn a_failed_write_is_counted_by_what_went_wrong() {
 
     let mut batch = Batch::new();
     batch.put(b"durable", b"please").expect("put");
-    db.write(&mut batch, true)
+    db.write_raw(&mut batch, true)
         .await
         .expect_err("a synced write with the WAL off is refused");
 
@@ -717,7 +717,7 @@ async fn every_read_write_and_sync_is_counted() {
     // A write goes to the log; a flush writes a table and a MANIFEST record.
     let mut batch = Batch::new();
     batch.put(b"io", b"counted").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let after_write = by_attr(reader(), &tag, "roble.disk.io", "disk.io.direction");
     assert!(
         after_write["write"] > 0,
@@ -856,7 +856,7 @@ async fn a_compaction_does_not_fill_the_block_cache() {
             .put(format!("p{i:04}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
     // The foreground reads a key of the *fixture's* table, which this
@@ -920,7 +920,7 @@ async fn a_compaction_still_takes_what_the_cache_already_has() {
             .put(format!("w{i:04}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
     // Walk the whole table, so every one of its blocks is in the cache.
@@ -992,7 +992,7 @@ async fn the_records_estimate_climbs_to_what_the_store_holds() {
     for i in 0..9 {
         batch.put(format!("r{i}").as_bytes(), b"v").expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     assert_eq!(
         collected(reader(), &tag)
             .get("roble.records.estimate")
@@ -1050,7 +1050,7 @@ async fn a_store_takes_its_amounts_back_when_it_closes() {
         let db = roble::open_with(&env, &dir, options).await.expect("open");
         let mut batch = Batch::new();
         batch.put(b"held", b"value").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let levels = by_attr(reader(), &tag, "roble.level.tables", "roble.level");
         assert_eq!(levels.get("0").copied(), Some(1));
         assert!(collected(reader(), &tag)["roble.memtable.size"] > 0);
@@ -1079,7 +1079,7 @@ async fn the_store_names_itself_and_the_caller_may_rename_it() {
     let db = roble::open_with(&env, &dir, options).await.expect("open");
     let mut batch = Batch::new();
     batch.put(b"a", b"b").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     drop(db);
 
     let by_path = KeyValue::new("roble.store", "/db");
@@ -1096,7 +1096,7 @@ async fn the_store_names_itself_and_the_caller_may_rename_it() {
     let db = roble::open_with(&env, &dir, options).await.expect("open");
     let mut batch = Batch::new();
     batch.put(b"c", b"d").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     assert!(
         collected(reader(), &renamed).contains_key("roble.write.operations"),
@@ -1141,7 +1141,7 @@ async fn put<F: Fs>(db: &roble::Db<F>, i: usize) -> roble::Result<()> {
     batch
         .put(format!("s{i:04}").as_bytes(), &[b'v'; 32])
         .expect("put");
-    db.write(&mut batch, true).await
+    db.write_raw(&mut batch, true).await
 }
 
 #[compio::test]
@@ -1351,7 +1351,7 @@ async fn l0s_sublevels_are_counted_and_not_its_tables() {
                 .put(format!("q{i:03}").as_bytes(), format!("{round}").as_bytes())
                 .expect("put");
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
     }
 
@@ -1405,7 +1405,7 @@ async fn a_floor_opens_one_table_a_level() {
     let mut batch = Batch::new();
     batch.put(b"k0000", b"old").expect("put");
     batch.put(b"k0399", b"old").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     db.compact(0, &[table]).await.expect("compact into L1");
     let wide = db.versions().version.level(1)[0].file_num;
@@ -1419,7 +1419,7 @@ async fn a_floor_opens_one_table_a_level() {
             .put(format!("k{i:04}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     db.compact(0, &[table]).await.expect("compact into L1");
 
@@ -1487,7 +1487,7 @@ async fn a_scan_opens_only_the_tables_its_seeks_land_in() {
             .put(format!("k{i:04}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     db.compact(0, &[table]).await.expect("compact into L1");
 
@@ -1559,7 +1559,7 @@ async fn a_level_whose_table_lies_past_the_probe_is_not_opened() {
         for key in keys {
             batch.put(key.as_bytes(), b"v").expect("put");
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let table = db.flush().await.expect("flush").expect("a table");
         db.compact(0, &[table]).await.expect("compact into L1");
     }
@@ -1612,7 +1612,7 @@ async fn a_get_opens_only_the_newest_l0_table_holding_the_key() {
     for value in [&b"old"[..], b"new"] {
         let mut batch = Batch::new();
         batch.put(b"hot", value).expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
     }
 
@@ -1660,11 +1660,11 @@ async fn a_get_the_memtable_answers_opens_no_table() {
     // memtable.
     let mut batch = Batch::new();
     batch.put(b"hot", b"old").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
     let mut batch = Batch::new();
     batch.put(b"hot", b"new").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let opened = |r: &BTreeMap<String, i64>| r.values().sum::<i64>();
     let before = opened(&lookups(reader(), &tag, "table"));

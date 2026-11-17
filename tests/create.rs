@@ -118,7 +118,7 @@ async fn a_created_database_takes_a_write_with_the_wal_on() {
 
     let mut batch = Batch::new();
     batch.put(b"/a", b"one").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let found = db
         .get(b"/a", Comparison::Equal)
@@ -160,7 +160,7 @@ async fn the_first_key_of_a_created_database_is_numbered_where_pebbles_is() {
 
     let mut batch = Batch::new();
     batch.put(b"/first", b"v").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
     let smallest = db
@@ -234,7 +234,7 @@ async fn an_unfinished_creation_is_finished() {
         .expect("the leftovers of a creation are finished");
     let mut batch = Batch::new();
     batch.put(b"key", b"value").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     drop(db);
     assert_eq!(
         listing(env.sim(), &dir).await,
@@ -285,7 +285,7 @@ async fn creation_will_not_write_over_a_log_that_holds_a_write() {
         .expect("create");
     let mut batch = Batch::new();
     batch.put(b"key", b"value").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     drop(db);
     env.sim()
         .remove(&dir.join("marker.manifest.000001.MANIFEST-000001"))
@@ -314,7 +314,7 @@ async fn creation_will_not_write_over_a_database_missing_its_marker() {
         .expect("create");
     let mut batch = Batch::new();
     batch.put(b"key", b"value").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
     drop(db);
     let fs: &SimFs = env.sim();
@@ -457,7 +457,7 @@ async fn a_created_database_hands_out_numbers_past_the_files_it_holds() {
 
     let mut batch = Batch::new();
     batch.put(b"/a", b"v").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     assert!(
         !held.contains(&table),

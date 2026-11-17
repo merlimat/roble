@@ -102,7 +102,7 @@ async fn a_missed_block_is_kept_in_the_buffer_it_was_read_into() {
             .put(format!("k{i:05}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     let probe = b"k00500";

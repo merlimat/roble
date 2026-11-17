@@ -132,7 +132,7 @@ async fn a_memtable_filling_up_holds_its_budget_and_not_twice_it() {
                     .expect("put");
                 i += 1;
             }
-            db.write(&mut batch, false).await.expect("write");
+            db.write_raw(&mut batch, false).await.expect("write");
         }
         let held = PEAK.load(Relaxed) - before;
         assert!(

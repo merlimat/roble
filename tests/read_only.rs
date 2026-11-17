@@ -182,7 +182,7 @@ async fn reader(env: &ReaderEnv) -> roble::Result<roble::Db<ReaderFs>> {
 async fn put(db: &roble::Db<ReaderFs>, key: &[u8], value: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 }
 
 async fn get<F: Fs>(db: &roble::Db<F>, key: &[u8]) -> roble::Result<Option<Vec<u8>>> {
@@ -257,7 +257,7 @@ async fn a_reader_refuses_everything_that_would_change_the_directory() {
     let mut batch = Batch::new();
     batch.put(b"b", b"2").expect("put");
     assert!(matches!(
-        ro.write(&mut batch, false).await,
+        ro.write_raw(&mut batch, false).await,
         Err(Error::ReadOnly)
     ));
     assert!(matches!(ro.flush().await, Err(Error::ReadOnly)));

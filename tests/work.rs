@@ -92,7 +92,7 @@ async fn ready_to_compact(env: &SimEnv, dir: &Path, unit: u64) -> (roble::Db<Sim
             .put(format!("y{i:04}").as_bytes(), b"value")
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     (db, table)
 }
@@ -120,7 +120,7 @@ async fn ready_to_flush(env: &SimEnv, dir: &Path, unit: u64) -> roble::Db<SimFs>
             .put(format!("y{i:04}").as_bytes(), b"value")
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db
 }
 
@@ -283,7 +283,7 @@ async fn pacing_changes_no_answer() {
                 .expect("put");
         }
         batch.delete_range(b"z0010", b"z0050").expect("range");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
 
         let in_l0: Vec<u64> = db

@@ -123,7 +123,7 @@ async fn main() {
     // there and flushed into a table first — otherwise the delete would be a
     // tombstone over nothing and Pebble would agree with it for free.
     if created {
-        let mut batch = db.batch();
+        let mut batch = db.indexed_batch();
         batch
             .put(b"alpha", b"from-nothing")
             .unwrap_or_else(|e| fail(&format!("put: {e}")));
@@ -152,7 +152,7 @@ async fn main() {
     // it is unchanged by having an index over it.
     let mut wrote: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     for i in 0..8 {
         let k = format!("wal-{i:03}").into_bytes();
         let v = format!("value-{i}").into_bytes();
@@ -175,7 +175,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| fail(&format!("commit: {e}")));
 
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     let big_key = b"wal-big".to_vec();
     let big_value = vec![b'x'; 40 * 1024];
     batch
@@ -189,7 +189,7 @@ async fn main() {
 
     // A delete of a key the tables hold, so Pebble has to apply roble's
     // tombstone and not merely add keys.
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     batch
         .delete(b"alpha")
         .unwrap_or_else(|e| fail(&format!("delete: {e}")));
@@ -220,7 +220,7 @@ async fn main() {
         // drop; a range deletion so the output carries a range-deletion
         // block; and enough bulk after it, inside its range, that the output
         // splits with the tombstone across a boundary.
-        let mut batch = db.batch();
+        let mut batch = db.indexed_batch();
         for i in 0..8 {
             let k = format!("wal-{i:03}").into_bytes();
             batch
@@ -306,7 +306,7 @@ async fn main() {
     if settle {
         // More rounds, so there is enough to spread over several levels.
         for round in 0..6 {
-            let mut batch = db.batch();
+            let mut batch = db.indexed_batch();
             for i in 0..16 {
                 let k = format!("settle-{:03}", (round * 7 + i) % 40).into_bytes();
                 let v = format!("round-{round}").into_bytes();

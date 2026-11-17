@@ -70,6 +70,12 @@ pub use scan::Scan;
 pub use snapshot::Snapshot;
 pub use version::{Table, Version, VersionSet};
 
+/// The format crate roble reads and writes Pebble's files with, re-exported
+/// so that the `roble_format::Error` a [`FormatError`] hands out through
+/// [`source`](std::error::Error::source) is always named at the version roble
+/// was built with: a downcast to another version's type would find nothing.
+pub use roble_format;
+
 /// What roble's own tests and benchmark reach inside the engine.
 ///
 /// Not part of the API: hidden from the documentation, and free to change in

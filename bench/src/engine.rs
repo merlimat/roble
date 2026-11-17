@@ -319,7 +319,7 @@ impl Store for Roble {
         // An *indexed* batch, which is the one Oxia uses: its `PebbleBatch`
         // reads back through itself before committing, so the repr measured
         // here is the one built under an index.
-        let mut batch = self.db.batch();
+        let mut batch = self.db.indexed_batch();
         for i in from..from + count {
             batch
                 .put(&key_for(shard, i), &value_for(cfg, shard, i))

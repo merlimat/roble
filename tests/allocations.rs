@@ -245,7 +245,7 @@ async fn a_warm_write_allocates_nothing() {
         for key in &keys[..1_000] {
             batch.clear();
             batch.put(key, &value).expect("put");
-            db.write(&mut batch, false).await.expect("write");
+            db.write_raw(&mut batch, false).await.expect("write");
         }
     }
 
@@ -253,7 +253,7 @@ async fn a_warm_write_allocates_nothing() {
     for key in &keys[1_000..] {
         batch.clear();
         batch.put(key, &value).expect("put");
-        db.write(&mut batch, false).await.expect("write");
+        db.write_raw(&mut batch, false).await.expect("write");
     }
     let made = ALLOCS.load(Relaxed) - before;
     assert_eq!(
