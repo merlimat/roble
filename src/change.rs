@@ -123,7 +123,7 @@ impl Changes {
     /// memtable to write out would otherwise have to take the permit to
     /// find out, and then the answer would be yes because it had just
     /// stopped the flush that was making it no
-    /// (`crate::open::Opened::flush_wanted`).
+    /// (`crate::open::Db::flush_wanted`).
     pub(crate) fn park(&self, cx: &std::task::Context<'_>) {
         self.waiting.borrow_mut().push(cx.waker().clone());
     }
@@ -155,7 +155,7 @@ impl Changes {
 /// compacted would have to hold the store — and then dropping the store
 /// would not release the directory until that task finished, which `Drop`
 /// cannot wait for. So the task is the caller's, built around
-/// `Opened::flush_wanted` and `Opened::compaction_wanted`, and this is how a
+/// `Db::flush_wanted` and `Db::compaction_wanted`, and this is how a
 /// write and a flush tell it.
 #[derive(Default)]
 pub(crate) struct Waiters {
@@ -288,7 +288,7 @@ impl Drop for Claim<'_> {
 /// Held from the sequence number a write stamps to the memtable it applies
 /// to, which is the span two writes may not share. Read by a freeze too,
 /// which cannot take a memtable away from a write that is still adding to it
-/// (`crate::open::Opened::freeze_memtable`).
+/// (`crate::open::Db::freeze_memtable`).
 #[derive(Default)]
 pub(crate) struct Writers {
     underway: Cell<bool>,

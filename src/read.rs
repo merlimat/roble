@@ -44,7 +44,7 @@ use roble_format::key::{self, Kind};
 
 use crate::env::Fs;
 use crate::error::Result;
-use crate::open::Opened;
+use crate::open::Db;
 
 /// Which key a read is asking for, relative to the one it is given.
 ///
@@ -92,7 +92,7 @@ pub struct Found {
 /// reads in flight has two buffers.
 ///
 /// Hand the same one back on every call and a read in a steady state stops
-/// allocating. [`Opened::get`] makes one per call, which is what a caller
+/// allocating. [`Db::get`] makes one per call, which is what a caller
 /// that wants its answer owned is paying for.
 #[derive(Debug, Default)]
 pub struct Lookup {
@@ -230,7 +230,7 @@ struct Candidate {
     kind: Kind,
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Reads the key `how` says, or `None` if there is none.
     ///
     /// Allocates the answer and the scratch the read needed to find it.

@@ -89,7 +89,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn forward<F: Fs>(db: &roble::Opened<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
+async fn forward<F: Fs>(db: &roble::Db<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Vec::new();
@@ -100,7 +100,7 @@ async fn forward<F: Fs>(db: &roble::Opened<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
-async fn backward<F: Fs>(db: &roble::Opened<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
+async fn backward<F: Fs>(db: &roble::Db<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut scan = db.scan().await.expect("scan");
     scan.last().await.expect("last");
     let mut out = Vec::new();
@@ -130,7 +130,7 @@ fn expected(model: &Model, probe: &[u8], how: Comparison) -> Option<(Vec<u8>, Ve
 
 /// Every comparison of every key in the alphabet, and of keys either side of
 /// it, against the model.
-async fn check_gets<F: Fs>(db: &roble::Opened<F>, model: &Model, step: usize, seed: u64) {
+async fn check_gets<F: Fs>(db: &roble::Db<F>, model: &Model, step: usize, seed: u64) {
     for n in 0..16u64 {
         for probe in [key(n), [key(n), vec![b'!']].concat()] {
             for how in [

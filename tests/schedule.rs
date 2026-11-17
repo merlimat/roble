@@ -61,7 +61,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 /// Every key the database holds.
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -74,18 +74,18 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 
 /// How many tables each level holds.
 /// How deep L0 is, which is what its allowance is counted in (§9).
-fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
+fn l0_depth<F: Fs>(db: &roble::Db<F>) -> u64 {
     db.versions().version.l0_sublevels().expect("the sublevels") as u64
 }
 
-fn levels<F: Fs>(db: &roble::Opened<F>) -> Vec<usize> {
+fn levels<F: Fs>(db: &roble::Db<F>) -> Vec<usize> {
     let versions = db.versions();
     (0..7).map(|l| versions.version.level(l).len()).collect()
 }
 
 /// Writes one key and flushes it, giving one L0 table — and whatever the
 /// flush then decided to do about it.
-async fn write_and_flush<F: Fs>(db: &roble::Opened<F>, key: &[u8]) {
+async fn write_and_flush<F: Fs>(db: &roble::Db<F>, key: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, b"value").expect("put");
     db.write(&mut batch, true).await.expect("write");
@@ -278,7 +278,7 @@ fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 }
 
 /// Whether a task waiting to be told there is a compaction would be told now.
-fn wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
+fn wanted_now<F: Fs>(db: &roble::Db<F>) -> bool {
     let mut cx = Context::from_waker(Waker::noop());
     pin!(db.compaction_wanted())
         .as_mut()
@@ -446,7 +446,7 @@ async fn a_task_waits_for_a_merge_already_running_rather_than_standing_down() {
 
 /// Whether a task waiting to be told there is a memtable to write out would
 /// be told now (§5).
-fn flush_wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
+fn flush_wanted_now<F: Fs>(db: &roble::Db<F>) -> bool {
     let mut cx = Context::from_waker(Waker::noop());
     pin!(db.flush_wanted()).as_mut().poll(&mut cx).is_ready()
 }

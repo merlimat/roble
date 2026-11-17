@@ -53,14 +53,14 @@ use crate::env::{Disk, Fs};
 use crate::error::Result;
 use crate::memtable::Memtable;
 use crate::metrics::Metrics;
-use crate::open::Opened;
+use crate::open::Db;
 use crate::scan::{Opener, Scan, open_table};
 use crate::table::{covered_by_tombstone, is_deletion};
 use crate::version::Version;
 
 /// A read-only view of a store as it was when the snapshot was made.
 ///
-/// Made by [`Opened::snapshot`]. Scans over it see what it saw, whatever the
+/// Made by [`Db::snapshot`]. Scans over it see what it saw, whatever the
 /// store does meanwhile, and [`Snapshot::lookup`] answers about any key at
 /// all rather than only the ones a scan's bounds take in.
 pub struct Snapshot<D: Disk> {
@@ -255,7 +255,7 @@ impl<D: Disk> Snapshot<D> {
     }
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// A read-only view of the store as it is now.
     ///
     /// Holds the current version, which is what lets [`Snapshot::lookup`]

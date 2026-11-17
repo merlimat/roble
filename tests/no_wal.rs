@@ -79,7 +79,7 @@ fn of_type(names: &[String], want: FileType) -> Vec<u64> {
         .collect()
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();

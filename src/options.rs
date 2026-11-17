@@ -173,8 +173,8 @@ impl<F: Fs> Options<F> {
     /// such a flush is the one that retries it.
     ///
     /// **This line is the backstop.** A store with a task waiting on
-    /// [`crate::Opened::flush_wanted`] is told there is a memtable to write
-    /// out at seven eighths of it ([`crate::Opened::flush_line`]), and that
+    /// [`crate::Db::flush_wanted`] is told there is a memtable to write
+    /// out at seven eighths of it ([`crate::Db::flush_line`]), and that
     /// task writes it out while the writes carry on into the last eighth —
     /// so the only writes that come down here are the ones a store whose
     /// flushes have stopped keeping up, or one with nobody to hand them to,

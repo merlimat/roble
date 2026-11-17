@@ -705,7 +705,7 @@ impl<D: Disk> Scan<D> {
     /// allocations of whatever scan it was before.
     ///
     /// Crate-private: its arguments are a store's internals, and the way to
-    /// one from outside is [`crate::Opened::scan`].
+    /// one from outside is [`crate::Db::scan`].
     ///
     /// Opens nothing. Each level below L0 becomes one [`Level`] over the
     /// stretch of its tables the bounds reach, found by two binary searches
@@ -1391,7 +1391,7 @@ impl Heap {
     }
 }
 
-impl<F: crate::env::Fs> crate::Opened<F> {
+impl<F: crate::env::Fs> crate::Db<F> {
     /// A scan over every key in the database.
     pub async fn scan(&self) -> Result<Scan<F::Disk>> {
         self.scan_range(None, None).await

@@ -60,7 +60,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -73,7 +73,7 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 
 /// Writes `count` keys from `at` and flushes, giving one L0 table.
 /// How deep L0 is, which is what `l0_compaction_threshold` is counted in.
-fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
+fn l0_depth<F: Fs>(db: &roble::Db<F>) -> u64 {
     db.versions().version.l0_sublevels().expect("the sublevels") as u64
 }
 
@@ -84,7 +84,7 @@ fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
 /// stack: L0 is measured in the layers its tables form, so two flushes of
 /// the same range are two layers and two flushes of different ranges are one
 /// (§9, `Version::l0_sublevels`).
-async fn flush_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, at: usize, count: usize) -> u64 {
+async fn flush_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, at: usize, count: usize) -> u64 {
     let mut batch = Batch::new();
     for i in at..at + count {
         batch

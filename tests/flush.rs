@@ -51,7 +51,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -69,7 +69,7 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 /// table it adds, the log it retires — and a compaction following it would
 /// change the version before the assertion could read it.
 /// `tests/schedule.rs` is where the scheduling is the subject.
-async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Opened<SimFs> {
+async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
     roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open")
@@ -302,7 +302,7 @@ async fn a_table_written_in_several_chunks_reads_back_whole() {
 
 /// A fresh store with compaction left to the caller, for a flush's table to
 /// be the only one there is.
-async fn created(env: &SimEnv) -> roble::Opened<SimFs> {
+async fn created(env: &SimEnv) -> roble::Db<SimFs> {
     roble::open_with(
         env,
         Path::new("/db"),
@@ -314,7 +314,7 @@ async fn created(env: &SimEnv) -> roble::Opened<SimFs> {
     .expect("create")
 }
 
-async fn put<F: Fs>(db: &roble::Opened<F>, key: &[u8], value: &[u8]) {
+async fn put<F: Fs>(db: &roble::Db<F>, key: &[u8], value: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
     db.write(&mut batch, true).await.expect("write");

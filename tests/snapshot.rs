@@ -56,7 +56,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 
 /// A store whose flushes do not go on to compact, so a version stays put
 /// while a test reads it.
-async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Opened<SimFs> {
+async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
     roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open")
@@ -73,7 +73,7 @@ async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
     out
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     walk(&mut db.scan().await.expect("scan")).await
 }
 
@@ -90,7 +90,7 @@ async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
     names
 }
 
-async fn write<F: Fs>(db: &roble::Opened<F>, build: impl FnOnce(&mut Batch)) {
+async fn write<F: Fs>(db: &roble::Db<F>, build: impl FnOnce(&mut Batch)) {
     let mut batch = Batch::new();
     build(&mut batch);
     db.write(&mut batch, true).await.expect("write");

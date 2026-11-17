@@ -103,7 +103,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -133,7 +133,7 @@ fn opened(wal: bool, budget: u64) -> Options<SimFs> {
     if wal { o } else { o.disable_wal(true) }
 }
 
-async fn put<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result<()> {
+async fn put<F: Fs>(db: &roble::Db<F>, i: usize, wal: bool) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch.put(&key_at(i), VALUE).expect("put");
     db.write(&mut batch, wal).await
@@ -145,12 +145,12 @@ async fn put<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result
 /// L0 is measured in the layers its tables form (§9), so a test that wants a
 /// deep L0 has to write a deep one. Keys that march forward make tables that
 /// do not overlap, and any number of those is one layer and one seek.
-async fn put_overlapping<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result<()> {
+async fn put_overlapping<F: Fs>(db: &roble::Db<F>, i: usize, wal: bool) -> roble::Result<()> {
     put(db, i % ENTRIES as usize, wal).await
 }
 
 /// How deep L0 is, which is what the thresholds are counted in.
-fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
+fn l0_depth<F: Fs>(db: &roble::Db<F>) -> u64 {
     db.versions().version.l0_sublevels().expect("the sublevels") as u64
 }
 
@@ -158,7 +158,7 @@ fn l0_depth<F: Fs>(db: &roble::Opened<F>) -> u64 {
 ///
 /// Capped, because a store that flushed on every write would never reach the
 /// line and a test that waited for it would hang rather than fail.
-async fn fill_to<F: Fs>(db: &roble::Opened<F>, budget: u64, wal: bool) -> usize {
+async fn fill_to<F: Fs>(db: &roble::Db<F>, budget: u64, wal: bool) -> usize {
     let mut i = 0;
     while (db.unflushed_bytes() as u64) < budget {
         put(db, i, wal).await.expect("write");
@@ -241,7 +241,7 @@ async fn two_writes_at_once_make_room_once_between_them() {
 
 /// Whether a task waiting to be told there is a memtable to write out would
 /// be told now (§5).
-fn flush_wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
+fn flush_wanted_now<F: Fs>(db: &roble::Db<F>) -> bool {
     let mut cx = Context::from_waker(Waker::noop());
     pin!(db.flush_wanted()).as_mut().poll(&mut cx).is_ready()
 }
@@ -251,7 +251,7 @@ fn flush_wanted_now<F: Fs>(db: &roble::Opened<F>) -> bool {
 ///
 /// The same as [`fill_to`] for a store nobody is waiting on, which is what
 /// every caller of it here is.
-async fn fill_past_the_line<F: Fs>(db: &roble::Opened<F>, wal: bool) -> usize {
+async fn fill_past_the_line<F: Fs>(db: &roble::Db<F>, wal: bool) -> usize {
     assert!(
         !flush_wanted_now(db),
         "an empty store should have nothing to write out"

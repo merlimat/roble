@@ -207,8 +207,8 @@ async fn yield_now() {
 pub struct Roble {
     /// Shared with the two tasks `open` spawns beside it, which is what
     /// takes a flush and a merge off the write that would otherwise pay for
-    /// them (§9, `roble::Opened::flush_wanted`).
-    db: std::rc::Rc<roble::Opened<roble::FileFs>>,
+    /// them (§9, `roble::Db::flush_wanted`).
+    db: std::rc::Rc<roble::Db<roble::FileFs>>,
     /// The working space `get` hands back on every call. One per store,
     /// as Oxia holds one store per shard and reads them from one thread.
     ///
@@ -299,7 +299,7 @@ impl Store for Roble {
         // The tasks `open` spawned hold the store while they wait, so
         // dropping these would not release the directory and the open below
         // would find it locked. Told there is nothing more coming, and then
-        // given the turns they need to hear it (§9, `roble::Opened::stop`).
+        // given the turns they need to hear it (§9, `roble::Db::stop`).
         for shard in &shards {
             shard.db.stop();
         }

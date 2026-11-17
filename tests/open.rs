@@ -87,7 +87,7 @@ async fn the_replay_recovers_the_counters_a_store_resumes_from() {
     // against what the database must be rather than against a Go dump.
     let v = db.versions();
     assert_eq!(v.comparer_name, BYTEWISE);
-    assert_eq!(db.format_version, 16, "the fixture is written at the pin");
+    assert_eq!(db.format_version(), 16, "the fixture is written at the pin");
     assert_eq!(db.manifest_filename(), "MANIFEST-000001");
 
     // Three flushes and a compaction happened, so the next file number has to
@@ -353,7 +353,8 @@ async fn the_highest_marker_iteration_wins() {
 
     let db = roble::open(&env, &dir).await.expect("open");
     assert_eq!(
-        db.format_version, 16,
+        db.format_version(),
+        16,
         "iteration 7 should win over iteration 3"
     );
     assert_eq!(
@@ -913,7 +914,7 @@ async fn a_manifest_record_that_does_not_frame_is_refused_with_its_number() {
 
 #[compio::test]
 async fn an_opened_database_describes_itself() {
-    // `Opened`'s Debug is written out rather than derived, because the lock
+    // `Db`'s Debug is written out rather than derived, because the lock
     // has no business in a debug line and a `Fs::Lock` need not be Debug at
     // all. Written-out means it can drift from the struct, so it is checked
     // for naming the things someone debugging an open would look for.
@@ -921,7 +922,7 @@ async fn an_opened_database_describes_itself() {
     let db = roble::open(&env, &dir).await.expect("open");
     let text = format!("{db:?}");
     for expected in [
-        "Opened",
+        "Db",
         "dir",
         "format_version",
         "manifest_filename",
@@ -1030,7 +1031,7 @@ async fn give_the_runtime_a_turn(at: &Path) {
 
 #[compio::test]
 async fn a_task_of_its_own_can_be_the_one_that_compacts() {
-    // The pattern `Opened::compaction_wanted` documents, run for real. The
+    // The pattern `Db::compaction_wanted` documents, run for real. The
     // caller owns the task and owns stopping it; the store only says when
     // there is something to do. A flush that finds the task waiting leaves
     // the merge to it, so the write that caused the flush pays for none of
