@@ -34,11 +34,12 @@ pub mod manifest;
 pub mod rangedel;
 pub mod record;
 pub mod sst;
+#[doc(hidden)]
 pub mod value_block;
 
-pub use block::{BlockBuilder, BlockHandle};
+pub use block::BlockHandle;
 pub use checksum::ChecksumType;
-pub use dump::{dump_table, first_difference};
+pub use dump::dump_table;
 pub use error::{Error, Result};
 pub use footer::{FOOTER_LEN, Footer, TableFormat};
 pub use key::{InternalKey, Kind};

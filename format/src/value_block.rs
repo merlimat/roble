@@ -91,7 +91,7 @@ impl ValueIndex {
     /// That value is a block handle *plus* three width bytes
     /// (`valblk.EncodeIndexHandle`), which is why it cannot be read with
     /// [`BlockHandle::decode`] alone.
-    pub fn decode_metaindex_value(src: &[u8]) -> Result<Self> {
+    pub(crate) fn decode_metaindex_value(src: &[u8]) -> Result<Self> {
         let (handle, n) = BlockHandle::decode(src)?;
         let widths = &src[n..];
         if widths.len() < 3 {
@@ -116,7 +116,7 @@ impl ValueIndex {
     }
 
     /// The bytes each row of the index occupies.
-    pub fn row_width(&self) -> usize {
+    pub(crate) fn row_width(&self) -> usize {
         self.block_num_len as usize + self.offset_len as usize + self.length_len as usize
     }
 

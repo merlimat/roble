@@ -129,7 +129,8 @@ async fn try_open_bytes(bytes: Vec<u8>) -> (SimEnv, roble::Result<OpenTable<robl
 /// way what reaches the engine is a table every check before this one passes.
 #[compio::test]
 async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
-    use roble_format::{BlockBuilder, FOOTER_LEN, InternalKey, Kind};
+    use roble_format::block::BlockBuilder;
+    use roble_format::{FOOTER_LEN, InternalKey, Kind};
 
     let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
     for (i, k) in [b"/oxia/a", b"/oxia/b"].iter().enumerate() {

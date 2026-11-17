@@ -166,7 +166,10 @@ impl TableWriter {
             return Error::unsupported("roble never sets the obsolete bit");
         }
         if key.seq_num > crate::key::SEQ_NUM_MAX {
-            return Error::corrupt(format!("sequence number {} is too large", key.seq_num));
+            return Error::invalid_argument(format!(
+                "sequence number {} is too large",
+                key.seq_num
+            ));
         }
 
         let mut encoded = Vec::with_capacity(key.user_key.len() + TRAILER_LEN);
@@ -239,7 +242,7 @@ impl TableWriter {
             std::cmp::Ordering::Less => false,
         };
         if !ordered {
-            return Error::corrupt(format!(
+            return Error::invalid_argument(format!(
                 "keys out of order: {:?}#{} after {:?}#{}",
                 String::from_utf8_lossy(key.user_key),
                 key.seq_num,

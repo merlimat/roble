@@ -173,7 +173,7 @@ impl Compressor {
         let zstd = match codec {
             Codec::Zstd(level) => Some(
                 zstd::bulk::Compressor::new(level)
-                    .map_err(|e| Error::Unsupported(format!("zstd level {level}: {e}")))?,
+                    .map_err(|e| Error::InvalidArgument(format!("zstd level {level}: {e}")))?,
             ),
             _ => None,
         };
@@ -197,7 +197,7 @@ impl Compressor {
                 let n = self
                     .snappy
                     .compress(block, &mut self.out)
-                    .map_err(|e| Error::Corrupt(format!("snappy compression: {e}")))?;
+                    .map_err(|e| Error::InvalidArgument(format!("snappy compression: {e}")))?;
                 self.out.truncate(n);
                 Compression::Snappy
             }
@@ -214,7 +214,7 @@ impl Compressor {
                     .as_mut()
                     .expect("a Zstd codec has a context")
                     .compress_to_buffer(block, &mut self.out[prefix..])
-                    .map_err(|e| Error::Corrupt(format!("zstd compression: {e}")))?;
+                    .map_err(|e| Error::InvalidArgument(format!("zstd compression: {e}")))?;
                 self.out.truncate(prefix + n);
                 Compression::Zstd
             }

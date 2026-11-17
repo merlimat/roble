@@ -40,10 +40,10 @@ use crate::error::{Error, Result};
 use crate::key::{InternalKey, Kind, SEQ_NUM_MAX, TRAILER_LEN};
 
 /// `metaRangeDelV2Name`: the fragmented range-deletion block.
-pub const META_NAME_V2: &[u8] = b"rocksdb.range_del2";
+pub(crate) const META_NAME_V2: &[u8] = b"rocksdb.range_del2";
 
 /// `metaRangeDelV1Name`: the unfragmented block, which Pebble refuses.
-pub const META_NAME_V1: &[u8] = b"rocksdb.range_del";
+pub(crate) const META_NAME_V1: &[u8] = b"rocksdb.range_del";
 
 /// One range tombstone: `[start, end)` deleted as of `seq_num`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +191,7 @@ fn check_fragmented(prev: &Tombstone, next: &Tombstone) -> Result<()> {
 
 /// Builds a v2 range-deletion block.
 #[derive(Debug, Default)]
+#[doc(hidden)]
 pub struct Builder {
     tombstones: Vec<Tombstone>,
 }
@@ -227,14 +228,14 @@ impl Builder {
     /// Adds a tombstone, checking the fragmentation invariant as it goes.
     pub fn add(&mut self, start: &[u8], end: &[u8], seq_num: u64) -> Result<()> {
         if start >= end {
-            return Error::corrupt(format!(
+            return Error::invalid_argument(format!(
                 "tombstone start {:?} is not below its end {:?}",
                 String::from_utf8_lossy(start),
                 String::from_utf8_lossy(end)
             ));
         }
         if seq_num >= SEQ_NUM_MAX {
-            return Error::corrupt(format!(
+            return Error::invalid_argument(format!(
                 "tombstone sequence number {seq_num} is the range-delete sentinel"
             ));
         }
@@ -243,8 +244,13 @@ impl Builder {
             end: end.to_vec(),
             seq_num,
         };
+        // The same invariant a decoded block is held to, but broken here by
+        // whoever is adding, so it is their mistake and not damage.
         if let Some(prev) = self.tombstones.last() {
-            check_fragmented(prev, &t)?;
+            check_fragmented(prev, &t).map_err(|e| match e {
+                Error::Corrupt(m) => Error::InvalidArgument(m),
+                other => other,
+            })?;
         }
         self.tombstones.push(t);
         Ok(())
@@ -303,23 +309,57 @@ mod tests {
         // Overlapping but not identical: must be refused.
         let mut b = Builder::new();
         b.add(b"/a", b"/m", 5).expect("first");
-        assert!(b.add(b"/f", b"/z", 4).is_err(), "overlap must be refused");
+        assert!(
+            b.add(b"/f", b"/z", 4)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "overlap must be refused"
+        );
 
         // Same range, non-decreasing sequence numbers: must be refused.
         let mut b = Builder::new();
         b.add(b"/a", b"/m", 5).expect("first");
-        assert!(b.add(b"/a", b"/m", 5).is_err(), "equal seqnums refused");
-        assert!(b.add(b"/a", b"/m", 9).is_err(), "rising seqnums refused");
+        assert!(
+            b.add(b"/a", b"/m", 5)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "equal seqnums refused"
+        );
+        assert!(
+            b.add(b"/a", b"/m", 9)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "rising seqnums refused"
+        );
 
         // Descending start keys: must be refused.
         let mut b = Builder::new();
         b.add(b"/m", b"/z", 5).expect("first");
-        assert!(b.add(b"/a", b"/c", 4).is_err(), "descending starts refused");
+        assert!(
+            b.add(b"/a", b"/c", 4)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "descending starts refused"
+        );
 
         // An empty or inverted range: must be refused.
         let mut b = Builder::new();
-        assert!(b.add(b"/a", b"/a", 1).is_err(), "empty range refused");
-        assert!(b.add(b"/z", b"/a", 1).is_err(), "inverted range refused");
+        assert!(
+            b.add(b"/a", b"/a", 1)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "empty range refused"
+        );
+        assert!(
+            b.add(b"/z", b"/a", 1)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "inverted range refused"
+        );
+
+        // The sentinel sequence number is the format's, not a tombstone's.
+        let mut b = Builder::new();
+        assert!(
+            b.add(b"/a", b"/b", SEQ_NUM_MAX)
+                .is_err_and(|e| matches!(e, Error::InvalidArgument(_))),
+            "the sentinel refused"
+        );
+        // Every refusal above is the caller's mistake, so `InvalidArgument`
+        // rather than `Corrupt`: nothing was read and nothing on disk is wrong.
     }
 
     fn stones(raw: &[(&[u8], &[u8], u64)]) -> Vec<Tombstone> {

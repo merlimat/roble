@@ -31,16 +31,17 @@
 use crate::key::TRAILER_LEN;
 
 /// `base.DefaultBlockRestartInterval`: a full key every 16 entries.
-pub const DEFAULT_RESTART_INTERVAL: usize = 16;
+pub(crate) const DEFAULT_RESTART_INTERVAL: usize = 16;
 
 /// `indexBlockRestartInterval`: index blocks restart at every entry.
-pub const INDEX_RESTART_INTERVAL: usize = 1;
+pub(crate) const INDEX_RESTART_INTERVAL: usize = 1;
 
 /// `setHasSameKeyPrefixRestartMask`.
 const SET_HAS_SAME_KEY_PREFIX_MASK: u32 = 1 << 31;
 
 /// Builds one row block.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct BlockBuilder {
     buf: Vec<u8>,
     restarts: Vec<u32>,
@@ -163,6 +164,7 @@ impl BlockBuilder {
 /// From Pebblev3 on it is the *previous* key's user-key length, so the shared
 /// prefix stops at the previous key's trailer. Before that it is the current
 /// key's user-key length. Either way a trailer is never shared.
+#[doc(hidden)]
 pub fn max_shared_len(
     format: crate::TableFormat,
     prev_internal_key: &[u8],

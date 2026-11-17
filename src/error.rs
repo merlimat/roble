@@ -54,6 +54,13 @@ pub enum Error {
     /// database has retired or not finished writing; opening again reads the
     /// database as it is now (DESIGN.md §6, "Reading beside a writer").
     Stale(String),
+    /// The caller asked for something no database could do: a
+    /// [`delete_range`](crate::Db::delete_range) whose start is not below its
+    /// end, or a batch past 2³² − 1 entries.
+    ///
+    /// Nothing was read and nothing on disk is wrong, which is what sets it
+    /// apart from [`Error::Format`] and [`Error::Corrupt`].
+    InvalidArgument(String),
 }
 
 /// What [`Error::Format`] carries: a file roble could not read, and why.
@@ -88,6 +95,7 @@ impl fmt::Display for Error {
             Error::NoDatabase(m) => write!(f, "{m}"),
             Error::ReadOnly => write!(f, "the database was opened read-only"),
             Error::Stale(m) => write!(f, "stale: {m}"),
+            Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
         }
     }
 }
@@ -105,7 +113,8 @@ impl std::error::Error for Error {
             | Error::Corrupt(_)
             | Error::NoDatabase(_)
             | Error::ReadOnly
-            | Error::Stale(_) => None,
+            | Error::Stale(_)
+            | Error::InvalidArgument(_) => None,
         }
     }
 }
@@ -123,7 +132,13 @@ impl From<io::Error> for Error {
 #[doc(hidden)]
 impl From<roble_format::Error> for Error {
     fn from(e: roble_format::Error) -> Self {
-        Error::Format(FormatError(e))
+        match e {
+            // The caller's mistake, found while the format crate encoded what
+            // it was given: not a file roble could not read, which is what
+            // `Format` says.
+            roble_format::Error::InvalidArgument(m) => Error::InvalidArgument(m),
+            e => Error::Format(FormatError(e)),
+        }
     }
 }
 
@@ -161,6 +176,28 @@ mod tests {
         assert_eq!(
             Error::ReadOnly.to_string(),
             "the database was opened read-only"
+        );
+        // "invalid argument:" means the caller's mistake, with nothing on
+        // disk to look at.
+        assert_eq!(
+            Error::InvalidArgument("an empty range".to_string()).to_string(),
+            "invalid argument: an empty range"
+        );
+    }
+
+    /// The format crate's `InvalidArgument` is the caller's mistake, found
+    /// while encoding what it was given, so it comes out as roble's own and
+    /// not as `Format`, which says a file could not be read.
+    #[test]
+    fn a_format_invalid_argument_is_not_a_format_error() {
+        let e = Error::from(roble_format::Error::InvalidArgument("x".to_string()));
+        assert!(
+            matches!(e, Error::InvalidArgument(ref m) if m == "x"),
+            "{e:?}"
+        );
+        assert!(
+            std::error::Error::source(&e).is_none(),
+            "nothing underneath the caller's mistake"
         );
     }
 
@@ -226,6 +263,7 @@ mod tests {
             Error::Unsupported("x".to_string()),
             Error::Corrupt("x".to_string()),
             Error::NoDatabase("x".to_string()),
+            Error::InvalidArgument("x".to_string()),
         ] {
             assert!(e.source().is_none(), "{e} should have no source");
         }
