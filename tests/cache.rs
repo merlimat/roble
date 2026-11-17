@@ -24,9 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
-use roble::cache::{DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 use roble::sim::{SimEnv, SimFs};
 use roble::{Caches, Comparison, Disk, Fs, Options, WriteBuf};
+use roble::{DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 
 /// Loads a committed fixture directory into a simulated filesystem.
 async fn load(name: &str) -> (SimEnv, PathBuf, u64) {
@@ -256,7 +256,7 @@ async fn a_block_is_cached_decoded_rather_than_as_it_was_read() {
     let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, DEFAULT_BLOCK_BYTES);
     let blocks = caches.blocks(0);
     let disk = fs.open(&path, roble::Access::ReadOnly).await.expect("open");
-    let table = roble::table::OpenTable::open(1, disk, blocks.clone())
+    let table = roble::__private::OpenTable::open(1, disk, blocks.clone())
         .await
         .expect("open table");
 
@@ -326,7 +326,7 @@ async fn two_stores_blocks_do_not_collide_either() {
 /// table cache about every table it collects.
 #[test]
 fn forgetting_an_entry_gives_its_room_back() {
-    let mut clock: roble::cache::Clock<u64, u64> = roble::cache::Clock::new(2);
+    let mut clock: roble::__private::Clock<u64, u64> = roble::__private::Clock::new(2);
     clock.insert(1, 10, 1);
     clock.insert(2, 20, 1);
 

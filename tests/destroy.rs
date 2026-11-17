@@ -21,9 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
-use roble::cache::{DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 use roble::sim::{SimEnv, SimFs};
 use roble::{Caches, Disk, Fs, Options, WriteBuf};
+use roble::{DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 use roble_format::batch::Batch;
 
 async fn load(name: &str) -> (SimEnv, PathBuf) {

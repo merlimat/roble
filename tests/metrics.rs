@@ -45,7 +45,7 @@ use opentelemetry_sdk::metrics::{
     InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
 };
 
-use roble::cache::DEFAULT_OPEN_TABLES;
+use roble::DEFAULT_OPEN_TABLES;
 use roble::sim::{SimEnv, SimFs};
 use roble::{Caches, Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;

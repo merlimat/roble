@@ -26,37 +26,37 @@
 //! filesystem that can be made to fail or crash at any single operation, which
 //! is how §12 tests the failure paths.
 
-pub mod batch;
-pub mod buf;
-pub mod cache;
+mod batch;
+mod buf;
+mod cache;
 mod change;
-pub mod checkpoint;
-pub mod compact;
+mod checkpoint;
+mod compact;
 mod create;
-pub mod destroy;
-pub mod env;
-pub mod flush;
-pub mod memtable;
+mod destroy;
+mod env;
+mod flush;
+mod memtable;
 mod metrics;
-pub mod obsolete;
-pub mod open;
-pub mod options;
-pub mod pick;
-pub mod read;
-pub mod rotate;
-pub mod scan;
+mod obsolete;
+mod open;
+mod options;
+mod pick;
+mod read;
+mod rotate;
+mod scan;
 pub mod sim;
-pub mod snapshot;
-pub mod table;
-pub mod version;
-pub mod work;
+mod snapshot;
+mod table;
+mod version;
+mod work;
 
 mod error;
 mod file;
 
 pub use batch::IndexedBatch;
 pub use buf::{ReadBuf, WriteBuf};
-pub use cache::{BlockCache, Caches};
+pub use cache::{BlockCache, Caches, DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
@@ -67,3 +67,17 @@ pub use read::{Comparison, Found, Lookup};
 pub use scan::Scan;
 pub use snapshot::Snapshot;
 pub use version::{Table, Version, VersionSet};
+
+/// What roble's own tests and benchmark reach inside the engine.
+///
+/// Not part of the API: hidden from the documentation, and free to change in
+/// any release.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::cache::Clock;
+    pub use crate::compact::TARGET_FILE_SIZE;
+    pub use crate::env::read_all;
+    pub use crate::memtable::Memtable;
+    pub use crate::pick::{L0_COMPACTION_THRESHOLD, L0_STOP_WRITES_THRESHOLD, LBASE_MAX_BYTES};
+    pub use crate::table::OpenTable;
+}

@@ -27,7 +27,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use roble::memtable::Memtable;
+use roble::__private::Memtable;
 use roble_format::key::{self, Kind, TRAILER_LEN};
 
 /// An encoded internal key ordered as Pebble orders them, so that a
