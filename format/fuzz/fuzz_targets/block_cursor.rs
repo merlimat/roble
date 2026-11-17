@@ -27,10 +27,11 @@ use std::cmp::Ordering;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
+use roble_format::TableFormat;
 use roble_format::block::Block;
+use roble_format::block::BlockBuilder;
 use roble_format::block::restart::Cursor;
 use roble_format::key;
-use roble_format::{BlockBuilder, TableFormat};
 
 #[derive(Arbitrary, Debug)]
 struct Case {

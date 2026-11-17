@@ -41,6 +41,7 @@ pub const SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 /// These numbers never leave the batch's own index. The repr carries no
 /// sequence numbers at all until commit stamps the header, so nothing with
 /// this bit set is ever written to a log, a table or a MANIFEST.
+#[doc(hidden)]
 pub const SEQ_NUM_BATCH: u64 = 1 << 55;
 
 /// `InternalKeyKindSSTableInternalObsoleteBit`: set in a Pebblev4 block to mark
@@ -48,7 +49,7 @@ pub const SEQ_NUM_BATCH: u64 = 1 << 55;
 pub const OBSOLETE_BIT: u8 = 64;
 
 /// `InternalKeyKindSSTableInternalObsoleteMask`, which clears the obsolete bit.
-pub const OBSOLETE_MASK: u8 = 191;
+pub(crate) const OBSOLETE_MASK: u8 = 191;
 
 /// What an internal key does to the key space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +144,7 @@ impl Kind {
 
     /// Whether roble serves this kind, as opposed to refusing the table
     /// (DESIGN.md §3). The reader applies this; the encoding does not care.
+    #[doc(hidden)]
     pub fn is_accepted(self) -> bool {
         matches!(
             self,
@@ -165,7 +167,7 @@ impl Kind {
 /// land on that user key's newest entry rather than past it. The kind is
 /// Pebble's `InternalKeyKindMax`, asserted against [`Kind::Excise`] in this
 /// module's tests because `to_byte` cannot be called in a constant.
-pub const SEARCH_TRAILER: u64 = (SEQ_NUM_MAX << 8) | 24;
+pub(crate) const SEARCH_TRAILER: u64 = (SEQ_NUM_MAX << 8) | 24;
 
 /// Splits an encoded internal key into its user key and its **raw** trailer.
 ///

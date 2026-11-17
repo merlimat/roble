@@ -41,7 +41,8 @@ mod builder;
 mod compression;
 pub mod restart;
 
-pub use builder::{BlockBuilder, DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL, max_shared_len};
+pub use builder::{BlockBuilder, max_shared_len};
+pub(crate) use builder::{DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL};
 pub(crate) use compression::decode as decode_compressed;
 pub use compression::{Compression, Decoded};
 
@@ -59,6 +60,7 @@ use crate::varint;
 /// This is the seam a block cache needs: without it, reading a block means
 /// having the whole file in memory, and a cache keyed by (file, offset) has
 /// nothing to cache.
+#[doc(hidden)]
 pub fn decode_fetched(
     fetched: &[u8],
     offset: u64,
@@ -87,7 +89,7 @@ pub fn decode_fetched(
 pub const TRAILER_SIZE: usize = 5;
 
 /// `rowblk.EmptySize`: the four-byte restart count every block ends with.
-pub const EMPTY_BLOCK_SIZE: usize = 4;
+pub(crate) const EMPTY_BLOCK_SIZE: usize = 4;
 
 /// `setHasSameKeyPrefixRestartMask`, the stolen high bit of a restart offset.
 const SET_HAS_SAME_KEY_PREFIX_MASK: u32 = 1 << 31;
@@ -172,6 +174,7 @@ const VALUE_KIND_BLOB_HANDLE: u8 = 0x40;
 /// it is walked, so an uncompressed block stays the bytes that came off the
 /// disk (DESIGN.md §8).
 #[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
 pub struct Block<'a> {
     data: &'a [u8],
     restarts_at: usize,
@@ -247,14 +250,6 @@ impl<'a> Block<'a> {
         )
     }
 
-    /// A cursor that can seek and step either way over this block.
-    ///
-    /// The cursor does not borrow the block: every operation takes the block
-    /// again, so that an iterator can own the bytes and the cursor together.
-    pub fn cursor(&self) -> restart::Cursor {
-        restart::Cursor::new()
-    }
-
     /// A cursor over this **data** block, decoding internal keys and value
     /// prefixes.
     pub fn data_cursor(&self, format: crate::TableFormat) -> restart::DataCursor {
@@ -288,6 +283,7 @@ impl<'a> Block<'a> {
 
 /// One entry of a block, with its key still opaque.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct RawEntry<'a, 'k> {
     /// The key as stored, assembled from the previous key's shared prefix.
     pub key: &'k [u8],
@@ -300,6 +296,7 @@ pub struct RawEntry<'a, 'k> {
 /// The key is assembled into a buffer the iterator owns and lent out per
 /// entry; the value is lent straight from the block.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct BlockIter<'a> {
     entries: &'a [u8],
     pos: usize,
@@ -379,6 +376,7 @@ impl<'a> BlockIter<'a> {
 
 /// One entry of a data block.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct Entry<'a, 'k> {
     /// The internal key, assembled from the previous key's shared prefix.
     pub key: InternalKey<'k>,
@@ -388,6 +386,7 @@ pub struct Entry<'a, 'k> {
 
 /// Walks a data block, decoding internal keys and value prefixes.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct DataBlockIter<'a> {
     inner: BlockIter<'a>,
     format: crate::TableFormat,

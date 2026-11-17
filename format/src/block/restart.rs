@@ -170,6 +170,7 @@ impl<'a> Parts<'a> {
 /// stops an index block's separator — which may be a `SET` key — from having a
 /// byte stripped off the handle beside it.
 #[derive(Clone, Debug, Default)]
+#[doc(hidden)]
 pub struct Cursor {
     /// Where the current entry starts, and where it ends.
     pos: usize,
@@ -512,6 +513,7 @@ impl Cursor {
 /// A [`Cursor`] over a **data** block, decoding internal keys and the
 /// Pebblev3+ value prefix.
 #[derive(Clone, Debug)]
+#[doc(hidden)]
 pub struct DataCursor {
     inner: Cursor,
     format: TableFormat,
@@ -610,7 +612,7 @@ mod tests {
 
     /// Every entry in the block, read forwards with the cursor.
     fn forwards(block: &Block<'_>) -> Vec<Vec<u8>> {
-        let mut c = block.cursor();
+        let mut c = Cursor::new();
         c.first(block).expect("first");
         let mut out = Vec::new();
         while c.is_valid() {
@@ -622,7 +624,7 @@ mod tests {
 
     /// Every entry in the block, read backwards with the cursor.
     fn backwards(block: &Block<'_>) -> Vec<Vec<u8>> {
-        let mut c = block.cursor();
+        let mut c = Cursor::new();
         c.last(block).expect("last");
         let mut out = Vec::new();
         while c.is_valid() {
@@ -703,7 +705,7 @@ mod tests {
                 let want_ge = keys
                     .iter()
                     .position(|k| crate::key::compare(k, probe).expect("compare").is_ge());
-                let mut c = block.cursor();
+                let mut c = Cursor::new();
                 c.seek_ge(&block, probe).expect("seek_ge");
                 match want_ge {
                     Some(i) => {
@@ -719,7 +721,7 @@ mod tests {
                 let want_lt = keys
                     .iter()
                     .rposition(|k| crate::key::compare(k, probe).expect("compare").is_lt());
-                let mut c = block.cursor();
+                let mut c = Cursor::new();
                 c.seek_lt(&block, probe).expect("seek_lt");
                 match want_lt {
                     Some(i) => {
@@ -747,7 +749,7 @@ mod tests {
             let block = Block::new(&bytes).expect("block");
 
             for (i, key) in keys.iter().enumerate() {
-                let mut c = block.cursor();
+                let mut c = Cursor::new();
                 c.seek_ge(&block, key).expect("seek_ge");
                 assert_eq!(c.key(), &key[..]);
 
@@ -760,7 +762,7 @@ mod tests {
                     assert!(!c.is_valid(), "past the last entry");
                 }
 
-                let mut c = block.cursor();
+                let mut c = Cursor::new();
                 c.seek_ge(&block, key).expect("seek_ge");
                 c.prev(&block).expect("prev");
                 if i > 0 {
@@ -799,7 +801,7 @@ mod tests {
         let keys = numbered(20);
         let bytes = build(&keys, 4, false);
         let block = Block::new(&bytes).expect("block");
-        let mut c = block.cursor();
+        let mut c = Cursor::new();
 
         // `last` scans the final interval, 16 to 19, and keeps it, so the
         // three steps back to its restart entry rescan nothing.
@@ -837,7 +839,7 @@ mod tests {
         let block_a = Block::new(&bytes_a).expect("block");
         let block_b = Block::new(&bytes_b).expect("block");
         for how in ["first", "seek"] {
-            let mut c = block_a.cursor();
+            let mut c = Cursor::new();
             c.last(&block_a).expect("last");
             if how == "first" {
                 c.first(&block_b).expect("first");
@@ -875,7 +877,7 @@ mod tests {
                 }
                 let bytes = b.finish().to_vec();
                 let block = Block::new(&bytes).expect("block");
-                let mut c = block.cursor();
+                let mut c = Cursor::new();
                 let mut at: Option<usize> = None;
                 for (step, m) in walk.chars().enumerate() {
                     match m {
@@ -932,7 +934,7 @@ mod tests {
         let block = Block::new(&bytes).expect("block");
         assert_eq!(forwards(&block), versions, "newest first");
 
-        let mut c = block.cursor();
+        let mut c = Cursor::new();
         c.seek_ge(&block, &crate::key::search_key(b"k"))
             .expect("seek");
         assert_eq!(
