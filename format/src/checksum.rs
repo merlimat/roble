@@ -21,6 +21,8 @@
 //! either the trailing type byte or the cooking produces a checksum that is
 //! wrong for every block, which is at least a loud failure.
 
+use crc_fast::CrcAlgorithm::Crc32Iscsi;
+
 use crate::error::{Error, Result};
 
 /// The checksum over a block, from the first byte of the footer.
@@ -63,7 +65,7 @@ impl ChecksumType {
     /// Record framing checksums a byte range directly, with no trailing block
     /// type, so it needs the raw form rather than [`ChecksumType::compute`].
     pub fn compute_raw(self, data: &[u8]) -> u32 {
-        let c = crc32c::crc32c_append(0, data);
+        let c = crc_fast::checksum(Crc32Iscsi, data) as u32;
         c.rotate_right(15).wrapping_add(0xa282_ead8)
     }
 
@@ -71,8 +73,10 @@ impl ChecksumType {
     pub fn compute(self, data: &[u8], block_type: u8) -> Result<u32> {
         match self {
             ChecksumType::Crc32c => {
-                let c = crc32c::crc32c_append(0, data);
-                let c = crc32c::crc32c_append(c, &[block_type]);
+                let mut d = crc_fast::Digest::new(Crc32Iscsi);
+                d.update(data);
+                d.update(&[block_type]);
+                let c = d.finalize() as u32;
                 // internal/crc: Value() = (c>>15 | c<<17) + 0xa282ead8, which
                 // is a rotation, since 15 + 17 == 32.
                 Ok(c.rotate_right(15).wrapping_add(0xa282_ead8))

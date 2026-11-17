@@ -6,9 +6,11 @@ license.workspace = true
 description = "Encodes and decodes Pebble's on-disk formats. No I/O, no async, no engine."
 
 [dependencies]
-# crc32c for the block checksum Pebble writes by default (sstable/block: the
-# Castagnoli CRC, rotated and offset — see checksum.rs).
-crc32c = "0.6.8"
+# CRC-32C for the block checksum Pebble writes by default (sstable/block: the
+# Castagnoli CRC, rotated and offset — see checksum.rs). crc-fast folds with
+# carry-less multiply on top of the CRC instructions: 2-4x the crc32c crate at
+# block and WAL chunk sizes. Default features add a C FFI and a panic handler.
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
 ruzstd = "0.9"
 # Snappy for L1+ blocks, which is what Oxia configures (DESIGN.md §3).
 snap = "1.1.1"
