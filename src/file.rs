@@ -62,6 +62,20 @@ fn copy_instead(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// What a directory entry's metadata came back as, or `None` if the entry
+/// was deleted between reading the directory and asking.
+///
+/// A reader beside a writer meets that whenever the writer retires a file
+/// while the reader lists the directory (DESIGN.md §6, "Reading beside a
+/// writer"). The file is not in the directory any more, so the answer is to
+/// leave it out of the listing, not to fail it. Any other error is one.
+fn unless_gone<T>(meta: io::Result<T>) -> io::Result<Option<T>> {
+    match meta {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        meta => meta.map(Some),
+    }
+}
+
 /// Databases in the file system, on the current compio runtime.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultEnv;
@@ -130,17 +144,13 @@ impl Fs for FileFs {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            // Deleted since the directory was read: by a writer, if this is a
-            // reader beside one. It is not in the directory any more.
-            let meta = match entry.metadata() {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                meta => meta?,
-            };
-            out.push(DirEntry {
-                name: PathBuf::from(entry.file_name()),
-                size: if meta.is_dir() { 0 } else { meta.len() },
-                is_dir: meta.is_dir(),
-            });
+            if let Some(meta) = unless_gone(entry.metadata())? {
+                out.push(DirEntry {
+                    name: PathBuf::from(entry.file_name()),
+                    size: if meta.is_dir() { 0 } else { meta.len() },
+                    is_dir: meta.is_dir(),
+                });
+            }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
@@ -160,17 +170,11 @@ impl Fs for FileFs {
         while let Some(d) = stack.pop() {
             for entry in std::fs::read_dir(&d)? {
                 let entry = entry?;
-                // A file deleted between the listing and here is one a
-                // writer retired, which a reader beside it will see: it no
-                // longer takes any space.
-                let meta = match entry.metadata() {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                    meta => meta?,
-                };
-                if meta.is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    used_bytes += meta.len();
+                // One deleted since the listing takes no space any more.
+                match unless_gone(entry.metadata())? {
+                    Some(meta) if meta.is_dir() => stack.push(entry.path()),
+                    Some(meta) => used_bytes += meta.len(),
+                    None => {}
                 }
             }
         }
@@ -312,6 +316,18 @@ async fn sync_dir(_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The branch a listing takes when a writer deletes a file between the
+    /// directory read and the stat, which no test can time on a real file
+    /// system, so it is checked against the error kinds themselves.
+    #[test]
+    fn an_entry_deleted_mid_listing_is_left_out_and_nothing_else_is() {
+        let gone = io::Error::from(io::ErrorKind::NotFound);
+        assert!(matches!(unless_gone::<u64>(Err(gone)), Ok(None)));
+        let refused = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(unless_gone::<u64>(Err(refused)).is_err());
+        assert!(matches!(unless_gone(Ok(7u64)), Ok(Some(7))));
+    }
 
     #[test]
     fn a_failed_link_copies_only_where_no_link_was_possible() {

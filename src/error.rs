@@ -123,6 +123,16 @@ mod tests {
             Error::Unsupported("range keys".to_string()).to_string(),
             "unsupported: range keys"
         );
+        // "stale:" means try again, which a reader beside a writer should,
+        // and is not damage.
+        assert_eq!(
+            Error::Stale("000004.sst is gone".to_string()).to_string(),
+            "stale: 000004.sst is gone"
+        );
+        assert_eq!(
+            Error::ReadOnly.to_string(),
+            "the database was opened read-only"
+        );
     }
 
     /// The three that carry their own wording, unprefixed.
