@@ -38,6 +38,7 @@ const META_FULL_FILTER_PREFIX: &[u8] = b"fullfilter.";
 
 /// The blocks the metaindex points at.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Metaindex {
     /// The properties block, which every table has.
     pub properties: Option<BlockHandle>,
