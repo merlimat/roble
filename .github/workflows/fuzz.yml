@@ -1,0 +1,129 @@
+# Copyright 2026 Matteo Merli <matteo.merli@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Fuzz
+
+# The format fuzzing of DESIGN.md §12 (format/fuzz/README.md).
+#
+# A pull request that touches the format crate gets a minute per target: long
+# enough to catch a decoder that now panics on something the corpus already
+# holds, short enough not to hold the review up. The nightly run is where new
+# ground is found, ten minutes per target, and the corpus it grows is cached
+# so that every later run, a pull request's included, starts from it rather
+# than from the golden seeds.
+on:
+  pull_request:
+    paths:
+      - format/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/fuzz.yml
+  push:
+    branches: [main]
+    paths:
+      - format/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: How long to run each target, in seconds
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  SECONDS_PER_TARGET: >-
+    ${{ github.event_name == 'workflow_dispatch' && inputs.seconds
+     || github.event_name == 'schedule' && '600'
+     || '60' }}
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One target finding something says nothing about the others.
+      fail-fast: false
+      matrix:
+        target: [decode_records, decode_block, decode_table, roundtrip, block_cursor]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a static musl binary, and it builds for its
+      # own host unless told otherwise. Address Sanitizer cannot link against a
+      # static libc, so the target is the toolchain's host, named explicitly.
+      - name: Name the target triple
+        run: |
+          echo "FUZZ_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+      # Every target builds the same crate, so they share one build cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: format/fuzz
+          shared-key: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The corpus a previous run on main grew, if there is one. A pull
+      # request can restore main's cache but never saves its own.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: format/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Seed from the golden files
+        run: python3 format/fuzz/seed.py
+
+      - name: Fuzz for ${{ env.SECONDS_PER_TARGET }} seconds
+        working-directory: format
+        run: >-
+          cargo fuzz run --target "$FUZZ_TRIPLE" ${{ matrix.target }} --
+          -max_total_time=${{ env.SECONDS_PER_TARGET }}
+          -malloc_limit_mb=256
+
+      # The input that failed, and `cargo fuzz run <target> <file>` replays
+      # it (format/fuzz/README.md).
+      - name: Upload the failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: format/fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+      # Shrunk to the inputs that still add coverage before it is kept, or
+      # the corpus would only ever grow.
+      - name: Minimise the corpus
+        if: success() && github.event_name != 'pull_request'
+        working-directory: format
+        run: cargo fuzz cmin --target "$FUZZ_TRIPLE" ${{ matrix.target }}
+      - name: Save the corpus
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/cache/save@v4
+        with:
+          path: format/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}

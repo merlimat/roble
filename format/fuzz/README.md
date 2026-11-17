@@ -33,6 +33,11 @@ cd format
 cargo +nightly fuzz run decode_table -- -max_total_time=300 -malloc_limit_mb=256
 ```
 
+CI (`.github/workflows/fuzz.yml`) runs every target for a minute on a pull
+request that touches the format crate, and for ten minutes nightly. It keeps
+the corpus main's runs grow in the Actions cache, and uploads a failing input
+as an artifact of the run.
+
 `-malloc_limit_mb` is what turns "a length read from the file sized an
 allocation" into a crash rather than a slow run. A crash leaves its input in
 `format/fuzz/artifacts/<target>/`; `cargo +nightly fuzz run <target> <file>`
