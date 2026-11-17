@@ -453,6 +453,70 @@ async fn a_task_waits_for_a_merge_already_running_rather_than_standing_down() {
     );
 }
 
+/// Whether a caller waiting for no compaction to be underway would be told
+/// now.
+fn settled_now<F: Fs>(db: &roble::Db<F>) -> bool {
+    let mut cx = Context::from_waker(Waker::noop());
+    pin!(db.compaction_settled())
+        .as_mut()
+        .poll(&mut cx)
+        .is_ready()
+}
+
+#[compio::test]
+async fn a_caller_waits_out_a_merge_already_running_and_no_longer() {
+    // What a caller waits on for the store's own merge task to drain the
+    // picker, rather than polling it (the bench's settle). It waits while a
+    // merge is underway and ends once none is, whether or not the picker has
+    // more: unlike `compaction_wanted`, it must not wait for work, because
+    // after the last merge there is none.
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .background_tasks(false)
+            .disable_automatic_compactions(true)
+            .compaction_unit(1),
+    )
+    .await
+    .expect("open");
+    assert!(
+        db.pick().is_some(),
+        "the fixture arrives wanting a compaction"
+    );
+    assert!(
+        settled_now(&db),
+        "nobody is merging, so there is nothing to wait out, work or no work"
+    );
+
+    // One compaction, driven by hand as far as its first suspension, which
+    // is past the point where it claims what it is reading.
+    let mut cx = Context::from_waker(Waker::noop());
+    env.sim().pause_at(1);
+    let mut running = pin!(db.compact_once());
+    assert!(
+        running.as_mut().poll(&mut cx).is_pending(),
+        "the compaction should have suspended with its tables claimed"
+    );
+    assert!(!settled_now(&db), "a merge is underway, so this waits");
+
+    let mut polls = 0;
+    let merged = loop {
+        if let Poll::Ready(result) = running.as_mut().poll(&mut cx) {
+            break result.expect("the compaction");
+        }
+        polls += 1;
+        assert!(polls < 100_000, "the compaction is not making progress");
+    };
+    assert!(!merged.is_empty(), "it should have written something");
+    assert!(settled_now(&db), "and once it has landed, the wait is over");
+    assert!(
+        db.pick().is_none(),
+        "with the picker satisfied too, which is where a settle loop stops"
+    );
+}
+
 /// Whether a task waiting to be told there is a memtable to write out would
 /// be told now (§5).
 fn flush_wanted_now<F: Fs>(db: &roble::Db<F>) -> bool {

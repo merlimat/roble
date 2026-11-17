@@ -740,7 +740,10 @@ async fn a_chunked_compaction_output_reads_back_whole() {
             .target_file_size(2 << 20)
             // Larger than the job, so the write does not flush part way
             // through and leave two L0 tables.
-            .memtable_size(64 << 20),
+            .memtable_size(64 << 20)
+            // Values of one repeated byte, which compressed would fit the
+            // whole job in a single chunk.
+            .compression(roble::Codec::None),
     )
     .await
     .expect("create");
@@ -798,10 +801,22 @@ async fn a_chunked_compaction_output_reads_back_whole() {
 }
 
 /// Opens with a target file size small enough that a test can cross it.
+///
+/// Uncompressed, because these targets are smaller than a block: the split
+/// counts the open block as built, so a compressed table would close at the
+/// target and then shrink by whatever its one block compressed by.
+/// `a_compressed_output_is_split_at_its_stored_size` is the compressed case,
+/// at a target a block is small beside.
 async fn open_splitting(env: &SimEnv, dir: &Path, target: u64) -> roble::Db<SimFs> {
-    roble::open_with(env, dir, roble::Options::new().target_file_size(target))
-        .await
-        .expect("open")
+    roble::open_with(
+        env,
+        dir,
+        roble::Options::new()
+            .target_file_size(target)
+            .compression(roble::Codec::None),
+    )
+    .await
+    .expect("open")
 }
 
 #[compio::test]
@@ -1483,6 +1498,177 @@ async fn a_merge_of_interleaved_and_repeated_keys_answers_what_a_btreemap_would(
             "L1 tables {} and {} share a bound that is not an exclusive sentinel",
             lhs.file_num,
             rhs.file_num
+        );
+    }
+}
+
+/// Every codec, end to end: a flush writes L0 uncompressed whatever the
+/// option says, a compaction writes L1 with the codec, and the store answers
+/// the same from the compressed table — forwards, backwards, by key, and
+/// again after a reopen, when every block is a miss and has to be
+/// decompressed rather than found in the cache.
+#[compio::test]
+async fn a_compaction_writes_the_codec_it_was_given_and_reads_it_back() {
+    use roble::{Access, Codec};
+    use roble_format::block::Compression;
+    use roble_format::sst::Table;
+
+    for (codec, stored) in [
+        (Codec::None, Compression::None),
+        (Codec::Snappy, Compression::Snappy),
+        (Codec::Zstd(Codec::ZSTD_DEFAULT_LEVEL), Compression::Zstd),
+    ] {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        env.sim().mkdir_all(&dir).await.expect("mkdir");
+        let options = || {
+            Options::new()
+                .create_if_missing(true)
+                .disable_automatic_compactions(true)
+                .compression(codec)
+        };
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+
+        // Serialized records, as Oxia's values are, so a block compresses
+        // well past the 12% Pebble requires before it keeps the result.
+        let mut model = Model::new();
+        let mut batch = Batch::new();
+        for i in 0..3000u32 {
+            let key = format!("/oxia/default/shard-0001/users/{i:08}").into_bytes();
+            let value =
+                format!(r#"{{"user":{i},"name":"user-{i}","status":"active"}}"#).into_bytes();
+            batch.put(&key, &value).expect("put");
+            model.insert(key, value);
+        }
+        let l0 = flush_batch(&db, &mut batch).await;
+        let l1 = one_output(db.compact(0, &[l0]).await.expect("compact"));
+
+        let read = async |file_num: u64| {
+            let disk = env
+                .sim()
+                .open(
+                    &dir.join(roble_format::files::table_filename(file_num)),
+                    Access::ReadOnly,
+                )
+                .await
+                .expect("open table");
+            roble::__private::read_all(&disk, ()).await.expect("read")
+        };
+        let kinds = |bytes: &[u8]| -> Vec<Compression> {
+            let table = Table::open(bytes).expect("table");
+            let n = table.data_block_handles().expect("index").len();
+            assert!(n > 4, "{n} blocks in {} bytes", bytes.len());
+            table
+                .data_block_handles()
+                .expect("index")
+                .into_iter()
+                .map(|h| table.block_compression(h).expect("trailer"))
+                .collect()
+        };
+        assert!(
+            kinds(&read(l1).await).iter().all(|&c| c == stored),
+            "{codec:?}: L1 holds {stored:?} blocks"
+        );
+        assert_eq!(contents(&db).await, model, "{codec:?}");
+        drop(db);
+
+        // The L0 table is gone by now, so check the rule on a fresh flush:
+        // whatever the codec, L0 is written uncompressed.
+        let db = roble::open_with(&env, &dir, options())
+            .await
+            .expect("reopen");
+        let mut more = Batch::new();
+        for i in 0..3000u32 {
+            let key = format!("/oxia/default/shard-0002/users/{i:08}").into_bytes();
+            let value = format!(r#"{{"user":{i},"status":"active"}}"#).into_bytes();
+            more.put(&key, &value).expect("put");
+            model.insert(key, value);
+        }
+        let fresh = flush_batch(&db, &mut more).await;
+        assert!(
+            kinds(&read(fresh).await)
+                .iter()
+                .all(|&c| c == Compression::None),
+            "{codec:?}: L0 is written uncompressed"
+        );
+
+        // Cold reads of the compressed table: by key, then backwards.
+        for i in [0u32, 1, 1499, 2999] {
+            let key = format!("/oxia/default/shard-0001/users/{i:08}").into_bytes();
+            let found = db
+                .get(&key, Comparison::Equal)
+                .await
+                .expect("get")
+                .expect("present");
+            assert_eq!(found.value, model[&key], "{codec:?} {i}");
+        }
+        let mut scan = db.range(..).expect("scan");
+        scan.last().await.expect("last");
+        let mut backwards = Vec::new();
+        while scan.is_valid() {
+            backwards.push(scan.key().to_vec());
+            scan.prev().await.expect("prev");
+        }
+        backwards.reverse();
+        assert_eq!(
+            backwards,
+            model.keys().cloned().collect::<Vec<_>>(),
+            "{codec:?}"
+        );
+    }
+}
+
+/// A compressed output is split at the size it takes on disk, not at the
+/// bytes of keys and values that went into it. Counting those instead closed
+/// every table at a fraction of its target once its blocks compressed, which
+/// for the same data means several times as many tables.
+#[compio::test]
+async fn a_compressed_output_is_split_at_its_stored_size() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    env.sim().mkdir_all(&dir).await.expect("mkdir");
+    // L1's target is twice this, 128 KiB: eight blocks, so one block of
+    // estimate is small beside it.
+    const TARGET: u64 = 128 << 10;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .memtable_size(64 << 20)
+            .target_file_size(TARGET / 2)
+            .compression(roble::Codec::Snappy),
+    )
+    .await
+    .expect("open");
+
+    let mut batch = Batch::new();
+    let mut raw = 0u64;
+    for i in 0..40_000u32 {
+        let key = format!("/oxia/default/shard-0001/users/{i:08}");
+        let value = format!(r#"{{"user":{i},"name":"user-{i}","status":"active"}}"#);
+        raw += (key.len() + value.len()) as u64;
+        batch.put(key.as_bytes(), value.as_bytes()).expect("put");
+    }
+    let a = flush_batch(&db, &mut batch).await;
+    let before = contents(&db).await;
+    let outputs = db.compact(0, &[a]).await.expect("compact");
+    assert_eq!(contents(&db).await, before);
+
+    let in_l1: Vec<roble::Table> = db.versions().version.level(1).to_vec();
+    let stored: u64 = in_l1.iter().map(|t| t.size).sum();
+    assert!(
+        stored * 2 < raw,
+        "the values should compress: {stored} bytes stored from {raw}"
+    );
+    assert!(outputs.len() > 2, "several outputs, got {outputs:?}");
+    for t in &in_l1[..in_l1.len() - 1] {
+        assert!(
+            t.size >= TARGET - roble_format::sst::DEFAULT_BLOCK_SIZE as u64,
+            "table {} is {} bytes against a {TARGET} target",
+            t.file_num,
+            t.size
         );
     }
 }

@@ -15,8 +15,11 @@
 //! The table writer (`sstable/rowblk_writer.go`).
 //!
 //! roble writes the narrowest table Go Pebble accepts (DESIGN.md §3):
-//! Pebblev4, row blocks, uncompressed, crc32c, a single-level index, values in
-//! place, and the obsolete bit never set. No value blocks, no range keys, no
+//! Pebblev4, row blocks, crc32c, a single-level index, values in place, and
+//! the obsolete bit never set. Blocks are uncompressed unless
+//! [`WriterOptions::compression`] says otherwise, and then it is the data and
+//! index blocks that are, as in Pebble's `layoutWriter`: the filter,
+//! range-deletion, properties and metaindex blocks are always stored as built. No value blocks, no range keys, no
 //! two-level index — all of which it *reads*, and none of which it needs to
 //! produce.
 //!
@@ -40,7 +43,8 @@
 use std::collections::BTreeMap;
 
 use crate::block::{
-    BlockBuilder, BlockHandle, DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL, max_shared_len,
+    BlockBuilder, BlockHandle, Codec, Compressor, DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL,
+    max_shared_len,
 };
 use crate::checksum::ChecksumType;
 use crate::error::{Error, Result};
@@ -69,6 +73,9 @@ pub struct WriterOptions {
     /// throws away the point-lookup filtering Oxia configures, so the default
     /// matches Oxia's `bloom.FilterPolicy(10)` (DESIGN.md §1).
     pub filter_bits_per_key: Option<usize>,
+    /// What data and index blocks are compressed with. A block compression
+    /// does not shrink by 12% is stored uncompressed anyway, as Pebble does.
+    pub compression: Codec,
 }
 
 impl Default for WriterOptions {
@@ -77,6 +84,7 @@ impl Default for WriterOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             format: TableFormat::Pebblev4,
             filter_bits_per_key: Some(filter::DEFAULT_BITS_PER_KEY),
+            compression: Codec::None,
         }
     }
 }
@@ -114,6 +122,7 @@ pub struct TableWriter {
     data_size: u64,
     range_del: rangedel::Builder,
     filter: Option<FilterBuilder>,
+    compressor: Compressor,
 }
 
 impl TableWriter {
@@ -142,6 +151,7 @@ impl TableWriter {
             data_size: 0,
             range_del: rangedel::Builder::new(),
             filter: opts.filter_bits_per_key.map(FilterBuilder::new),
+            compressor: Compressor::new(opts.compression)?,
         })
     }
 
@@ -250,7 +260,7 @@ impl TableWriter {
         }
         let block = self.data.finish().to_vec();
         self.data.reset();
-        let handle = self.write_block(&block)?;
+        let handle = self.write_block(&block, true)?;
         self.data_size += handle.length;
         self.num_data_blocks += 1;
 
@@ -264,6 +274,19 @@ impl TableWriter {
         self.index
             .add(&sep, &encoded_handle, max_shared, None, false);
         Ok(())
+    }
+
+    /// About how large the table would be if finished now: every block
+    /// written so far as stored, compressed or not, plus the open data block
+    /// and the index as built (`RawRowWriter.EstimatedSize`).
+    ///
+    /// What a caller splitting its output at a target size should compare
+    /// against. Counting the keys and values that went in instead overshoots
+    /// by whatever compression saved, so a table of compressible values
+    /// would end at a fraction of its target.
+    pub fn estimated_size(&self) -> u64 {
+        self.taken
+            + (self.buf.len() + self.data.estimated_size() + self.index.estimated_size()) as u64
     }
 
     /// How many finished bytes are waiting to be taken.
@@ -309,20 +332,28 @@ impl TableWriter {
     }
 
     /// Appends a block and its trailer, returning its handle.
-    fn write_block(&mut self, block: &[u8]) -> Result<BlockHandle> {
+    ///
+    /// `compress` is for the data and index blocks, the ones Pebble's
+    /// `layoutWriter.writeBlock` compresses; the rest go through its
+    /// `writeBlockUncompressed`. The handle and the checksum cover the bytes
+    /// as stored, compressed or not.
+    fn write_block(&mut self, block: &[u8], compress: bool) -> Result<BlockHandle> {
         // The offset in the file, which is what a handle means: the bytes
         // already taken, then the ones still here.
         let offset = self.taken + self.buf.len() as u64;
-        // Uncompressed is roble's default and keeps a cached block the bytes
-        // that came off the disk (DESIGN.md §8).
-        let block_type = 0u8;
-        let checksum = ChecksumType::Crc32c.compute(block, block_type);
-        self.buf.extend_from_slice(block);
+        let (algorithm, stored) = if compress {
+            self.compressor.compress(block)?
+        } else {
+            (crate::block::Compression::None, block)
+        };
+        let block_type = algorithm.to_byte();
+        let checksum = ChecksumType::Crc32c.compute(stored, block_type);
+        self.buf.extend_from_slice(stored);
         self.buf.push(block_type);
         self.buf.extend_from_slice(&checksum.to_le_bytes());
         Ok(BlockHandle {
             offset,
-            length: block.len() as u64,
+            length: stored.len() as u64,
         })
     }
 
@@ -338,21 +369,23 @@ impl TableWriter {
         self.flush_data_block()?;
 
         let index_block = self.index.finish().to_vec();
-        let index_handle = self.write_block(&index_block)?;
+        let index_handle = self.write_block(&index_block, true)?;
 
-        // Pebble writes this block uncompressed, always; roble writes every
-        // block uncompressed, so nothing special is needed beyond saying so.
+        // Pebble writes this block uncompressed, always, and so do the
+        // filter, properties and metaindex below (`WriteRangeDeletionBlock`,
+        // `WriteFilterBlock`, `WritePropertiesBlock` below Pebblev7, and
+        // `Finish`).
         let range_del_handle = if self.range_del.is_empty() {
             None
         } else {
             let block = self.range_del.finish();
-            Some(self.write_block(&block)?)
+            Some(self.write_block(&block, false)?)
         };
 
         let filter_handle = match self.filter.as_ref() {
             Some(f) if !f.is_empty() => {
                 let block = f.finish();
-                Some(self.write_block(&block)?)
+                Some(self.write_block(&block, false)?)
             }
             _ => None,
         };
@@ -366,7 +399,7 @@ impl TableWriter {
             prev = name.clone();
         }
         let props_block = props_builder.finish().to_vec();
-        let props_handle = self.write_block(&props_block)?;
+        let props_handle = self.write_block(&props_block, false)?;
 
         // The metaindex is a row block, so its names must be added in order:
         // "rocksdb.properties" sorts before "rocksdb.range_del2".
@@ -386,7 +419,7 @@ impl TableWriter {
             metaindex.add(name, &encoded_handle, 0, None, false);
         }
         let metaindex_block = metaindex.finish().to_vec();
-        let metaindex_handle = self.write_block(&metaindex_block)?;
+        let metaindex_handle = self.write_block(&metaindex_block, false)?;
 
         self.write_footer(metaindex_handle, index_handle);
         Ok(self.buf)
@@ -419,7 +452,7 @@ impl TableWriter {
         };
         put_str("rocksdb.comparator", BYTEWISE_COMPARER);
         put_str("rocksdb.merge.operator", CONCATENATE_MERGER);
-        put_str("rocksdb.compression", "NoCompression");
+        put_str("rocksdb.compression", self.opts.compression.property_name());
         if filter_handle.is_some() {
             put_str("rocksdb.filter.policy", filter::POLICY_NAME);
         }
