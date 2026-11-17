@@ -30,7 +30,7 @@ use crate::cache::Caches;
 use crate::env::Fs;
 
 /// How a store is opened.
-pub struct Options<F: Fs> {
+pub struct Options<F: Fs = crate::FileFs> {
     /// The caches it draws on, shared with every other store on the thread
     /// that was given the same handle (§8).
     pub(crate) caches: Caches<F>,

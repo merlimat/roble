@@ -208,7 +208,7 @@ pub struct Roble {
     /// Shared with the two tasks `open` spawns beside it, which is what
     /// takes a flush and a merge off the write that would otherwise pay for
     /// them (§9, `roble::Db::flush_wanted`).
-    db: std::rc::Rc<roble::Db<roble::FileFs>>,
+    db: std::rc::Rc<roble::Db>,
     /// The working space `get` hands back on every call. One per store,
     /// as Oxia holds one store per shard and reads them from one thread.
     ///

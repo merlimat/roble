@@ -66,7 +66,7 @@ use crate::version::Version;
 /// Made by [`Db::snapshot`]. Scans over it see what it saw, whatever the
 /// store does meanwhile, and [`Snapshot::get`] answers about any key at
 /// all rather than only the ones a scan's bounds take in.
-pub struct Snapshot<F: Fs> {
+pub struct Snapshot<F: Fs = crate::FileFs> {
     /// The version as it was, which says which tables there were and where.
     ///
     /// Holding it is what keeps the sweep off those tables, however many

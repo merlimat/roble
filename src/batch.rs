@@ -61,7 +61,7 @@ use crate::scan::Scan;
 /// Built by [`Db::batch`], read with [`IndexedBatch::get`] and
 /// [`IndexedBatch::range`], and applied to the store by
 /// [`IndexedBatch::commit`].
-pub struct IndexedBatch<'a, F: Fs> {
+pub struct IndexedBatch<'a, F: Fs = crate::FileFs> {
     db: &'a Db<F>,
     repr: Batch,
     index: Rc<RefCell<Memtable>>,
