@@ -32,6 +32,13 @@ use roble_format::files::{self, FileType};
 
 /// A filesystem a reader may read and nothing more.
 ///
+/// The writer in these tests opens through it too, with `reader` off, so
+/// that one instantiation of the engine's generic code runs both the
+/// writer's paths and the reader's. The coverage gate counts the best
+/// instantiation of each function rather than their union (DESIGN.md §12),
+/// so a reader on a type of its own would leave every line only it runs
+/// counted as missed.
+///
 /// It can also play the writer's part at the moment a reader opens a file: a
 /// name in `gone` is removed just before the reader opens it, and `grow`
 /// appends to one file just before the reader opens another. Those are the
@@ -39,6 +46,8 @@ use roble_format::files::{self, FileType};
 #[derive(Clone)]
 struct ReaderFs {
     sim: SimFs,
+    /// Whether to refuse every change; off for the writer.
+    reader: bool,
     gone: Rc<RefCell<Vec<PathBuf>>>,
     grow: Rc<RefCell<Option<(PathBuf, PathBuf)>>>,
 }
@@ -47,9 +56,23 @@ impl ReaderFs {
     fn new(sim: &SimFs) -> Self {
         ReaderFs {
             sim: sim.clone(),
+            reader: true,
             gone: Default::default(),
             grow: Default::default(),
         }
+    }
+
+    /// The same filesystem, for the writer.
+    fn writing(sim: &SimFs) -> Self {
+        ReaderFs {
+            reader: false,
+            ..ReaderFs::new(sim)
+        }
+    }
+
+    /// Fails the test if a reader is about to change the directory.
+    fn refuse(&self, what: &str, path: &Path) {
+        assert!(!self.reader, "a reader {what} {}", path.display());
     }
 }
 
@@ -58,15 +81,14 @@ impl Fs for ReaderFs {
     type Lock = SimLock;
 
     async fn create(&self, path: &Path) -> roble::Result<SimDisk> {
-        panic!("a reader created {}", path.display())
+        self.refuse("created", path);
+        self.sim.create(path).await
     }
 
     async fn open(&self, path: &Path, access: Access) -> roble::Result<SimDisk> {
-        assert!(
-            matches!(access, Access::ReadOnly),
-            "a reader opened {} to write",
-            path.display()
-        );
+        if matches!(access, Access::ReadWrite) {
+            self.refuse("opened to write", path);
+        }
         if self.gone.borrow().iter().any(|p| p == path) {
             let _ = self.sim.remove(path).await;
         }
@@ -83,15 +105,18 @@ impl Fs for ReaderFs {
     }
 
     async fn remove(&self, path: &Path) -> roble::Result<()> {
-        panic!("a reader removed {}", path.display())
+        self.refuse("removed", path);
+        self.sim.remove(path).await
     }
 
-    async fn rename(&self, from: &Path, _to: &Path) -> roble::Result<()> {
-        panic!("a reader renamed {}", from.display())
+    async fn rename(&self, from: &Path, to: &Path) -> roble::Result<()> {
+        self.refuse("renamed", from);
+        self.sim.rename(from, to).await
     }
 
-    async fn link(&self, from: &Path, _to: &Path) -> roble::Result<()> {
-        panic!("a reader linked {}", from.display())
+    async fn link(&self, from: &Path, to: &Path) -> roble::Result<()> {
+        self.refuse("linked", from);
+        self.sim.link(from, to).await
     }
 
     async fn list(&self, dir: &Path) -> roble::Result<Vec<DirEntry>> {
@@ -99,11 +124,13 @@ impl Fs for ReaderFs {
     }
 
     async fn mkdir_all(&self, dir: &Path) -> roble::Result<()> {
-        panic!("a reader made {}", dir.display())
+        self.refuse("made", dir);
+        self.sim.mkdir_all(dir).await
     }
 
     async fn sync_dir(&self, dir: &Path) -> roble::Result<()> {
-        panic!("a reader synced {}", dir.display())
+        self.refuse("synced", dir);
+        self.sim.sync_dir(dir).await
     }
 
     async fn disk_usage(&self, dir: &Path) -> roble::Result<DiskUsage> {
@@ -111,7 +138,8 @@ impl Fs for ReaderFs {
     }
 
     async fn lock(&self, path: &Path) -> roble::Result<SimLock> {
-        panic!("a reader locked {}", path.display())
+        self.refuse("locked", path);
+        self.sim.lock(path).await
     }
 }
 
@@ -133,20 +161,25 @@ fn dir() -> PathBuf {
     PathBuf::from("/db")
 }
 
-async fn writer(env: &SimEnv) -> roble::Opened<SimFs> {
+async fn writer(env: &SimEnv) -> roble::Opened<ReaderFs> {
     let options = Options::default()
         .create_if_missing(true)
         .disable_automatic_compactions(true);
-    roble::open_with(env, &dir(), options)
+    roble::open_with(&ReaderEnv(ReaderFs::writing(env.sim())), &dir(), options)
         .await
         .expect("open the writer")
+}
+
+/// What the writer's own open makes of the directory, without creating one.
+async fn reopen(env: &SimEnv) -> roble::Result<roble::Opened<ReaderFs>> {
+    roble::open(&ReaderEnv(ReaderFs::writing(env.sim())), &dir()).await
 }
 
 async fn reader(env: &ReaderEnv) -> roble::Result<roble::Opened<ReaderFs>> {
     roble::open_read_only(env, &dir(), Options::default()).await
 }
 
-async fn put(db: &roble::Opened<SimFs>, key: &[u8], value: &[u8]) {
+async fn put(db: &roble::Opened<ReaderFs>, key: &[u8], value: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
     db.write(&mut batch, true).await.expect("write");
@@ -359,10 +392,7 @@ async fn a_torn_earlier_log_is_corrupt_to_the_writer_and_stale_to_a_reader() {
 
     let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
     assert!(matches!(reader(&env).await, Err(Error::Stale(_))));
-    assert!(matches!(
-        roble::open(&sim_env, &dir()).await,
-        Err(Error::Corrupt(_))
-    ));
+    assert!(matches!(reopen(&sim_env).await, Err(Error::Corrupt(_))));
 }
 
 /// A reader opens a directory whose lock the writer holds, and leaves the
@@ -401,10 +431,7 @@ async fn a_torn_manifest_is_corrupt_to_the_writer_and_stale_to_a_reader() {
 
     let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
     assert!(matches!(reader(&env).await, Err(Error::Stale(_))));
-    assert!(matches!(
-        roble::open(&sim_env, &dir()).await,
-        Err(Error::Corrupt(_))
-    ));
+    assert!(matches!(reopen(&sim_env).await, Err(Error::Corrupt(_))));
 }
 
 /// A reader does not check the version's tables against its listing, which a
@@ -427,8 +454,5 @@ async fn a_missing_table_is_stale_when_a_read_reaches_it() {
     assert_eq!(get(&ro, b"b").await.expect("get"), Some(b"2".to_vec()));
     assert!(matches!(get(&ro, b"a").await, Err(Error::Stale(_))));
     // The writer refuses the same directory at once.
-    assert!(matches!(
-        roble::open(&sim_env, &dir()).await,
-        Err(Error::Corrupt(_))
-    ));
+    assert!(matches!(reopen(&sim_env).await, Err(Error::Corrupt(_))));
 }

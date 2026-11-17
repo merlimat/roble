@@ -144,13 +144,11 @@ impl Fs for FileFs {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if let Some(meta) = unless_gone(entry.metadata())? {
-                out.push(DirEntry {
-                    name: PathBuf::from(entry.file_name()),
-                    size: if meta.is_dir() { 0 } else { meta.len() },
-                    is_dir: meta.is_dir(),
-                });
-            }
+            out.extend(unless_gone(entry.metadata())?.map(|meta| DirEntry {
+                name: PathBuf::from(entry.file_name()),
+                size: if meta.is_dir() { 0 } else { meta.len() },
+                is_dir: meta.is_dir(),
+            }));
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
@@ -171,10 +169,11 @@ impl Fs for FileFs {
             for entry in std::fs::read_dir(&d)? {
                 let entry = entry?;
                 // One deleted since the listing takes no space any more.
-                match unless_gone(entry.metadata())? {
-                    Some(meta) if meta.is_dir() => stack.push(entry.path()),
-                    Some(meta) => used_bytes += meta.len(),
-                    None => {}
+                let meta = unless_gone(entry.metadata())?;
+                if meta.as_ref().is_some_and(|m| m.is_dir()) {
+                    stack.push(entry.path());
+                } else {
+                    used_bytes += meta.map_or(0, |m| m.len());
                 }
             }
         }
