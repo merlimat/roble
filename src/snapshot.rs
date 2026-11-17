@@ -44,6 +44,7 @@
 //! the word "prefix" where the encoding is.
 
 use std::cell::RefCell;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::ops::RangeBounds;
 use std::rc::Rc;
 
@@ -55,6 +56,7 @@ use crate::error::Result;
 use crate::memtable::Memtable;
 use crate::metrics::Metrics;
 use crate::open::Db;
+use crate::read::{Comparison, Found};
 use crate::scan::{Opener, Scan, open_table};
 use crate::table::{covered_by_tombstone, is_deletion};
 use crate::version::Version;
@@ -62,7 +64,7 @@ use crate::version::Version;
 /// A read-only view of a store as it was when the snapshot was made.
 ///
 /// Made by [`Db::snapshot`]. Scans over it see what it saw, whatever the
-/// store does meanwhile, and [`Snapshot::lookup`] answers about any key at
+/// store does meanwhile, and [`Snapshot::get`] answers about any key at
 /// all rather than only the ones a scan's bounds take in.
 pub struct Snapshot<F: Fs> {
     /// The version as it was, which says which tables there were and where.
@@ -114,26 +116,59 @@ impl<F: Fs> Snapshot<F> {
         Ok(scan)
     }
 
-    /// The value of `key` as the snapshot saw it, wherever the key sorts, or
-    /// `None` if the snapshot held no live value for it.
+    /// Reads the key `how` says as the snapshot saw it, wherever the key
+    /// sorts, or `None` if there is none.
     ///
+    /// [`Db::get`] at the snapshot's instant. With [`Comparison::Equal`] it is
     /// Oxia's `Lookup`, which returns `ErrKeyNotFound` where this returns
-    /// `None`. It is a point lookup rather than a scan positioned once, so
-    /// that it costs what a point lookup costs: the bloom filters rule out
+    /// `None`. That one is a point lookup rather than a scan positioned once,
+    /// so that it costs what a point lookup costs: the bloom filters rule out
     /// the tables that cannot hold the key, and a scan consults no filter
     /// because a scan asks about a range (§6). Oxia reaches the same place
     /// from the other side, seeking a cloned iterator with `SeekPrefixGE` so
     /// that the filters are consulted after all.
-    pub async fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    ///
+    /// The other four make a scan bounded on the side the comparison decides
+    /// and take the first or last key in it, as the store's do. The store
+    /// keeps that scan in the caller's [`crate::GetBuf`] between reads; a
+    /// snapshot makes one per call.
+    pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
         let _timer = self.metrics.get.start();
-        let result = self.lookup_inner(key).await;
-        let value = self.metrics.read_errors.saw(result)?;
-        if let Some(value) = &value {
+        let result = self.get_inner(key, how).await;
+        let found = self.metrics.read_errors.saw(result)?;
+        if let Some(found) = &found {
             self.metrics
                 .read_bytes
-                .add((key.len() + value.len()) as u64);
+                .add((found.key.len() + found.value.len()) as u64);
         }
-        Ok(value)
+        Ok(found)
+    }
+
+    async fn get_inner(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
+        let mut scan = match how {
+            Comparison::Equal => {
+                let value = self.lookup_inner(key).await?;
+                return Ok(value.map(|value| Found {
+                    key: key.to_vec(),
+                    value,
+                }));
+            }
+            Comparison::Ceiling => self.range(key..)?,
+            Comparison::Higher => self.range((Excluded(key), Unbounded))?,
+            Comparison::Floor => self.range(..=key)?,
+            Comparison::Lower => self.range(..key)?,
+        };
+        match how {
+            Comparison::Ceiling | Comparison::Higher => scan.first().await?,
+            _ => scan.last().await?,
+        }
+        if !scan.is_valid() {
+            return Ok(None);
+        }
+        Ok(Some(Found {
+            key: scan.key().to_vec(),
+            value: scan.value().to_vec(),
+        }))
     }
 
     async fn lookup_inner(&self, user: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -255,7 +290,7 @@ impl<F: Fs> Snapshot<F> {
 impl<F: Fs> Db<F> {
     /// A read-only view of the store as it is now.
     ///
-    /// Holds the current version, which is what lets [`Snapshot::lookup`]
+    /// Holds the current version, which is what lets [`Snapshot::get`]
     /// reach a key wherever it sorts, and what stops the obsolete sweep
     /// collecting a file the snapshot still needs (`crate::obsolete::Pinned`).
     /// Opens nothing: the snapshot's lookups and scans open the tables they

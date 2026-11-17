@@ -93,9 +93,9 @@ hold different amounts: a scan holds the tables its bounds reach, and a
 snapshot holds every table of its version, so a snapshot nobody holds keeps a
 whole shard's files from being collected (§5, §6). There is no counter for
 snapshots *created*, because nothing asks for the rate — only for whether any
-are outstanding. A `lookup` on one is a point lookup like `get` with `Equal`:
-it counts in `roble.get.duration` and `roble.read.bytes` and in neither scan
-series.
+are outstanding. A `get` on one counts as the store's does: in
+`roble.get.duration` and `roble.read.bytes`, and, under any comparison but
+`Equal`, as one scan and one entry.
 
 ## Flushing and compacting
 

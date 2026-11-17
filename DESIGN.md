@@ -1699,7 +1699,7 @@ let snap = db.snapshot()?;             // one instant, every table held open
 let mut scan = snap.range(&b"/users/"[..]..&b"/users0"[..])?;
 scan.first().await?;
 while scan.is_valid() { /* scan.key(), scan.value() */ scan.next().await?; }
-let other = snap.lookup(b"/sessions/7").await?;   // a key outside those bounds
+let other = snap.get(b"/sessions/7", Comparison::Equal).await?;   // outside those bounds
 
 db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
 
@@ -1720,7 +1720,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | batch `Count`, `Size`, `Checksum` | `count`, `len`, `as_bytes` — the Pebble repr, so a checksum over it matches Go |
 | `Get` with `ComparisonType` | `get` with `Comparison` |
 | `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
-| `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `range` and `lookup` on it (§6) |
+| `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `range` and `get` on it (§6) |
 | `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
 | `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
 | `pebble.Open` of a shard's path, new or returning | `open_with` with `create_if_missing` (§6) |

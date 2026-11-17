@@ -446,7 +446,10 @@ async fn run(case: Case) {
                 for p in lookups.iter().take(8) {
                     let p = p.bytes();
                     assert_eq!(
-                        snap.lookup(&p).await.expect("lookup"),
+                        snap.get(&p, roble::Comparison::Equal)
+                            .await
+                            .expect("get")
+                            .map(|found| found.value),
                         seen.get(&p).cloned(),
                         "a snapshot's lookup of {p:?}"
                     );

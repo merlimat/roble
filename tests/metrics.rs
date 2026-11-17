@@ -306,6 +306,15 @@ async fn a_scan_counts_the_keys_it_steps_onto() {
     let after = collected(reader(), &tag);
     assert_eq!(after.get("roble.scans").copied(), Some(2));
     assert_eq!(after.get("roble.scan.entries").copied(), Some(walked + 1));
+
+    // And so is a snapshot's, while its `Equal` is a point lookup that counts
+    // in neither.
+    let snap = db.snapshot().expect("snapshot");
+    snap.get(b"a0", Comparison::Ceiling).await.expect("get");
+    snap.get(b"a0", Comparison::Equal).await.expect("get");
+    let after = collected(reader(), &tag);
+    assert_eq!(after.get("roble.scans").copied(), Some(3));
+    assert_eq!(after.get("roble.scan.entries").copied(), Some(walked + 2));
 }
 
 #[compio::test]

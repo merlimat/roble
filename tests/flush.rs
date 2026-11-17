@@ -374,7 +374,10 @@ async fn a_snapshot_between_two_versions_still_reads_the_older_after_a_flush() {
     db.flush().await.expect("flush").expect("a table");
 
     assert_eq!(
-        snap.lookup(b"/k").await.expect("lookup"),
+        snap.get(b"/k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"older".to_vec()),
         "the snapshot should read the version it was made with"
     );
