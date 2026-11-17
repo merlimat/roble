@@ -1,0 +1,33 @@
+[package]
+name = "roble-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+compio = "0.19.2"
+libfuzzer-sys = "0.4"
+# Metrics off: nothing here reads them, and it keeps opentelemetry out of
+# every fuzz build.
+roble = { path = "..", default-features = false }
+roble-format = { path = "../format" }
+
+# Its own workspace: `cargo fuzz` needs nightly and sanitizer flags that the
+# main workspace must never be built with.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "open_corrupt"
+path = "fuzz_targets/open_corrupt.rs"
+test = false
+doc = false
+bench = false
