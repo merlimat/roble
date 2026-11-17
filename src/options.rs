@@ -156,6 +156,10 @@ impl<F: Fs> Options<F> {
     ///
     /// A store with this set still *reports* that it has fallen behind, in
     /// `roble.compaction.debt`. It simply does nothing about it.
+    ///
+    /// Not part of the API: the only way left to compact is `compact_once`,
+    /// which is not part of it either.
+    #[doc(hidden)]
     pub fn disable_automatic_compactions(mut self, disable: bool) -> Self {
         self.disable_automatic_compactions = disable;
         self
@@ -234,9 +238,9 @@ impl<F: Fs> Options<F> {
     /// starts *wanting* L0 compacted. Between the two a flush runs the merge
     /// and nothing waits; at this one a write does.
     ///
-    /// A store with [`Self::disable_automatic_compactions`] set ignores this
-    /// entirely, because it owns L0's depth too: a write that waited for a
-    /// merge nobody was going to run would wait for ever.
+    /// A store told not to compact on its own ignores this entirely, because
+    /// then L0's depth is not its to manage: a write that waited for a merge
+    /// nobody was going to run would wait for ever.
     pub fn l0_stop_writes_threshold(mut self, tables: u64) -> Self {
         self.l0_stop_writes_threshold = tables;
         self
