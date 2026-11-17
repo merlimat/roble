@@ -112,6 +112,7 @@ impl<F: Fs> Db<F> {
     /// Returns the output tables' file numbers, in key order. Empty when the
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
+    #[doc(hidden)]
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
         self.writable()?;
         let Some(plan) = self.plan(level, file_nums).await? else {

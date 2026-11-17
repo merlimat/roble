@@ -78,6 +78,7 @@ impl<F: Fs> Db<F> {
     ///
     /// Returns the new MANIFEST's name. A flush does this for itself once the
     /// file it is appending to has grown past [`Db::max_manifest_bytes`].
+    #[doc(hidden)]
     pub async fn rotate_manifest(&self) -> Result<String> {
         self.writable()?;
         let change = self.changes().begin().await;

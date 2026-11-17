@@ -71,7 +71,9 @@ pub use version::{Table, Version, VersionSet};
 /// What roble's own tests and benchmark reach inside the engine.
 ///
 /// Not part of the API: hidden from the documentation, and free to change in
-/// any release.
+/// any release. The same goes for the `#[doc(hidden)]` methods on [`Db`] and
+/// for [`Pick`]: the maintenance and inspection calls the tests, the CLI,
+/// bench, compat and the fuzz targets drive by hand.
 #[doc(hidden)]
 pub mod __private {
     pub use crate::cache::{BlockCache, Clock};
