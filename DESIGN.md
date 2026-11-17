@@ -1012,8 +1012,10 @@ are there. Each case:
   it can still read names, so for a store with the lock such a file is damage
   and stays an error; for a reader it is a version that has moved on. A table
   is opened when a read first reaches it, so this can come from a `get` or a
-  scan long after the open. A file already open keeps its bytes where the
-  filesystem allows it, as POSIX does.
+  scan long after the open. Only the open of a file is checked this way: a
+  file already open keeps its bytes on a POSIX filesystem, so `FileFs` reads
+  it to the end. Where a deleted file stops reading, as in the simulated
+  filesystem, such a read fails as the I/O error it is, not as stale.
 - **The table check is skipped.** An open with the lock refuses a version that
   names a table the directory does not hold. A reader lists the directory
   before it reads the MANIFEST, so a flush in between names a table the listing
@@ -1033,12 +1035,13 @@ are there. Each case:
   reader saw.
 
 Real damage looks the same as a race to a reader, and is told apart by
-persisting: it fails every open, and the error says what it met. The command-line
-tool's `get`, `scan`, `stats` and `tables` open read-only and retry a stale
-read up to ten times, as encina's do. A scan that has printed entries resumes
-after the last key it printed, so what it prints across a retry is not one
-snapshot: the entries before the retry are as of one open, and those after
-it as of the next.
+persisting: it fails every open, and the error says what it met. So does a
+writer that retires files faster than a reader can open the database — one
+flushing every millisecond, which retires a log each time, outruns a reader
+that has to start a process first — and then the retries run out on a race
+rather than on damage. A scan that resumes in a new open after the last key
+it returned is not one snapshot: the entries before the retry are as of one
+open, and those after it as of the next.
 
 ### Creating a database
 
@@ -1702,6 +1705,9 @@ db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
 
 // A shard arriving on this node, where Oxia cannot tell new from returning.
 let db = roble::open_with(&env, dir, Options::new().create_if_missing(true)).await?;
+
+// Another process's database, read beside it without its lock (§6).
+let ro = roble::open_read_only(&env, dir, Options::new()).await?;
 ```
 
 The Oxia mapping, so the surface is complete rather than approximately right:

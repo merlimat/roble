@@ -378,3 +378,57 @@ async fn a_reader_does_not_take_the_lock() {
     // And the lock it never took is not one it kept either.
     let _db = writer(&sim_env).await;
 }
+
+/// A torn record at the end of the MANIFEST is corruption to the writer and
+/// stale to a reader, which may have caught the writer appending an edit.
+#[compio::test]
+async fn a_torn_manifest_is_corrupt_to_the_writer_and_stale_to_a_reader() {
+    let sim_env = SimEnv::new();
+    let db = writer(&sim_env).await;
+    put(&db, b"a", b"1").await;
+    drop(db);
+    let manifest = named(sim_env.sim(), FileType::Manifest).await.remove(0);
+    let disk = sim_env
+        .sim()
+        .open(&manifest, Access::ReadWrite)
+        .await
+        .expect("open");
+    let at = disk.len().await.expect("len");
+    // A chunk header that claims more bytes than follow it.
+    let torn = vec![0xde, 0xad, 0xbe, 0xef, 0xff, 0x00, 1, b'x'];
+    let (result, _) = disk.write(WriteBuf::new(torn), at, ()).await;
+    result.expect("write");
+
+    let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+    assert!(matches!(reader(&env).await, Err(Error::Stale(_))));
+    assert!(matches!(
+        roble::open(&sim_env, &dir()).await,
+        Err(Error::Corrupt(_))
+    ));
+}
+
+/// A reader does not check the version's tables against its listing, which a
+/// flush between the two would fail; a table that has really gone is stale
+/// when a read reaches it, and only then.
+#[compio::test]
+async fn a_missing_table_is_stale_when_a_read_reaches_it() {
+    let sim_env = SimEnv::new();
+    let db = writer(&sim_env).await;
+    put(&db, b"a", b"1").await;
+    db.flush().await.expect("flush");
+    put(&db, b"b", b"2").await;
+    drop(db);
+    let table = named(sim_env.sim(), FileType::Table).await.remove(0);
+    sim_env.sim().remove(&table).await.expect("remove");
+
+    let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+    let ro = reader(&env).await.expect("open without the table");
+    // In the log, so no table is needed to read it.
+    assert_eq!(get(&ro, b"b").await.expect("get"), Some(b"2".to_vec()));
+    assert!(matches!(get(&ro, b"a").await, Err(Error::Stale(_))));
+    // The writer refuses the same directory at once.
+    assert!(matches!(
+        roble::open(&sim_env, &dir()).await,
+        Err(Error::Corrupt(_))
+    ));
+}
