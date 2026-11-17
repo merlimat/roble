@@ -95,9 +95,9 @@ impl<F: Fs> Db<F> {
     /// are in the one that replaced it, and carry higher sequence numbers.
     ///
     /// A flush is also where the store notices it has too many tables, so a
-    /// flush that wrote one runs the compaction the picker chose before
-    /// returning, unless [`crate::Options::disable_automatic_compactions`]
-    /// says otherwise (§9, `crate::pick`). The number here names the table
+    /// flush that wrote one hands the compaction the picker chose to the
+    /// store's merge task, or runs it before returning if that task is not
+    /// there to take it (§9, `crate::pick`). The number here names the table
     /// *this flush wrote*, which that compaction may already have merged
     /// away — a caller holding it has a file number and not a promise.
     ///
@@ -141,10 +141,12 @@ impl<F: Fs> Db<F> {
         if flushed.is_some() {
             // Handed to whoever is waiting to be told there is work, and run
             // here only if nobody is (§9,
-            // `crate::open::Db::compaction_wanted`). A store whose
-            // caller runs a task for this stops paying for merges in its
-            // writes; a store without one is exactly as it was.
-            if !self.version_changed() {
+            // `crate::open::Db::compaction_wanted`). A store with its merge
+            // task waiting stops paying for merges in its writes; a store
+            // without one is exactly as it was. And not at all once the store
+            // is stopping: the flush closing waits for is the last thing it
+            // waits for, not the start of a merge.
+            if !self.version_changed() && self.running() {
                 self.maybe_compact().await;
             }
         }
@@ -153,7 +155,7 @@ impl<F: Fs> Db<F> {
 
     /// The flush proper: the table, the log, the edit, the bookkeeping.
     async fn flush_inner(&self, change: &Change<'_>) -> Result<Option<u64>> {
-        let _timer = self.metrics.flush.start();
+        let _timer = self.store.metrics.flush.start();
 
         // 1. The memtable this flush writes out, frozen so that a write
         //    arriving from here is none of this flush's business.
@@ -177,11 +179,14 @@ impl<F: Fs> Db<F> {
                     None
                 } else {
                     let log_num = self.version_set().next_file_num;
-                    let log_path = self.dir.join(roble_format::files::log_filename(log_num));
+                    let log_path = self
+                        .store
+                        .dir
+                        .join(roble_format::files::log_filename(log_num));
                     let log_disk = self.fs().create(&log_path).await?;
                     log_disk.sync(Default::default()).await?;
                     log_disk.close().await?;
-                    self.fs().sync_dir(&self.dir).await?;
+                    self.fs().sync_dir(&self.store.dir).await?;
                     Some(log_num)
                 };
                 self.freeze_memtable(log_num).await?;
@@ -216,21 +221,22 @@ impl<F: Fs> Db<F> {
         //    without one (§5, `crate::change`). So the only reader of a table
         //    the MANIFEST does not yet name is this flush.
         let path = self
+            .store
             .dir
             .join(roble_format::files::table_filename(table_num));
         let disk = self.fs().create(&path).await?;
         let entries = memtable.borrow().len() as u64;
         let (written, new_table) =
             build_table(&memtable, &disk, table_num, self.compaction_unit()).await?;
-        self.metrics.flush_size.record(written);
-        self.metrics.flush_bytes.add(written);
-        self.metrics.written.add(written as usize);
+        self.store.metrics.flush_size.record(written);
+        self.store.metrics.flush_bytes.add(written);
+        self.store.metrics.written.add(written as usize);
         {
-            let _timer = self.metrics.sync_duration.start();
+            let _timer = self.store.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
         }
         disk.close().await?;
-        self.fs().sync_dir(&self.dir).await?;
+        self.fs().sync_dir(&self.store.dir).await?;
 
         // 3. The edit. Before this the table is a file nothing refers to.
         // With the WAL off the edit says nothing about log numbers, which
@@ -274,12 +280,13 @@ impl<F: Fs> Db<F> {
         //    next flush will find again (§6). Reporting a flush that worked
         //    as one that did not would be the larger lie.
         let _ = self.sweep(change).await;
-        self.metrics.saw_version(&self.version_set().version);
-        self.metrics
+        self.store.metrics.saw_version(&self.version_set().version);
+        self.store
+            .metrics
             .memtable_size
             .set(self.unflushed_bytes() as i64);
         self.measure_disk().await;
-        self.metrics.flushes.add(1);
+        self.store.metrics.flushes.add(1);
         self.saw_debt();
         self.saw_table_entries(table_num, Some(entries));
         self.recount_records();
@@ -335,7 +342,7 @@ impl<F: Fs> Db<F> {
 
     /// The append itself, whose every failure the caller above makes final.
     async fn append_edit(&self, edit: &VersionEdit) -> Result<u64> {
-        let path = self.dir.join(self.manifest_filename());
+        let path = self.store.dir.join(self.manifest_filename());
         let disk = self.fs().open(&path, Access::ReadWrite).await?;
         let at = disk.len().await? as usize;
 
@@ -349,9 +356,9 @@ impl<F: Fs> Db<F> {
             .write(WriteBuf::new(framed), at as u64, Default::default())
             .await;
         result?;
-        self.metrics.written.add(written);
+        self.store.metrics.written.add(written);
         {
-            let _timer = self.metrics.sync_duration.start();
+            let _timer = self.store.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
         }
         disk.close().await?;

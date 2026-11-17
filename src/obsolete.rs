@@ -375,7 +375,7 @@ impl<F: Fs> Db<F> {
     pub(crate) async fn sweep(&self, _change: &Change<'_>) -> Result<Vec<String>> {
         let names: Vec<String> = self
             .fs()
-            .list(&self.dir)
+            .list(&self.store.dir)
             .await?
             .iter()
             .map(|e| e.name.to_string_lossy().into_owned())
@@ -398,7 +398,7 @@ impl<F: Fs> Db<F> {
         // which the permit cannot speak for because the compaction writes
         // them without it (§9, `Pending`).
         in_use.extend(self.pending().tables());
-        let removed = remove_obsolete(self.fs(), &self.dir, &names, &live, &in_use).await?;
+        let removed = remove_obsolete(self.fs(), &self.store.dir, &names, &live, &in_use).await?;
         self.forget_markers(&removed);
         Ok(removed)
     }

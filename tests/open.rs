@@ -1031,108 +1031,67 @@ async fn give_the_runtime_a_turn(at: &Path) {
 }
 
 #[compio::test]
-async fn a_task_of_its_own_can_be_the_one_that_compacts() {
-    // The pattern `Db::compaction_wanted` documents, run for real. The
-    // caller owns the task and owns stopping it; the store only says when
-    // there is something to do. A flush that finds the task waiting leaves
-    // the merge to it, so the write that caused the flush pays for none of
-    // it — which is what §9 has been working towards since #72.
+async fn the_store_runs_its_own_merges() {
+    // A store opened to write spawns a task that waits for a merge worth
+    // running, and a flush that finds it waiting leaves the merge to it: the
+    // write that caused the flush pays for none of it (§9).
     //
     // `tests/schedule.rs` pins which of the two does the merge, by hand and
-    // deterministically. What this adds is that the shape works against a
-    // real runtime and a real disk at all.
+    // deterministically. What this adds is that the store's own task does it
+    // against a real runtime and a real disk, with nobody calling for it.
     let (tmp, dir) = fixture("db-reads");
     // The fixture arrives four layers deep, so five is the line the flush
-    // below crosses: the task has to be waiting *before* there is work, or
-    // the flush would find nobody and do the merge itself. The key it writes
-    // falls inside a range L0 already holds, so its table lands a layer
-    // above rather than beside (§9).
-    let db = std::rc::Rc::new(
-        roble::open_with(
-            &roble::DefaultEnv,
-            &dir,
-            roble::Options::new().l0_compaction_threshold(5),
-        )
-        .await
-        .expect("open"),
-    );
+    // below crosses. The key it writes falls inside a range L0 already
+    // holds, so its table lands a layer above rather than beside (§9).
+    let db = roble::open_with(
+        &roble::DefaultEnv,
+        &dir,
+        roble::Options::new().l0_compaction_threshold(5),
+    )
+    .await
+    .expect("open");
+    let in_l0 = db.versions().version.level(0).len();
 
-    let started = std::rc::Rc::new(std::cell::Cell::new(false));
-    let merged = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let (task_db, began, count) = (
-        std::rc::Rc::clone(&db),
-        std::rc::Rc::clone(&started),
-        std::rc::Rc::clone(&merged),
-    );
-    roble::Env::spawn(&roble::DefaultEnv, async move {
-        began.set(true);
-        loop {
-            task_db.compaction_wanted().await;
-            let outputs = task_db
-                .compact_once()
-                .await
-                .expect("the task's own compaction");
-            count.set(count.get() + outputs.len());
-        }
-    });
-
-    // Until the task has had its first turn, which is the turn it parks on.
-    // Bounded, so a task that never runs fails the test rather than hanging
-    // it.
+    // The task has to be parked before there is work, or the flush would
+    // find nobody and run the merge itself; it is spawned by the open, and
+    // these turns are where it first gets polled.
     let tick = tmp.path().join("tick");
-    for _ in 0..64 {
-        if started.get() {
-            break;
-        }
+    for _ in 0..8 {
         give_the_runtime_a_turn(&tick).await;
     }
-    assert!(
-        started.get(),
-        "the task should have been polled, and so be waiting to be told"
-    );
-    assert_eq!(merged.get(), 0, "and should have had nothing to do yet");
 
     let mut batch = roble_format::batch::Batch::new();
     batch.put(b"background", b"yes").expect("put");
     db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
+    assert_eq!(
+        db.versions().version.level(0).len(),
+        in_l0 + 1,
+        "the flush had somebody waiting, so it should have left the merge to them"
+    );
 
-    // Until the merge has landed, which is bounded by the clock and not, as
-    // the wait above is, by a count of turns. That one waits for a single
-    // poll, and any turn gives one. This one waits for the whole of
-    // `compact_once` — the inputs opened, the output written, the MANIFEST,
-    // the sweep — and how many of this loop's turns that I/O spans depends
-    // on what else the machine's disk is doing: some sixty on a quiet one,
-    // past a hundred on a busy one. Sixty-four of them failed this test
-    // anywhere from one run in a hundred to five in six, against merges
-    // that every one of those runs went on to finish, which is the reason
-    // `settle` in the benchmark is guarded the same way (#119). The minute
-    // is not a claim about how long a merge takes, only a bound past which
-    // it is not coming, so a task that never runs still fails the test
-    // rather than hanging it.
+    // Until the merge has landed, which is bounded by the clock and not by a
+    // count of turns: it spans the inputs opened, the output written, the
+    // MANIFEST and the sweep, and how many turns that I/O takes depends on
+    // what else the machine's disk is doing (#119). The minute is only a
+    // bound past which it is not coming.
     let waiting = std::time::Instant::now();
-    while merged.get() == 0 && waiting.elapsed() < std::time::Duration::from_secs(60) {
+    while !db.versions().version.level(0).is_empty()
+        && waiting.elapsed() < std::time::Duration::from_secs(60)
+    {
         give_the_runtime_a_turn(&tick).await;
     }
-
-    assert!(
-        merged.get() > 0,
-        "the flush had somebody waiting, so the merge was the task's to do"
-    );
     assert_eq!(
         db.versions().version.level(0).len(),
         0,
-        "and the merge it ran should have taken all of L0"
+        "the store's own task should have merged the whole of L0"
     );
     let found = db
         .get(b"background", roble::Comparison::Equal)
         .await
         .expect("get");
-    assert_eq!(
-        found.map(|f| f.value),
-        Some(b"yes".to_vec()),
-        "and the store the task compacted is the store this test is holding"
-    );
+    assert_eq!(found.map(|f| f.value), Some(b"yes".to_vec()));
+    db.close().await.expect("close");
 }
 
 #[compio::test]
@@ -1159,7 +1118,10 @@ async fn a_task_of_its_own_can_be_the_one_that_flushes() {
             roble::Options::new()
                 .disable_wal(true)
                 .disable_automatic_compactions(true)
-                .memtable_size(16 << 10),
+                .memtable_size(16 << 10)
+                // This test is the task, run by hand so that it can count
+                // what it flushed; the store's own would race it.
+                .background_tasks(false),
         )
         .await
         .expect("open"),

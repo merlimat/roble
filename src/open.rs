@@ -88,8 +88,11 @@ const SEQ_NUM_START: u64 = 10;
 
 /// An open database: its directory locked, its MANIFEST and logs replayed.
 ///
-/// Made by [`open`], [`open_with`] or [`open_read_only`]. Dropping it releases
-/// the directory lock.
+/// Made by [`open`], [`open_with`] or [`open_read_only`]. Close it with
+/// [`Db::close`], which waits for the store's background work to stop and
+/// then releases the directory; or just drop it, which stops that work and
+/// releases the directory at once if none is in flight, or as soon as the
+/// flush or merge in flight has finished.
 ///
 /// Generic over the filesystem it was opened in, which is [`crate::FileFs`]
 /// unless an [`Env`] says otherwise, and so is written plain `Db` there; the
@@ -97,16 +100,38 @@ const SEQ_NUM_START: u64 = 10;
 /// carry the same parameter with the same default.
 ///
 /// It is `!Send` and `!Sync`, and not `Clone`: a store belongs to one thread
-/// (§10). The tasks that wait on [`Db::flush_wanted`] and
-/// [`Db::compaction_wanted`] need a `'static` handle of their own, so put
-/// the store in an [`Rc`](std::rc::Rc) and give each task a clone of that. To
-/// shut down, call [`Db::stop`] and wait for those clones to be dropped; once
-/// the `Rc` is the only one left, [`Rc::try_unwrap`](std::rc::Rc::try_unwrap)
-/// gives the store back for [`Db::destroy`], which consumes it.
+/// (§10). To share one between tasks, put it in an [`Rc`](std::rc::Rc).
+///
+/// **It flushes and compacts in the background.** A store opened to write
+/// spawns two tasks through [`Env::spawn`]: one writes a memtable out when it
+/// is nearly full, so a write rarely waits for a flush, and one runs the
+/// merges the picker chooses, so a write never pays for one. They hold the
+/// store's state, not this handle, and stop when it is closed or dropped.
 pub struct Db<F: Fs = crate::FileFs> {
+    /// The state, shared with the background tasks.
+    pub(crate) store: std::rc::Rc<Store<F>>,
+    /// Whether this is the caller's handle, whose drop shuts the store down,
+    /// or one of the handles a background task holds.
+    owner: bool,
+}
+
+/// What a [`Db`] is a handle on: everything an open store holds.
+///
+/// Behind an `Rc` so that the background tasks can hold it beyond any borrow
+/// of the caller's handle (`Env::spawn` takes a `'static` future).
+pub(crate) struct Store<F: Fs> {
     // Held, not used: dropping it is what releases the directory. None for a
-    // store opened read-only, which takes no lock.
-    _lock: Option<F::Lock>,
+    // store opened read-only, which takes no lock, and taken early by a
+    // handle dropped while nothing is in flight ([`Db`]'s `Drop`).
+    _lock: std::cell::RefCell<Option<F::Lock>>,
+    /// How many background tasks are still running, and who is waiting for
+    /// that to reach zero ([`Db::close`]).
+    tasks: std::cell::Cell<usize>,
+    tasks_done: crate::change::Waiters,
+    /// How many background tasks are inside a flush or a merge right now:
+    /// what decides whether dropping the caller's handle may release the
+    /// directory at once.
+    working: std::cell::Cell<usize>,
     /// Whether this store was opened by [`open_read_only`], and so refuses
     /// everything that would change the directory.
     read_only: bool,
@@ -506,49 +531,59 @@ async fn open_dir<E: Env>(
         entries: Default::default(),
         read_only,
     });
-    Ok(Db {
-        _lock: lock,
-        read_only,
-        metrics,
-        fs,
-        store_id,
-        caches: options.caches,
-        disable_wal: options.disable_wal,
-        disable_automatic_compactions: options.disable_automatic_compactions,
-        memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
-        frozen: std::cell::RefCell::new(None),
-        writers: Default::default(),
-        compacting: Default::default(),
-        compaction_waiters: Default::default(),
-        compaction_failed: std::cell::Cell::new(false),
-        flush_waiters: Default::default(),
-        flush_failed: std::cell::Cell::new(false),
-        stopped: std::cell::Cell::new(false),
-        next_seq: std::cell::Cell::new(next_seq),
-        log: std::cell::RefCell::new(log),
-        dir: dir.to_path_buf(),
-        format_version,
-        manifest: std::cell::RefCell::new(Manifest {
-            filename: manifest_filename,
-            marker_iter: manifest_marker_iter,
+    let db = Db {
+        store: std::rc::Rc::new(Store {
+            _lock: std::cell::RefCell::new(lock),
+            tasks: std::cell::Cell::new(0),
+            tasks_done: Default::default(),
+            working: std::cell::Cell::new(0),
+            read_only,
+            metrics,
+            fs,
+            store_id,
+            caches: options.caches,
+            disable_wal: options.disable_wal,
+            disable_automatic_compactions: options.disable_automatic_compactions,
+            memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
+            frozen: std::cell::RefCell::new(None),
+            writers: Default::default(),
+            compacting: Default::default(),
+            compaction_waiters: Default::default(),
+            compaction_failed: std::cell::Cell::new(false),
+            flush_waiters: Default::default(),
+            flush_failed: std::cell::Cell::new(false),
+            stopped: std::cell::Cell::new(false),
+            next_seq: std::cell::Cell::new(next_seq),
+            log: std::cell::RefCell::new(log),
+            dir: dir.to_path_buf(),
+            format_version,
+            manifest: std::cell::RefCell::new(Manifest {
+                filename: manifest_filename,
+                marker_iter: manifest_marker_iter,
+            }),
+            tables,
+            records_in_tables: std::cell::Cell::new(0),
+            markers: std::cell::RefCell::new(markers),
+            memtable_size: options.memtable_size,
+            max_manifest_bytes: options.max_manifest_bytes,
+            readers,
+            pending: Default::default(),
+            pinned: Default::default(),
+            manifest_failed: std::cell::Cell::new(false),
+            changes: crate::change::Changes::default(),
+            l0_compaction_threshold: options.l0_compaction_threshold,
+            l0_stop_writes_threshold: options.l0_stop_writes_threshold,
+            lbase_max_bytes: options.lbase_max_bytes,
+            compaction_unit: options.compaction_unit,
+            target_file_size: options.target_file_size,
+            versions: std::cell::RefCell::new(versions),
         }),
-        tables,
-        records_in_tables: std::cell::Cell::new(0),
-        markers: std::cell::RefCell::new(markers),
-        memtable_size: options.memtable_size,
-        max_manifest_bytes: options.max_manifest_bytes,
-        readers,
-        pending: Default::default(),
-        pinned: Default::default(),
-        manifest_failed: std::cell::Cell::new(false),
-        changes: crate::change::Changes::default(),
-        l0_compaction_threshold: options.l0_compaction_threshold,
-        l0_stop_writes_threshold: options.l0_stop_writes_threshold,
-        lbase_max_bytes: options.lbase_max_bytes,
-        compaction_unit: options.compaction_unit,
-        target_file_size: options.target_file_size,
-        versions: std::cell::RefCell::new(versions),
-    })
+        owner: true,
+    };
+    if !read_only && options.background_tasks {
+        db.spawn_background(env);
+    }
+    Ok(db)
 }
 
 /// Refuses the files whose mere presence puts the database above roble's pin.
@@ -822,12 +857,42 @@ async fn replay_logs<F: Fs>(
 impl<F: Fs> std::fmt::Debug for Db<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db")
-            .field("dir", &self.dir)
-            .field("format_version", &self.format_version)
-            .field("manifest_filename", &self.manifest.borrow().filename)
-            .field("markers", &self.markers.borrow())
-            .field("versions", &self.versions)
+            .field("dir", &self.store.dir)
+            .field("format_version", &self.store.format_version)
+            .field("manifest_filename", &self.store.manifest.borrow().filename)
+            .field("markers", &self.store.markers.borrow())
+            .field("versions", &self.store.versions)
             .finish()
+    }
+}
+
+/// Whether a write is durable when it returns, or only written.
+///
+/// Pebble's `pebble.Sync` and `pebble.NoSync`. A write is appended to the
+/// log either way; [`Durability::Sync`] also syncs the log before the write
+/// returns, so it survives the machine going away and not just the store.
+///
+/// With the WAL off ([`crate::Options::disable_wal`]) there is no log to
+/// sync, and [`Durability::Sync`] is refused with [`Error::Unsupported`]
+/// rather than ignored: nothing but [`Db::flush`] makes a write durable
+/// then, and saying otherwise would be the silent half of a data loss (§4).
+///
+/// Every write names one. The [`Default`] is [`Durability::Sync`], the
+/// choice that loses nothing, for a caller that keeps one in a struct of
+/// its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Synced to disk before the write returns.
+    #[default]
+    Sync,
+    /// Written to the log, and synced later or not at all.
+    NoSync,
+}
+
+impl Durability {
+    /// Whether the log is to be synced.
+    pub(crate) fn syncs(self) -> bool {
+        self == Durability::Sync
     }
 }
 
@@ -835,34 +900,34 @@ impl<F: Fs> Db<F> {
     /// Sets `key` to `value`.
     ///
     /// A batch of that one write, appended to the log and then applied to
-    /// the memtable. `sync` decides whether it is durable when this returns
-    /// or merely written: without it the write survives the store going away
-    /// but not the machine. With the WAL off there is no log to sync, and
-    /// `sync` is refused rather than ignored, since nothing but
-    /// [`Db::flush`] can make a write durable then (§4).
+    /// the memtable, and durable when this returns if `durability` says so.
     ///
     /// Several writes that have to land together, or that are read back
     /// before they do, go in an [`Db::indexed_batch`] instead. This one
     /// builds no index, which is about 90 ns a write cheaper.
-    pub async fn put(&self, key: &[u8], value: &[u8], sync: bool) -> Result<()> {
+    pub async fn put(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.put(key, value)?;
-        self.write_raw(&mut batch, sync).await
+        self.write_raw(&mut batch, durability.syncs()).await
     }
 
-    /// Deletes `key`, durably if `sync` says so, as [`Db::put`] writes.
-    pub async fn delete(&self, key: &[u8], sync: bool) -> Result<()> {
+    /// Deletes `key`, as [`Db::put`] writes.
+    pub async fn delete(&self, key: &[u8], durability: Durability) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.delete(key)?;
-        self.write_raw(&mut batch, sync).await
+        self.write_raw(&mut batch, durability.syncs()).await
     }
 
-    /// Deletes every key in `start..end`, durably if `sync` says so, as
-    /// [`Db::put`] writes.
-    pub async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) -> Result<()> {
+    /// Deletes every key in `start..end`, as [`Db::put`] writes.
+    pub async fn delete_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        durability: Durability,
+    ) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.delete_range(start, end)?;
-        self.write_raw(&mut batch, sync).await
+        self.write_raw(&mut batch, durability.syncs()).await
     }
 
     /// Appends a batch to the log, syncs it if asked, and then applies it to
@@ -878,7 +943,7 @@ impl<F: Fs> Db<F> {
     /// saying otherwise would be the silent half of a data loss.
     ///
     /// What [`IndexedBatch::commit`](crate::IndexedBatch::commit) and
-    /// [`Db::put`] go through. It takes the format's own batch, which roble's
+    /// [`Db::put`] go through, with `sync` for [`Durability::Sync`]. It takes the format's own batch, which roble's
     /// tests build directly; a caller builds an [`Db::indexed_batch`].
     #[doc(hidden)]
     pub async fn write_raw(
@@ -886,9 +951,9 @@ impl<F: Fs> Db<F> {
         batch: &mut roble_format::batch::Batch,
         sync: bool,
     ) -> Result<()> {
-        let _timer = self.metrics.write.start();
+        let _timer = self.store.metrics.write.start();
         let result = self.write_inner(batch, sync).await;
-        self.metrics.write_errors.saw(result)
+        self.store.metrics.write_errors.saw(result)
     }
 
     /// The body of [`Db::write_raw`], so one place counts what it returned.
@@ -899,11 +964,11 @@ impl<F: Fs> Db<F> {
         // reason is the same: with no log there is nowhere for a sync to
         // make the batch durable, and returning `Ok` would be a promise of
         // durability that only `flush` can keep (§4).
-        if sync && self.disable_wal {
+        if sync && self.store.disable_wal {
             return Err(Error::Unsupported(format!(
                 "{} was opened with the WAL off, so a write cannot be made durable on its \
                  own; flush instead",
-                self.dir.display()
+                self.store.dir.display()
             )));
         }
 
@@ -937,17 +1002,18 @@ impl<F: Fs> Db<F> {
         // number stamped below and the offset the record goes to are both
         // read here and both committed to after the disk has been waited on
         // (§5, `crate::change`).
-        let _writing = self.writers.begin().await;
+        let _writing = self.store.writers.begin().await;
 
-        let base = self.next_seq.get();
+        let base = self.store.next_seq.get();
         batch.set_seq_num(base);
 
-        if !self.disable_wal {
-            let _timer = self.metrics.wal.start();
+        if !self.store.disable_wal {
+            let _timer = self.store.metrics.wal.start();
             // The log, with the borrow released before any waiting: a
             // `RefCell` held across an await is a panic waiting for the
             // first reader that arrives in the middle of a write.
             let Some((disk, log_num, at)) = self
+                .store
                 .log
                 .borrow()
                 .as_ref()
@@ -955,7 +1021,7 @@ impl<F: Fs> Db<F> {
             else {
                 return Err(Error::Unsupported(format!(
                     "{} holds no log file, so a write could not be recovered",
-                    self.dir.display()
+                    self.store.dir.display()
                 )));
             };
 
@@ -973,38 +1039,46 @@ impl<F: Fs> Db<F> {
                 )
                 .await;
             result?;
-            self.metrics.written.add(written);
+            self.store.metrics.written.add(written);
             if sync {
-                let _timer = self.metrics.sync_duration.start();
+                let _timer = self.store.metrics.sync_duration.start();
                 disk.sync(Default::default()).await?;
             }
-            if let Some(log) = self.log.borrow_mut().as_mut() {
+            if let Some(log) = self.store.log.borrow_mut().as_mut() {
                 log.at = end;
             }
         }
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
-        self.next_seq.set(next);
+        self.store.next_seq.set(next);
         // The store holds something a flush did not, so a flush that failed
         // is worth asking for again (§5, [`Db::flush_wanted`]). This is
         // the only thing that changes that answer, which is why the retry
         // hangs off a write and not off a clock (§10).
-        self.flush_failed.set(false);
+        self.store.flush_failed.set(false);
 
         // Only when something is recording. Each of these would do nothing
         // with what it was handed otherwise, but the handing was not free: the
         // batch read a second time into a list, and every memtable's bytes
         // summed, on every write of a store nobody was metering.
-        if self.metrics.recording() {
+        if self.store.metrics.recording() {
             for entry in iter_kinds(batch.as_bytes())? {
-                self.metrics.write_operations[entry].add(1);
+                self.store.metrics.write_operations[entry].add(1);
             }
-            self.metrics
+            self.store
+                .metrics
                 .write_size
                 .record(batch.as_bytes().len() as u64);
-            self.metrics.write_bytes.add(batch.as_bytes().len() as u64);
-            self.metrics.write_entries.record(batch.count() as u64);
-            self.metrics
+            self.store
+                .metrics
+                .write_bytes
+                .add(batch.as_bytes().len() as u64);
+            self.store
+                .metrics
+                .write_entries
+                .record(batch.count() as u64);
+            self.store
+                .metrics
                 .memtable_size
                 .set(self.unflushed_bytes() as i64);
             self.saw_records();
@@ -1050,7 +1124,7 @@ impl<F: Fs> Db<F> {
     /// this loop again.
     async fn make_room(&self) -> Result<()> {
         loop {
-            if (self.unflushed_bytes() as u64) < self.memtable_size {
+            if (self.unflushed_bytes() as u64) < self.store.memtable_size {
                 return Ok(());
             }
 
@@ -1112,8 +1186,8 @@ impl<F: Fs> Db<F> {
         // level-triggered, so whoever is parked only looks again when told,
         // and this is the write that has something new to tell them.
         let told = (self.unflushed_bytes() as u64) >= self.flush_line()
-            && !self.flush_failed.get()
-            && self.flush_waiters.wake();
+            && !self.store.flush_failed.get()
+            && self.store.flush_waiters.wake();
         // A change underway is a flush — a compaction holds the permit only
         // to decide and to record (§9) — and a claim is the merge itself.
         if told || self.changes().underway() || self.compacting().underway() {
@@ -1132,7 +1206,7 @@ impl<F: Fs> Db<F> {
     /// tables it did before there was anywhere else for a flush to run.
     #[doc(hidden)]
     pub fn flush_line(&self) -> u64 {
-        self.memtable_size - self.memtable_size / crate::memtable::FLUSH_RESERVE
+        self.store.memtable_size - self.store.memtable_size / crate::memtable::FLUSH_RESERVE
     }
 
     /// Waits until L0 is shallow enough to accept another table, draining it
@@ -1157,14 +1231,16 @@ impl<F: Fs> Db<F> {
             // tables than the line is not past it, and counting the layers —
             // a list of L0's tables built, sorted and compared pairwise — is
             // only for the store that might be. This runs on every write.
-            if (self.version_set().version.level(0).len() as u64) < self.l0_stop_writes_threshold {
+            if (self.version_set().version.level(0).len() as u64)
+                < self.store.l0_stop_writes_threshold
+            {
                 return Ok(());
             }
             // In layers, which is what the line is counted in: a store
             // holding twelve tables a read crosses in one seek is not deep
             // (§9, `crate::pick::l0_depth`).
             let in_l0 = crate::pick::l0_depth(&self.version_set().version);
-            if in_l0 < self.l0_stop_writes_threshold {
+            if in_l0 < self.store.l0_stop_writes_threshold {
                 return Ok(());
             }
             // Both of the things the merge this needs can be behind: the
@@ -1198,8 +1274,8 @@ impl<F: Fs> Db<F> {
     /// behind. By the time it is handed over, the change that was underway
     /// has finished and the question is worth asking again.
     async fn stalled(&self, why: usize) {
-        self.metrics.write_stalls[why].add(1);
-        let _timer = self.metrics.write_stall[why].start();
+        self.store.metrics.write_stalls[why].add(1);
+        let _timer = self.store.metrics.write_stall[why].start();
         if self.changes().underway() {
             drop(self.changes().begin().await);
         } else {
@@ -1211,19 +1287,19 @@ impl<F: Fs> Db<F> {
 
     /// The highest sequence number any read may see.
     pub(crate) fn last_seq_num(&self) -> u64 {
-        self.next_seq.get().saturating_sub(1)
+        self.store.next_seq.get().saturating_sub(1)
     }
 
     /// The memtable a write goes to, which a flush may replace afterwards.
     pub(crate) fn memtable(&self) -> std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>> {
-        std::rc::Rc::clone(&self.memtable.borrow())
+        std::rc::Rc::clone(&self.store.memtable.borrow())
     }
 
     /// The memtable a flush is writing out, if there is one.
     pub(crate) fn frozen(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::memtable::Memtable>>> {
-        self.frozen.borrow().clone()
+        self.store.frozen.borrow().clone()
     }
 
     /// Every memtable a read has to look in: the one writes go to, and the
@@ -1252,12 +1328,12 @@ impl<F: Fs> Db<F> {
 
     /// The directory the database lives in.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        &self.store.dir
     }
 
     /// The format major version the database was written in.
     pub fn format_version(&self) -> u64 {
-        self.format_version
+        self.store.format_version
     }
 
     /// The log this store is appending to, if it has one.
@@ -1268,7 +1344,7 @@ impl<F: Fs> Db<F> {
     /// replayed.
     #[doc(hidden)]
     pub fn current_log(&self) -> Option<u64> {
-        self.log.borrow().as_ref().map(|l| l.log_num)
+        self.store.log.borrow().as_ref().map(|l| l.log_num)
     }
 
     /// How many bytes of writes no table holds yet.
@@ -1282,73 +1358,69 @@ impl<F: Fs> Db<F> {
     /// The MANIFEST this store is appending to.
     #[doc(hidden)]
     pub fn manifest_filename(&self) -> String {
-        self.manifest.borrow().filename.clone()
+        self.store.manifest.borrow().filename.clone()
     }
 
     /// Every `marker.` file the directory holds, sorted, current and obsolete
     /// alike.
     #[doc(hidden)]
     pub fn markers(&self) -> Vec<String> {
-        self.markers.borrow().clone()
+        self.store.markers.borrow().clone()
     }
 
     /// Which iteration of `marker.manifest.*` names the current MANIFEST.
     pub(crate) fn manifest_marker_iter(&self) -> u64 {
-        self.manifest.borrow().marker_iter
+        self.store.manifest.borrow().marker_iter
     }
 
     /// How many readers this store has open for each of its tables
     /// (`crate::obsolete`).
     pub(crate) fn readers(&self) -> &std::rc::Rc<crate::obsolete::Readers> {
-        &self.readers
+        &self.store.readers
     }
 
     /// The output tables a compaction is in the middle of writing
     /// (`crate::obsolete`).
     pub(crate) fn pending(&self) -> &crate::obsolete::Pending {
-        &self.pending
+        &self.store.pending
     }
 
     /// The versions a reader still holds after an edit replaced them
     /// (`crate::obsolete`).
     pub(crate) fn pinned(&self) -> &crate::obsolete::Pinned {
-        &self.pinned
+        &self.store.pinned
     }
 
     /// How this store opens its tables, for a scan or a snapshot to open
     /// theirs with as they reach them.
     pub(crate) fn tables(&self) -> std::rc::Rc<Tables<F>> {
-        std::rc::Rc::clone(&self.tables)
+        std::rc::Rc::clone(&self.store.tables)
     }
 
     /// Lets go of the table cache's reader for one of this store's tables.
     pub(crate) fn forget_reader(&self, file_num: u64) {
-        self.caches.forget_table(self.store_id, file_num);
+        self.store
+            .caches
+            .forget_table(self.store.store_id, file_num);
     }
 
     /// The tables the compaction underway is reading (§9).
     pub(crate) fn compacting(&self) -> &crate::change::Compacting {
-        &self.compacting
+        &self.store.compacting
     }
 
     /// Waits until there is a memtable worth writing out.
     ///
-    /// The other half of what a store hands to a task of its own, and the
-    /// half that takes the flush off the write that found the memtable full
-    /// (§5). A write tells whoever is parked here an eighth of the budget
-    /// before it fills; the task freezes that
+    /// What the store's flush task waits on ([`Db::spawn_background`]), and
+    /// the half of its background work that takes the flush off the write
+    /// that found the memtable full (§5). A write tells whoever is parked
+    /// here an eighth of the budget before it fills; the task freezes that
     /// memtable and writes it out while the writes carry on into the fresh
     /// one, which is what the eighth is kept back for.
     ///
-    /// ```ignore
-    /// let worker = std::rc::Rc::clone(&db);
-    /// env.spawn(async move {
-    ///     while worker.running() {
-    ///         worker.flush_wanted().await;
-    ///         let _ = worker.flush().await;
-    ///     }
-    /// });
-    /// ```
+    /// Not part of the API: public only so that a test can stand in for the
+    /// task, with the store's own turned off
+    /// ([`crate::Options::background_tasks`]).
     ///
     /// Its own wait and not [`Db::compaction_wanted`]'s, because the two
     /// have to be able to run at once. A merge is the longest thing a store
@@ -1368,9 +1440,10 @@ impl<F: Fs> Db<F> {
     /// reason; and a flush that **failed** is not wanted again until the
     /// store has taken another write, because until then it would write out
     /// the same memtable to the same disk and fail the same way.
+    #[doc(hidden)]
     pub async fn flush_wanted(&self) {
         std::future::poll_fn(|cx| {
-            if self.stopped.get() {
+            if self.store.stopped.get() {
                 return std::task::Poll::Ready(());
             }
             if self.changes().underway() {
@@ -1379,8 +1452,12 @@ impl<F: Fs> Db<F> {
             }
             let held = self.unflushed_bytes() as u64;
             // A reader never flushes, however much its replay brought back.
-            if self.read_only || self.flush_failed.get() || held == 0 || held < self.flush_line() {
-                self.flush_waiters.park(cx);
+            if self.store.read_only
+                || self.store.flush_failed.get()
+                || held == 0
+                || held < self.flush_line()
+            {
+                self.store.flush_waiters.park(cx);
                 return std::task::Poll::Pending;
             }
             std::task::Poll::Ready(())
@@ -1388,33 +1465,117 @@ impl<F: Fs> Db<F> {
         .await
     }
 
-    /// Tells the tasks a caller runs beside this store that nothing more is
+    /// Tells the tasks waiting beside this store that nothing more is
     /// coming, so they can end and let go of it (§9).
     ///
-    /// A store runs no tasks of its own, so the ones parked on
-    /// [`Db::flush_wanted`] and [`Db::compaction_wanted`] are the
-    /// caller's — and each of them holds the store while it waits. §9 says
-    /// the caller owns stopping them; this is the half of that the caller
-    /// cannot write for itself, because a parked task has to be woken by
-    /// whatever it is parked on. From here both waits return at once,
-    /// [`Db::running`] is false, and the last task to let go is what
-    /// lets the store be dropped and the directory released.
+    /// What closing and dropping the store start with: a parked task has to
+    /// be woken by whatever it is parked on. From here both waits return at
+    /// once, [`Db::running`] is false, and the last task to let go is what
+    /// lets the store's state be freed.
     ///
-    /// Nothing else changes: a store that has been stopped still reads,
-    /// still writes, and still flushes and compacts inside its writes, which
-    /// is what it did before anybody was listening.
+    /// Nothing else changes, but for one thing: a store that has been
+    /// stopped still reads, still writes, and still flushes inside its
+    /// writes, but a flush no longer goes on to the merge nobody is waiting
+    /// for, since closing waits for the flush in flight and should not wait
+    /// for a merge it started.
+    #[doc(hidden)]
     pub fn stop(&self) {
-        self.stopped.set(true);
-        self.flush_waiters.wake();
-        self.compaction_waiters.wake();
+        self.store.stopped.set(true);
+        self.store.flush_waiters.wake();
+        self.store.compaction_waiters.wake();
     }
 
-    /// Whether the tasks a caller runs beside this store should keep going.
+    /// Waits for the store's background work to stop, then releases the
+    /// directory.
     ///
-    /// False once [`Db::stop`] has been called, which is the loop
-    /// condition the examples on the two waits are written around.
+    /// The flush or merge in flight runs to its end first; nothing new is
+    /// started. Once this returns, the directory can be opened again at once,
+    /// which dropping the store promises only when nothing was in flight.
+    ///
+    /// It does not flush. With the WAL off ([`crate::Options::disable_wal`]),
+    /// what the memtable holds is gone with the store unless
+    /// [`Db::flush`] wrote it out first.
+    pub async fn close(self) -> Result<()> {
+        self.wind_down().await;
+        Ok(())
+    }
+
+    /// Stops the background tasks and waits until every one has ended.
+    pub(crate) async fn wind_down(&self) {
+        self.stop();
+        std::future::poll_fn(|cx| {
+            if self.store.tasks.get() == 0 {
+                return std::task::Poll::Ready(());
+            }
+            self.store.tasks_done.park(cx);
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    /// Starts the tasks that flush and compact in the background (§5, §9).
+    ///
+    /// Each holds a handle of its own on the store's state, and each counts
+    /// itself in while it runs, so [`Db::close`] knows when they are gone.
+    /// The merge task is left out for a store told to leave compaction to
+    /// its caller: it would run exactly the merges that option is there to
+    /// hold back.
+    pub(crate) fn spawn_background<E: Env<Fs = F>>(&self, env: &E) {
+        let flusher = self.task_handle();
+        env.spawn(async move {
+            while flusher.running() {
+                flusher.flush_wanted().await;
+                if !flusher.running() {
+                    break;
+                }
+                let _working = Working::of(&flusher.store);
+                if let Err(e) = flusher.flush().await {
+                    // Nobody to hand it to. The store has taken note
+                    // (`saw_flush_failure`) and asks again after the next
+                    // write; a failure that lasts reaches a write at the
+                    // budget, which flushes inline and gets it itself.
+                    tracing::warn!(dir = %flusher.store.dir.display(), error = %e, "background flush failed");
+                }
+            }
+        });
+        if self.store.disable_automatic_compactions {
+            return;
+        }
+        let merger = self.task_handle();
+        env.spawn(async move {
+            while merger.running() {
+                merger.compaction_wanted().await;
+                if !merger.running() {
+                    break;
+                }
+                let _working = Working::of(&merger.store);
+                if let Err(e) = merger.compact_once().await {
+                    // Not asked for again until the version changes
+                    // (`saw_compaction_failure`), so this is not a spin.
+                    tracing::warn!(dir = %merger.store.dir.display(), error = %e, "background compaction failed");
+                }
+            }
+        });
+    }
+
+    /// A handle for a background task: the same state, counted in
+    /// [`Store::tasks`] until it is dropped, and with no say over the
+    /// directory.
+    fn task_handle(&self) -> Db<F> {
+        self.store.tasks.set(self.store.tasks.get() + 1);
+        Db {
+            store: std::rc::Rc::clone(&self.store),
+            owner: false,
+        }
+    }
+
+    /// Whether the tasks beside this store should keep going.
+    ///
+    /// False once [`Db::stop`] has been called: the condition the store's
+    /// own loops are written around ([`Db::spawn_background`]).
+    #[doc(hidden)]
     pub fn running(&self) -> bool {
-        !self.stopped.get()
+        !self.store.stopped.get()
     }
 
     /// Refuses a change to the directory if this store was opened read-only
@@ -1423,7 +1584,7 @@ impl<F: Fs> Db<F> {
     /// Called first by everything public that writes, flushes, compacts,
     /// rotates, sweeps or destroys, before it has taken anything.
     pub(crate) fn writable(&self) -> Result<()> {
-        if self.read_only {
+        if self.store.read_only {
             return Err(Error::ReadOnly);
         }
         Ok(())
@@ -1431,31 +1592,15 @@ impl<F: Fs> Db<F> {
 
     /// Takes account of a flush that failed (§5).
     pub(crate) fn saw_flush_failure(&self) {
-        self.flush_failed.set(true);
+        self.store.flush_failed.set(true);
     }
 
     /// Waits until there is a compaction worth running.
     ///
-    /// What a background compaction is built out of. **The store runs no
-    /// tasks of its own**: `Env::spawn` takes a `'static` future and these
-    /// methods take `&self`, so a task that compacted would have to hold the
-    /// store — and then dropping the store would not release the directory
-    /// until that task had finished, which `Drop` cannot wait for. So the
-    /// task belongs to the caller, which also owns stopping it:
-    ///
-    /// ```ignore
-    /// let worker = std::rc::Rc::clone(&db);
-    /// env.spawn(async move {
-    ///     while worker.running() {
-    ///         worker.compaction_wanted().await;
-    ///         let _ = worker.compact_once().await;
-    ///     }
-    /// });
-    /// ```
-    ///
-    /// The loop ends when the caller says so ([`Db::stop`]), which it
-    /// has to be able to do: the task holds the store while it waits, and a
-    /// store nothing lets go of is a directory nothing unlocks.
+    /// What the store's merge task waits on ([`Db::spawn_background`]). Not
+    /// part of the API: public only so that a test can stand in for the
+    /// task, with the store's own turned off
+    /// ([`crate::Options::background_tasks`]).
     ///
     /// A flush that finds somebody waiting here leaves the merge to them and
     /// returns; a flush that finds nobody runs it where it stands (§9). So a
@@ -1474,24 +1619,25 @@ impl<F: Fs> Db<F> {
     /// because the picker would give the same answer against the same
     /// version and asking for it again at once is a spin rather than a
     /// retry. The next flush is what makes it a retry.
+    #[doc(hidden)]
     pub async fn compaction_wanted(&self) {
         std::future::poll_fn(|cx| {
             // Nothing more is coming, so the task around this is meant to
             // end rather than wait ([`Db::stop`]).
-            if self.stopped.get() {
+            if self.store.stopped.get() {
                 return std::task::Poll::Ready(());
             }
             // Somebody is already on it. Waiting for them is the only answer
             // that does not spin: the picker would name the tables they have
             // claimed, `compact_once` would stand down, and this would say
             // yes again at once (§9, `crate::change::Compacting`).
-            if self.compacting.underway() {
-                self.compacting.park(cx);
+            if self.store.compacting.underway() {
+                self.store.compacting.park(cx);
                 return std::task::Poll::Pending;
             }
             // A reader never compacts, whatever the picker would choose.
-            if self.read_only || self.compaction_failed.get() || self.pick().is_none() {
-                self.compaction_waiters.park(cx);
+            if self.store.read_only || self.store.compaction_failed.get() || self.pick().is_none() {
+                self.store.compaction_waiters.park(cx);
                 return std::task::Poll::Pending;
             }
             std::task::Poll::Ready(())
@@ -1506,30 +1652,30 @@ impl<F: Fs> Db<F> {
     /// Says whether it woke anybody, which is how a flush knows whether the
     /// merge is somebody else's now (§9).
     pub(crate) fn version_changed(&self) -> bool {
-        self.compaction_failed.set(false);
-        self.compaction_waiters.wake()
+        self.store.compaction_failed.set(false);
+        self.store.compaction_waiters.wake()
     }
 
     /// Takes account of a compaction that failed.
     pub(crate) fn saw_compaction_failure(&self) {
-        self.compaction_failed.set(true);
+        self.store.compaction_failed.set(true);
     }
 
     /// The permit every operation that changes what the database is made of
     /// takes first (§5, `crate::change`).
     pub(crate) fn changes(&self) -> &crate::change::Changes {
-        &self.changes
+        &self.store.changes
     }
 
     /// Whether an append to the MANIFEST has failed, which is the end of
     /// this store's writing life (`crate::flush`).
     pub(crate) fn manifest_failed(&self) -> bool {
-        self.manifest_failed.get()
+        self.store.manifest_failed.get()
     }
 
     /// Takes account of an append to the MANIFEST that failed.
     pub(crate) fn saw_manifest_failure(&self) {
-        self.manifest_failed.set(true);
+        self.store.manifest_failed.set(true);
     }
 
     /// How many bytes a store holds before a write writes a memtable out
@@ -1539,36 +1685,36 @@ impl<F: Fs> Db<F> {
     /// [`Db::flush_line`], an eighth below this (§5).
     #[doc(hidden)]
     pub fn memtable_size(&self) -> u64 {
-        self.memtable_size
+        self.store.memtable_size
     }
 
     /// How large the MANIFEST may grow before a flush replaces it
     /// (`crate::rotate`), as [`crate::Options`] was asked for.
     pub(crate) fn max_manifest_bytes(&self) -> u64 {
-        self.max_manifest_bytes
+        self.store.max_manifest_bytes
     }
 
     /// How many tables L0 may hold before the picker wants it compacted.
     #[doc(hidden)]
     pub fn l0_compaction_threshold(&self) -> u64 {
-        self.l0_compaction_threshold
+        self.store.l0_compaction_threshold
     }
 
     /// How many tables L0 may hold before a write waits for it to drain
     /// (§9).
     #[doc(hidden)]
     pub fn l0_stop_writes_threshold(&self) -> u64 {
-        self.l0_stop_writes_threshold
+        self.store.l0_stop_writes_threshold
     }
 
     /// How many bytes L1 may hold, each level below it ten times more.
     pub(crate) fn lbase_max_bytes(&self) -> u64 {
-        self.lbase_max_bytes
+        self.store.lbase_max_bytes
     }
 
     /// How many entries a compaction merges before it hands the thread back.
     pub(crate) fn compaction_unit(&self) -> u64 {
-        self.compaction_unit
+        self.store.compaction_unit
     }
 
     /// How large a table a compaction into `level` aims to write.
@@ -1578,7 +1724,8 @@ impl<F: Fs> Db<F> {
     /// larger files there cost fewer of them.
     #[doc(hidden)]
     pub fn target_file_size(&self, level: u32) -> u64 {
-        self.target_file_size
+        self.store
+            .target_file_size
             .saturating_mul(1u64.checked_shl(level).unwrap_or(u64::MAX))
     }
 
@@ -1588,29 +1735,33 @@ impl<F: Fs> Db<F> {
     /// past that point an append that still went to the old file would be an
     /// append a reopen never sees.
     pub(crate) fn install_manifest(&self, filename: String, marker_iter: u64, marker: String) {
-        *self.manifest.borrow_mut() = Manifest {
+        *self.store.manifest.borrow_mut() = Manifest {
             filename,
             marker_iter,
         };
-        let mut markers = self.markers.borrow_mut();
+        let mut markers = self.store.markers.borrow_mut();
         markers.push(marker);
         markers.sort();
     }
 
     /// Drops names the obsolete sweep removed from the marker list.
     pub(crate) fn forget_markers(&self, removed: &[String]) {
-        self.markers.borrow_mut().retain(|m| !removed.contains(m));
+        self.store
+            .markers
+            .borrow_mut()
+            .retain(|m| !removed.contains(m));
     }
 
     /// Takes note of how many entries a table holds.
     pub(crate) fn saw_table_entries(&self, file_num: u64, entries: Option<u64>) {
-        if !self.metrics.recording() {
+        if !self.store.metrics.recording() {
             return;
         }
         let Some(entries) = entries else {
             return;
         };
         if self
+            .store
             .tables
             .entries
             .borrow_mut()
@@ -1627,13 +1778,14 @@ impl<F: Fs> Db<F> {
     /// Only where the version changes or a table's count is first learned:
     /// the sum walks every table, and a write must not.
     pub(crate) fn recount_records(&self) {
-        if !self.metrics.recording() {
+        if !self.store.metrics.recording() {
             return;
         }
         let live = self.version_set().version.table_file_nums();
-        let mut known = self.tables.entries.borrow_mut();
+        let mut known = self.store.tables.entries.borrow_mut();
         known.retain(|file_num, _| live.contains(file_num));
-        self.records_in_tables
+        self.store
+            .records_in_tables
             .set(known.values().copied().sum::<u64>());
         drop(known);
         self.saw_records();
@@ -1641,13 +1793,14 @@ impl<F: Fs> Db<F> {
 
     /// Restates the estimate from what the tables and the memtable hold.
     pub(crate) fn saw_records(&self) {
-        if !self.metrics.recording() {
+        if !self.store.metrics.recording() {
             return;
         }
         let in_memory: usize = self.memtables().iter().map(|m| m.borrow().len()).sum();
-        self.metrics
+        self.store
+            .metrics
             .records
-            .set((self.records_in_tables.get() + in_memory as u64) as i64);
+            .set((self.store.records_in_tables.get() + in_memory as u64) as i64);
     }
 
     /// Restates how much of the disk the directory takes.
@@ -1657,7 +1810,7 @@ impl<F: Fs> Db<F> {
     /// directory. A failure is dropped rather than reported: a metric that
     /// could not be measured is not a reason to fail the work it describes.
     pub(crate) async fn measure_disk(&self) {
-        if !self.metrics.recording() {
+        if !self.store.metrics.recording() {
             return;
         }
         let _ = self.disk_usage().await;
@@ -1677,19 +1830,19 @@ impl<F: Fs> Db<F> {
     /// and not one to make on a timer. Oxia memoizes Pebble's for five
     /// seconds for that reason ([METRICS.md](../METRICS.md)).
     pub async fn disk_usage(&self) -> Result<u64> {
-        let usage = self.fs.disk_usage(&self.dir).await?;
-        self.metrics.disk_size.set(usage.used_bytes as i64);
+        let usage = self.store.fs.disk_usage(&self.store.dir).await?;
+        self.store.metrics.disk_size.set(usage.used_bytes as i64);
         Ok(usage.used_bytes)
     }
 
     /// The filesystem this store's files live in.
     pub(crate) fn fs(&self) -> &F {
-        &self.fs
+        &self.store.fs
     }
 
     /// The version set, for a flush to add to.
     pub(crate) fn versions_mut(&self) -> std::cell::RefMut<'_, VersionSet> {
-        self.versions.borrow_mut()
+        self.store.versions.borrow_mut()
     }
 
     /// Applies an edit a flush or a compaction has made durable.
@@ -1699,8 +1852,8 @@ impl<F: Fs> Db<F> {
     /// here is what keeps the sweep off the tables that reader has still to
     /// open (`crate::obsolete::Pinned`).
     pub(crate) fn apply_edit(&self, edit: &VersionEdit) -> Result<()> {
-        let mut versions = self.versions.borrow_mut();
-        self.pinned.retiring(&versions.version);
+        let mut versions = self.store.versions.borrow_mut();
+        self.store.pinned.retiring(&versions.version);
         versions.apply(edit)
     }
 
@@ -1727,47 +1880,50 @@ impl<F: Fs> Db<F> {
         // The last await before the swap, and that is the whole point of
         // where it is: a write that started after this one returned would be
         // in flight on the memtable the next lines take away (§5).
-        self.writers.settled().await;
+        self.store.writers.settled().await;
         let fresh = std::rc::Rc::new(std::cell::RefCell::new(
             crate::memtable::Memtable::with_budget(
                 self.last_seq_num().wrapping_add(1),
-                self.memtable_size as usize,
+                self.store.memtable_size as usize,
             ),
         ));
-        let old = std::mem::replace(&mut *self.memtable.borrow_mut(), fresh);
-        *self.frozen.borrow_mut() = Some(old);
+        let old = std::mem::replace(&mut *self.store.memtable.borrow_mut(), fresh);
+        *self.store.frozen.borrow_mut() = Some(old);
         if let Some(log) = log {
             // The log's number is spent here rather than taken, because from
             // here the store is writing to it and nothing can put that back.
             // `crate::rotate` draws the same line in the other place a file
             // number outlives the operation that asked for it.
             self.versions_mut().next_file_num = log.log_num + 1;
-            *self.log.borrow_mut() = Some(log);
+            *self.store.log.borrow_mut() = Some(log);
         }
         Ok(())
     }
 
     /// Forgets the frozen memtable, now that a table holds what it held.
     pub(crate) fn thaw(&self) {
-        *self.frozen.borrow_mut() = None;
+        *self.store.frozen.borrow_mut() = None;
     }
 
     /// Whether this store was opened with the WAL off.
     #[doc(hidden)]
     pub fn wal_disabled(&self) -> bool {
-        self.disable_wal
+        self.store.disable_wal
     }
 
     /// Whether this store leaves compaction to its caller (§9).
     pub(crate) fn automatic_compactions_disabled(&self) -> bool {
-        self.disable_automatic_compactions
+        self.store.disable_automatic_compactions
     }
 
     /// Opens an existing log for appending, without pointing the store at
     /// it: that is a step of its own, taken with the memtable.
     async fn open_log(&self, log_num: u64) -> Result<Log<F::Disk>> {
-        let path = self.dir.join(roble_format::files::log_filename(log_num));
-        let disk = self.fs.open(&path, Access::ReadWrite).await?;
+        let path = self
+            .store
+            .dir
+            .join(roble_format::files::log_filename(log_num));
+        let disk = self.store.fs.open(&path, Access::ReadWrite).await?;
         Ok(Log {
             disk: std::rc::Rc::new(disk),
             log_num,
@@ -1783,7 +1939,7 @@ impl<F: Fs> Db<F> {
     /// edit. Cheap: the version inside is shared, not copied.
     #[doc(hidden)]
     pub fn versions(&self) -> VersionSet {
-        self.versions.borrow().clone()
+        self.store.versions.borrow().clone()
     }
 
     /// The store's own version set, borrowed.
@@ -1791,7 +1947,7 @@ impl<F: Fs> Db<F> {
     /// Never held across an `.await`: an edit applied meanwhile would find
     /// it borrowed.
     pub(crate) fn version_set(&self) -> std::cell::Ref<'_, VersionSet> {
-        self.versions.borrow()
+        self.store.versions.borrow()
     }
 
     /// The open reader for one table, from the cache or freshly opened.
@@ -1803,10 +1959,10 @@ impl<F: Fs> Db<F> {
         &self,
         file_num: u64,
     ) -> Result<std::rc::Rc<crate::table::OpenTable<F::Disk>>> {
-        if let Some(held) = self.tables.cached(file_num) {
+        if let Some(held) = self.store.tables.cached(file_num) {
             return Ok(held);
         }
-        let (table, learned) = self.tables.opened(file_num).await?;
+        let (table, learned) = self.store.tables.opened(file_num).await?;
         if learned {
             self.recount_records();
         }
@@ -1827,11 +1983,11 @@ impl<F: Fs> Db<F> {
         use std::fmt::Write as _;
 
         let mut out = String::new();
-        for m in self.markers.borrow().iter() {
+        for m in self.store.markers.borrow().iter() {
             let _ = writeln!(out, "marker {m}");
         }
-        let _ = writeln!(out, "format-version {}", self.format_version);
-        for (level, tables) in self.versions.borrow().version.levels() {
+        let _ = writeln!(out, "format-version {}", self.store.format_version);
+        for (level, tables) in self.store.versions.borrow().version.levels() {
             if tables.is_empty() {
                 continue;
             }
@@ -1968,4 +2124,46 @@ fn iter_kinds(repr: &[u8]) -> Result<Vec<usize>> {
         });
     }
     Ok(out)
+}
+
+impl<F: Fs> Drop for Db<F> {
+    /// Stops the background tasks; and releases the directory at once if
+    /// none of them is in the middle of a flush or a merge.
+    ///
+    /// A task that is only waiting does nothing more once it is woken: it
+    /// sees the store stopped and ends, and what it lets go of is state no
+    /// file is open for writing in. A task inside a flush or a merge keeps
+    /// the lock until that work has finished and the task has ended, so
+    /// nobody else opens the directory while files are still being written
+    /// in it. [`Db::close`] is how a caller waits for that.
+    fn drop(&mut self) {
+        if !self.owner {
+            let left = self.store.tasks.get() - 1;
+            self.store.tasks.set(left);
+            if left == 0 {
+                self.store.tasks_done.wake();
+            }
+            return;
+        }
+        self.stop();
+        if self.store.working.get() == 0 {
+            drop(self.store._lock.borrow_mut().take());
+        }
+    }
+}
+
+/// Counts a background task in as working until it is dropped.
+struct Working<'a>(&'a std::cell::Cell<usize>);
+
+impl<'a> Working<'a> {
+    fn of<F: Fs>(store: &'a Store<F>) -> Self {
+        store.working.set(store.working.get() + 1);
+        Working(&store.working)
+    }
+}
+
+impl Drop for Working<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }

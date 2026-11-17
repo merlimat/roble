@@ -52,7 +52,7 @@ use roble_format::key::{self, InternalKey, Kind};
 use crate::env::Fs;
 use crate::error::Result;
 use crate::memtable::Memtable;
-use crate::open::Db;
+use crate::open::{Db, Durability};
 use crate::read::{Comparison, Found, successor};
 use crate::scan::Scan;
 
@@ -272,14 +272,26 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
         )
     }
 
-    /// Applies the batch to the store, syncing the log if asked.
+    /// Applies the batch to the store, durable when this returns if
+    /// `durability` says so ([`Durability`]).
     ///
     /// Takes the batch, because the stand-in numbers in its index are only
     /// meaningful before a commit: afterwards its entries are the store's,
     /// with sequence numbers of their own, and reading them through this
     /// index again would find every one of them twice.
-    pub async fn commit(mut self, sync: bool) -> Result<()> {
-        self.db.write_raw(&mut self.repr, sync).await
+    pub async fn commit(mut self, durability: Durability) -> Result<()> {
+        self.db.write_raw(&mut self.repr, durability.syncs()).await
+    }
+}
+
+/// How much it holds, not the entries: a batch can be a whole replicated
+/// write, and its repr is what [`IndexedBatch::as_bytes`] is for.
+impl<F: Fs> std::fmt::Debug for IndexedBatch<'_, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexedBatch")
+            .field("count", &self.count())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
     }
 }
 

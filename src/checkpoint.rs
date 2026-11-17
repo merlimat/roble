@@ -93,7 +93,7 @@ impl<F: Fs> Db<F> {
         for file_num in tables {
             let name = files::table_filename(file_num);
             self.fs()
-                .link(&self.dir.join(&name), &dir.join(&name))
+                .link(&self.store.dir.join(&name), &dir.join(&name))
                 .await?;
         }
 

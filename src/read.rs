@@ -262,7 +262,7 @@ impl<F: Fs> Db<F> {
     /// its buffers have reached the sizes the data needs, a lookup in a steady
     /// state allocates nothing at all.
     pub async fn get_into(&self, key: &[u8], how: Comparison, buf: &mut GetBuf) -> Result<bool> {
-        let _timer = self.metrics.get.start();
+        let _timer = self.store.metrics.get.start();
         buf.key.clear();
         buf.value.clear();
         let result = match how {
@@ -272,9 +272,10 @@ impl<F: Fs> Db<F> {
             Comparison::Equal => self.equal(key, buf).await,
             _ => self.positioned(key, how, buf).await,
         };
-        let found = self.metrics.read_errors.saw(result)?;
+        let found = self.store.metrics.read_errors.saw(result)?;
         if found {
-            self.metrics
+            self.store
+                .metrics
                 .read_bytes
                 .add((buf.key.len() + buf.value.len()) as u64);
         } else {
@@ -371,7 +372,7 @@ impl<F: Fs> Db<F> {
         // Through the scan the buffer keeps, rebuilt in its own allocations
         // and parked again however the seek went, so that it never holds the
         // store between two lookups.
-        let scan = scan.get::<F>(&self.metrics);
+        let scan = scan.get::<F>(&self.store.metrics);
         let found = async {
             self.rebuild_scan(scan, std::iter::empty(), lower, upper)?;
             match (lower, upper) {

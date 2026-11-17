@@ -620,7 +620,10 @@ async fn a_range_reads_what_a_btreemap_range_reads_for_every_kind_of_bound() {
         batch.put(key, b"v").expect("put");
         model.insert(key.to_vec(), b"v".to_vec());
     }
-    batch.commit(false).await.expect("commit");
+    batch
+        .commit(roble::Durability::NoSync)
+        .await
+        .expect("commit");
 
     let (b, d) = (&b"b"[..], &b"d"[..]);
     for lower in [Unbounded, Included(b), Excluded(b)] {

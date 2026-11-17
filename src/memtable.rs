@@ -179,6 +179,17 @@ pub(crate) const MEMTABLE_SIZE: u64 = 4 << 20;
 /// without one there is nothing to make room for.
 pub(crate) const FLUSH_RESERVE: u64 = 8;
 
+/// How much it holds, not what.
+impl std::fmt::Debug for Memtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Memtable")
+            .field("len", &self.len())
+            .field("bytes", &self.bytes())
+            .field("range_deletions", &self.ranges.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Memtable {
     /// An empty memtable whose shape is determined by `seed`.
     pub fn new(seed: u64) -> Self {
