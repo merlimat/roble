@@ -620,10 +620,10 @@ pub(crate) struct Latency(Option<LocalLatency>);
 impl Latency {
     /// Times until the guard it returns is dropped.
     ///
-    /// `None` without metrics, so the clock is not read at all: §10 lets a
-    /// store read the real clock only where the env allows it, and this is
-    /// the one place that does. A seeded run without a meter provider reads
-    /// no clock anywhere.
+    /// `None` without metrics, so the clock is not read at all: §10 keeps a
+    /// store off the clock, and timing what a meter provider asked for is
+    /// the one place that reads it. A seeded run without a meter provider
+    /// reads no clock anywhere.
     pub(crate) fn start(&self) -> Option<Timer<'_>> {
         self.0.as_ref().map(|l| l.start())
     }

@@ -23,8 +23,8 @@
 //! executor back, resume.
 //!
 //! **A unit is work, not time.** The pacer counts entries, not milliseconds,
-//! because §10 lets a store read the clock only where the env allows it and
-//! a job that yielded on a timer would stop a seeded run replaying. Counting
+//! because §10 keeps a store off the clock, and a job that yielded on a timer
+//! would stop a seeded run replaying. Counting
 //! what was done gives the same slices every run, on every machine.
 //!
 //! Yielding is not free — it is a wake and a trip back through the executor —
