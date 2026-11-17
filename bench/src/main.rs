@@ -831,7 +831,11 @@ pub fn key_into(s: usize, i: usize, out: &mut Vec<u8>) {
 /// same generator fills them in every engine, so all the stores hold the same
 /// bytes.
 pub fn value_for(cfg: &Config, s: usize, i: usize) -> Vec<u8> {
-    let mut rng = Rng::new(cfg.seed ^ ((s as u64) << 40) ^ (i as u64));
+    // `i << 1`, not `i`: `Rng::new` sets bit 0, so a bare `i` gave records 2k
+    // and 2k+1 one value between them. With keys in record order the two sit
+    // side by side, and Snappy halved RocksDB's store while roble, which
+    // writes no compression, kept it whole.
+    let mut rng = Rng::new(cfg.seed ^ ((s as u64) << 40) ^ ((i as u64) << 1));
     // `--value-chunk` is the dial between incompressible and compressible: a
     // value is one random chunk repeated to fill it, so a chunk the size of
     // the value gives Snappy nothing to find, and a smaller one gives it an
@@ -1372,6 +1376,10 @@ pub struct Config {
 
 impl Config {
     fn parse() -> Self {
+        Self::parse_from(std::env::args().skip(1).collect())
+    }
+
+    fn parse_from(args: Vec<String>) -> Self {
         let mut cfg = Config {
             dir: PathBuf::new(),
             engine: "roble".to_string(),
@@ -1395,7 +1403,6 @@ impl Config {
             tsv: false,
             phases: None,
         };
-        let args: Vec<String> = std::env::args().skip(1).collect();
         let mut saw_dir = false;
         let mut i = 0;
         while i < args.len() {
@@ -1800,6 +1807,18 @@ mod tests {
         }
         assert!(!Workload::parse("D").pebble_agrees);
         assert!(!Workload::parse("F").pebble_agrees);
+    }
+
+    /// Every record gets a value of its own. When two neighbouring records
+    /// shared one, an engine that compresses stored half the bytes of one
+    /// that does not, but only with keys in record order — which made roble's
+    /// ordered-key reads look twice as slow as RocksDB's.
+    #[test]
+    fn records_do_not_share_values() {
+        let cfg = Config::parse_from(vec!["--dir".into(), "unused".into()]);
+        let values: std::collections::HashSet<Vec<u8>> =
+            (0..10_000).map(|i| value_for(&cfg, 0, i)).collect();
+        assert_eq!(values.len(), 10_000);
     }
 
     /// Both skewed draws stay inside the keyspace at its edges, where the
