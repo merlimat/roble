@@ -167,7 +167,16 @@ fn usage_and_bad_arguments_behave() {
         assert!(out.status.success(), "{args:?} should succeed");
         let text = stdout(&out);
         assert!(text.contains("Usage: roble"), "{args:?}: {text}");
-        for command in ["sst", "manifest", "completions"] {
+        for command in [
+            "sst",
+            "manifest",
+            "completions",
+            "put",
+            "delete-range",
+            "scan",
+            "stats",
+            "tables",
+        ] {
             assert!(text.contains(command), "{args:?} omits {command}");
         }
         // The after_help prose, which says what a refusal means.
@@ -186,6 +195,8 @@ fn usage_and_bad_arguments_behave() {
         vec!["sst", "dump", "a", "b"],
         vec!["manifest", "dump"],
         vec!["sst", "dump", "--nonsense", "x"],
+        vec!["put", r"\x0g", "v"],
+        vec!["put", r"\q", "v"],
     ] {
         let out = roble(&args);
         assert_eq!(
@@ -419,4 +430,505 @@ fn the_dump_shows_the_fields_an_edit_rarely_carries() {
     for expected in ["prev-log 7", "marked-for-compaction", "<undecodable:"] {
         assert!(text.contains(expected), "the dump should show {expected:?}");
     }
+}
+
+/// A copy of a database fixture in a directory of its own: opening one takes
+/// its lock and may sweep it, which the checked-in fixture must not see.
+fn a_copy_of(fixture: &str) -> tempfile::TempDir {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/golden")
+        .join(fixture);
+    let dir = tempfile::tempdir().expect("tempdir");
+    for entry in std::fs::read_dir(&from).expect("fixture") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), dir.path().join(entry.file_name())).expect("copy");
+    }
+    dir
+}
+
+fn on(dir: &Path, args: &[&str]) -> Output {
+    let mut all = vec!["-d", dir.to_str().expect("path")];
+    all.extend_from_slice(args);
+    roble(&all)
+}
+
+/// What one command writes, the next one reads: the commands share nothing
+/// but the directory, so every write here has to be in it before the
+/// process that made it exits.
+#[test]
+fn puts_and_deletes_are_read_back_by_the_next_command() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // A directory that is not there yet, which `put` creates.
+    let dir = tmp.path().join("db");
+
+    for (key, value) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        let out = on(&dir, &["put", key, value]);
+        assert!(out.status.success(), "put {key}: {}", stderr(&out));
+    }
+    let out = on(&dir, &["get", "b"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "2\n");
+
+    let out = on(&dir, &["scan", "-s", "b", "-e", "d"]);
+    assert_eq!(stdout(&out), "b\t2\nc\t3\n");
+
+    let out = on(&dir, &["delete", "a"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = on(&dir, &["delete-range", "-s", "b", "-e", "d"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = on(&dir, &["scan"]);
+    assert_eq!(stdout(&out), "d\t4\n");
+}
+
+/// Keys and values are bytes: an escape in an argument is the byte it names,
+/// and a byte that is not text is printed escaped the same way.
+#[test]
+fn bytes_that_are_not_text_go_in_and_come_out_escaped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let out = on(dir, &["put", r"k\x00\xff", r"back\\slash\x09"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = on(dir, &["scan"]);
+    assert_eq!(stdout(&out), "k\\x00\\xff\tback\\\\slash\\x09\n");
+
+    let out = on(dir, &["get", "-x", r"k\x00\xff"]);
+    assert_eq!(
+        stdout(&out),
+        "00000000  62 61 63 6b 5c 73 6c 61  73 68 09                 |back\\slash.|\n"
+    );
+}
+
+#[test]
+fn get_exits_one_for_a_key_that_is_not_there() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = on(tmp.path(), &["put", "k", "v"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = on(tmp.path(), &["get", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).is_empty());
+    assert!(stderr(&out).contains("not found"), "{}", stderr(&out));
+}
+
+/// Only `put` creates a database. The others refuse a directory that holds
+/// none, and leave it as they found it, without so much as a `LOCK`.
+#[test]
+fn only_put_creates_a_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing = tmp.path().join("missing");
+    for args in [
+        vec!["get", "k"],
+        vec!["scan"],
+        vec!["delete", "k"],
+        vec!["delete-range", "-s", "a", "-e", "b"],
+        vec!["stats"],
+        vec!["tables"],
+    ] {
+        let out = on(&missing, &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&out).contains("missing"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        assert!(!missing.exists(), "{args:?} created the directory");
+
+        let out = on(tmp.path(), &args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr(&out).contains("no database"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).expect("list").count(),
+            0,
+            "{args:?} left something behind"
+        );
+    }
+}
+
+/// Every file in `dir`, by name, with its bytes.
+fn contents(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .expect("list")
+        .map(|e| {
+            let e = e.expect("entry");
+            let bytes = std::fs::read(e.path()).expect("read");
+            (e.file_name().to_string_lossy().into_owned(), bytes)
+        })
+        .collect()
+}
+
+/// While another process holds the directory, the commands that read open
+/// it read-only and work, see what is still only in the log, and leave every
+/// file as it was. The commands that write fail at once rather than wait.
+/// Only where roble locks.
+#[cfg(unix)]
+#[test]
+fn a_database_open_elsewhere_is_read_and_not_written() {
+    let db = a_copy_of("db-reads");
+    // Written to the log and never flushed: a read has to replay it.
+    let out = on(db.path(), &["put", "unflushed", "yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let lock = std::fs::File::open(db.path().join("LOCK")).expect("open LOCK");
+    lock.lock().expect("lock");
+    let before = contents(db.path());
+
+    let out = on(db.path(), &["get", "unflushed"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "yes\n");
+    let out = on(db.path(), &["scan"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("unflushed\tyes\n"),
+        "{}",
+        stdout(&out)
+    );
+    for args in [&["stats"][..], &["tables"]] {
+        let out = on(db.path(), args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(contents(db.path()), before, "a read changed the directory");
+
+    for args in [
+        &["put", "k", "v"][..],
+        &["delete", "k"],
+        &["delete-range", "-s", "a", "-e", "z"],
+    ] {
+        let out = on(db.path(), args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&out).contains("already open"), "{}", stderr(&out));
+    }
+    assert_eq!(contents(db.path()), before);
+}
+
+/// `tables` lists what the MANIFEST names, and `stats` adds the same tables
+/// up. The fixture is a database Pebble wrote, with tables in L0 and L6.
+#[test]
+fn stats_and_tables_describe_the_same_layout() {
+    let db = a_copy_of("db-reads");
+
+    let out = on(db.path(), &["tables"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let tables = stdout(&out);
+    let mut rows = tables.lines().map(|l| l.split('\t').collect::<Vec<_>>());
+    let header = rows.next().expect("a header");
+    assert_eq!(header.len(), 13, "{header:?}");
+    let lines: Vec<Vec<&str>> = rows.collect();
+    assert!(!lines.is_empty());
+    let column = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    for fields in &lines {
+        assert_eq!(fields.len(), header.len(), "{fields:?}");
+        assert_eq!(fields[column("format")], "pebblev4", "{fields:?}");
+        assert_eq!(fields[column("compression")], "NoCompression", "{fields:?}");
+        assert!(fields[1].ends_with(".sst"), "{fields:?}");
+        assert!(
+            db.path().join(fields[1]).exists(),
+            "{} is not in the directory",
+            fields[1]
+        );
+    }
+    let in_level = |level: &str| lines.iter().filter(|f| f[0] == level).count();
+    let sum = |name: &str| -> u64 {
+        lines
+            .iter()
+            .map(|f| f[column(name)].parse::<u64>().unwrap())
+            .sum()
+    };
+    let bytes = sum("size");
+
+    let out = on(db.path(), &["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stats = stdout(&out);
+    let field = |name: &str| {
+        stats
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("stats omits {name}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(field("tables "), lines.len().to_string());
+    assert_eq!(field("table bytes "), bytes.to_string());
+    assert_eq!(field("table entries "), sum("entries").to_string());
+    assert_eq!(field("format version "), "16");
+    for level in 0..7 {
+        let row = stats
+            .lines()
+            .find(|l| l.split_whitespace().next() == Some(&level.to_string()))
+            .unwrap_or_else(|| panic!("stats omits level {level}"));
+        let count: usize = row.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert_eq!(count, in_level(&format!("L{level}")), "level {level}");
+    }
+}
+
+/// Without -d, a command opens the database in the current directory.
+#[test]
+fn the_directory_is_the_current_one_by_default() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_roble"))
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .expect("run roble")
+    };
+    let out = run(&["put", "k", "v"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&on(tmp.path(), &["get", "k"])), "v\n");
+    assert_eq!(stdout(&run(&["get", "k"])), "v\n");
+}
+
+/// `scan -x` dumps each key and value across as many lines as it takes, and a
+/// reader that goes away part-way, as `head` does, is a quiet stop.
+#[test]
+fn a_scan_piped_into_a_reader_that_goes_away_is_not_an_error() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Each value dumps to about four times its size, so these overflow any
+    // pipe's buffer long before the scan is done.
+    let value = "v".repeat(60_000);
+    for key in ["a", "b", "c"] {
+        let out = on(tmp.path(), &["put", key, &value]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_roble"))
+        .args(["-d", tmp.path().to_str().unwrap(), "scan", "-x"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run roble");
+    // Read the first lines, then go away while the command is still writing.
+    let mut head = [0; 256];
+    child
+        .stdout
+        .as_mut()
+        .expect("stdout is piped")
+        .read_exact(&mut head)
+        .expect("read");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait for roble");
+
+    let head = String::from_utf8_lossy(&head);
+    assert!(
+        head.starts_with(
+            "key   00000000  61                                                |a|\n\
+             value 00000000  76 76 76 76 76 76 76 76  76 76 76 76 76 76 76 76  |vvvvvvvvvvvvvvvv|\n\
+             \x20     00000010  76"
+        ),
+        "{head:?}"
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(out.stderr.is_empty(), "{}", stderr(&out));
+}
+
+/// A database with nothing in its tables: every level holds none of the
+/// bytes, and there is no compaction to run.
+#[test]
+fn stats_on_an_empty_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = on(tmp.path(), &["put", "k", "v"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let out = on(tmp.path(), &["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for expected in [
+        "tables                                 0",
+        "next compaction                     none",
+    ] {
+        assert!(text.contains(expected), "{expected:?} in {text}");
+    }
+    assert!(
+        text.contains(
+            "\n    0          0                0     0.0%            0            0        -\n"
+        ),
+        "{text}"
+    );
+    // The write is in the log and the memtable, and in no table yet.
+    assert!(
+        !text.contains("unflushed bytes                        0\n"),
+        "{text}"
+    );
+    assert_eq!(stdout(&on(tmp.path(), &["tables"])).lines().count(), 1);
+}
+
+/// A database with no log to write to says so, rather than naming one.
+#[test]
+fn stats_without_a_log() {
+    let db = a_copy_of("db-simple");
+    std::fs::remove_file(db.path().join("000002.log")).expect("remove the log");
+    let out = on(db.path(), &["stats"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("wal                                 none"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// The commands that read keep working while a writer in another thread
+/// flushes and compacts under them, deleting the tables and logs they read:
+/// a read that finds a file gone opens again, and a scan picks up after the
+/// last key it printed, so no key is printed twice or out of order.
+#[test]
+fn reads_carry_on_beside_a_writer_that_compacts() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let db = a_copy_of("db-reads");
+    let dir = db.path().to_path_buf();
+    let keys_of = |out: &Output| -> Vec<String> {
+        stdout(out)
+            .lines()
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect()
+    };
+    // What the fixture holds, which the writer below adds to and never
+    // touches: its keys all sort before "x". Compared as printed, since some
+    // hold bytes that print escaped and so sort differently as text.
+    let fixture = keys_of(&on(&dir, &["scan"]));
+    assert!(fixture.iter().all(|k| k.as_str() < "x"), "{fixture:?}");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (dir, stop) = (dir.clone(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let runtime = compio::runtime::Runtime::new().expect("runtime");
+            runtime.block_on(async {
+                let options = roble::Options::default().l0_compaction_threshold(2);
+                let db = roble::open_with(&roble::DefaultEnv, &dir, options)
+                    .await
+                    .expect("open the writer");
+                let mut round = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut batch = roble_format::batch::Batch::new();
+                    for i in 0..50 {
+                        let key = format!("x{:03}", (round * 7 + i) % 200);
+                        batch.put(key.as_bytes(), b"v").expect("put");
+                    }
+                    db.write(&mut batch, false).await.expect("write");
+                    db.flush().await.expect("flush");
+                    db.compact_once().await.expect("compact");
+                    round += 1;
+                    // A flush a few milliseconds apart: still many to every
+                    // read, and slow enough that a loaded machine opens a
+                    // database between two of them. A writer that retires
+                    // files faster than a reader can open one keeps every
+                    // read stale, which the retries cannot outlast (§6).
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                round
+            })
+        })
+    };
+
+    for _ in 0..20 {
+        let out = on(&dir, &["scan"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let keys = keys_of(&out);
+        let (old, new) = keys.split_at(fixture.len().min(keys.len()));
+        assert_eq!(old, fixture, "the fixture's keys, once each");
+        assert!(
+            new.windows(2).all(|w| w[0] < w[1]),
+            "the writer's keys, in order and once each: {new:?}"
+        );
+        for args in [&["stats"][..], &["tables"], &["get", "x000"]] {
+            let out = on(&dir, args);
+            // `get` may run before the writer has put the key.
+            assert!(out.status.code() != Some(2), "{args:?}: {}", stderr(&out));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let rounds = writer.join().expect("the writer");
+    assert!(rounds > 0, "the writer never wrote");
+}
+
+/// A database whose keys `k000`..`k199` are in several L1 tables, written
+/// by the engine directly, and the file of the last of them.
+fn a_database_in_several_tables() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let runtime = compio::runtime::Runtime::new().expect("runtime");
+    let last = runtime.block_on(async {
+        let options = roble::Options::default()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .target_file_size(1024);
+        let db = roble::open_with(&roble::DefaultEnv, &path, options)
+            .await
+            .expect("open");
+        let mut batch = roble_format::batch::Batch::new();
+        for i in 0..200 {
+            batch
+                .put(format!("k{i:03}").as_bytes(), &[b'v'; 64])
+                .expect("put");
+        }
+        db.write(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush");
+        let l0: Vec<u64> = db
+            .versions()
+            .version
+            .level(0)
+            .iter()
+            .map(|t| t.file_num)
+            .collect();
+        let out = db.compact(0, &l0).await.expect("compact");
+        assert!(out.len() > 2, "the compaction should split: {out:?}");
+        *out.last().unwrap()
+    });
+    let file = path.join(roble_format::files::table_filename(last));
+    (dir, file)
+}
+
+/// A table the version names and the directory has lost stays lost however
+/// often a read opens the database again: the read gives up, after the
+/// retries a writer retiring files would have been given, and says why.
+#[test]
+fn a_read_gives_up_on_a_table_that_stays_gone() {
+    let (db, last) = a_database_in_several_tables();
+    std::fs::remove_file(&last).expect("remove the last table");
+
+    // A scan prints what it reads before the table it cannot open, once each,
+    // and every reopening resumes after the last key it printed.
+    let out = on(db.path(), &["scan"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(stderr(&out).contains("stale"), "{}", stderr(&out));
+    let text = stdout(&out);
+    let keys: Vec<&str> = text
+        .lines()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
+    assert!(
+        !keys.is_empty(),
+        "the scan printed nothing before the lost table"
+    );
+    let mut sorted = keys.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(keys, sorted, "a key was printed twice or out of order");
+
+    for args in [&["get", "k199"][..], &["stats"], &["tables"]] {
+        let out = on(db.path(), args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(stdout(&out).is_empty(), "{args:?}: {}", stdout(&out));
+        assert!(stderr(&out).contains("stale"), "{args:?}: {}", stderr(&out));
+    }
+}
+
+/// A marker file the format crate cannot read is refused with the directory
+/// it was found in, before anything is opened.
+#[test]
+fn a_directory_with_an_unreadable_marker_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("marker.bad"), b"").expect("write");
+    let out = on(tmp.path(), &["get", "k"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = stderr(&out);
+    assert!(err.contains("marker.bad"), "{err}");
+    assert!(err.contains(tmp.path().to_str().unwrap()), "{err}");
 }
