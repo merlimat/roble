@@ -59,6 +59,7 @@ fn blob_unsupported() -> Error {
 }
 
 /// One entry a seek landed on.
+#[derive(Debug)]
 pub struct Entry {
     /// The encoded internal key.
     pub key: Vec<u8>,
@@ -109,6 +110,18 @@ pub struct OpenTable<D: Disk> {
     /// store that wants an estimate of the records it holds gets this one
     /// free, for every table something has had reason to open.
     pub entries: Option<u64>,
+}
+
+/// Which table, and how much of it is in memory.
+impl<D: Disk> std::fmt::Debug for OpenTable<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenTable")
+            .field("file_num", &self.file_num)
+            .field("index_entries", &self.index.len())
+            .field("filter", &self.filter.is_some())
+            .field("tombstones", &self.tombstones.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<D: Disk> OpenTable<D> {
@@ -799,6 +812,16 @@ impl<D: Disk> OpenTable<D> {
             ahead: 0,
             ahead_back: false,
         }
+    }
+}
+
+/// Which table, and which block of it.
+impl<D: Disk> std::fmt::Debug for TableIter<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableIter")
+            .field("file_num", &self.table.file_num)
+            .field("block", &self.at)
+            .finish_non_exhaustive()
     }
 }
 

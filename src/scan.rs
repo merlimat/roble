@@ -654,6 +654,21 @@ impl<D: Disk> Source<D> {
     }
 }
 
+/// Its bounds, the sequence number it reads at, and where it is: what a
+/// caller looking at one in a debugger would want, without the merge
+/// behind it.
+impl<F: Fs> std::fmt::Debug for Scan<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scan")
+            .field("lower", &self.lower.get())
+            .field("upper", &self.upper.get())
+            .field("snapshot", &self.snapshot)
+            .field("direction", &self.dir)
+            .field("key", &self.is_valid().then(|| self.key()))
+            .finish_non_exhaustive()
+    }
+}
+
 impl<F: Fs> Drop for Scan<F> {
     /// A scan that has gone away is one fewer open, and a store that keeps
     /// reporting scans nobody holds is how an iterator leak hides.

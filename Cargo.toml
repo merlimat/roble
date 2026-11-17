@@ -61,6 +61,9 @@ libc = "0.2"
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
+# Every public type can be printed, so a caller's own `#[derive(Debug)]`
+# over one of roble's never fails to compile.
+missing_debug_implementations = "warn"
 
 [workspace]
 members = ["bench", "cli", "format", "compat/minlz", "compat/sst-roundtrip", "compat/wal-replay"]
@@ -80,6 +83,7 @@ publish = false
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+missing_debug_implementations = "warn"
 # `cargo fuzz` builds with `--cfg fuzzing`, under which roble-format skips
 # checksum verification so a fuzzer can reach the parsers behind it
 # (format/fuzz/README.md).

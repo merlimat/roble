@@ -304,3 +304,31 @@ impl<F: Fs> Options<F> {
         self
     }
 }
+
+// Written out rather than derived: the caches are a handle whose own line
+// says what they hold, and a meter provider has nothing worth printing
+// beyond whether there is one.
+impl<F: Fs> std::fmt::Debug for Options<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Options");
+        d.field("caches", &self.caches)
+            .field("disable_wal", &self.disable_wal)
+            .field("create_if_missing", &self.create_if_missing)
+            .field(
+                "disable_automatic_compactions",
+                &self.disable_automatic_compactions,
+            )
+            .field("background_tasks", &self.background_tasks)
+            .field("memtable_size", &self.memtable_size)
+            .field("max_manifest_bytes", &self.max_manifest_bytes)
+            .field("l0_compaction_threshold", &self.l0_compaction_threshold)
+            .field("l0_stop_writes_threshold", &self.l0_stop_writes_threshold)
+            .field("lbase_max_bytes", &self.lbase_max_bytes)
+            .field("compaction_unit", &self.compaction_unit)
+            .field("target_file_size", &self.target_file_size);
+        #[cfg(feature = "opentelemetry")]
+        d.field("metered", &self.meter.is_some())
+            .field("metric_attributes", &self.metric_attributes);
+        d.finish()
+    }
+}
