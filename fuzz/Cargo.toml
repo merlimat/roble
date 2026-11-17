@@ -14,7 +14,7 @@ compio = "0.19.2"
 libfuzzer-sys = "0.4"
 # Metrics off: nothing here reads them, and it keeps opentelemetry out of
 # every fuzz build.
-roble = { path = "..", default-features = false }
+roble = { path = "..", default-features = false, features = ["sim"] }
 roble-format = { path = "../format" }
 
 # Its own workspace: `cargo fuzz` needs nightly and sanitizer flags that the

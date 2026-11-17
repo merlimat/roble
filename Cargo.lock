@@ -1234,6 +1234,7 @@ dependencies = [
  "nanometer",
  "opentelemetry",
  "opentelemetry_sdk",
+ "roble",
  "roble-format",
  "tempfile",
  "tracing",
