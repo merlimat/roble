@@ -74,10 +74,13 @@ async fn a_read_fetches_blocks_rather_than_whole_tables() {
 #[compio::test]
 async fn a_table_is_opened_once_and_then_held() {
     let (env, dir, _) = load("db-reads").await;
-    let db = roble::open(&env, &dir).await.expect("open");
+    let caches: Caches<SimFs> = Caches::default();
+    let db = roble::open_with(&env, &dir, Options::new().caches(caches.clone()))
+        .await
+        .expect("open");
 
     db.get(b"a0", Comparison::Equal).await.expect("get");
-    let opened = db.caches_for_test().open_tables();
+    let opened = caches.tables_held();
     assert!(opened > 0, "the read should have opened a table");
     let after_first = env.sim().bytes_read();
 
@@ -86,7 +89,7 @@ async fn a_table_is_opened_once_and_then_held() {
     let second = env.sim().bytes_read() - after_first;
 
     assert_eq!(
-        db.caches_for_test().open_tables(),
+        caches.tables_held(),
         opened,
         "the second read should reuse the open tables, not add more"
     );
@@ -125,9 +128,9 @@ async fn a_cache_bounded_to_one_table_still_answers() {
 
     assert_eq!(cramped, roomy, "eviction changed an answer");
     assert!(
-        caches.open_tables() <= 1,
+        caches.tables_held() <= 1,
         "the cache held {} tables against a budget of one",
-        caches.open_tables()
+        caches.tables_held()
     );
 }
 
@@ -176,7 +179,7 @@ async fn two_stores_sharing_a_cache_do_not_read_each_others_tables() {
     }
 
     assert_eq!(
-        shared.open_tables(),
+        shared.tables_held(),
         2,
         "both tables should be held separately in the one cache"
     );
@@ -227,9 +230,9 @@ async fn the_block_budget_is_kept_and_the_answers_do_not_change() {
     for probe in [b"a0".as_slice(), b"c2", b"f3", b"u2", b"w0"] {
         cramped.push(db.get(probe, Comparison::Ceiling).await.expect("get"));
         assert!(
-            caches.block_bytes() <= 4096,
+            caches.block_bytes_held() <= 4096,
             "the cache held {} bytes against a budget of 4096",
-            caches.block_bytes()
+            caches.block_bytes_held()
         );
     }
     assert_eq!(cramped, roomy, "eviction changed an answer");
@@ -254,7 +257,7 @@ async fn a_block_is_cached_decoded_rather_than_as_it_was_read() {
     disk.close().await.expect("close");
 
     let caches: Caches<SimFs> = Caches::new(DEFAULT_OPEN_TABLES, DEFAULT_BLOCK_BYTES);
-    let blocks = caches.blocks(0);
+    let blocks = roble::__private::block_cache(&caches, 0);
     let disk = fs.open(&path, roble::Access::ReadOnly).await.expect("open");
     let table = roble::__private::OpenTable::open(1, disk, blocks.clone())
         .await

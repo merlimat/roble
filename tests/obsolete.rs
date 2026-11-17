@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, Options, WriteBuf};
+use roble::{Caches, Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 use roble_format::files::{self, FileType};
 
@@ -506,11 +506,20 @@ async fn the_table_goes_once_the_scan_does() {
 #[compio::test]
 async fn a_sweep_keeps_the_readers_the_version_still_names() {
     let (env, dir) = load("db-reads").await;
-    let db = open_unscheduled(&env, &dir).await;
+    let caches: Caches<SimFs> = Caches::default();
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .caches(caches.clone()),
+    )
+    .await
+    .expect("open");
 
     // A read leaves a reader open for the table that answered it.
     db.get(b"a0", Comparison::Equal).await.expect("get");
-    let held = db.caches_for_test().open_tables();
+    let held = caches.tables_held();
     assert!(held > 0, "a read should have left a reader open");
 
     // A flush sweeps for itself, and retires none of the tables that reader
@@ -521,7 +530,7 @@ async fn a_sweep_keeps_the_readers_the_version_still_names() {
     db.flush().await.expect("flush").expect("a table");
 
     assert_eq!(
-        db.caches_for_test().open_tables(),
+        caches.tables_held(),
         held,
         "the sweep let go of a reader for a table the version still names"
     );

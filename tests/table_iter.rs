@@ -112,7 +112,10 @@ async fn try_open_bytes(bytes: Vec<u8>) -> (SimEnv, roble::Result<OpenTable<robl
 
     let caches: Caches<SimFs> = Caches::default();
     let disk = fs.open(&path, Access::ReadOnly).await.expect("open");
-    (env, OpenTable::open(1, disk, caches.blocks(0)).await)
+    (
+        env,
+        OpenTable::open(1, disk, roble::__private::block_cache(&caches, 0)).await,
+    )
 }
 
 /// An index names its blocks by handle, and a handle is read from the table.
