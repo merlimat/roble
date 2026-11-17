@@ -124,7 +124,7 @@ pub trait Store: Sized {
     ///
     /// A length and not the value, because **every engine here can produce a
     /// value without handing back an owned copy** and they do it differently:
-    /// roble reads into a `Lookup` the caller keeps, Pebble's `Get` borrows
+    /// roble reads into a `GetBuf` the caller keeps, Pebble's `Get` borrows
     /// the value from the block it is in and hands back a closer, RocksDB has
     /// `get_pinned`, and encina passes the borrowed value to a closure. An
     /// owned return would charge some of them for an allocation the
@@ -208,15 +208,15 @@ pub struct Roble {
     /// Shared with the two tasks `open` spawns beside it, which is what
     /// takes a flush and a merge off the write that would otherwise pay for
     /// them (§9, `roble::Db::flush_wanted`).
-    db: std::rc::Rc<roble::Db<roble::FileFs>>,
+    db: std::rc::Rc<roble::Db>,
     /// The working space `get` hands back on every call. One per store,
     /// as Oxia holds one store per shard and reads them from one thread.
     ///
     /// A `Cell` and not a `RefCell`: it is moved out for the call and back
     /// after, so there is no borrow to hold across the await inside. Clippy
     /// refuses that borrow, and is right to — it is the hazard that decided
-    /// a `Lookup` belongs to the caller in the first place.
-    lookup: std::cell::Cell<roble::Lookup>,
+    /// a `GetBuf` belongs to the caller in the first place.
+    lookup: std::cell::Cell<roble::GetBuf>,
 }
 
 impl Store for Roble {
@@ -289,7 +289,7 @@ impl Store for Roble {
 
             shards.push(Roble {
                 db,
-                lookup: std::cell::Cell::new(roble::Lookup::new()),
+                lookup: std::cell::Cell::new(roble::GetBuf::new()),
             });
         }
         shards
@@ -377,23 +377,22 @@ impl Store for Roble {
 
     fn levels(&self) -> Option<[usize; 7]> {
         let mut counts = [0usize; 7];
-        for (level, tables) in self.db.versions().version.levels() {
-            counts[level as usize] = tables.len();
+        for level in self.db.levels().ok()? {
+            counts[level.level as usize] = level.tables.len();
         }
         Some(counts)
     }
 
     fn layout(&self) -> Option<Vec<TableInfo>> {
-        let versions = self.db.versions();
         let mut out = Vec::new();
-        for (level, tables) in versions.version.levels() {
-            for t in tables {
+        for level in self.db.levels().ok()? {
+            for t in level.tables {
                 out.push(TableInfo {
-                    level: level as usize,
+                    level: level.level as usize,
                     name: roble_files::table_filename(t.file_num),
                     size: t.size,
-                    smallest: t.smallest_user_key().unwrap_or_default().to_vec(),
-                    largest: t.largest_user_key().unwrap_or_default().to_vec(),
+                    smallest: t.smallest,
+                    largest: t.largest,
                 });
             }
         }
@@ -403,8 +402,7 @@ impl Store for Roble {
     async fn scan(&self, reverse: bool, report: &mut Report) -> u64 {
         let mut c = self
             .db
-            .scan()
-            .await
+            .range(..)
             .unwrap_or_else(|e| fail(&format!("scan: {e}")));
         if reverse {
             c.last().await
@@ -428,8 +426,7 @@ impl Store for Roble {
     async fn scan_from(&self, from: &[u8], count: u64) -> u64 {
         let mut c = self
             .db
-            .scan()
-            .await
+            .range(..)
             .unwrap_or_else(|e| fail(&format!("scan: {e}")));
         c.seek_ge(from)
             .await

@@ -90,7 +90,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 async fn forward<F: Fs>(db: &roble::Db<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Vec::new();
     while scan.is_valid() {
@@ -101,7 +101,7 @@ async fn forward<F: Fs>(db: &roble::Db<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 async fn backward<F: Fs>(db: &roble::Db<F>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.last().await.expect("last");
     let mut out = Vec::new();
     while scan.is_valid() {

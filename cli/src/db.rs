@@ -20,10 +20,11 @@
 //! the words.
 
 use std::io::{self, BufWriter, Write};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::Path;
 use std::process::ExitCode;
 
-use roble::{Comparison, Db, DefaultEnv, FileFs, Options};
+use roble::{Comparison, Db, DefaultEnv, Options};
 use roble_format::batch::Batch;
 use roble_format::files::{self, MARKER_MANIFEST};
 
@@ -116,10 +117,11 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
             loop {
                 let scanned: Result<()> = async {
                     let db = open_read_only(dir).await?;
-                    let mut scan = db
-                        .scan_range(start.as_deref(), end.as_deref())
-                        .await
-                        .at(dir)?;
+                    let bounds = (
+                        start.as_deref().map_or(Unbounded, Included),
+                        end.as_deref().map_or(Unbounded, Excluded),
+                    );
+                    let mut scan = db.range(bounds).at(dir)?;
                     match &from {
                         Some(key) => scan.seek_ge(key).await,
                         None => scan.first().await,
@@ -180,20 +182,21 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
 ///
 /// Into a buffer, which a write cannot fail on, so what is written is not
 /// checked here. The buffer goes to the output once the read is done.
-fn tables(db: &Db<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
-    let versions = db.versions();
+fn tables(db: &Db, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
+    let levels = db.levels().at(dir)?;
     let _ = writeln!(
         out,
         "level\tfile\tsize\tseqs\tformat\tcompression\tentries\tdeletions\t\
          range-dels\traw\tratio\tsmallest\tlargest"
     );
-    for (level, tables) in versions.version.levels() {
-        for t in tables {
+    for level in &levels {
+        for t in &level.tables {
             let file = files::table_filename(t.file_num);
             let p = properties_of(&dir.join(&file))?;
             let _ = write!(
                 out,
-                "L{level}\t{file}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                "L{}\t{file}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                level.level,
                 t.size,
                 t.smallest_seq_num,
                 t.largest_seq_num,
@@ -205,9 +208,9 @@ fn tables(db: &Db<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
                 shown(p.raw()),
                 p.ratio()
             );
-            let _ = write_text(out, t.smallest_user_key().at(dir)?);
+            let _ = write_text(out, &t.smallest);
             let _ = out.write_all(b"\t");
-            let _ = write_text(out, t.largest_user_key().at(dir)?);
+            let _ = write_text(out, &t.largest);
             let _ = out.write_all(b"\n");
         }
     }
@@ -216,20 +219,19 @@ fn tables(db: &Db<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
 
 /// Prints the summary `stats` gives, then the table of levels, into a buffer
 /// as [`tables`] does.
-async fn stats(db: &Db<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
+async fn stats(db: &Db, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
     let disk = db.disk_usage().await.at(dir)?;
     let (sublevels, levels, debt) = {
-        let versions = db.versions();
-        let version = &versions.version;
-        let sublevels = version.l0_sublevels().at(dir)?;
+        let found = db.levels().at(dir)?;
+        let sublevels = found[0].sublevels;
         let mut levels: Vec<Level> = Vec::new();
-        for (level, tables) in version.levels() {
+        for level in &found {
             let mut row = Level {
-                level,
-                tables: tables.len(),
+                level: level.level,
+                tables: level.tables.len(),
                 ..Level::default()
             };
-            for t in tables {
+            for t in &level.tables {
                 let p = properties_of(&dir.join(files::table_filename(t.file_num)))?;
                 row.bytes += t.size;
                 row.entries += p.entries.unwrap_or(0);
@@ -409,17 +411,17 @@ fn properties_of(path: &Path) -> Result<TableProperties> {
 /// Without `create`, a directory that holds no database is refused before
 /// it is opened: opening takes the directory's lock, which would leave a
 /// `LOCK` file behind in a directory that was never a database.
-async fn open(dir: &Path, create: bool) -> Result<Db<FileFs>> {
+async fn open(dir: &Path, create: bool) -> Result<Db> {
     if !create {
         a_database_in(dir)?;
     }
-    let options = Options::<FileFs>::default().create_if_missing(create);
+    let options = Options::default().create_if_missing(create);
     roble::open_with(&DefaultEnv, dir, options).await.at(dir)
 }
 
 /// Opens the database in `dir` to read, beside any process that has it open
 /// to write. It takes no lock and changes nothing in the directory.
-async fn open_read_only(dir: &Path) -> Result<Db<FileFs>> {
+async fn open_read_only(dir: &Path) -> Result<Db> {
     a_database_in(dir)?;
     roble::open_read_only(&DefaultEnv, dir, Options::default())
         .await
@@ -448,7 +450,7 @@ fn a_database_in(dir: &Path) -> Result<()> {
 /// Runs `read` against the database in `dir`, opened read-only. When the
 /// process writing the database retires a file the read needs, opens it
 /// again and reads again, up to [`MAX_STALE`] times.
-async fn reading<T>(dir: &Path, mut read: impl AsyncFnMut(&Db<FileFs>) -> Result<T>) -> Result<T> {
+async fn reading<T>(dir: &Path, mut read: impl AsyncFnMut(&Db) -> Result<T>) -> Result<T> {
     let mut stale = 0;
     loop {
         let result = match open_read_only(dir).await {
@@ -464,7 +466,7 @@ async fn reading<T>(dir: &Path, mut read: impl AsyncFnMut(&Db<FileFs>) -> Result
 
 /// Writes `batch` and waits for it to be synced: the process exits straight
 /// after, so anything less would leave the write to the machine staying up.
-async fn write(db: &Db<FileFs>, dir: &Path, batch: &mut Batch) -> Result<()> {
+async fn write(db: &Db, dir: &Path, batch: &mut Batch) -> Result<()> {
     db.write(batch, true).await.at(dir)
 }
 

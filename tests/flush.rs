@@ -52,7 +52,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -369,16 +369,19 @@ async fn a_snapshot_between_two_versions_still_reads_the_older_after_a_flush() {
     let env = SimEnv::new();
     let db = created(&env).await;
     put(&db, b"/k", b"older").await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     put(&db, b"/k", b"newer").await;
     db.flush().await.expect("flush").expect("a table");
 
     assert_eq!(
-        snap.lookup(b"/k").await.expect("lookup"),
+        snap.get(b"/k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|found| found.value),
         Some(b"older".to_vec()),
         "the snapshot should read the version it was made with"
     );
-    let mut scan = snap.scan().expect("scan");
+    let mut scan = snap.range(..).expect("scan");
     scan.first().await.expect("first");
     assert!(scan.is_valid(), "the snapshot's scan should find /k");
     assert_eq!(scan.value(), b"older", "and so should its scan");
@@ -422,7 +425,7 @@ async fn a_scan_open_across_a_flush_keeps_its_snapshot() {
     batch.put(b"m9", b"before").expect("put");
     db.write(&mut batch, true).await.expect("write");
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
 
     db.flush().await.expect("flush").expect("a table");

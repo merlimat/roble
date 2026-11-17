@@ -359,6 +359,7 @@ impl<F: Fs> Db<F> {
     ///
     /// A table a reader is still open for is left for a later sweep, and the
     /// table cache's own reader is let go of first (§5).
+    #[doc(hidden)]
     pub async fn remove_obsolete_files(&self) -> Result<Vec<String>> {
         self.writable()?;
         let change = self.changes().begin().await;
@@ -385,7 +386,7 @@ impl<F: Fs> Db<F> {
         // The borrow is released before the await: a `RefCell` held across
         // one is a panic waiting for the next reader.
         let live = {
-            let versions = self.versions();
+            let versions = self.version_set();
             Live::of(&versions, manifest_num, &names)?
         };
         let mut in_use = self.release_dead_readers(&live);

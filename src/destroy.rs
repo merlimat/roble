@@ -65,8 +65,7 @@ use crate::open::Db;
 impl<F: Fs> Db<F> {
     /// Removes every file of this database, consuming the store.
     ///
-    /// Oxia's `KV.Delete`. Returns the names it removed, as
-    /// [`Db::remove_obsolete_files`] does.
+    /// Oxia's `KV.Delete`. Returns the names of the files it removed.
     ///
     /// The database's directory is left behind, empty: see the module's
     /// documentation for that and for the order of what follows. A

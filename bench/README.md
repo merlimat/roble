@@ -104,7 +104,7 @@ They always run in this order, whatever order `--phases` names them in.
   **Each engine reads it the best way it offers, and reports the value's
   length rather than the value.** That is not a detail: every one of them can
   produce a value without handing back an owned copy, and they do it
-  differently. roble reads into a `Lookup` the caller keeps; RocksDB has
+  differently. roble reads into a `GetBuf` the caller keeps; RocksDB has
   `get_pinned`; encina passes the borrowed value to a closure; Pebble's `Get`
   borrowed from the block it was in and gave back a closer. Asking for an
   owned value charged some of them for an allocation this row is not about
@@ -260,7 +260,7 @@ once (§8).
 That 4.8 us is worth reading against `floor`, which is 3.2 us for a seek that
 answers one key. The difference is the merge roble builds over every table in
 the version before the first step — which an Oxia `KeyRangeScan` would not
-pay, because it has bounds and `scan_range` opens only the tables they reach.
+pay, because it has bounds and `range` opens only the tables they reach.
 
 With the default `zipf:1-1000` spec, 20,000 scans:
 

@@ -785,11 +785,11 @@ the same session. `floor`, with no window, was **1.03x** of the window in every
 round, level with RocksDB. `get`, which builds no scan, and a full scan were
 unmoved (1.00x, 1.02x).
 
-**A kept `Lookup` makes an ordered comparison allocate nothing.** A scan has
+**A kept `GetBuf` makes an ordered comparison allocate nothing.** A scan has
 more to build than a point lookup — a source a level and a memtable, a heap,
 its bounds, the key it seeks to, a block cursor a table it opens — and a
 `floor` built one and dropped it on every call, 24 allocations, 30 for a
-`ceiling`. A `Lookup` now keeps one scan parked between calls and rebuilds it
+`ceiling`. A `GetBuf` now keeps one scan parked between calls and rebuilds it
 in its own allocations, so once warm the four ordered comparisons allocate
 nothing, as `Equal` already did (`tests/allocations.rs`). Parked, it holds
 nothing of the store — no version, table or memtable — so keeping the buffer
@@ -1083,13 +1083,20 @@ in place it must not be written. `checkpoint` does the same, for the same
 reason — written the other way round, a checkpoint interrupted between the two
 left a directory an open read as a database whose format version had never been
 recorded, which is the one case that message is for. Both orders leave an
-unfinished directory refused; only one of them describes what is there.
+unfinished directory that an open refuses; only one of them describes what is
+there.
 
-**A directory holding any `marker.` file is refused rather than written into.**
-What is there is either a database this would overwrite or a creation that did
-not finish, and one marker cannot say which, so the operator clears the
-directory. This is deliberately Pebble's answer too — `ErrorIfNotPristine`
-exists to error in exactly the retried-creation case.
+**A directory holding a `marker.` file is refused rather than written into,
+unless it is a creation that did not finish.** A marker means either a database
+this would overwrite or a creation that stopped between its two markers. The
+second is told apart by holding nothing else: only the creation's own names —
+`LOCK`, `MANIFEST-000001`, `000002.log` and `marker.format-version.000001.016`
+— with the log empty. Such a directory holds nothing anyone wrote, so a
+creation finishes it, rewriting every file whole. Refusing it instead would
+leave a directory no open will ever read again: a failure between the
+markers, and every later `create_if_missing` open failed. Anything more — a table, a later iteration of
+a marker, a log holding a write a database acknowledged before losing its
+manifest marker — is refused, and the operator clears the directory.
 
 Two numbers are worth stating. The MANIFEST takes file number 1 and the log 2,
 as Pebble's do, and the edit says 3 comes next, so the first flush numbers its
@@ -1695,11 +1702,11 @@ db.flush().await?;                     // a table; the logs it covers can go
 
 let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
 
-let snap = db.snapshot().await?;       // one instant, every table held open
-let mut scan = snap.scan_range(Some(b"/users/"), Some(b"/users0"))?;
+let snap = db.snapshot()?;             // one instant, every table held open
+let mut scan = snap.range(&b"/users/"[..]..&b"/users0"[..])?;
 scan.first().await?;
 while scan.is_valid() { /* scan.key(), scan.value() */ scan.next().await?; }
-let other = snap.lookup(b"/sessions/7").await?;   // a key outside those bounds
+let other = snap.get(b"/sessions/7", Comparison::Equal).await?;   // outside those bounds
 
 db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
 
@@ -1720,7 +1727,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | batch `Count`, `Size`, `Checksum` | `count`, `len`, `as_bytes` — the Pebble repr, so a checksum over it matches Go |
 | `Get` with `ComparisonType` | `get` with `Comparison` |
 | `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
-| `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `scan_range` and `lookup` on it (§6) |
+| `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `range` and `get` on it (§6) |
 | `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
 | `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
 | `pebble.Open` of a shard's path, new or returning | `open_with` with `create_if_missing` (§6) |

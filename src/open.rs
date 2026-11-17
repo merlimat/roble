@@ -91,6 +91,11 @@ const SEQ_NUM_START: u64 = 10;
 /// Made by [`open`], [`open_with`] or [`open_read_only`]. Dropping it releases
 /// the directory lock.
 ///
+/// Generic over the filesystem it was opened in, which is [`crate::FileFs`]
+/// unless an [`Env`] says otherwise, and so is written plain `Db` there; the
+/// [`Scan`](crate::Scan)s, [`Snapshot`](crate::Snapshot)s and batches it makes
+/// carry the same parameter with the same default.
+///
 /// It is `!Send` and `!Sync`, and not `Clone`: a store belongs to one thread
 /// (§10). The tasks that wait on [`Db::flush_wanted`] and
 /// [`Db::compaction_wanted`] need a `'static` handle of their own, so put
@@ -98,7 +103,7 @@ const SEQ_NUM_START: u64 = 10;
 /// shut down, call [`Db::stop`] and wait for those clones to be dropped; once
 /// the `Rc` is the only one left, [`Rc::try_unwrap`](std::rc::Rc::try_unwrap)
 /// gives the store back for [`Db::destroy`], which consumes it.
-pub struct Db<F: Fs> {
+pub struct Db<F: Fs = crate::FileFs> {
     // Held, not used: dropping it is what releases the directory. None for a
     // store opened read-only, which takes no lock.
     _lock: Option<F::Lock>,
@@ -239,17 +244,17 @@ pub struct Db<F: Fs> {
 ///
 /// A store that shares a thread with others, or that wants Oxia's
 /// configuration, is opened with [`open_with`] instead (§8, §11).
-pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Db<E::Fs>> {
+pub async fn open<E: Env>(env: &E, dir: impl AsRef<Path>) -> Result<Db<E::Fs>> {
     open_with(env, dir, crate::options::Options::default()).await
 }
 
 /// Opens the database in `dir` as `options` says.
 pub async fn open_with<E: Env>(
     env: &E,
-    dir: &Path,
+    dir: impl AsRef<Path>,
     options: crate::options::Options<E::Fs>,
 ) -> Result<Db<E::Fs>> {
-    open_dir(env, dir, options, false).await
+    open_dir(env, dir.as_ref(), options, false).await
 }
 
 /// Opens the database in `dir` to read, beside whatever process may be
@@ -268,10 +273,10 @@ pub async fn open_with<E: Env>(
 /// §6, "Reading beside a writer").
 pub async fn open_read_only<E: Env>(
     env: &E,
-    dir: &Path,
+    dir: impl AsRef<Path>,
     options: crate::options::Options<E::Fs>,
 ) -> Result<Db<E::Fs>> {
-    open_dir(env, dir, options, true).await
+    open_dir(env, dir.as_ref(), options, true).await
 }
 
 async fn open_dir<E: Env>(
@@ -1083,6 +1088,7 @@ impl<F: Fs> Db<F> {
     /// waiting on [`Db::flush_wanted`] to be told: a store on its own
     /// goes on filling the whole budget for the one memtable, and writes the
     /// tables it did before there was anywhere else for a flush to run.
+    #[doc(hidden)]
     pub fn flush_line(&self) -> u64 {
         self.memtable_size - self.memtable_size / crate::memtable::FLUSH_RESERVE
     }
@@ -1109,13 +1115,13 @@ impl<F: Fs> Db<F> {
             // tables than the line is not past it, and counting the layers —
             // a list of L0's tables built, sorted and compared pairwise — is
             // only for the store that might be. This runs on every write.
-            if (self.versions().version.level(0).len() as u64) < self.l0_stop_writes_threshold {
+            if (self.version_set().version.level(0).len() as u64) < self.l0_stop_writes_threshold {
                 return Ok(());
             }
             // In layers, which is what the line is counted in: a store
             // holding twelve tables a read crosses in one seek is not deep
             // (§9, `crate::pick::l0_depth`).
-            let in_l0 = crate::pick::l0_depth(&self.versions().version);
+            let in_l0 = crate::pick::l0_depth(&self.version_set().version);
             if in_l0 < self.l0_stop_writes_threshold {
                 return Ok(());
             }
@@ -1218,6 +1224,7 @@ impl<F: Fs> Db<F> {
     /// a log that was never created — a database Pebble wrote with the WAL
     /// disabled has it at zero. The store writes to the newest log it
     /// replayed.
+    #[doc(hidden)]
     pub fn current_log(&self) -> Option<u64> {
         self.log.borrow().as_ref().map(|l| l.log_num)
     }
@@ -1231,12 +1238,14 @@ impl<F: Fs> Db<F> {
     }
 
     /// The MANIFEST this store is appending to.
+    #[doc(hidden)]
     pub fn manifest_filename(&self) -> String {
         self.manifest.borrow().filename.clone()
     }
 
     /// Every `marker.` file the directory holds, sorted, current and obsolete
     /// alike.
+    #[doc(hidden)]
     pub fn markers(&self) -> Vec<String> {
         self.markers.borrow().clone()
     }
@@ -1285,7 +1294,7 @@ impl<F: Fs> Db<F> {
     /// The other half of what a store hands to a task of its own, and the
     /// half that takes the flush off the write that found the memtable full
     /// (§5). A write tells whoever is parked here an eighth of the budget
-    /// before it fills ([`Db::flush_line`]); the task freezes that
+    /// before it fills; the task freezes that
     /// memtable and writes it out while the writes carry on into the fresh
     /// one, which is what the eighth is kept back for.
     ///
@@ -1486,34 +1495,37 @@ impl<F: Fs> Db<F> {
     ///
     /// The backstop, not the line a flush is usually started at: that is
     /// [`Db::flush_line`], an eighth below this (§5).
+    #[doc(hidden)]
     pub fn memtable_size(&self) -> u64 {
         self.memtable_size
     }
 
     /// How large the MANIFEST may grow before a flush replaces it
     /// (`crate::rotate`), as [`crate::Options`] was asked for.
-    pub fn max_manifest_bytes(&self) -> u64 {
+    pub(crate) fn max_manifest_bytes(&self) -> u64 {
         self.max_manifest_bytes
     }
 
     /// How many tables L0 may hold before the picker wants it compacted.
+    #[doc(hidden)]
     pub fn l0_compaction_threshold(&self) -> u64 {
         self.l0_compaction_threshold
     }
 
     /// How many tables L0 may hold before a write waits for it to drain
     /// (§9).
+    #[doc(hidden)]
     pub fn l0_stop_writes_threshold(&self) -> u64 {
         self.l0_stop_writes_threshold
     }
 
     /// How many bytes L1 may hold, each level below it ten times more.
-    pub fn lbase_max_bytes(&self) -> u64 {
+    pub(crate) fn lbase_max_bytes(&self) -> u64 {
         self.lbase_max_bytes
     }
 
     /// How many entries a compaction merges before it hands the thread back.
-    pub fn compaction_unit(&self) -> u64 {
+    pub(crate) fn compaction_unit(&self) -> u64 {
         self.compaction_unit
     }
 
@@ -1522,6 +1534,7 @@ impl<F: Fs> Db<F> {
     /// Pebble's `TargetFileSizes`: L0's, then twice that for each level
     /// below. Deeper levels hold more and are rewritten less often, so
     /// larger files there cost fewer of them.
+    #[doc(hidden)]
     pub fn target_file_size(&self, level: u32) -> u64 {
         self.target_file_size
             .saturating_mul(1u64.checked_shl(level).unwrap_or(u64::MAX))
@@ -1575,7 +1588,7 @@ impl<F: Fs> Db<F> {
         if !self.metrics.recording() {
             return;
         }
-        let live = self.versions().version.table_file_nums();
+        let live = self.version_set().version.table_file_nums();
         let mut known = self.tables.entries.borrow_mut();
         known.retain(|file_num, _| live.contains(file_num));
         self.records_in_tables
@@ -1698,12 +1711,13 @@ impl<F: Fs> Db<F> {
     }
 
     /// Whether this store was opened with the WAL off.
+    #[doc(hidden)]
     pub fn wal_disabled(&self) -> bool {
         self.disable_wal
     }
 
     /// Whether this store leaves compaction to its caller (§9).
-    pub fn automatic_compactions_disabled(&self) -> bool {
+    pub(crate) fn automatic_compactions_disabled(&self) -> bool {
         self.disable_automatic_compactions
     }
 
@@ -1719,8 +1733,22 @@ impl<F: Fs> Db<F> {
         })
     }
 
-    /// What the MANIFEST says, as it stands.
-    pub fn versions(&self) -> std::cell::Ref<'_, VersionSet> {
+    /// What the MANIFEST says, as it stands: a copy, for roble's own tests
+    /// and tools, which read counters and tables [`Db::levels`] does not show.
+    ///
+    /// Owned rather than a borrow of the store's own, so that a caller can
+    /// hold it across an `.await` while a flush or a compaction applies an
+    /// edit. Cheap: the version inside is shared, not copied.
+    #[doc(hidden)]
+    pub fn versions(&self) -> VersionSet {
+        self.versions.borrow().clone()
+    }
+
+    /// The store's own version set, borrowed.
+    ///
+    /// Never held across an `.await`: an edit applied meanwhile would find
+    /// it borrowed.
+    pub(crate) fn version_set(&self) -> std::cell::Ref<'_, VersionSet> {
         self.versions.borrow()
     }
 
@@ -1752,6 +1780,7 @@ impl<F: Fs> Db<F> {
     /// report and Pebble exposes no public accessor for them, so they are
     /// asserted separately rather than smuggled into a comparison that would
     /// then only be checking roble against itself.
+    #[doc(hidden)]
     pub fn dump(&self) -> Result<String> {
         use std::fmt::Write as _;
 

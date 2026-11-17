@@ -54,7 +54,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 /// Everything a scan walks, forwards.
-async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
+async fn walk<F: Fs>(scan: &mut roble::Scan<F>) -> Model {
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -65,7 +65,7 @@ async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
 }
 
 async fn store_contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    walk(&mut db.scan().await.expect("scan")).await
+    walk(&mut db.range(..).expect("scan")).await
 }
 
 #[compio::test]
@@ -279,13 +279,13 @@ async fn reading_through_a_batch_agrees_with_the_model() {
 
     // A scan, forwards.
     assert_eq!(
-        walk(&mut batch.scan().await.expect("scan")).await,
+        walk(&mut batch.range(..).expect("scan")).await,
         model,
         "a scan through the batch disagrees with the model"
     );
 
     // And backwards, which is a different code path through the merge.
-    let mut scan = batch.scan().await.expect("scan");
+    let mut scan = batch.range(..).expect("scan");
     scan.last().await.expect("last");
     let mut reverse = Model::new();
     while scan.is_valid() {
@@ -356,7 +356,7 @@ async fn committing_applies_exactly_what_the_batch_read_back() {
         batch
             .delete_range(&keys[4], &keys[6])
             .expect("delete_range");
-        expected = walk(&mut batch.scan().await.expect("scan")).await;
+        expected = walk(&mut batch.range(..).expect("scan")).await;
 
         batch.commit(true).await.expect("commit");
         assert_eq!(
@@ -450,7 +450,7 @@ async fn an_empty_batch_reads_like_the_store() {
     assert!(batch.is_empty());
     assert_eq!(batch.count(), 0);
     assert_eq!(
-        walk(&mut batch.scan().await.expect("scan")).await,
+        walk(&mut batch.range(..).expect("scan")).await,
         store_contents(&db).await,
     );
 }
@@ -603,7 +603,7 @@ async fn a_batch_settles_a_put_against_its_own_range_deletion() {
             batch.delete_range(start, end).expect("delete_range");
             batch.put(key, b"written-second").expect("put");
         }
-        let mut scan = batch.scan().await.expect("scan");
+        let mut scan = batch.range(..).expect("scan");
         scan.seek_ge(key).await.expect("seek");
         let seen = (scan.is_valid() && scan.key() == key).then(|| scan.value().to_vec());
         assert_eq!(seen, want, "the scan should agree with the Equal path");

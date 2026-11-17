@@ -37,8 +37,9 @@ jobs:
       - name: Set the version from the tag
         run: |
           version="${GITHUB_REF_NAME#v}"
-          # The workspace version, and the two requirements on roble-format.
-          sed -i "s/\"0\.0\.0-dev\"/\"$version\"/" Cargo.toml cli/Cargo.toml
+          # The workspace version, and the requirements on roble and
+          # roble-format, keeping the `=` on roble-cli's exact pin of roble.
+          sed -i -E "s/\"(=?)0\.0\.0-dev\"/\"\1$version\"/" Cargo.toml cli/Cargo.toml
           # Every published crate must now carry the tag's version, or nothing
           # is published. bench and compat have publish = false, which cargo
           # metadata reports as an empty list of registries.

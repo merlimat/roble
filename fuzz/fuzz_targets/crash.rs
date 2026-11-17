@@ -143,7 +143,7 @@ impl History {
 }
 
 async fn contents<F: Fs>(db: &Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     let mut forward = Model::new();
     scan.first().await.expect("first");
     while scan.is_valid() {

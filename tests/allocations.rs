@@ -14,7 +14,7 @@
 
 //! How often a read allocates, which is a property and not a measurement.
 //!
-//! A point lookup through a [`roble::Lookup`] the caller hands back is meant
+//! A point lookup through a [`roble::GetBuf`] the caller hands back is meant
 //! to allocate a bounded number of times however much data the store holds —
 //! not "usually", and not "a bit more each release". That only stays true if
 //! something fails when it stops being true: the cost it is guarding against
@@ -29,7 +29,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use roble::{Comparison, Lookup};
+use roble::{Comparison, GetBuf};
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
@@ -93,13 +93,13 @@ async fn a_warm_point_lookup_allocates_nothing() {
 
     // Whatever the fixture's first key is, reached without assuming one.
     let probe = {
-        let mut scan = db.scan().await.expect("scan");
+        let mut scan = db.range(..).expect("scan");
         scan.seek_ge(b"").await.expect("seek");
         assert!(scan.is_valid(), "the fixture should hold at least one key");
         scan.key().to_vec()
     };
 
-    let mut buf = Lookup::new();
+    let mut buf = GetBuf::new();
     // Warm: the buffers reach the sizes this key needs, the tables open, and
     // the blocks enter the cache. None of that is what is being counted.
     for _ in 0..500 {
@@ -133,13 +133,13 @@ async fn a_warm_point_lookup_allocates_nothing() {
     );
 }
 
-/// A warm `floor` or `ceiling` through a kept `Lookup` allocates nothing
+/// A warm `floor` or `ceiling` through a kept `GetBuf` allocates nothing
 /// either.
 ///
 /// The four ordered comparisons are a scan positioned once and read, and a
 /// scan has far more to build than a point lookup: a source for each level
 /// and each memtable, a heap over them, its bounds, the internal key it
-/// seeks to, and a block cursor for every table it opens. A `Lookup` keeps
+/// seeks to, and a block cursor for every table it opens. A `GetBuf` keeps
 /// one scan parked between calls and rebuilds it in its own allocations, so
 /// once the first few calls have grown every buffer to the size the data
 /// needs there is nothing left to ask the allocator for — this is what says
@@ -159,7 +159,7 @@ async fn a_warm_ordered_lookup_allocates_nothing() {
 
     let mut probes = Vec::new();
     {
-        let mut scan = db.scan().await.expect("scan");
+        let mut scan = db.range(..).expect("scan");
         scan.first().await.expect("first");
         while scan.is_valid() && probes.len() < 64 {
             probes.push(scan.key().to_vec());
@@ -169,7 +169,7 @@ async fn a_warm_ordered_lookup_allocates_nothing() {
     }
     assert!(probes.len() > 2, "the fixture should hold keys to probe");
 
-    let mut buf = Lookup::new();
+    let mut buf = GetBuf::new();
     let comparisons = [Comparison::Floor, Comparison::Ceiling];
     // Warm, as the point lookup above is: every buffer grown, every table
     // open, every block cached.

@@ -65,7 +65,8 @@ impl<F: Fs> Db<F> {
     /// A write that arrives while this is running is not in it, and that is
     /// what a checkpoint is: a directory as of a moment, and the moment is
     /// the flush.
-    pub async fn checkpoint(&self, dir: &Path) -> Result<()> {
+    pub async fn checkpoint(&self, dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
         // The flush below would refuse too; refused here so that a reader
         // does not depend on the order of what follows.
         self.writable()?;
@@ -78,7 +79,7 @@ impl<F: Fs> Db<F> {
         self.fs().mkdir_all(dir).await?;
 
         let (tables, edit, manifest_num) = {
-            let versions = self.versions();
+            let versions = self.version_set();
             // The MANIFEST takes the next number the store had to give, and
             // the edit says the number after it is next. Nothing in the
             // checkpoint has to agree with the store it came from — it is a

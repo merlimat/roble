@@ -112,6 +112,7 @@ impl<F: Fs> Db<F> {
     /// Returns the output tables' file numbers, in key order. Empty when the
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
+    #[doc(hidden)]
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
         self.writable()?;
         let Some(plan) = self.plan(level, file_nums).await? else {
@@ -285,7 +286,7 @@ impl<F: Fs> Db<F> {
         // edit saying the number after *this* compaction's last would hand
         // one of them out again (`take_file_num`). Pebble writes the live
         // counter into every edit for the same reason.
-        let next_file_num = self.versions().next_file_num;
+        let next_file_num = self.version_set().next_file_num;
         let edit = VersionEdit {
             comparer_name: None,
             min_unflushed_log_num: None,
@@ -308,7 +309,7 @@ impl<F: Fs> Db<F> {
             let _ = self.rotate_inner(&change).await;
         }
         let _ = self.sweep(&change).await;
-        self.metrics.saw_version(&self.versions().version);
+        self.metrics.saw_version(&self.version_set().version);
         self.measure_disk().await;
         self.metrics.compactions.add(1);
         self.saw_debt();
@@ -333,7 +334,7 @@ impl<F: Fs> Db<F> {
         output_level: u32,
         file_nums: &[u64],
     ) -> Result<(Vec<(u32, TableMeta)>, Vec<(Vec<u8>, Vec<u8>)>)> {
-        let versions = self.versions();
+        let versions = self.version_set();
         let wanted: BTreeSet<u64> = file_nums.iter().copied().collect();
 
         let mut inputs: Vec<(u32, TableMeta)> = Vec::new();

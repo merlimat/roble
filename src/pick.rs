@@ -108,6 +108,7 @@ pub(crate) fn l0_depth(version: &Version) -> u64 {
 
 /// A compaction the picker would run.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct Pick {
     /// The level the tables come from.
     pub level: u32,
@@ -144,8 +145,9 @@ impl<F: Fs> Db<F> {
     /// Ties go to the level nearest L0, which is where a table being there
     /// costs the most: every read consults all of L0, and only the levels
     /// above the answer below it.
+    #[doc(hidden)]
     pub fn pick(&self) -> Option<Pick> {
-        let versions = self.versions();
+        let versions = self.version_set();
         let allowance = |level: u32| {
             if level == 0 {
                 self.l0_compaction_threshold()
@@ -213,7 +215,7 @@ impl<F: Fs> Db<F> {
     /// tables rather than bytes, so its excess is charged at what its tables
     /// weigh.
     pub fn compaction_debt(&self) -> u64 {
-        let versions = self.versions();
+        let versions = self.version_set();
         let mut debt = 0;
         for level in 0..NUM_LEVELS - 1 {
             let tables = versions.version.level(level);
@@ -247,7 +249,7 @@ impl<F: Fs> Db<F> {
         self.metrics.saw_debt(self.compaction_debt());
     }
 
-    /// Runs the compaction [`Db::pick`] chose, if there is one.
+    /// Runs the compaction the picker chooses, if there is one.
     ///
     /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.

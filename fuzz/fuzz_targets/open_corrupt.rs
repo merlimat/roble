@@ -140,7 +140,7 @@ fn mutate(files: &mut Files, m: &Mutation) {
 /// Reads the whole store every way there is, stopping at the first error.
 async fn read<F: Fs>(db: &Db<F>) -> roble::Result<()> {
     let mut keys = Vec::new();
-    let mut scan = db.scan().await?;
+    let mut scan = db.range(..)?;
     scan.first().await?;
     while scan.is_valid() {
         keys.push(scan.key().to_vec());

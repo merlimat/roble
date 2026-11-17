@@ -156,7 +156,7 @@ async fn roble_reads_what_go_pebble_reads() {
     }
 }
 
-/// `get_into` answers what `get` answers, through one `Lookup` reused for
+/// `get_into` answers what `get` answers, through one `GetBuf` reused for
 /// every probe and every comparison.
 ///
 /// The reuse is the whole point of the method, and it is also where it can
@@ -191,7 +191,7 @@ async fn get_into_answers_what_get_answers_through_one_reused_lookup() {
         .await
         .expect("open the database Go wrote");
 
-    let mut buf = roble::Lookup::new();
+    let mut buf = roble::GetBuf::new();
     let (mut hits, mut misses, mut after_an_answer) = (0usize, 0usize, 0usize);
     for probe in &probes {
         for (name, how) in [
@@ -261,13 +261,13 @@ async fn take_empties_the_lookup() {
         .expect("open the database Go wrote");
 
     // Whatever the fixture's first key is, reached without assuming one.
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.seek_ge(b"").await.expect("seek");
     assert!(scan.is_valid(), "the fixture should hold at least one key");
     let (key, value) = (scan.key().to_vec(), scan.value().to_vec());
     drop(scan);
 
-    let mut buf = roble::Lookup::new();
+    let mut buf = roble::GetBuf::new();
     assert!(
         db.get_into(&key, Comparison::Equal, &mut buf)
             .await

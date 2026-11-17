@@ -43,6 +43,7 @@
 //! doubling is bounded by what the caller was going to hold anyway.
 
 use std::cell::RefCell;
+use std::ops::RangeBounds;
 use std::rc::Rc;
 
 use roble_format::batch::Batch;
@@ -58,9 +59,9 @@ use crate::scan::Scan;
 /// A batch of writes, readable through itself.
 ///
 /// Built by [`Db::batch`], read with [`IndexedBatch::get`] and
-/// [`IndexedBatch::scan`], and applied to the store by
+/// [`IndexedBatch::range`], and applied to the store by
 /// [`IndexedBatch::commit`].
-pub struct IndexedBatch<'a, F: Fs> {
+pub struct IndexedBatch<'a, F: Fs = crate::FileFs> {
     db: &'a Db<F>,
     repr: Batch,
     index: Rc<RefCell<Memtable>>,
@@ -189,7 +190,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
         if how == Comparison::Equal {
             return self.equal(key).await;
         }
-        let mut scan = self.scan().await?;
+        let mut scan = self.range(..)?;
         match how {
             Comparison::Ceiling => scan.seek_ge(key).await?,
             Comparison::Higher => scan.seek_ge(&successor(key)).await?,
@@ -260,21 +261,15 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
         })
     }
 
-    /// A scan over the batch and the store together.
-    pub async fn scan(&self) -> Result<Scan<F::Disk>> {
-        self.scan_range(None, None).await
-    }
-
-    /// The same, bounded below by `lower` (included) and above by `upper`
-    /// (excluded).
-    pub async fn scan_range(
-        &self,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-    ) -> Result<Scan<F::Disk>> {
-        self.db
-            .scan_with(vec![Rc::clone(&self.index)], lower, upper)
-            .await
+    /// A scan over the keys in `range`, reading the batch and the store
+    /// together, as [`Db::range`] makes one over the store alone.
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<Scan<F>> {
+        let (lower, upper) = crate::scan::bounds(&range);
+        self.db.scan_with(
+            vec![Rc::clone(&self.index)],
+            lower.as_deref(),
+            upper.as_deref(),
+        )
     }
 
     /// Applies the batch to the store, syncing the log if asked.
