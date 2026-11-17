@@ -211,19 +211,52 @@ async fn only_an_open_that_may_create_makes_the_directory() {
 }
 
 #[compio::test]
-async fn creation_will_not_write_over_a_marker_it_finds() {
-    // What is left of a creation that did not finish cannot be told from a
-    // database whose other marker is missing, so neither is written into.
-    // Pebble refuses the same case, through `ErrorIfNotPristine`.
+async fn an_unfinished_creation_is_finished() {
+    // Everything a creation writes except the marker that makes it a
+    // database: the state a failure or a crash between the two markers
+    // leaves. It holds nothing anyone wrote, so the next open that may create
+    // finishes the job rather than refusing a directory no open would ever
+    // read again.
     let env = SimEnv::new();
     let dir = PathBuf::from("/db");
     let db = roble::open_with(&env, &dir, creating())
         .await
         .expect("create");
     drop(db);
+    let created = listing(env.sim(), &dir).await;
+    env.sim()
+        .remove(&dir.join("marker.manifest.000001.MANIFEST-000001"))
+        .await
+        .expect("remove");
 
-    // Everything a creation writes except the marker that makes it a
-    // database: the state a crash between the two markers leaves.
+    let db = roble::open_with(&env, &dir, creating())
+        .await
+        .expect("the leftovers of a creation are finished");
+    let mut batch = Batch::new();
+    batch.put(b"key", b"value").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    drop(db);
+    assert_eq!(
+        listing(env.sim(), &dir).await,
+        created,
+        "finishing a creation should leave what an uninterrupted one does"
+    );
+}
+
+#[compio::test]
+async fn creation_will_not_write_over_a_log_that_holds_a_write() {
+    // The same files, but a write reached the log before the marker went
+    // missing. That is a database, whatever it lacks, and creating one in
+    // its place would empty the log of a write that was acknowledged.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(&env, &dir, creating())
+        .await
+        .expect("create");
+    let mut batch = Batch::new();
+    batch.put(b"key", b"value").expect("put");
+    db.write(&mut batch, true).await.expect("write");
+    drop(db);
     env.sim()
         .remove(&dir.join("marker.manifest.000001.MANIFEST-000001"))
         .await
@@ -231,10 +264,50 @@ async fn creation_will_not_write_over_a_marker_it_finds() {
 
     let err = roble::open_with(&env, &dir, creating())
         .await
-        .expect_err("the leftovers of a creation are not a directory to create in");
+        .expect_err("a log holding a write is not a creation's leftovers");
     assert!(
         err.to_string().contains("marker.format-version.000001.016"),
         "the refusal should name what is in the way: {err}"
+    );
+}
+
+#[compio::test]
+async fn creation_will_not_write_over_a_database_missing_its_marker() {
+    // A database Pebble wrote, with tables, logs and a later iteration of
+    // the format marker, whose manifest marker is gone. Nothing a creation
+    // leaves looks like this, so it is not written into.
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-reads");
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let fs: &SimFs = env.sim();
+    fs.mkdir_all(&dir).await.expect("mkdir");
+    for entry in std::fs::read_dir(&src).expect("read fixture") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name().into_string().expect("UTF-8 name");
+        if name.starts_with("marker.manifest.") {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).expect("read file");
+        let disk = fs.create(&dir.join(&name)).await.expect("create");
+        let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
+        result.expect("write");
+        disk.sync(()).await.expect("sync");
+        disk.close().await.expect("close");
+    }
+    fs.sync_dir(&dir).await.expect("sync dir");
+    let before = listing(fs, &dir).await;
+
+    let err = roble::open_with(&env, &dir, creating())
+        .await
+        .expect_err("a database missing its marker is not a directory to create in");
+    assert!(
+        err.to_string().contains("marker.format-version"),
+        "the refusal should name what is in the way: {err}"
+    );
+    assert_eq!(
+        listing(fs, &dir).await,
+        before,
+        "a refused creation should have written nothing"
     );
 }
 
@@ -439,6 +512,12 @@ async fn a_half_written_creation_never_reads_as_a_database() {
                 .await
                 .unwrap_or_else(|e| panic!("failing at {n} of {total}, the created database: {e}"));
         }
+        // And whatever it left, the next open that may create gets a
+        // database from it: an interrupted creation is one to finish, not a
+        // directory no open will touch again.
+        roble::open_with(&env, &dir, creating())
+            .await
+            .unwrap_or_else(|e| panic!("failing at {n} of {total}, then creating again: {e}"));
     }
     assert!(
         saw_one_marker > 0,
