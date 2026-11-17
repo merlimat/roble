@@ -18,6 +18,8 @@
 //! format as Pebble writes it; what roble declines to serve is a policy, and
 //! keeping it in one place is what makes the policy reviewable.
 
+use std::sync::OnceLock;
+
 use crate::block::{Block, BlockHandle, Compression, Decoded, TRAILER_SIZE};
 use crate::error::{Error, Result};
 use crate::footer::{FOOTER_LEN, Footer};
@@ -101,6 +103,12 @@ pub struct Table<'a> {
     metaindex: Metaindex,
     properties: Properties,
     two_level_index: bool,
+    /// The flattened index, decoded by the first seek and kept for the rest.
+    ///
+    /// Not at [`Table::open`], so a table that is only dumped or walked
+    /// never pays for it, and not cached on failure, so a damaged index is
+    /// reported again by the next seek rather than once.
+    index: OnceLock<Vec<IndexEntry>>,
 }
 
 impl<'a> Table<'a> {
@@ -146,7 +154,17 @@ impl<'a> Table<'a> {
             metaindex,
             properties,
             two_level_index,
+            index: OnceLock::new(),
         })
+    }
+
+    /// The flattened index, decoded on first use ([`Table::index_entries`]).
+    fn index(&self) -> Result<&[IndexEntry]> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let built = self.index_entries()?;
+        Ok(self.index.get_or_init(|| built))
     }
 
     /// The table's footer.
@@ -301,8 +319,8 @@ impl<'a> Table<'a> {
     where
         F: FnMut(crate::InternalKey<'_>, crate::block::Value<'_>) -> Result<()>,
     {
-        let index = self.index_entries()?;
-        let start = first_block_at_or_after(&index, target)?;
+        let index = self.index()?;
+        let start = first_block_at_or_after(index, target)?;
         // From that block forward: a target that falls past one block's last
         // key but before the next block's separator is answered by the next
         // block's first entry.
@@ -329,14 +347,14 @@ impl<'a> Table<'a> {
     where
         F: FnMut(crate::InternalKey<'_>, crate::block::Value<'_>) -> Result<()>,
     {
-        let index = self.index_entries()?;
+        let index = self.index()?;
         if index.is_empty() {
             return Ok(false);
         }
         // The block whose separator first reaches the target may hold keys on
         // both sides of it. A target past every separator is answered by the
         // last block.
-        let start = first_block_at_or_after(&index, target)?;
+        let start = first_block_at_or_after(index, target)?;
         let mut i = start.min(index.len() - 1);
         loop {
             let decoded = self.decode_block(index[i].handle)?;
@@ -537,6 +555,58 @@ fn parse_metaindex(block: &Block<'_>) -> Result<ParsedMetaindex> {
 mod tests {
     use super::*;
     use crate::block::BlockHandle;
+
+    /// Opening a table leaves the index alone, and the first seek decodes it
+    /// once for every seek after: before, each seek rebuilt it, two levels
+    /// of it for a two-level index.
+    #[test]
+    fn the_index_is_decoded_by_the_first_seek_and_kept() {
+        use crate::sst::{TableWriter, WriterOptions};
+
+        let mut w = TableWriter::new(WriterOptions::default().block_size(64)).expect("writer");
+        for i in 0..50u64 {
+            let user_key = format!("/oxia/{i:04}");
+            let key = crate::InternalKey {
+                user_key: user_key.as_bytes(),
+                seq_num: 100 - i,
+                kind: Kind::Set,
+                obsolete: false,
+            };
+            w.add(key, b"value").expect("add");
+        }
+        let bytes = w.finish().expect("finish");
+        let table = Table::open(&bytes).expect("open");
+        assert!(table.index.get().is_none(), "open does not decode it");
+
+        let target = key::search_key(b"/oxia/0025");
+        let mut found = Vec::new();
+        assert!(
+            table
+                .seek_ge(&target, |k, _| {
+                    found.push(k.user_key.to_vec());
+                    Ok(())
+                })
+                .expect("seek_ge")
+        );
+        let kept = table.index.get().expect("the first seek keeps it");
+        assert!(kept.len() > 1, "small blocks, so an index of several");
+        let at = kept.as_ptr();
+
+        assert!(
+            table
+                .seek_lt(&target, |k, _| {
+                    found.push(k.user_key.to_vec());
+                    Ok(())
+                })
+                .expect("seek_lt")
+        );
+        assert_eq!(
+            table.index.get().expect("still kept").as_ptr(),
+            at,
+            "and the second seek reuses it rather than building another"
+        );
+        assert_eq!(found, [b"/oxia/0025".to_vec(), b"/oxia/0024".to_vec()]);
+    }
 
     fn key_of(kind: Kind) -> crate::InternalKey<'static> {
         crate::InternalKey {
