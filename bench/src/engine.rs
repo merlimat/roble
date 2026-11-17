@@ -298,7 +298,11 @@ impl Store for Roble {
             .delete_range(start, end)
             .unwrap_or_else(|e| fail(&format!("delete range: {e}")));
         batch
-            .commit(sync)
+            .commit(if sync {
+                roble::Durability::Sync
+            } else {
+                roble::Durability::NoSync
+            })
             .await
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
     }
