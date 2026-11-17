@@ -112,6 +112,13 @@ impl<F: Fs> Db<F> {
     /// Returns the output tables' file numbers, in key order. Empty when the
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
+    ///
+    /// Takes the tables of `level` it is given and no others, so a pick of
+    /// some of L0 can leave behind an older table that overlaps them and put
+    /// newer keys below it. The store's own compactions never do — they take
+    /// L0 whole — and nor does Pebble, whose reads, like a scan's skip past
+    /// a range tombstone here (`crate::scan`), take a deeper level's keys to
+    /// be older.
     #[doc(hidden)]
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
         self.writable()?;

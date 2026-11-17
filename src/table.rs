@@ -1018,14 +1018,23 @@ pub fn covered_by_tombstone<D: Disk>(
     user: &[u8],
     seq: u64,
 ) -> Result<bool> {
-    for table in tables {
-        for t in &table.tombstones {
-            if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    Ok(tables
+        .iter()
+        .any(|table| covering_tombstone(table, user, seq).is_some()))
+}
+
+/// The range tombstone of `table` that covers `user` with a sequence number
+/// above `seq`, if it has one: what [`covered_by_tombstone`] asks, with the
+/// tombstone that answered, whose span a scan can then skip whole.
+pub(crate) fn covering_tombstone<'t, D: Disk>(
+    table: &'t OpenTable<D>,
+    user: &[u8],
+    seq: u64,
+) -> Option<&'t Tombstone> {
+    table
+        .tombstones
+        .iter()
+        .find(|t| t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice())
 }
 
 /// Gives back the reason the obsolete sweep had to leave this table's file
