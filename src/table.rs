@@ -779,6 +779,14 @@ impl<D: Disk> OpenTable<D> {
     /// The same, on a block cursor kept from another iterator, if it was
     /// built for this table's format: a cursor assembles the key it is on
     /// into a buffer, and reusing one is reusing that buffer.
+    ///
+    /// Not for a table with no data blocks, such as one holding nothing but a
+    /// range deletion. Positioning an iterator over that returns before it
+    /// reaches the cursor, so a kept cursor would stay on the entry of the
+    /// table it came from, and the iterator would offer that entry as this
+    /// table's. A level of a scan that moved onto such a table did exactly
+    /// that, and the merge took an older version from a deeper level instead
+    /// of the one it had passed over.
     pub(crate) fn iter_reusing(
         self: &Rc<Self>,
         cursor: Option<(
@@ -787,7 +795,9 @@ impl<D: Disk> OpenTable<D> {
         )>,
     ) -> TableIter<D> {
         let cursor = match cursor {
-            Some((format, cursor)) if format == self.footer.format => cursor,
+            Some((format, cursor)) if format == self.footer.format && !self.index.is_empty() => {
+                cursor
+            }
             _ => roble_format::block::restart::DataCursor::new(self.footer.format),
         };
         TableIter {
