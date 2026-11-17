@@ -1414,12 +1414,12 @@ impl<F: Fs> Db<F> {
 
     /// Waits until no compaction is underway.
     ///
-    /// For a caller that drives compactions beside a task that also does,
-    /// and so finds [`Db::compact_once`] standing down because the task has
-    /// claimed what the picker chose: this is how it waits that merge out
-    /// rather than asking again in a loop. [`Db::compaction_wanted`] will
-    /// not do, because once the last merge finishes it waits for work that
-    /// may never come.
+    /// For a caller waiting for the store's own merge task (§9) to drain
+    /// what the picker has chosen: it parks while a merge runs and returns
+    /// once none does, whether or not the picker has more, so the caller
+    /// asks [`Db::pick`] again rather than polling it. Waiting for the
+    /// picker to have work would not do, because once the last merge
+    /// finishes there is none and may never be again.
     #[doc(hidden)]
     pub async fn compaction_settled(&self) {
         self.compacting().settled().await

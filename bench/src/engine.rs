@@ -320,45 +320,31 @@ impl Store for Roble {
             .flush()
             .await
             .unwrap_or_else(|e| fail(&format!("flush: {e}")));
-        // roble compacts cooperatively on the thread that owns the store
-        // (§9), so this is the caller's to drive and its cost is counted here
-        // rather than in a background total — partly by doing the merges and
-        // partly by handing the thread to the task beside this shard, which
-        // is doing them too. A merge that task has already claimed comes back
-        // here as an empty answer rather than an error, and is *waited* out,
-        // not counted: what this returns is the share this call merged
-        // itself.
+        // The store merges on a task of its own (§9), so this waits for it,
+        // as RocksDB's `wait_for_compact` below does, and does none of the
+        // work itself: its cost lands in `cpu s` wherever the task ran.
         //
-        // Waited, not polled. This loop used to yield and ask again, and at
-        // six million records it asked 750,000 times while the task beside it
-        // did every merge — some 15 to 23% of the phase's CPU spent watching,
-        // where RocksDB's `wait_for_compact` below sleeps. That made the
-        // settle row a measurement of the bench as much as of the store.
+        // Waited, not polled. This used to merge beside the store's task and,
+        // whenever that task had claimed the picker's choice, yield and ask
+        // again: at six million records, 680,000 times a run with every merge
+        // the task's, and some 0.75 s of the phase's CPU spent watching.
         //
-        // The guard is a clock, for a picker that keeps choosing work that
-        // nobody finishes.
+        // The guard is a clock, for a picker that keeps choosing work nobody
+        // finishes — which is what a failing compaction looks like from
+        // here, since the task logs the error and waits for the version to
+        // change before trying again.
         let started = Instant::now();
-        let mut ran = 0;
         while self.db.pick().is_some() {
-            let merged = self
-                .db
-                .compact_once()
-                .await
-                .unwrap_or_else(|e| fail(&format!("compact: {e}")));
-            if merged.is_empty() {
-                if started.elapsed() > Duration::from_secs(600) {
-                    fail(&format!(
-                        "the picker never settled: ten minutes of compaction after {ran} merges \
-                         of this call's own, and it still has work to choose"
-                    ));
-                }
-                self.db.compaction_settled().await;
-            } else {
-                ran += 1;
+            if started.elapsed() > Duration::from_secs(600) {
+                fail(
+                    "the picker never settled: ten minutes and it still has work to choose; \
+                     a background compaction may be failing (see its warnings)",
+                );
             }
+            self.db.compaction_settled().await;
             yield_now().await;
         }
-        ran
+        1
     }
 
     fn levels(&self) -> Option<[usize; 7]> {

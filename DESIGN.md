@@ -2007,9 +2007,11 @@ Stated rather than quietly decided:
   3.48 s against 3.76 here, 4.15 against 3.69 in the earlier round — the CPU
   compression spends is about what writing a third of the bytes saves. Every
   roble settle figure in this item includes the bench's settle loop polling
-  the picker while the shard's own task merged — some 680,000 times a run.
-  It now waits instead (`Db::compaction_settled`), which took the Snappy
-  settle from 3.67 and 3.45 s to 2.92 and 2.72 in two interleaved rounds.
+  the picker while the store's own task merged — some 680,000 times a run,
+  every merge the task's. It now only waits for that task
+  (`Db::compaction_settled`), as RocksDB's settle waits for its threads,
+  which took the Snappy settle from a median of 3.58 s to 2.57 over three
+  interleaved rounds, the load unchanged.
   RocksDB's 1.11 s is not the same work either: its threads did most of the
   merging during the load, whose row carries it (4.80 s against roble's
   3.63), and its flushes compress where roble's L0 does not, so roble writes
