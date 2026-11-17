@@ -130,7 +130,12 @@ impl Fs for FileFs {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            let meta = entry.metadata()?;
+            // Deleted since the directory was read: by a writer, if this is a
+            // reader beside one. It is not in the directory any more.
+            let meta = match entry.metadata() {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                meta => meta?,
+            };
             out.push(DirEntry {
                 name: PathBuf::from(entry.file_name()),
                 size: if meta.is_dir() { 0 } else { meta.len() },
@@ -159,7 +164,7 @@ impl Fs for FileFs {
                 // writer retired, which a reader beside it will see: it no
                 // longer takes any space.
                 let meta = match entry.metadata() {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     meta => meta?,
                 };
                 if meta.is_dir() {
