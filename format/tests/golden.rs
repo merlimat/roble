@@ -326,12 +326,8 @@ fn reads_back(codec: roble_format::block::Codec) {
     use roble_format::{InternalKey, Kind};
 
     // Small blocks so the index is exercised rather than a single block.
-    let opts = WriterOptions {
-        block_size: 512,
-        compression: codec,
-        ..Default::default()
-    };
-    let mut w = TableWriter::new(opts).expect("writer");
+    let mut w = TableWriter::new(WriterOptions::default().block_size(512).compression(codec))
+        .expect("writer");
 
     let mut expected = Vec::new();
     for i in 0..300u64 {
@@ -570,6 +566,36 @@ fn the_reader_refuses_a_foreign_comparer_too() {
         matches!(err, roble_format::Error::Unsupported(_)),
         "expected Unsupported, got {err:?}"
     );
+}
+
+/// A writer told to write no filter writes none, and one left at the
+/// default writes Oxia's: a table without a filter is legal, but every point
+/// lookup on it reads a block to answer "not here".
+#[test]
+fn the_filter_is_written_unless_turned_off() {
+    use roble_format::sst::{TableWriter, WriterOptions};
+    use roble_format::{InternalKey, Kind};
+
+    let key = InternalKey {
+        user_key: b"/oxia/a",
+        seq_num: 1,
+        kind: Kind::Set,
+        obsolete: false,
+    };
+    for (opts, filtered) in [
+        (WriterOptions::default(), true),
+        (WriterOptions::default().filter_bits_per_key(None), false),
+    ] {
+        let mut w = TableWriter::new(opts).expect("writer");
+        w.add(key, b"v").expect("add");
+        let bytes = w.finish().expect("finish");
+        let table = Table::open(&bytes).expect("open");
+        assert_eq!(
+            table.filter_block().expect("filter block").is_some(),
+            filtered,
+            "{opts:?}"
+        );
+    }
 }
 
 /// A table with no point key answers every read, rather than refusing them.

@@ -624,10 +624,7 @@ struct Output {
 impl Output {
     fn new(start: Option<Vec<u8>>, compression: Codec) -> Result<Self> {
         Ok(Output {
-            writer: TableWriter::new(WriterOptions {
-                compression,
-                ..WriterOptions::default()
-            })?,
+            writer: TableWriter::new(WriterOptions::default().compression(compression))?,
             bounds: Bounds::default(),
             start,
             points: 0,
