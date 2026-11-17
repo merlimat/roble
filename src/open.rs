@@ -91,6 +91,11 @@ const SEQ_NUM_START: u64 = 10;
 /// Made by [`open`], [`open_with`] or [`open_read_only`]. Dropping it releases
 /// the directory lock.
 ///
+/// Generic over the filesystem it was opened in, which is [`crate::FileFs`]
+/// unless an [`Env`] says otherwise, and so is written plain `Db` there; the
+/// [`Scan`](crate::Scan)s, [`Snapshot`](crate::Snapshot)s and batches it makes
+/// carry the same parameter with the same default.
+///
 /// It is `!Send` and `!Sync`, and not `Clone`: a store belongs to one thread
 /// (§10). The tasks that wait on [`Db::flush_wanted`] and
 /// [`Db::compaction_wanted`] need a `'static` handle of their own, so put
@@ -98,7 +103,7 @@ const SEQ_NUM_START: u64 = 10;
 /// shut down, call [`Db::stop`] and wait for those clones to be dropped; once
 /// the `Rc` is the only one left, [`Rc::try_unwrap`](std::rc::Rc::try_unwrap)
 /// gives the store back for [`Db::destroy`], which consumes it.
-pub struct Db<F: Fs> {
+pub struct Db<F: Fs = crate::FileFs> {
     // Held, not used: dropping it is what releases the directory. None for a
     // store opened read-only, which takes no lock.
     _lock: Option<F::Lock>,

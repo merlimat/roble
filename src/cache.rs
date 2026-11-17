@@ -366,7 +366,7 @@ impl BlockCache {
 ///
 /// Cloning is cheap and shares: two stores given the same `Caches` draw on one
 /// budget, which is the point (§8).
-pub struct Caches<F: Fs> {
+pub struct Caches<F: Fs = crate::FileFs> {
     tables: TableClock<F>,
     blocks: BlockClock,
     next_store: Rc<std::cell::Cell<u64>>,

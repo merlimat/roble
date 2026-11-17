@@ -626,7 +626,7 @@ impl Bound {
 ///
 /// Forward and reverse, optionally bounded. The bounds are half-open as
 /// Pebble's are: `lower` is included and `upper` is not.
-pub struct Scan<F: Fs> {
+pub struct Scan<F: Fs = crate::FileFs> {
     iters: Vec<Source<F::Disk>>,
     /// The sources arranged so that the next key is the top of a heap rather
     /// than the winner of a look at every one of them.
