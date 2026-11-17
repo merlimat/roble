@@ -1,10 +1,9 @@
 [package]
 name = "roble"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-publish.workspace = true
 description = "Embedded ordered key-value store whose on-disk files are Pebble's"
 
 [dependencies]
@@ -18,7 +17,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 nanometer = "0.1"
 # The version nanometer pins.
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
-roble-format = { path = "format" }
+roble-format = { path = "format", version = "0.0.0-dev" }
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["fs", "macros"] }
@@ -41,9 +40,14 @@ members = ["bench", "cli", "format", "compat/minlz", "compat/sst-roundtrip", "co
 resolver = "3"
 
 [workspace.package]
+# The release workflow publishes the version its tag names, for roble,
+# roble-format and roble-cli. See .github/workflows/release.yml.
+version = "0.0.0-dev"
 edition = "2024"
 authors = ["Matteo Merli <matteo.merli@gmail.com>"]
 license = "Apache-2.0"
+# bench and compat are never published; roble, roble-format and roble-cli
+# opt out of this.
 publish = false
 
 [workspace.lints.rust]
