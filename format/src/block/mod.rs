@@ -72,7 +72,8 @@ pub fn decode_fetched(
     let stored = u32::from_le_bytes(trailer[1..5].try_into().expect("4 bytes"));
 
     let computed = checksum.compute(data, block_type)?;
-    if computed != stored {
+    // A fuzzer that has to forge a CRC never gets past it (format/fuzz).
+    if computed != stored && !cfg!(fuzzing) {
         return Err(Error::ChecksumMismatch {
             offset,
             stored,

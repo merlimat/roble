@@ -1,0 +1,57 @@
+[package]
+name = "roble-format-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+roble-format = { path = ".." }
+
+# Its own workspace: `cargo fuzz` needs nightly and sanitizer flags that the
+# main workspace must never be built with.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_records"
+path = "fuzz_targets/decode_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_block"
+path = "fuzz_targets/decode_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_table"
+path = "fuzz_targets/decode_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_cursor"
+path = "fuzz_targets/block_cursor.rs"
+test = false
+doc = false
+bench = false

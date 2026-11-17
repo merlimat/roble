@@ -421,7 +421,8 @@ impl<'a> RecordReader<'a> {
 
             let covered = &self.buf[self.pos + 6..self.pos + header_len + size];
             let computed = ChecksumType::Crc32c.compute_raw(covered);
-            if computed != crc {
+            // A fuzzer that has to forge a CRC never gets past it (format/fuzz).
+            if computed != crc && !cfg!(fuzzing) {
                 return Err(Error::ChecksumMismatch {
                     offset: self.pos as u64,
                     stored: crc,
