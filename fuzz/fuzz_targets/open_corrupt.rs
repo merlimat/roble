@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use roble::sim::SimEnv;
-use roble::{Comparison, Disk, Fs, Opened, Options, WriteBuf};
+use roble::{Comparison, Disk, Fs, Db, Options, WriteBuf};
 use roble_format::batch::Batch;
 
 #[derive(Arbitrary, Debug)]
@@ -168,7 +168,7 @@ fn mutate(files: &mut Files, m: &Mutation) {
 }
 
 /// Reads the whole store every way there is, stopping at the first error.
-async fn read<F: Fs>(db: &Opened<F>) -> roble::Result<()> {
+async fn read<F: Fs>(db: &Db<F>) -> roble::Result<()> {
     let mut keys = Vec::new();
     let mut scan = db.scan().await?;
     scan.first().await?;
@@ -200,7 +200,7 @@ async fn read<F: Fs>(db: &Opened<F>) -> roble::Result<()> {
 }
 
 /// Writes, flushes and compacts until there is nothing left to compact.
-async fn write<F: Fs>(db: &Opened<F>) -> roble::Result<()> {
+async fn write<F: Fs>(db: &Db<F>) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch.put(b"/oxia/fuzz", b"value")?;
     batch.delete_range(b"/oxia/a", b"/oxia/m")?;

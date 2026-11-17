@@ -49,9 +49,9 @@ use roble_format::record::RecordWriter;
 use crate::buf::WriteBuf;
 use crate::env::{Disk, Fs};
 use crate::error::Result;
-use crate::open::Opened;
+use crate::open::Db;
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Writes a checkpoint of this store into `dir`, which must not already
     /// hold a database.
     ///
@@ -131,7 +131,7 @@ impl<F: Fs> Opened<F> {
             // `FormatMajorVersion.String` is `%03d`, and the value is parsed
             // as a number either way, so writing `16` here was readable and
             // still not what Pebble writes.
-            &files::format_version_value(self.format_version),
+            &files::format_version_value(self.format_version()),
         )
         .await?;
         crate::rotate::move_marker(self.fs(), dir, MARKER_MANIFEST, 1, &filename).await?;

@@ -148,7 +148,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -160,7 +160,7 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 }
 
 /// Writes `n` keys under `prefix`, and says what they were.
-async fn write_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, n: usize) -> Model {
+async fn write_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, n: usize) -> Model {
     let mut batch = Batch::new();
     let mut written = Model::new();
     for i in 0..n {
@@ -173,7 +173,7 @@ async fn write_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, n: usize) -> Mod
 }
 
 /// Sets up a store with keys waiting in its memtable, pausing at `n`.
-async fn ready_to_flush(env: &SimEnv, dir: &Path, n: u64) -> (roble::Opened<SimFs>, Model) {
+async fn ready_to_flush(env: &SimEnv, dir: &Path, n: u64) -> (roble::Db<SimFs>, Model) {
     let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open");
@@ -245,7 +245,7 @@ async fn ready_to_compact(
     env: &SimEnv,
     dir: &Path,
     prefix: &str,
-) -> (roble::Opened<SimFs>, Model, Vec<u64>) {
+) -> (roble::Db<SimFs>, Model, Vec<u64>) {
     let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open");
@@ -369,7 +369,7 @@ async fn a_turn() {
 /// exercise its end and not its middle. The merge yields after every entry,
 /// which is what gives whatever is running beside it a turn while the gap is
 /// open.
-async fn ready_to_split(env: &SimEnv, dir: &Path) -> (roble::Opened<SimFs>, Model, Vec<u64>) {
+async fn ready_to_split(env: &SimEnv, dir: &Path) -> (roble::Db<SimFs>, Model, Vec<u64>) {
     let db = roble::open_with(
         env,
         dir,
@@ -574,7 +574,7 @@ async fn every_waiting_change_gets_its_turn() {
 }
 
 /// Writes one key, and says what it wrote.
-async fn put<F: Fs>(db: &roble::Opened<F>, key: &[u8], value: &[u8]) -> Model {
+async fn put<F: Fs>(db: &roble::Db<F>, key: &[u8], value: &[u8]) -> Model {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
     db.write(&mut batch, true).await.expect("write");
@@ -672,7 +672,7 @@ async fn two_writes_at_once_do_not_share_a_sequence_number() {
 
 /// Opens `db-reads` with a merge that hands the thread back every entry, so
 /// that a compaction of it suspends often enough to interleave with.
-async fn ready_to_merge(env: &SimEnv, dir: &Path, prefix: &str) -> (roble::Opened<SimFs>, Model) {
+async fn ready_to_merge(env: &SimEnv, dir: &Path, prefix: &str) -> (roble::Db<SimFs>, Model) {
     let db = roble::open_with(
         env,
         dir,
@@ -831,7 +831,7 @@ async fn a_compaction_that_failed_leaves_its_tables_free() {
 }
 
 /// Whether the picker still wants something compacted.
-fn self_picks<F: Fs>(db: &roble::Opened<F>) -> bool {
+fn self_picks<F: Fs>(db: &roble::Db<F>) -> bool {
     db.pick().is_some()
 }
 

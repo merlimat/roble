@@ -21,7 +21,7 @@
 //!    then freeze the memtable and point the store at both in one step. From
 //!    here a write goes to a memtable this flush is not writing out and a
 //!    log its edit does not retire, which is what makes a write arriving in
-//!    the middle of a flush safe (§5, `crate::open::Opened::freeze_memtable`).
+//!    the middle of a flush safe (§5, `crate::open::Db::freeze_memtable`).
 //!    With the WAL off there is no log, so only the memtable moves and the
 //!    edit's minimum unflushed log number falls away.
 //! 2. Write the table and sync it, then sync the directory. A table whose
@@ -61,7 +61,7 @@ use crate::change::Change;
 use crate::env::{Access, Disk, Fs};
 use crate::error::{Error, Result};
 use crate::memtable::Memtable;
-use crate::open::Opened;
+use crate::open::Db;
 
 /// How many of a table's bytes a flush, or a compaction, gathers before
 /// handing them to the disk.
@@ -82,7 +82,7 @@ use crate::open::Opened;
 /// L6 output is 128 MiB of it where a flush is bounded by the memtable.
 pub(crate) const WRITE_CHUNK: usize = 1 << 20;
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Writes the memtable out as a table and records it in the MANIFEST.
     ///
     /// Returns the new table's file number, or `None` when there was nothing
@@ -129,7 +129,7 @@ impl<F: Fs> Opened<F> {
             // once: the next flush would write out the same memtable to the
             // same disk, and a task that asked for it again on the spot
             // would be spinning rather than retrying. A write is what makes
-            // it a retry (§5, `crate::open::Opened::flush_wanted`).
+            // it a retry (§5, `crate::open::Db::flush_wanted`).
             if flushed.is_err() {
                 self.saw_flush_failure();
             }
@@ -141,7 +141,7 @@ impl<F: Fs> Opened<F> {
         if flushed.is_some() {
             // Handed to whoever is waiting to be told there is work, and run
             // here only if nobody is (§9,
-            // `crate::open::Opened::compaction_wanted`). A store whose
+            // `crate::open::Db::compaction_wanted`). A store whose
             // caller runs a task for this stops paying for merges in its
             // writes; a store without one is exactly as it was.
             if !self.version_changed() {

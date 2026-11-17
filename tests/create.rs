@@ -64,7 +64,7 @@ async fn an_open_that_may_create_makes_a_database_an_ordinary_open_reads() {
     let db = roble::open(&env, &dir)
         .await
         .expect("the created database should open without being created again");
-    assert_eq!(db.format_version, 16, "written at roble's pin");
+    assert_eq!(db.format_version(), 16, "written at roble's pin");
     assert!(
         db.versions().version.levels().all(|(_, t)| t.is_empty()),
         "and hold no tables"

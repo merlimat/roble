@@ -60,7 +60,7 @@ use crate::buf::WriteBuf;
 use crate::change::Change;
 use crate::env::{Disk, Fs};
 use crate::error::Result;
-use crate::open::Opened;
+use crate::open::Db;
 use crate::version::VersionSet;
 
 /// The default size a MANIFEST may reach before it is replaced.
@@ -72,12 +72,12 @@ use crate::version::VersionSet;
 /// the heuristic can arrive with the compactions that make it matter.
 pub const MAX_MANIFEST_BYTES: u64 = 128 << 20;
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Starts a fresh MANIFEST holding a snapshot of the current version, and
     /// points the manifest marker at it.
     ///
     /// Returns the new MANIFEST's name. A flush does this for itself once the
-    /// file it is appending to has grown past [`Opened::max_manifest_bytes`].
+    /// file it is appending to has grown past [`Db::max_manifest_bytes`].
     pub async fn rotate_manifest(&self) -> Result<String> {
         self.writable()?;
         let change = self.changes().begin().await;

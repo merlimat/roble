@@ -54,7 +54,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -82,7 +82,7 @@ async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
 ///
 /// `sync` is the store's own: asking for one with no log to sync is refused,
 /// and rightly (§4).
-async fn write_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, keys: usize, sync: bool) -> Model {
+async fn write_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, keys: usize, sync: bool) -> Model {
     let mut batch = Batch::new();
     let mut written = Model::new();
     for i in 0..keys {

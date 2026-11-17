@@ -161,7 +161,7 @@ fn dir() -> PathBuf {
     PathBuf::from("/db")
 }
 
-async fn writer(env: &SimEnv) -> roble::Opened<ReaderFs> {
+async fn writer(env: &SimEnv) -> roble::Db<ReaderFs> {
     let options = Options::default()
         .create_if_missing(true)
         .disable_automatic_compactions(true);
@@ -171,21 +171,21 @@ async fn writer(env: &SimEnv) -> roble::Opened<ReaderFs> {
 }
 
 /// What the writer's own open makes of the directory, without creating one.
-async fn reopen(env: &SimEnv) -> roble::Result<roble::Opened<ReaderFs>> {
+async fn reopen(env: &SimEnv) -> roble::Result<roble::Db<ReaderFs>> {
     roble::open(&ReaderEnv(ReaderFs::writing(env.sim())), &dir()).await
 }
 
-async fn reader(env: &ReaderEnv) -> roble::Result<roble::Opened<ReaderFs>> {
+async fn reader(env: &ReaderEnv) -> roble::Result<roble::Db<ReaderFs>> {
     roble::open_read_only(env, &dir(), Options::default()).await
 }
 
-async fn put(db: &roble::Opened<ReaderFs>, key: &[u8], value: &[u8]) {
+async fn put(db: &roble::Db<ReaderFs>, key: &[u8], value: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
     db.write(&mut batch, true).await.expect("write");
 }
 
-async fn get<F: Fs>(db: &roble::Opened<F>, key: &[u8]) -> roble::Result<Option<Vec<u8>>> {
+async fn get<F: Fs>(db: &roble::Db<F>, key: &[u8]) -> roble::Result<Option<Vec<u8>>> {
     Ok(db
         .get(key, Comparison::Equal)
         .await?

@@ -66,7 +66,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -90,7 +90,7 @@ fn entry_cost() -> u64 {
 
 /// One key per batch, so that "the budget plus one batch" is a figure this
 /// file can state exactly rather than estimate.
-async fn put<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result<()> {
+async fn put<F: Fs>(db: &roble::Db<F>, i: usize, wal: bool) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch.put(&key_at(i), VALUE).expect("put");
     db.write(&mut batch, wal).await
@@ -101,7 +101,7 @@ async fn put<F: Fs>(db: &roble::Opened<F>, i: usize, wal: bool) -> roble::Result
 /// Capped, and the cap is not padding: a store that flushed on every write
 /// would never reach the line, and a test that waited for it would hang
 /// rather than fail. A sweep that hangs tells nobody anything.
-async fn fill_to<F: Fs>(db: &roble::Opened<F>, budget: u64, wal: bool) -> usize {
+async fn fill_to<F: Fs>(db: &roble::Db<F>, budget: u64, wal: bool) -> usize {
     let mut i = 0;
     while (db.unflushed_bytes() as u64) < budget {
         put(db, i, wal).await.expect("write");

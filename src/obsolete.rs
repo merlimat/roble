@@ -76,7 +76,7 @@ use roble_format::files::{self, FileType, MARKER_MANIFEST};
 use crate::change::Change;
 use crate::env::Fs;
 use crate::error::Result;
-use crate::open::Opened;
+use crate::open::Db;
 use crate::version::{Version, VersionSet};
 
 /// What the database still refers to.
@@ -206,7 +206,7 @@ impl Pinned {
 ///
 /// A table counted here is one some reader can still ask for a block of: a
 /// lookup between opening a table and reading it, or the table cache, which
-/// the sweep lets go of first (`Opened::sweep`). A scan's tables are kept by
+/// the sweep lets go of first (`Db::sweep`). A scan's tables are kept by
 /// the version it holds ([`Pinned`]), which takes in the ones it has open.
 ///
 /// Every count is one `OpenTable`'s whole life: taken when one is built and
@@ -350,7 +350,7 @@ pub(crate) async fn remove_obsolete<F: Fs>(
     Ok(removed)
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Deletes every file the database no longer refers to, and says which.
     ///
     /// A flush calls this for itself, so a caller writing through the store

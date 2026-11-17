@@ -86,12 +86,19 @@ use crate::version::VersionSet;
 /// made and wrote one key to.
 const SEQ_NUM_START: u64 = 10;
 
-/// A database directory, open: its lock held and its MANIFEST replayed.
+/// An open database: its directory locked, its MANIFEST and logs replayed.
 ///
-/// This is what `open` has established, not yet a store you can read keys
-/// from: the memtables, caches and iterator tree are built on top of it.
-/// Dropping it releases the directory lock.
-pub struct Opened<F: Fs> {
+/// Made by [`open`], [`open_with`] or [`open_read_only`]. Dropping it releases
+/// the directory lock.
+///
+/// It is `!Send` and `!Sync`, and not `Clone`: a store belongs to one thread
+/// (§10). The tasks that wait on [`Db::flush_wanted`] and
+/// [`Db::compaction_wanted`] need a `'static` handle of their own, so put
+/// the store in an [`Rc`](std::rc::Rc) and give each task a clone of that. To
+/// shut down, call [`Db::stop`] and wait for those clones to be dropped; once
+/// the `Rc` is the only one left, [`Rc::try_unwrap`](std::rc::Rc::try_unwrap)
+/// gives the store back for [`Db::destroy`], which consumes it.
+pub struct Db<F: Fs> {
     // Held, not used: dropping it is what releases the directory. None for a
     // store opened read-only, which takes no lock.
     _lock: Option<F::Lock>,
@@ -145,9 +152,9 @@ pub struct Opened<F: Fs> {
     /// with what the tables already hold.
     next_seq: std::cell::Cell<u64>,
     /// The directory the database lives in.
-    pub dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// The format major version it was written in.
-    pub format_version: u64,
+    format_version: u64,
     /// The MANIFEST being appended to, and the iteration of the marker that
     /// names it.
     ///
@@ -232,7 +239,7 @@ pub struct Opened<F: Fs> {
 ///
 /// A store that shares a thread with others, or that wants Oxia's
 /// configuration, is opened with [`open_with`] instead (§8, §11).
-pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Opened<E::Fs>> {
+pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Db<E::Fs>> {
     open_with(env, dir, crate::options::Options::default()).await
 }
 
@@ -241,7 +248,7 @@ pub async fn open_with<E: Env>(
     env: &E,
     dir: &Path,
     options: crate::options::Options<E::Fs>,
-) -> Result<Opened<E::Fs>> {
+) -> Result<Db<E::Fs>> {
     open_dir(env, dir, options, false).await
 }
 
@@ -263,7 +270,7 @@ pub async fn open_read_only<E: Env>(
     env: &E,
     dir: &Path,
     options: crate::options::Options<E::Fs>,
-) -> Result<Opened<E::Fs>> {
+) -> Result<Db<E::Fs>> {
     open_dir(env, dir, options, true).await
 }
 
@@ -272,7 +279,7 @@ async fn open_dir<E: Env>(
     dir: &Path,
     options: crate::options::Options<E::Fs>,
     read_only: bool,
-) -> Result<Opened<E::Fs>> {
+) -> Result<Db<E::Fs>> {
     // Cloned, not borrowed: the store outlives this call and is meant to be
     // ownable by a task of its own (§10).
     let fs = env.fs().clone();
@@ -494,7 +501,7 @@ async fn open_dir<E: Env>(
         entries: Default::default(),
         read_only,
     });
-    Ok(Opened {
+    Ok(Db {
         _lock: lock,
         read_only,
         metrics,
@@ -807,9 +814,9 @@ async fn replay_logs<F: Fs>(
 
 // Written out rather than derived: the lock has no business in a debug line,
 // and a `Fs::Lock` is not required to be `Debug` at all.
-impl<F: Fs> std::fmt::Debug for Opened<F> {
+impl<F: Fs> std::fmt::Debug for Db<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Opened")
+        f.debug_struct("Db")
             .field("dir", &self.dir)
             .field("format_version", &self.format_version)
             .field("manifest_filename", &self.manifest.borrow().filename)
@@ -819,7 +826,7 @@ impl<F: Fs> std::fmt::Debug for Opened<F> {
     }
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Appends a batch to the log, syncs it if asked, and then applies it to
     /// the memtable.
     ///
@@ -837,7 +844,7 @@ impl<F: Fs> Opened<F> {
         self.metrics.write_errors.saw(result)
     }
 
-    /// The body of [`Opened::write`], so one place counts what it returned.
+    /// The body of [`Db::write`], so one place counts what it returned.
     async fn write_inner(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
         self.writable()?;
         // Refused before anything is stamped, so a write that cannot keep
@@ -875,7 +882,7 @@ impl<F: Fs> Opened<F> {
         // Room made and L0 shallow enough, this write gives the thread up
         // once to whatever is flushing or merging beside it — which is how
         // the flush this write did *not* have to do gets to happen at all
-        // (§9, [`Opened::share_the_thread`]).
+        // (§9, [`Db::share_the_thread`]).
         self.share_the_thread().await;
 
         // Held from here to the end of the function, which is the span no
@@ -932,7 +939,7 @@ impl<F: Fs> Opened<F> {
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
         self.next_seq.set(next);
         // The store holds something a flush did not, so a flush that failed
-        // is worth asking for again (§5, [`Opened::flush_wanted`]). This is
+        // is worth asking for again (§5, [`Db::flush_wanted`]). This is
         // the only thing that changes that answer, which is why the retry
         // hangs off a write and not off a clock (§10).
         self.flush_failed.set(false);
@@ -987,9 +994,9 @@ impl<F: Fs> Opened<F> {
     /// [`crate::Options::disable_automatic_compactions`] for it.
     ///
     /// **Reaching the budget is the backstop and not the plan.** A store
-    /// with a task waiting on [`Opened::flush_wanted`] is told there is a
+    /// with a task waiting on [`Db::flush_wanted`] is told there is a
     /// memtable to write out an eighth of the budget before it fills
-    /// ([`Opened::share_the_thread`], [`Opened::flush_line`]), and that task
+    /// ([`Db::share_the_thread`], [`Db::flush_line`]), and that task
     /// freezes it and writes it out while the writes carry on into the fresh
     /// one behind it. Only a store whose flushes have stopped keeping up —
     /// or one with nobody to hand them to — comes down here, and then it is
@@ -1073,7 +1080,7 @@ impl<F: Fs> Opened<F> {
     /// The eighth is the room the writes that arrive during a flush go into,
     /// and [`crate::memtable::FLUSH_RESERVE`] says why it is an eighth and
     /// not a half. Crossing it does nothing at all unless somebody is
-    /// waiting on [`Opened::flush_wanted`] to be told: a store on its own
+    /// waiting on [`Db::flush_wanted`] to be told: a store on its own
     /// goes on filling the whole budget for the one memtable, and writes the
     /// tables it did before there was anywhere else for a flush to run.
     pub fn flush_line(&self) -> u64 {
@@ -1195,6 +1202,16 @@ impl<F: Fs> Opened<F> {
         std::iter::once(self.memtable()).chain(self.frozen())
     }
 
+    /// The directory the database lives in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The format major version the database was written in.
+    pub fn format_version(&self) -> u64 {
+        self.format_version
+    }
+
     /// The log this store is appending to, if it has one.
     ///
     /// Not the same as the MANIFEST's `min_unflushed_log_num`, which can name
@@ -1268,7 +1285,7 @@ impl<F: Fs> Opened<F> {
     /// The other half of what a store hands to a task of its own, and the
     /// half that takes the flush off the write that found the memtable full
     /// (§5). A write tells whoever is parked here an eighth of the budget
-    /// before it fills ([`Opened::flush_line`]); the task freezes that
+    /// before it fills ([`Db::flush_line`]); the task freezes that
     /// memtable and writes it out while the writes carry on into the fresh
     /// one, which is what the eighth is kept back for.
     ///
@@ -1282,7 +1299,7 @@ impl<F: Fs> Opened<F> {
     /// });
     /// ```
     ///
-    /// Its own wait and not [`Opened::compaction_wanted`]'s, because the two
+    /// Its own wait and not [`Db::compaction_wanted`]'s, because the two
     /// have to be able to run at once. A merge is the longest thing a store
     /// does and it holds no permit while it runs (§9), so a flush can go
     /// through the middle of one — but only if something is there to run it,
@@ -1291,12 +1308,12 @@ impl<F: Fs> Opened<F> {
     /// later.
     ///
     /// Level-triggered and asked again on every poll, as
-    /// [`Opened::compaction_wanted`] is, so a task that starts after the
+    /// [`Db::compaction_wanted`] is, so a task that starts after the
     /// line was crossed is told at once. The two exceptions are both
     /// "later with no clock to say when" (§10): a change already underway
     /// may be the very flush this would run, so this waits for it and looks
     /// again rather than queueing to repeat it — Pebble's loop in
-    /// `maybeInduceWriteStall`, which `Opened::make_room` runs for the same
+    /// `maybeInduceWriteStall`, which `Db::make_room` runs for the same
     /// reason; and a flush that **failed** is not wanted again until the
     /// store has taken another write, because until then it would write out
     /// the same memtable to the same disk and fail the same way.
@@ -1324,12 +1341,12 @@ impl<F: Fs> Opened<F> {
     /// coming, so they can end and let go of it (§9).
     ///
     /// A store runs no tasks of its own, so the ones parked on
-    /// [`Opened::flush_wanted`] and [`Opened::compaction_wanted`] are the
+    /// [`Db::flush_wanted`] and [`Db::compaction_wanted`] are the
     /// caller's — and each of them holds the store while it waits. §9 says
     /// the caller owns stopping them; this is the half of that the caller
     /// cannot write for itself, because a parked task has to be woken by
     /// whatever it is parked on. From here both waits return at once,
-    /// [`Opened::running`] is false, and the last task to let go is what
+    /// [`Db::running`] is false, and the last task to let go is what
     /// lets the store be dropped and the directory released.
     ///
     /// Nothing else changes: a store that has been stopped still reads,
@@ -1343,7 +1360,7 @@ impl<F: Fs> Opened<F> {
 
     /// Whether the tasks a caller runs beside this store should keep going.
     ///
-    /// False once [`Opened::stop`] has been called, which is the loop
+    /// False once [`Db::stop`] has been called, which is the loop
     /// condition the examples on the two waits are written around.
     pub fn running(&self) -> bool {
         !self.stopped.get()
@@ -1385,7 +1402,7 @@ impl<F: Fs> Opened<F> {
     /// });
     /// ```
     ///
-    /// The loop ends when the caller says so ([`Opened::stop`]), which it
+    /// The loop ends when the caller says so ([`Db::stop`]), which it
     /// has to be able to do: the task holds the store while it waits, and a
     /// store nothing lets go of is a directory nothing unlocks.
     ///
@@ -1409,7 +1426,7 @@ impl<F: Fs> Opened<F> {
     pub async fn compaction_wanted(&self) {
         std::future::poll_fn(|cx| {
             // Nothing more is coming, so the task around this is meant to
-            // end rather than wait ([`Opened::stop`]).
+            // end rather than wait ([`Db::stop`]).
             if self.stopped.get() {
                 return std::task::Poll::Ready(());
             }
@@ -1468,7 +1485,7 @@ impl<F: Fs> Opened<F> {
     /// itself (§4), as [`crate::Options`] was asked for.
     ///
     /// The backstop, not the line a flush is usually started at: that is
-    /// [`Opened::flush_line`], an eighth below this (§5).
+    /// [`Db::flush_line`], an eighth below this (§5).
     pub fn memtable_size(&self) -> u64 {
         self.memtable_size
     }
@@ -1768,7 +1785,7 @@ impl<F: Fs> Opened<F> {
 /// How a store opens its tables: through the table cache, and from its
 /// directory when the cache does not hold one.
 ///
-/// Apart from [`Opened`] and shared by `Rc`, because a scan outlives the
+/// Apart from [`Db`] and shared by `Rc`, because a scan outlives the
 /// call that made it and opens tables as it reaches them (`crate::scan`), so
 /// it needs everything opening one takes without a borrow of the store. Each
 /// field is a handle the store holds as well.

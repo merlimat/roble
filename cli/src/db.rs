@@ -23,7 +23,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use roble::{Comparison, DefaultEnv, FileFs, Opened, Options};
+use roble::{Comparison, Db, DefaultEnv, FileFs, Options};
 use roble_format::batch::Batch;
 use roble_format::files::{self, MARKER_MANIFEST};
 
@@ -180,7 +180,7 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
 ///
 /// Into a buffer, which a write cannot fail on, so what is written is not
 /// checked here. The buffer goes to the output once the read is done.
-fn tables(db: &Opened<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
+fn tables(db: &Db<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
     let versions = db.versions();
     let _ = writeln!(
         out,
@@ -216,7 +216,7 @@ fn tables(db: &Opened<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
 
 /// Prints the summary `stats` gives, then the table of levels, into a buffer
 /// as [`tables`] does.
-async fn stats(db: &Opened<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
+async fn stats(db: &Db<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
     let disk = db.disk_usage().await.at(dir)?;
     let (sublevels, levels, debt) = {
         let versions = db.versions();
@@ -252,7 +252,7 @@ async fn stats(db: &Opened<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()>
         None => "none".to_string(),
     };
 
-    let _ = writeln!(out, "format version  {:>24}", db.format_version);
+    let _ = writeln!(out, "format version  {:>24}", db.format_version());
     let _ = writeln!(out, "manifest        {:>24}", db.manifest_filename());
     let _ = writeln!(out, "wal             {wal:>24}");
     let _ = writeln!(out, "unflushed bytes {:>24}", db.unflushed_bytes());
@@ -409,7 +409,7 @@ fn properties_of(path: &Path) -> Result<TableProperties> {
 /// Without `create`, a directory that holds no database is refused before
 /// it is opened: opening takes the directory's lock, which would leave a
 /// `LOCK` file behind in a directory that was never a database.
-async fn open(dir: &Path, create: bool) -> Result<Opened<FileFs>> {
+async fn open(dir: &Path, create: bool) -> Result<Db<FileFs>> {
     if !create {
         a_database_in(dir)?;
     }
@@ -419,7 +419,7 @@ async fn open(dir: &Path, create: bool) -> Result<Opened<FileFs>> {
 
 /// Opens the database in `dir` to read, beside any process that has it open
 /// to write. It takes no lock and changes nothing in the directory.
-async fn open_read_only(dir: &Path) -> Result<Opened<FileFs>> {
+async fn open_read_only(dir: &Path) -> Result<Db<FileFs>> {
     a_database_in(dir)?;
     roble::open_read_only(&DefaultEnv, dir, Options::default())
         .await
@@ -448,10 +448,7 @@ fn a_database_in(dir: &Path) -> Result<()> {
 /// Runs `read` against the database in `dir`, opened read-only. When the
 /// process writing the database retires a file the read needs, opens it
 /// again and reads again, up to [`MAX_STALE`] times.
-async fn reading<T>(
-    dir: &Path,
-    mut read: impl AsyncFnMut(&Opened<FileFs>) -> Result<T>,
-) -> Result<T> {
+async fn reading<T>(dir: &Path, mut read: impl AsyncFnMut(&Db<FileFs>) -> Result<T>) -> Result<T> {
     let mut stale = 0;
     loop {
         let result = match open_read_only(dir).await {
@@ -467,7 +464,7 @@ async fn reading<T>(
 
 /// Writes `batch` and waits for it to be synced: the process exits straight
 /// after, so anything less would leave the write to the machine staying up.
-async fn write(db: &Opened<FileFs>, dir: &Path, batch: &mut Batch) -> Result<()> {
+async fn write(db: &Db<FileFs>, dir: &Path, batch: &mut Batch) -> Result<()> {
     db.write(batch, true).await.at(dir)
 }
 

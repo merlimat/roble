@@ -453,7 +453,7 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   **The budget is the backstop, and the line sits an eighth below it.** A
   write that pays for a flush waits for a table to be built, written and
   synced, which at 64 MiB is a tenth of a second. So a store with a task
-  waiting on `Opened::flush_wanted` is told there is a memtable to write out
+  waiting on `Db::flush_wanted` is told there is a memtable to write out
   at seven eighths of the budget; that task freezes it and writes it out
   while the writes carry on into the fresh one behind it, and the last eighth
   is what they carry on into. The budget itself is unchanged and still counts
@@ -1515,7 +1515,7 @@ A write short of room in a memtable makes the room itself — a flush, before it
 batch is accepted (§4) — unless a change is already underway, in which case it
 waits for that one and asks again, and often finds the room already made. That
 is the backstop; the routine case does not reach it, because a store with a
-task waiting on `Opened::flush_wanted` was told there was a memtable to write
+task waiting on `Db::flush_wanted` was told there was a memtable to write
 out an eighth of the budget earlier and that task is already writing it (§5).
 A store without one has no such task to tell, and this is where it finds out.
 A write short of a shallow enough L0 does the same with a merge:
@@ -1547,8 +1547,8 @@ worse answer than letting the caller have what it asked for.
 **Flushing and compacting in tasks of their own.** A write that reaches the
 line tells whoever is waiting that there is a memtable to write out (§5); a
 flush that has written a table tells whoever is waiting that there is a merge
-to run, and runs it where it stands if nobody is. `Opened::flush_wanted` and
-`Opened::compaction_wanted` are the waiting, and the tasks are the
+to run, and runs it where it stands if nobody is. `Db::flush_wanted` and
+`Db::compaction_wanted` are the waiting, and the tasks are the
 **caller's**:
 
 ```rust
@@ -1581,12 +1581,12 @@ when, the caller says where. It keeps §12 intact as well, because no operation
 count in a failure sweep then depends on when a runtime chose to poll a
 detached task.
 
-**`Opened::stop` is the half of "owns stopping them" the caller cannot write
+**`Db::stop` is the half of "owns stopping them" the caller cannot write
 for itself.** A parked task is woken by what it is parked on and by nothing
 else, and both of these park on the store — so a store with no way to say
 "nothing more is coming" is a store its own tasks hold for ever, and a
 directory nothing unlocks. After `stop` both waits return at once,
-`Opened::running` is false, the loops end, and the last task to let go is what
+`Db::running` is false, the loops end, and the last task to let go is what
 lets the store be dropped. Nothing else changes: a stopped store still reads,
 still writes, and still flushes and compacts inside its writes.
 
@@ -1613,8 +1613,8 @@ Reuse encina's shape: a store opens in an `Env`, which opens its files and runs
 its tasks, and all I/O goes through a `Disk` whose requests move owned buffers.
 A request is any byte range: a disk may not refuse an offset or a length, which
 is what rules `O_DIRECT` out of the open and puts it under the block cache
-instead (§8). `Db` is `!Send` and `!Sync`, a cheap `Clone` handle shared by one
-thread's tasks. `DefaultEnv` uses compio.
+instead (§8). `Db` is `!Send` and `!Sync`, and not `Clone`: one thread's
+tasks share it through an `Rc`. `DefaultEnv` uses compio.
 
 **A store owns its filesystem.** `Clone` is on the trait because a store
 keeps the `Fs` it was opened in rather than borrowing it, which is what makes

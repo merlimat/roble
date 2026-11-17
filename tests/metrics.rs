@@ -1127,7 +1127,7 @@ fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 }
 
 /// Writes one key of a known arena cost.
-async fn put<F: Fs>(db: &roble::Opened<F>, i: usize) -> roble::Result<()> {
+async fn put<F: Fs>(db: &roble::Db<F>, i: usize) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch
         .put(format!("s{i:04}").as_bytes(), &[b'v'; 32])
@@ -1545,7 +1545,7 @@ async fn a_level_whose_table_lies_past_the_probe_is_not_opened() {
     .await
     .expect("open");
 
-    async fn into_l1<F: Fs>(db: &roble::Opened<F>, keys: &[&str]) {
+    async fn into_l1<F: Fs>(db: &roble::Db<F>, keys: &[&str]) {
         let mut batch = Batch::new();
         for key in keys {
             batch.put(key.as_bytes(), b"v").expect("put");

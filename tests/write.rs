@@ -60,7 +60,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 /// Everything the database shows, in order.
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();

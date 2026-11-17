@@ -51,23 +51,23 @@ use roble_format::key::{self, InternalKey, Kind};
 use crate::env::Fs;
 use crate::error::Result;
 use crate::memtable::Memtable;
-use crate::open::Opened;
+use crate::open::Db;
 use crate::read::{Comparison, Found, successor};
 use crate::scan::Scan;
 
 /// A batch of writes, readable through itself.
 ///
-/// Built by [`Opened::batch`], read with [`IndexedBatch::get`] and
+/// Built by [`Db::batch`], read with [`IndexedBatch::get`] and
 /// [`IndexedBatch::scan`], and applied to the store by
 /// [`IndexedBatch::commit`].
 pub struct IndexedBatch<'a, F: Fs> {
-    db: &'a Opened<F>,
+    db: &'a Db<F>,
     repr: Batch,
     index: Rc<RefCell<Memtable>>,
 }
 
 impl<'a, F: Fs> IndexedBatch<'a, F> {
-    pub(crate) fn new(db: &'a Opened<F>) -> Self {
+    pub(crate) fn new(db: &'a Db<F>) -> Self {
         IndexedBatch {
             db,
             repr: Batch::new(),
@@ -288,7 +288,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     }
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// A batch that can be read back through itself before it commits.
     pub fn batch(&self) -> IndexedBatch<'_, F> {
         IndexedBatch::new(self)

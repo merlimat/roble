@@ -83,7 +83,7 @@ fn tables(names: &[String]) -> Vec<u64> {
         .collect()
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -101,7 +101,7 @@ async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
 /// table it adds, the log it retires — and a compaction following it would
 /// change the version before the assertion could read it.
 /// `tests/schedule.rs` is where the scheduling is the subject.
-async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Opened<SimFs> {
+async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
     roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
         .await
         .expect("open")
@@ -409,7 +409,7 @@ async fn an_interrupted_flush_leaves_a_table_the_next_open_collects() {
 }
 
 /// The tables of L0, which the fixtures leave with something to compact.
-fn in_l0<F: Fs>(db: &roble::Opened<F>) -> Vec<u64> {
+fn in_l0<F: Fs>(db: &roble::Db<F>) -> Vec<u64> {
     let found: Vec<u64> = db
         .versions()
         .version
@@ -666,7 +666,7 @@ async fn a_kept_lookup_holds_no_table_between_reads() {
 /// go of the retired ones are all among them.
 #[compio::test]
 async fn a_table_a_get_has_chosen_is_not_collected_before_it_reads_it() {
-    async fn ready(env: &SimEnv, dir: &Path) -> (roble::Opened<SimFs>, Vec<u8>, Vec<u8>, Vec<u64>) {
+    async fn ready(env: &SimEnv, dir: &Path) -> (roble::Db<SimFs>, Vec<u8>, Vec<u8>, Vec<u64>) {
         let db = roble::open_with(env, dir, Options::new().disable_automatic_compactions(true))
             .await
             .expect("open");

@@ -100,7 +100,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
     (env, dir)
 }
 
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
@@ -121,7 +121,7 @@ fn options(wal: bool) -> Options<SimFs> {
 }
 
 /// Writes `n` keys under `prefix`, and says what they were.
-async fn write_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, n: usize, wal: bool) -> Model {
+async fn write_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, n: usize, wal: bool) -> Model {
     let mut batch = Batch::new();
     let mut written = Model::new();
     for i in 0..n {
@@ -137,7 +137,7 @@ async fn write_keys<F: Fs>(db: &roble::Opened<F>, prefix: &str, n: usize, wal: b
 
 /// Opens the fixture with keys waiting in its memtable, and says what the
 /// database then holds.
-async fn ready(env: &SimEnv, dir: &Path, wal: bool) -> (roble::Opened<SimFs>, Model) {
+async fn ready(env: &SimEnv, dir: &Path, wal: bool) -> (roble::Db<SimFs>, Model) {
     let db = roble::open_with(env, dir, options(wal))
         .await
         .expect("open");
@@ -177,7 +177,7 @@ struct Seen {
 /// Three ways, because they are three pieces of code: a scan merges the
 /// memtables as sources, a `get` walks each of them with a cursor of its own,
 /// and `unflushed_bytes` adds up their arenas.
-async fn read_through<F: Fs>(db: &roble::Opened<F>, tables_before: usize) -> Seen {
+async fn read_through<F: Fs>(db: &roble::Db<F>, tables_before: usize) -> Seen {
     let found = db
         .get(b"t007", Comparison::Equal)
         .await

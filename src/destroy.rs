@@ -60,13 +60,13 @@
 
 use crate::env::Fs;
 use crate::error::Result;
-use crate::open::Opened;
+use crate::open::Db;
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Removes every file of this database, consuming the store.
     ///
     /// Oxia's `KV.Delete`. Returns the names it removed, as
-    /// [`Opened::remove_obsolete_files`] does.
+    /// [`Db::remove_obsolete_files`] does.
     ///
     /// The database's directory is left behind, empty: see the module's
     /// documentation for that and for the order of what follows. A

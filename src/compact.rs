@@ -79,7 +79,7 @@ use crate::change::Claim;
 use crate::env::{Disk, Fs};
 use crate::error::{Error, Result};
 use crate::flush::Bounds;
-use crate::open::Opened;
+use crate::open::Db;
 use crate::table::{OpenTable, is_deletion};
 use crate::version::Table as TableMeta;
 
@@ -102,7 +102,7 @@ pub(crate) struct Plan<'a> {
     _claim: Claim<'a>,
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// Compacts the named tables of `level` into `level + 1`.
     ///
     /// Every table of `level + 1` whose key range meets theirs joins them, or

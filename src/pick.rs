@@ -32,7 +32,7 @@
 //! function of the version alone, and two stores given the same version pick
 //! the same compaction.
 //!
-//! **What runs it.** A flush, through [`Opened::maybe_compact`]: a flush is
+//! **What runs it.** A flush, through [`Db::maybe_compact`]: a flush is
 //! what fills L0, so it is where the store notices it has too much in it.
 //! That waited on the cooperative execution of `crate::work`, because a
 //! compaction that ran to completion while holding the thread was exactly
@@ -52,7 +52,7 @@ use roble_format::manifest::NUM_LEVELS;
 
 use crate::env::Fs;
 use crate::error::Result;
-use crate::open::Opened;
+use crate::open::Db;
 use crate::version::Version;
 
 /// How many tables L0 may hold before a write waits for it to drain.
@@ -138,7 +138,7 @@ impl Pick {
     }
 }
 
-impl<F: Fs> Opened<F> {
+impl<F: Fs> Db<F> {
     /// The compaction worth running, if any level is past its allowance.
     ///
     /// Ties go to the level nearest L0, which is where a table being there
@@ -159,7 +159,7 @@ impl<F: Fs> Opened<F> {
         // others. A write is about to wait for L0 to drain, and no other
         // level this could compact instead would let that write through, so
         // L0 wins outright however far past its allowance anything else is
-        // (§9, `crate::open::Opened::make_room`).
+        // (§9, `crate::open::Db::make_room`).
         //
         // Pebble arrives at the same place from the other direction: a deep
         // L0 buys it *extra concurrent* compactions
@@ -247,7 +247,7 @@ impl<F: Fs> Opened<F> {
         self.metrics.saw_debt(self.compaction_debt());
     }
 
-    /// Runs the compaction [`Opened::pick`] chose, if there is one.
+    /// Runs the compaction [`Db::pick`] chose, if there is one.
     ///
     /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.
@@ -259,7 +259,7 @@ impl<F: Fs> Opened<F> {
         self.run(plan).await
     }
 
-    /// Plans the compaction [`Opened::pick`] chose, if there is one and
+    /// Plans the compaction [`Db::pick`] chose, if there is one and
     /// nothing else has claimed its tables.
     ///
     /// The picker is not told what is claimed, and so can choose tables a

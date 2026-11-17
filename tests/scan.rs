@@ -85,7 +85,7 @@ fn probe_key(n: u64) -> Vec<u8> {
 }
 
 /// Everything a scan returns, which is also the model's starting point.
-async fn contents<F: Fs>(db: &roble::Opened<F>) -> Model {
+async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
     let mut scan = db.scan().await.expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
