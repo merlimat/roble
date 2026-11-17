@@ -96,9 +96,13 @@ async fn main() {
     // whose directory is certain to exist: `--created` is handed a path that
     // is not there yet, which is the whole point of it.
     let before = if swept { names_in(&dir) } else { Vec::new() };
+    // No background tasks: this program does one thing and hands the
+    // directory to Pebble, so its flushes and merges are the ones it asks
+    // for and nothing else is writing when it exits.
     let mut options = roble::Options::new()
         .disable_wal(no_wal)
-        .create_if_missing(created);
+        .create_if_missing(created)
+        .background_tasks(false);
     if settle {
         // Allowances a test-sized database can actually cross, so the picker
         // has something to do.

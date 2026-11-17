@@ -101,23 +101,24 @@ impl<F: Fs> Db<F> {
         writer.write_record(&snapshot.encode())?;
         let bytes = writer.as_bytes().to_vec();
 
-        let disk = self.fs().create(&self.dir.join(&filename)).await?;
+        let disk = self.fs().create(&self.store.dir.join(&filename)).await?;
         let written = bytes.len();
         let (result, _) = disk
             .write(WriteBuf::new(bytes), 0, Default::default())
             .await;
         result?;
-        self.metrics.written.add(written);
+        self.store.metrics.written.add(written);
         {
-            let _timer = self.metrics.sync_duration.start();
+            let _timer = self.store.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
         }
         disk.close().await?;
-        self.fs().sync_dir(&self.dir).await?;
+        self.fs().sync_dir(&self.store.dir).await?;
 
         // The one-way door.
         let iter = self.manifest_marker_iter() + 1;
-        let marker = move_marker(self.fs(), &self.dir, MARKER_MANIFEST, iter, &filename).await?;
+        let marker =
+            move_marker(self.fs(), &self.store.dir, MARKER_MANIFEST, iter, &filename).await?;
 
         // Past the door, and nothing here can fail.
         self.install_manifest(filename.clone(), iter, marker);

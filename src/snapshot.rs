@@ -301,13 +301,13 @@ impl<F: Fs> Db<F> {
     /// over can be collected.
     pub fn snapshot(&self) -> Result<Snapshot<F>> {
         let version = Rc::clone(&self.version_set().version);
-        self.metrics.snapshots_open.add(1);
+        self.store.metrics.snapshots_open.add(1);
         Ok(Snapshot {
             version,
             tables: self.tables(),
             memtables: self.memtables(),
             seq: self.last_seq_num(),
-            metrics: Rc::clone(&self.metrics),
+            metrics: Rc::clone(&self.store.metrics),
         })
     }
 }

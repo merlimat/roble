@@ -31,9 +31,6 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-// The trait `DefaultEnv::spawn` comes from, which is how a store's caller
-// puts a flush and a merge somewhere other than a write (§9).
-use roble::Env as _;
 use roble_format::files as roble_files;
 
 use crate::report::Report;
@@ -205,10 +202,10 @@ async fn yield_now() {
 
 /// roble, the subject.
 pub struct Roble {
-    /// Shared with the two tasks `open` spawns beside it, which is what
+    /// The store, which flushes and merges in tasks of its own (§9): what
     /// takes a flush and a merge off the write that would otherwise pay for
-    /// them (§9, `roble::Db::flush_wanted`).
-    db: std::rc::Rc<roble::Db>,
+    /// them.
+    db: roble::Db,
     /// The working space `get` hands back on every call. One per store,
     /// as Oxia holds one store per shard and reads them from one thread.
     ///
@@ -243,50 +240,12 @@ impl Store for Roble {
                     // of truth, so the store need only be durable at a flush.
                     .disable_wal(!cfg.wal)
                     // Stops the merge a flush would run where it stands, and
-                    // the stall a write would wait out for one; the task
-                    // below that would run it is not spawned either.
+                    // the stall a write would wait out for one; the store
+                    // does not spawn the task that would run it either.
                     .disable_automatic_compactions(!cfg.compactions),
             )
             .await
             .unwrap_or_else(|e| fail(&format!("open {}: {e}", at.display())));
-            let db = std::rc::Rc::new(db);
-
-            // A store runs no tasks of its own (§9), so a flush and the
-            // merge the picker chooses happen wherever the caller puts
-            // them — and until something does, they happen inside the write
-            // that found the memtable full. Oxia has a task per shard
-            // already; these are that task, and running them is what the
-            // `ycsb` row's `max` column is a measurement of.
-            //
-            // Two of them, because a flush and a merge have to be able to
-            // run at once: a merge is the longest thing a store does and it
-            // holds no permit while it runs, so a flush can go through the
-            // middle of one — but only if something is there to run it. The
-            // flush hands the merge to the second task and goes straight
-            // back to waiting.
-            let flusher = std::rc::Rc::clone(&db);
-            roble::DefaultEnv.spawn(async move {
-                while flusher.running() {
-                    flusher.flush_wanted().await;
-                    let _ = flusher.flush().await;
-                }
-            });
-            //
-            // Not under `--no-compactions`. The store's own option is not
-            // enough to stop this task: `compaction_wanted` answers from the
-            // picker and `compact_once` is the explicit call the option
-            // leaves alone, so the task would go on merging exactly what
-            // the option was asked to leave.
-            if cfg.compactions {
-                let merger = std::rc::Rc::clone(&db);
-                roble::DefaultEnv.spawn(async move {
-                    while merger.running() {
-                        merger.compaction_wanted().await;
-                        let _ = merger.compact_once().await;
-                    }
-                });
-            }
-
             shards.push(Roble {
                 db,
                 lookup: std::cell::Cell::new(roble::GetBuf::new()),
@@ -296,22 +255,16 @@ impl Store for Roble {
     }
 
     async fn reopen(shards: Vec<Self>, cfg: &Config, dir: &Path) -> Vec<Self> {
-        // The tasks `open` spawned hold the store while they wait, so
-        // dropping these would not release the directory and the open below
-        // would find it locked. Told there is nothing more coming, and then
-        // given the turns they need to hear it (§9, `roble::Db::stop`).
-        for shard in &shards {
-            shard.db.stop();
+        // Closed rather than dropped: a store whose task is in the middle
+        // of a flush or a merge keeps the directory until that work is done,
+        // and closing is what waits for it.
+        for shard in shards {
+            shard
+                .db
+                .close()
+                .await
+                .unwrap_or_else(|e| fail(&format!("close: {e}")));
         }
-        let mut turns = 0;
-        while shards.iter().any(|s| std::rc::Rc::strong_count(&s.db) > 1) {
-            yield_now().await;
-            turns += 1;
-            if turns > 1_000_000 {
-                fail("the tasks beside these stores never let go of them");
-            }
-        }
-        drop(shards);
         Self::open(cfg, dir).await
     }
 

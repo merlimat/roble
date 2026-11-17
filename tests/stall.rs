@@ -278,7 +278,7 @@ async fn a_write_says_there_is_a_memtable_to_write_out_before_the_budget() {
     for wal in [true, false] {
         let budget = ENTRIES * entry_cost();
         let (env, dir) = load("db-twin-a").await;
-        let db = roble::open_with(&env, &dir, opened(wal, budget))
+        let db = roble::open_with(&env, &dir, opened(wal, budget).background_tasks(false))
             .await
             .expect("open");
 
@@ -321,7 +321,7 @@ async fn a_write_hands_the_flush_to_whoever_is_waiting_for_one() {
     for wal in [true, false] {
         let budget = ENTRIES * entry_cost();
         let (env, dir) = load("db-twin-a").await;
-        let db = roble::open_with(&env, &dir, opened(wal, budget))
+        let db = roble::open_with(&env, &dir, opened(wal, budget).background_tasks(false))
             .await
             .expect("open");
         let mut model = contents(&db).await;
@@ -416,7 +416,7 @@ async fn the_budget_stops_a_store_whose_flushes_nobody_takes() {
     for wal in [true, false] {
         let budget = ENTRIES * entry_cost();
         let (env, dir) = load("db-twin-a").await;
-        let db = roble::open_with(&env, &dir, opened(wal, budget))
+        let db = roble::open_with(&env, &dir, opened(wal, budget).background_tasks(false))
             .await
             .expect("open");
         let mut model = contents(&db).await;
@@ -471,7 +471,7 @@ async fn a_task_waits_for_the_flush_underway_rather_than_queueing_to_repeat_it()
     // merge nobody asked for.
     let budget = ENTRIES * entry_cost();
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, opened(false, budget))
+    let db = roble::open_with(&env, &dir, opened(false, budget).background_tasks(false))
         .await
         .expect("open");
     fill_past_the_line(&db, false).await;
@@ -520,7 +520,7 @@ async fn a_flush_that_failed_is_not_asked_for_again_until_a_write() {
     // it is "later" with no clock to say when (§10).
     let budget = ENTRIES * entry_cost();
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, opened(false, budget))
+    let db = roble::open_with(&env, &dir, opened(false, budget).background_tasks(false))
         .await
         .expect("open");
     let filled = fill_past_the_line(&db, false).await;

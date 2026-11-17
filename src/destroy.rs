@@ -25,10 +25,9 @@
 //! its own edit — which is what §5's one-change permit exists to prevent. A
 //! destroy needs none of it: every other operation on a store takes `&self`
 //! and this one takes `self`, so an outstanding borrow anywhere forbids the
-//! move, and a store shared into a task of its own lives behind an `Rc` that
-//! has to be sole-owned before `self` can be had back (§10,
-//! `tests/open.rs`). There is no way to ask for a destroy while the store is
-//! busy.
+//! move, and the store's own background tasks are wound down — the flush or
+//! merge in flight finished, both tasks ended — before the first file goes.
+//! There is no way to ask for a destroy while the store is busy.
 //!
 //! What may still be alive is a [`Scan`](crate::Scan) or a
 //! [`Snapshot`](crate::Snapshot): those hold open readers and no borrow of
@@ -65,6 +64,9 @@ use crate::open::Db;
 impl<F: Fs> Db<F> {
     /// Removes every file of this database, consuming the store.
     ///
+    /// Waits for the store's background work to stop first, as
+    /// [`Db::close`] does.
+    ///
     /// Oxia's `KV.Delete`. Returns the names of the files it removed.
     ///
     /// The database's directory is left behind, empty: see the module's
@@ -77,9 +79,13 @@ impl<F: Fs> Db<F> {
     /// it does when the obsolete sweep retires one. The name goes either way.
     pub async fn destroy(self) -> Result<Vec<String>> {
         self.writable()?;
+        // Its background tasks first: a flush finishing after the files
+        // below were removed would write a table into a database that is
+        // supposed to be gone.
+        self.wind_down().await;
         let names: Vec<String> = self
             .fs()
-            .list(&self.dir)
+            .list(&self.store.dir)
             .await?
             .iter()
             .filter(|e| !e.is_dir)
@@ -92,7 +98,7 @@ impl<F: Fs> Db<F> {
 
         let mut removed = Vec::with_capacity(names.len());
         for name in names {
-            self.fs().remove(&self.dir.join(&name)).await?;
+            self.fs().remove(&self.store.dir.join(&name)).await?;
             removed.push(name);
         }
         // Synced, which the obsolete sweep does not bother with. An obsolete
@@ -101,7 +107,7 @@ impl<F: Fs> Db<F> {
         // holding data it would then open and serve. The simulated filesystem
         // forgets a removed name outright, so no test can tell this line from
         // its absence — stated rather than tested (§12).
-        self.fs().sync_dir(&self.dir).await?;
+        self.fs().sync_dir(&self.store.dir).await?;
         Ok(removed)
     }
 }

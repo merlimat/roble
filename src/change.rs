@@ -150,13 +150,9 @@ impl Changes {
 /// happen at once — a flush that queued behind a merge would be a write
 /// queueing behind it one memtable later.
 ///
-/// The store does not run background work itself: `Env::spawn` takes a
-/// `'static` future and a store's methods take `&self`, so a task that
-/// compacted would have to hold the store — and then dropping the store
-/// would not release the directory until that task finished, which `Drop`
-/// cannot wait for. So the task is the caller's, built around
-/// `Db::flush_wanted` and `Db::compaction_wanted`, and this is how a
-/// write and a flush tell it.
+/// The tasks are the store's own, spawned when it is opened and built
+/// around `Db::flush_wanted` and `Db::compaction_wanted`
+/// (`Db::spawn_background`), and this is how a write and a flush tell them.
 #[derive(Default)]
 pub(crate) struct Waiters {
     waiting: RefCell<Vec<Waker>>,

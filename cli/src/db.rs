@@ -411,7 +411,11 @@ async fn open(dir: &Path, create: bool) -> Result<Db> {
     if !create {
         a_database_in(dir)?;
     }
-    let options = Options::default().create_if_missing(create);
+    // No background tasks: a command does one thing and exits, and its
+    // `compact` is the merge, not a race with the store's own.
+    let options = Options::default()
+        .create_if_missing(create)
+        .background_tasks(false);
     roble::open_with(&DefaultEnv, dir, options).await.at(dir)
 }
 

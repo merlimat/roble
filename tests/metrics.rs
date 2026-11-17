@@ -1054,6 +1054,10 @@ async fn a_store_takes_its_amounts_back_when_it_closes() {
         let levels = by_attr(reader(), &tag, "roble.level.tables", "roble.level");
         assert_eq!(levels.get("0").copied(), Some(1));
         assert!(collected(reader(), &tag)["roble.memtable.size"] > 0);
+        // Closed rather than dropped: a drop stops the background tasks, but
+        // what they hold goes when the executor next runs them, and closing
+        // is what waits for that.
+        db.close().await.expect("close");
     }
 
     let seen = collected(reader(), &tag);

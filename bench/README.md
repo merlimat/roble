@@ -299,9 +299,8 @@ p99.9 and max, and it needs all four: on this phase they span four orders of
 magnitude.
 
 **A writing mix drives compaction by writing.** roble compacts cooperatively
-on the thread that owns the store (§9) — in a task this driver spawns beside
-each shard, which is the pattern `Db::flush_wanted` and
-`Db::compaction_wanted` document. A write at the line tells that task
+on the thread that owns the store (§9) — in the two tasks each store spawns
+for itself when it is opened. A write at the line tells the flushing one
 there is a memtable to write out and hands it the thread; it writes it out,
 and the merge the picker chooses follows. So the phase does not have to yield
 to any of it, and L0 stays inside its allowance of four — **1 or 2** through
