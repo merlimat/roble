@@ -28,6 +28,9 @@
 //!
 //! It also keeps the trait honest: a second implementation is what turns the
 //! trait from a description of `FileFs` into an interface.
+//!
+//! Behind the `sim` feature, off by default: an application that wants it
+//! for its own crash tests enables it in its `[dev-dependencies]`.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -47,7 +50,7 @@ const POISON: u8 = 0xa5;
 
 /// What a simulated operation is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Op {
+pub(crate) enum Op {
     /// Creating a file.
     Create,
     /// Opening a file.

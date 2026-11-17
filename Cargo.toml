@@ -6,6 +6,11 @@ authors.workspace = true
 license.workspace = true
 description = "Embedded ordered key-value store whose on-disk files are Pebble's"
 
+# Every feature documented, each gated item marked with the one it needs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 compio = { version = "0.19.2", features = ["fs"] }
 # The facade only, and without `attributes`: a library that logs says so and
@@ -26,6 +31,10 @@ roble-format = { path = "format", version = "0.0.0-dev" }
 [features]
 default = ["opentelemetry"]
 opentelemetry = ["dep:nanometer", "dep:opentelemetry"]
+# `roble::sim`, the in-memory filesystem that fails and crashes on command,
+# for an application's own crash tests (§12). Off by default: nothing a store
+# runs on needs it.
+sim = []
 
 # The one test that needs a meter provider.
 [[test]]
@@ -33,6 +42,11 @@ name = "metrics"
 required-features = ["opentelemetry"]
 
 [dev-dependencies]
+# Itself with `sim`, which every failure-path test drives, so a plain
+# `cargo test` builds them. No default features, so that
+# `--no-default-features` still tests the store without opentelemetry. A
+# path-only dev-dependency is dropped when the crate is published.
+roble = { path = ".", default-features = false, features = ["sim"] }
 compio = { version = "0.19.2", features = ["fs", "macros"] }
 # Collects the metrics the tests check, with a reader they keep a handle to.
 opentelemetry_sdk = { version = "=0.33.1", features = ["metrics", "experimental_metrics_custom_reader"] }

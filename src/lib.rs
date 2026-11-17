@@ -22,9 +22,11 @@
 //! (§10) — and, on top of it, [`open`], which reads a database directory:
 //! its markers, and its MANIFEST replayed into a [`Version`] (§6).
 //!
-//! [`DefaultEnv`] is the file system on compio; [`sim`] is an in-memory
-//! filesystem that can be made to fail or crash at any single operation, which
-//! is how §12 tests the failure paths.
+//! [`DefaultEnv`] is the file system on compio; `sim`, behind the feature of
+//! that name, is an in-memory filesystem that can be made to fail or crash at
+//! any single operation, which is how §12 tests the failure paths.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod batch;
 mod buf;
@@ -46,6 +48,8 @@ mod pick;
 mod read;
 mod rotate;
 mod scan;
+#[cfg(feature = "sim")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sim")))]
 pub mod sim;
 mod snapshot;
 mod table;

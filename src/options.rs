@@ -267,6 +267,7 @@ impl<F: Fs> Options<F> {
     /// through nanometer's `Producer`, which the app registers with its
     /// metric reader: see [nanometer](https://docs.rs/nanometer).
     #[cfg(feature = "opentelemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "opentelemetry")))]
     pub fn meter_provider<P: MeterProvider + ?Sized>(mut self, provider: &P) -> Self {
         self.meter = Some(nanometer::Meter::new(provider, crate::metrics::SCOPE));
         self
@@ -276,6 +277,7 @@ impl<F: Fs> Options<F> {
     /// `roble.store`: one of them with that key replaces the store's
     /// directory.
     #[cfg(feature = "opentelemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "opentelemetry")))]
     pub fn metric_attributes(mut self, attributes: &[KeyValue]) -> Self {
         self.metric_attributes.extend_from_slice(attributes);
         self

@@ -419,6 +419,7 @@ impl<F: Fs> Caches<F> {
     /// number repeated. Which store *looked* in it is the store's own
     /// `roble.cache.lookups`.
     #[cfg(feature = "opentelemetry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "opentelemetry")))]
     pub fn meter_provider<P: opentelemetry::metrics::MeterProvider + ?Sized>(
         self,
         provider: &P,
