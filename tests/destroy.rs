@@ -95,7 +95,7 @@ async fn destroy_does_not_flush_what_was_still_in_the_memtable() {
 
     let mut batch = Batch::new();
     batch.put(b"/unflushed", b"v").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let before = listing(env.sim(), &dir).await;
     let mut removed = db.destroy().await.expect("destroy");

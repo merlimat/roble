@@ -344,13 +344,13 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
     for round in 0..8u64 {
         let mut batch = Batch::new();
         write_round(&mut batch, &mut model, round);
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
     }
     // The ninth round stays in the memtable rather than becoming a table.
     let mut batch = Batch::new();
     write_round(&mut batch, &mut model, 8);
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let l0 = db.versions().version.level(0).len();
     assert!(
@@ -510,7 +510,7 @@ async fn a_tombstone_past_its_tables_last_key_hides_what_is_below_it() {
     for key in ["k25", "k35", "k65", "k75"] {
         below.put(key.as_bytes(), b"old").expect("put");
     }
-    db.write(&mut below, true).await.expect("write");
+    db.write_raw(&mut below, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     db.compact(0, &[table]).await.expect("compact into L1");
     let l1: Vec<u64> = db
@@ -542,7 +542,7 @@ async fn a_tombstone_past_its_tables_last_key_hides_what_is_below_it() {
     for build in builds {
         let mut batch = Batch::new();
         build(&mut batch);
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let table = db.flush().await.expect("flush").expect("a table");
         db.compact(0, &[table]).await.expect("compact into L1");
     }
@@ -615,7 +615,7 @@ async fn a_range_reads_what_a_btreemap_range_reads_for_every_kind_of_bound() {
         .await
         .expect("open");
     let mut model = Model::new();
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     for key in [&b"a"[..], b"b", b"b\0", b"c", b"d", b"d\0", b"e"] {
         batch.put(key, b"v").expect("put");
         model.insert(key.to_vec(), b"v".to_vec());

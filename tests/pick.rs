@@ -91,7 +91,7 @@ async fn flush_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, at: usize, count: us
             .put(format!("{prefix}{i:04}").as_bytes(), b"value")
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table")
 }
 
@@ -352,7 +352,7 @@ async fn the_last_level_is_never_picked() {
             .put(format!("i{i:04}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     // Push it all the way down.
@@ -505,7 +505,7 @@ async fn compacting_until_it_settles_changes_no_answer() {
             batch.delete(key.as_bytes()).expect("delete");
             model.remove(key.as_bytes());
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
 
         let mut ran = 0;

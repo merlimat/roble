@@ -11,7 +11,7 @@ use roble::sim::SimEnv;
 
 /// Writes `keys` and flushes them into one L0 table.
 async fn flushed(db: &roble::Db<roble::sim::SimFs>, keys: &[&[u8]]) {
-    let mut batch = db.batch();
+    let mut batch = db.indexed_batch();
     for key in keys {
         batch.put(key, b"value").expect("put");
     }

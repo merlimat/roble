@@ -811,7 +811,7 @@ fn reads_carry_on_beside_a_writer_that_compacts() {
                         let key = format!("x{:03}", (round * 7 + i) % 200);
                         batch.put(key.as_bytes(), b"v").expect("put");
                     }
-                    db.write(&mut batch, false).await.expect("write");
+                    db.write_raw(&mut batch, false).await.expect("write");
                     db.flush().await.expect("flush");
                     db.compact_once().await.expect("compact");
                     round += 1;
@@ -868,7 +868,7 @@ fn a_database_in_several_tables() -> (tempfile::TempDir, PathBuf) {
                 .put(format!("k{i:03}").as_bytes(), &[b'v'; 64])
                 .expect("put");
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush");
         let l0: Vec<u64> = db
             .versions()

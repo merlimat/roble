@@ -128,7 +128,7 @@ async fn what_is_written_is_what_is_read() {
                 }
             }
         }
-        db.write(&mut batch, false).await.expect("write");
+        db.write_raw(&mut batch, false).await.expect("write");
 
         assert_eq!(
             contents(&db).await,
@@ -161,7 +161,7 @@ async fn a_write_shadows_what_a_table_holds() {
 
     let mut batch = Batch::new();
     batch.put(&key, b"written-later").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
 
     let found = db.get(&key, Comparison::Equal).await.expect("get");
     assert_eq!(
@@ -173,7 +173,7 @@ async fn a_write_shadows_what_a_table_holds() {
     // And a delete hides it entirely.
     let mut batch = Batch::new();
     batch.delete(&key).expect("delete");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
     assert!(
         db.get(&key, Comparison::Equal)
             .await
@@ -205,7 +205,7 @@ async fn a_range_deletion_in_the_memtable_hides_a_table() {
 
     let mut batch = Batch::new();
     batch.delete_range(&start, &end).expect("delete_range");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
 
     let after = contents(&db).await;
     for k in &covered {
@@ -239,7 +239,7 @@ async fn a_scan_does_not_see_a_write_that_came_after_it() {
     let mut batch = Batch::new();
     batch.put(b"m1", b"first").expect("put");
     batch.put(b"m3", b"first").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
 
     let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
@@ -254,7 +254,7 @@ async fn a_scan_does_not_see_a_write_that_came_after_it() {
     let mut batch = Batch::new();
     batch.put(b"m2", b"later").expect("put");
     batch.put(b"m3", b"changed").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
 
     let mut seen = Model::new();
     while scan.is_valid() {
@@ -298,7 +298,7 @@ async fn sequence_numbers_carry_on_from_the_manifest() {
     let mut batch = Batch::new();
     batch.put(b"one", b"1").expect("put");
     batch.put(b"two", b"2").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
 
     assert_eq!(
         batch.seq_num(),
@@ -322,11 +322,11 @@ async fn a_crash_replays_to_the_last_synced_write() {
         let mut synced = Batch::new();
         synced.put(b"durable-1", b"kept").expect("put");
         synced.put(b"durable-2", b"kept").expect("put");
-        db.write(&mut synced, true).await.expect("write");
+        db.write_raw(&mut synced, true).await.expect("write");
 
         let mut unsynced = Batch::new();
         unsynced.put(b"lost-1", b"gone").expect("put");
-        db.write(&mut unsynced, false).await.expect("write");
+        db.write_raw(&mut unsynced, false).await.expect("write");
 
         // Both are readable before the crash: the memtable has them.
         for k in [b"durable-1".as_slice(), b"lost-1"] {
@@ -376,11 +376,11 @@ async fn a_replayed_write_keeps_its_sequence_number() {
         // Overwrite a key the tables hold, then delete it — both logged.
         let mut batch = Batch::new();
         batch.put(&key, b"newer").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
 
         let mut batch = Batch::new();
         batch.delete(&key).expect("delete");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
 
     env.sim().crash();
@@ -405,13 +405,13 @@ async fn writes_carry_on_in_the_same_log_after_a_reopen() {
         let db = roble::open(&env, &dir).await.expect("open");
         let mut batch = Batch::new();
         batch.put(b"round-1", b"a").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
     {
         let db = roble::open(&env, &dir).await.expect("reopen");
         let mut batch = Batch::new();
         batch.put(b"round-2", b"b").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
 
     env.sim().crash();
@@ -446,7 +446,7 @@ async fn a_write_after_a_reopen_outranks_what_replay_brought_back() {
         let db = roble::open(&env, &dir).await.expect("open");
         let mut batch = Batch::new();
         batch.put(b"contested", b"written-before").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
     env.sim().crash();
 
@@ -462,7 +462,7 @@ async fn a_write_after_a_reopen_outranks_what_replay_brought_back() {
         );
         let mut batch = Batch::new();
         batch.put(b"contested", b"written-after").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         assert_eq!(
             db.get(b"contested", Comparison::Equal)
                 .await
@@ -501,11 +501,11 @@ async fn a_record_that_spans_a_block_survives_a_crash() {
         // A small record first, so the big one does not start at offset zero.
         let mut batch = Batch::new();
         batch.put(b"small", b"s").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
 
         let mut batch = Batch::new();
         batch.put(b"big", &big).expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
 
     env.sim().crash();
@@ -590,7 +590,7 @@ async fn a_delete_after_a_reopen_buries_what_replay_brought_back() {
         let db = roble::open(&env, &dir).await.expect("open");
         let mut batch = Batch::new();
         batch.put(b"buried", b"value").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
     env.sim().crash();
 
@@ -605,7 +605,7 @@ async fn a_delete_after_a_reopen_buries_what_replay_brought_back() {
 
     let mut batch = Batch::new();
     batch.delete(b"buried").expect("delete");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     assert!(
         db.get(b"buried", Comparison::Equal)
             .await
@@ -613,4 +613,52 @@ async fn a_delete_after_a_reopen_buries_what_replay_brought_back() {
             .is_none(),
         "the delete was written later and must bury the replayed put"
     );
+}
+
+/// `put`, `delete` and `delete_range` on the store write what a batch of one
+/// would, and refuse `sync` on a store with the WAL off as a batch does.
+#[compio::test]
+async fn single_writes_on_the_store_read_back_as_a_model_would() {
+    let (env, dir) = load("db-simple").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let mut model = contents(&db).await;
+
+    db.put(b"/a", b"1", false).await.expect("put");
+    db.put(b"/b", b"2", true).await.expect("put");
+    db.put(b"/c", b"3", false).await.expect("put");
+    db.put(b"/d", b"4", false).await.expect("put");
+    for (k, v) in [(b"/a", b"1"), (b"/b", b"2"), (b"/c", b"3"), (b"/d", b"4")] {
+        model.insert(k.to_vec(), v.to_vec());
+    }
+    db.delete(b"/a", false).await.expect("delete");
+    model.remove(&b"/a"[..]);
+    db.delete_range(b"/b", b"/d", true)
+        .await
+        .expect("delete_range");
+    model.retain(|k, _| !(k.as_slice() >= &b"/b"[..] && k.as_slice() < &b"/d"[..]));
+
+    assert_eq!(contents(&db).await, model);
+    assert_eq!(
+        db.get(b"/d", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"4".to_vec())
+    );
+    drop(db);
+
+    let no_wal = roble::open_with(&env, &dir, roble::Options::new().disable_wal(true))
+        .await
+        .expect("open without the WAL");
+    for refused in [
+        no_wal.put(b"/e", b"5", true).await,
+        no_wal.delete(b"/d", true).await,
+        no_wal.delete_range(b"/a", b"/z", true).await,
+    ] {
+        assert!(
+            matches!(refused, Err(roble::Error::Unsupported(_))),
+            "a synced write with the WAL off should be refused: {refused:?}"
+        );
+    }
+    assert_eq!(contents(&no_wal).await, model, "and should change nothing");
 }

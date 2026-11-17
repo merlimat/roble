@@ -332,7 +332,7 @@ async fn run(case: Case) {
                 }
                 // With the WAL off a synced write is refused: there is
                 // nothing to sync.
-                db.write(&mut batch, config.wal).await.expect("write");
+                db.write_raw(&mut batch, config.wal).await.expect("write");
                 model = next;
                 if config.wal {
                     durable = model.clone();

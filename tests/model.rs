@@ -197,7 +197,7 @@ async fn a_store_answers_what_a_btreemap_would() {
                     }
                 }
             }
-            db.write(&mut batch, true).await.expect("write");
+            db.write_raw(&mut batch, true).await.expect("write");
 
             // Flush, compact and reopen often enough that the answer comes
             // from a different place each time: the memtable, a fresh table,

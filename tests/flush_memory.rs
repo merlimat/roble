@@ -120,7 +120,7 @@ async fn a_flush_holds_a_chunk_of_its_table_and_not_the_table() {
             .put(format!("k{i:08}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     drop(batch);
 
     // From here, and not from the start: the batch and the memtable are the

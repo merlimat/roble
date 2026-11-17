@@ -202,7 +202,7 @@ async fn scenario(case: &Case, env: &SimEnv, dir: &Path, h: &mut History) -> rob
                 // nothing to sync.
                 let sync = *sync && wal;
                 h.states.push(next);
-                let result = db.write(&mut batch, sync).await;
+                let result = db.write_raw(&mut batch, sync).await;
                 if result.is_ok() && sync {
                     h.durable = h.states.len() - 1;
                 }

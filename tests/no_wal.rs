@@ -104,7 +104,7 @@ async fn a_crash_takes_the_database_back_to_its_last_flush() {
         let mut batch = Batch::new();
         batch.put(b"before", b"the flush").expect("put");
         batch.delete(b"a0").expect("delete");
-        db.write(&mut batch, false).await.expect("write");
+        db.write_raw(&mut batch, false).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
         flushed = contents(&db).await;
 
@@ -113,7 +113,7 @@ async fn a_crash_takes_the_database_back_to_its_last_flush() {
         batch.put(b"after", b"the flush").expect("put");
         batch.put(b"before", b"overwritten").expect("put");
         batch.delete_range(b"a", b"b").expect("delete_range");
-        db.write(&mut batch, false).await.expect("write");
+        db.write_raw(&mut batch, false).await.expect("write");
         assert_ne!(
             contents(&db).await,
             flushed,
@@ -142,7 +142,7 @@ async fn a_write_is_refused_the_sync_it_cannot_keep() {
 
     let mut batch = Batch::new();
     batch.put(b"durable", b"please").expect("put");
-    match db.write(&mut batch, true).await {
+    match db.write_raw(&mut batch, true).await {
         Err(Error::Unsupported(m)) => assert!(m.contains("opened with the WAL off"), "got: {m}"),
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -154,7 +154,7 @@ async fn a_write_is_refused_the_sync_it_cannot_keep() {
     );
     // And the same batch goes through once it stops asking for what the
     // store cannot give.
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
     assert_eq!(
         db.get(b"durable", Comparison::Equal)
             .await
@@ -184,7 +184,7 @@ async fn nothing_reaches_the_log() {
         batch
             .put(format!("key-{i}").as_bytes(), b"value")
             .expect("put");
-        db.write(&mut batch, false).await.expect("write");
+        db.write_raw(&mut batch, false).await.expect("write");
     }
     db.flush().await.expect("flush").expect("a table");
 
@@ -206,7 +206,7 @@ async fn a_flush_with_the_wal_off_makes_no_log_and_retires_none() {
 
     let mut batch = Batch::new();
     batch.put(b"one", b"table").expect("put");
-    db.write(&mut batch, false).await.expect("write");
+    db.write_raw(&mut batch, false).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
 
     let after = listing(env.sim(), &dir).await;
@@ -247,7 +247,7 @@ async fn a_log_written_with_a_wal_is_still_replayed_without_one() {
         batch
             .put(b"first", b"flushed with the wal on")
             .expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
         with_wal = db.versions().min_unflushed_log_num;
         assert!(
@@ -257,7 +257,7 @@ async fn a_log_written_with_a_wal_is_still_replayed_without_one() {
 
         let mut batch = Batch::new();
         batch.put(b"logged", b"with the wal on").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
     env.sim().crash();
 

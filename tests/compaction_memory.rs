@@ -134,7 +134,7 @@ async fn a_compaction_holds_part_of_one_output_table() {
             .put(format!("k{i:08}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     drop(batch);
     let table = db.flush().await.expect("flush").expect("a table");
 

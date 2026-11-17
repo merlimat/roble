@@ -131,7 +131,7 @@ async fn write_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, n: usize, wal: bool)
     }
     // Asking for a sync with no log to sync is refused, and rightly: a store
     // should not promise a durability it has no way to keep.
-    db.write(&mut batch, wal).await.expect("write");
+    db.write_raw(&mut batch, wal).await.expect("write");
     written
 }
 
@@ -219,7 +219,7 @@ async fn a_write_in_the_middle_of_a_flush_is_not_lost() {
                 // whichever it came to first would hand back the stale one.
                 let mut batch = Batch::new();
                 batch.put(b"t007", b"newer").expect("put");
-                db.write(&mut batch, wal).await.expect("write");
+                db.write_raw(&mut batch, wal).await.expect("write");
                 written.insert(b"t007".to_vec(), b"newer".to_vec());
                 let found = db
                     .get(b"t007", Comparison::Equal)

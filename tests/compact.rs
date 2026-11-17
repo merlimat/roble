@@ -78,7 +78,7 @@ async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
 
 /// Writes a batch and flushes it, giving one L0 table.
 async fn flush_batch<F: Fs>(db: &roble::Db<F>, batch: &mut Batch) -> u64 {
-    db.write(batch, true).await.expect("write");
+    db.write_raw(batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table")
 }
 

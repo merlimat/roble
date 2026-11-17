@@ -953,7 +953,7 @@ async fn a_write_to_a_database_with_no_log_is_refused() {
 
     let mut batch = roble_format::batch::Batch::new();
     batch.put(b"k", b"v").expect("put");
-    match db.write(&mut batch, true).await {
+    match db.write_raw(&mut batch, true).await {
         Err(Error::Unsupported(m)) => assert!(
             m.contains("holds no log file") && m.contains("could not be recovered"),
             "got: {m}"
@@ -981,7 +981,7 @@ async fn a_store_can_be_owned_by_a_task_of_its_own() {
 
     let mut batch = roble_format::batch::Batch::new();
     batch.put(b"spawned", b"yes").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let flushed = std::rc::Rc::new(std::cell::Cell::new(None));
     let (task_db, report) = (std::rc::Rc::clone(&db), std::rc::Rc::clone(&flushed));
@@ -1094,7 +1094,7 @@ async fn a_task_of_its_own_can_be_the_one_that_compacts() {
 
     let mut batch = roble_format::batch::Batch::new();
     batch.put(b"background", b"yes").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     // Until the merge has landed, which is bounded by the clock and not, as
@@ -1210,7 +1210,7 @@ async fn a_task_of_its_own_can_be_the_one_that_flushes() {
         batch
             .put(format!("b{i:06}").as_bytes(), &value)
             .expect("put");
-        db.write(&mut batch, false).await.expect("write");
+        db.write_raw(&mut batch, false).await.expect("write");
         assert!(
             db.unflushed_bytes() as u64 <= budget,
             "after {} writes the store holds {} bytes, past the {budget} its budget and \

@@ -93,7 +93,7 @@ fn entry_cost() -> u64 {
 async fn put<F: Fs>(db: &roble::Db<F>, i: usize, wal: bool) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch.put(&key_at(i), VALUE).expect("put");
-    db.write(&mut batch, wal).await
+    db.write_raw(&mut batch, wal).await
 }
 
 /// Writes until the store is at `budget`, and says how many keys that took.
@@ -283,7 +283,7 @@ async fn the_room_is_made_before_the_batch_is_accepted() {
         batch.put(&refused, VALUE).expect("put");
         let waiting = db.unflushed_bytes();
         env.sim().fail_at(1);
-        let result = db.write(&mut batch, wal).await;
+        let result = db.write_raw(&mut batch, wal).await;
         env.sim().stop_failing();
 
         assert!(
@@ -302,7 +302,9 @@ async fn the_room_is_made_before_the_batch_is_accepted() {
         );
 
         // The same batch again, which is what a caller would do.
-        db.write(&mut batch, wal).await.expect("the write again");
+        db.write_raw(&mut batch, wal)
+            .await
+            .expect("the write again");
         model.insert(refused.clone(), VALUE.to_vec());
         assert_eq!(
             db.get(&refused, Comparison::Equal)
@@ -493,7 +495,7 @@ async fn a_store_that_sets_nothing_still_flushes_on_its_own() {
     for i in 0..written {
         let mut batch = Batch::new();
         batch.put(&key_at(i), &big).expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         model.insert(key_at(i), big.clone());
     }
 

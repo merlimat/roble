@@ -832,6 +832,39 @@ impl<F: Fs> std::fmt::Debug for Db<F> {
 }
 
 impl<F: Fs> Db<F> {
+    /// Sets `key` to `value`.
+    ///
+    /// A batch of that one write, appended to the log and then applied to
+    /// the memtable. `sync` decides whether it is durable when this returns
+    /// or merely written: without it the write survives the store going away
+    /// but not the machine. With the WAL off there is no log to sync, and
+    /// `sync` is refused rather than ignored, since nothing but
+    /// [`Db::flush`] can make a write durable then (§4).
+    ///
+    /// Several writes that have to land together, or that are read back
+    /// before they do, go in an [`Db::indexed_batch`] instead. This one
+    /// builds no index, which is about 90 ns a write cheaper.
+    pub async fn put(&self, key: &[u8], value: &[u8], sync: bool) -> Result<()> {
+        let mut batch = roble_format::batch::Batch::new();
+        batch.put(key, value)?;
+        self.write_raw(&mut batch, sync).await
+    }
+
+    /// Deletes `key`, durably if `sync` says so, as [`Db::put`] writes.
+    pub async fn delete(&self, key: &[u8], sync: bool) -> Result<()> {
+        let mut batch = roble_format::batch::Batch::new();
+        batch.delete(key)?;
+        self.write_raw(&mut batch, sync).await
+    }
+
+    /// Deletes every key in `start..end`, durably if `sync` says so, as
+    /// [`Db::put`] writes.
+    pub async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) -> Result<()> {
+        let mut batch = roble_format::batch::Batch::new();
+        batch.delete_range(start, end)?;
+        self.write_raw(&mut batch, sync).await
+    }
+
     /// Appends a batch to the log, syncs it if asked, and then applies it to
     /// the memtable.
     ///
@@ -843,13 +876,22 @@ impl<F: Fs> Db<F> {
     /// With the WAL off there is no log step and `sync` is refused rather
     /// than ignored: nothing but `flush` can make a write durable, and
     /// saying otherwise would be the silent half of a data loss.
-    pub async fn write(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
+    ///
+    /// What [`IndexedBatch::commit`](crate::IndexedBatch::commit) and
+    /// [`Db::put`] go through. It takes the format's own batch, which roble's
+    /// tests build directly; a caller builds an [`Db::indexed_batch`].
+    #[doc(hidden)]
+    pub async fn write_raw(
+        &self,
+        batch: &mut roble_format::batch::Batch,
+        sync: bool,
+    ) -> Result<()> {
         let _timer = self.metrics.write.start();
         let result = self.write_inner(batch, sync).await;
         self.metrics.write_errors.saw(result)
     }
 
-    /// The body of [`Db::write`], so one place counts what it returned.
+    /// The body of [`Db::write_raw`], so one place counts what it returned.
     async fn write_inner(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
         self.writable()?;
         // Refused before anything is stamped, so a write that cannot keep

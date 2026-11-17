@@ -94,7 +94,7 @@ async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
 async fn write<F: Fs>(db: &roble::Db<F>, build: impl FnOnce(&mut Batch)) {
     let mut batch = Batch::new();
     build(&mut batch);
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 }
 
 #[compio::test]

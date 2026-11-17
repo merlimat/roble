@@ -85,7 +85,7 @@ async fn a_flush_changes_no_answer() {
     batch.put(b"f2", b"two").expect("put");
     batch.delete(b"a0").expect("delete");
     batch.delete_range(b"c0", b"c3").expect("delete_range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let before = contents(&db).await;
     let levels_before = db.versions().version.table_count();
@@ -135,7 +135,7 @@ async fn a_flush_survives_a_crash_without_the_log() {
 
         let mut batch = Batch::new();
         batch.put(b"survives", b"yes").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
 
         assert!(
@@ -181,7 +181,7 @@ async fn a_flushed_range_deletion_still_covers() {
 
     let mut batch = Batch::new();
     batch.delete_range(&start, &end).expect("delete_range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
 
     let after = contents(&db).await;
@@ -256,7 +256,7 @@ async fn a_table_written_in_several_chunks_reads_back_whole() {
             .put(format!("k{i:08}").as_bytes(), &value)
             .expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let before = contents(&db).await;
     assert_eq!(before.len(), RECORDS, "every record should be in the store");
@@ -317,7 +317,7 @@ async fn created(env: &SimEnv) -> roble::Db<SimFs> {
 async fn put<F: Fs>(db: &roble::Db<F>, key: &[u8], value: &[u8]) {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 }
 
 #[compio::test]
@@ -423,7 +423,7 @@ async fn a_scan_open_across_a_flush_keeps_its_snapshot() {
     let mut batch = Batch::new();
     batch.put(b"m1", b"before").expect("put");
     batch.put(b"m9", b"before").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
@@ -460,7 +460,7 @@ async fn a_manifest_that_outgrows_a_block_still_reads() {
             batch
                 .put(format!("many-{rounds:04}").as_bytes(), b"v")
                 .expect("put");
-            db.write(&mut batch, true).await.expect("write");
+            db.write_raw(&mut batch, true).await.expect("write");
             db.flush().await.expect("flush").expect("a table");
             rounds += 1;
 
@@ -519,17 +519,17 @@ async fn overlapping_range_deletions_can_be_flushed() {
     for key in [&b"/a1"[..], b"/b1", b"/d1", b"/f1"] {
         let mut batch = Batch::new();
         batch.put(key, b"v").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
     }
 
     // Separate batches, so both tombstones are live in the one memtable.
     let mut batch = Batch::new();
     batch.delete_range(b"/a", b"/d").expect("first range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let mut batch = Batch::new();
     batch.delete_range(b"/b", b"/f").expect("overlapping range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let before = contents(&db).await;
     assert!(

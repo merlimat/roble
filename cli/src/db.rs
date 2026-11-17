@@ -25,7 +25,6 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use roble::{Comparison, Db, DefaultEnv, Options};
-use roble_format::batch::Batch;
 use roble_format::files::{self, MARKER_MANIFEST};
 
 use crate::{Error, Result};
@@ -71,23 +70,20 @@ pub fn run(dir: &Path, command: DbCommand) -> Result<ExitCode> {
 async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
     let mut out = BufWriter::new(io::stdout().lock());
     match command {
+        // Each waits for its write to be synced: the process exits straight
+        // after, so anything less would leave the write to the machine
+        // staying up.
         DbCommand::Put { key, value } => {
             let db = open(dir, true).await?;
-            let mut batch = Batch::new();
-            batch.put(&key, &value).at(dir)?;
-            write(&db, dir, &mut batch).await?;
+            db.put(&key, &value, true).await.at(dir)?;
         }
         DbCommand::Delete { key } => {
             let db = open(dir, false).await?;
-            let mut batch = Batch::new();
-            batch.delete(&key).at(dir)?;
-            write(&db, dir, &mut batch).await?;
+            db.delete(&key, true).await.at(dir)?;
         }
         DbCommand::DeleteRange { start, end } => {
             let db = open(dir, false).await?;
-            let mut batch = Batch::new();
-            batch.delete_range(&start, &end).at(dir)?;
-            write(&db, dir, &mut batch).await?;
+            db.delete_range(&start, &end, true).await.at(dir)?;
         }
         DbCommand::Get { key, hexdump } => {
             let found = reading(dir, async |db| {
@@ -462,12 +458,6 @@ async fn reading<T>(dir: &Path, mut read: impl AsyncFnMut(&Db) -> Result<T>) -> 
             result => return result,
         }
     }
-}
-
-/// Writes `batch` and waits for it to be synced: the process exits straight
-/// after, so anything less would leave the write to the machine staying up.
-async fn write(db: &Db, dir: &Path, batch: &mut Batch) -> Result<()> {
-    db.write(batch, true).await.at(dir)
 }
 
 /// Names the directory or file an error is about: every message this

@@ -136,7 +136,7 @@ fn opened(wal: bool, budget: u64) -> Options<SimFs> {
 async fn put<F: Fs>(db: &roble::Db<F>, i: usize, wal: bool) -> roble::Result<()> {
     let mut batch = Batch::new();
     batch.put(&key_at(i), VALUE).expect("put");
-    db.write(&mut batch, wal).await
+    db.write_raw(&mut batch, wal).await
 }
 
 /// Writes one key of a range the writes keep coming back to, so that every
@@ -704,7 +704,7 @@ async fn a_write_drains_an_l0_exactly_at_the_line() {
             batch.put(key, value.as_bytes()).expect("put");
             model.insert(key.to_vec(), value.into_bytes());
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
     }
     drop(db);
@@ -950,7 +950,7 @@ async fn a_wide_l0_the_picker_wants_is_still_not_something_a_write_waits_for() {
             batch
                 .put(format!("w{i:02}").as_bytes(), VALUE)
                 .expect("put");
-            db.write(&mut batch, true).await.expect("write");
+            db.write_raw(&mut batch, true).await.expect("write");
             db.flush().await.expect("flush").expect("a table");
         }
         db.versions().version.level(0).len() as u64
@@ -975,7 +975,7 @@ async fn a_wide_l0_the_picker_wants_is_still_not_something_a_write_waits_for() {
 
     let mut batch = Batch::new();
     batch.put(b"after", VALUE).expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     assert_eq!(
         db.versions().version.level(0).len() as u64,

@@ -168,7 +168,7 @@ async fn write_keys<F: Fs>(db: &roble::Db<F>, prefix: &str, n: usize) -> Model {
         batch.put(&key, b"value").expect("put");
         written.insert(key, b"value".to_vec());
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     written
 }
 
@@ -388,7 +388,7 @@ async fn ready_to_split(env: &SimEnv, dir: &Path) -> (roble::Db<SimFs>, Model, V
         batch.put(&key, &value).expect("put");
         model.insert(key, value.clone());
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     (db, model, vec![table])
 }
@@ -577,7 +577,7 @@ async fn every_waiting_change_gets_its_turn() {
 async fn put<F: Fs>(db: &roble::Db<F>, key: &[u8], value: &[u8]) -> Model {
     let mut batch = Batch::new();
     batch.put(key, value).expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     Model::from([(key.to_vec(), value.to_vec())])
 }
 
