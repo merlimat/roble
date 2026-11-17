@@ -53,3 +53,7 @@ publish = false
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+# `cargo fuzz` builds with `--cfg fuzzing`, under which roble-format skips
+# checksum verification so a fuzzer can reach the parsers behind it
+# (format/fuzz/README.md).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
