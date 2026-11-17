@@ -75,7 +75,7 @@ use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
 
 use crate::env::{Disk, Fs};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::read::successor_into;
 use std::cell::RefCell;
 
@@ -701,6 +701,9 @@ impl Bound {
 /// the scan keeps: the span and sequence number [`Scan::skip_covered`] moves
 /// the levels past, and the level of the table it came from (`None` for a
 /// memtable's).
+///
+/// And the key the last skip was made from, since the scan was positioned,
+/// which the next one has to be past (`Scan::skip_covered`).
 #[derive(Default)]
 struct Covering {
     start: Vec<u8>,
@@ -708,6 +711,8 @@ struct Covering {
     seq: u64,
     from: Option<u32>,
     set: bool,
+    skipped_from: Vec<u8>,
+    skipped: bool,
 }
 
 impl Covering {
@@ -963,6 +968,7 @@ impl<F: Fs> Scan<F> {
     /// it left them, and this is where that is said. Pebble pairs them for
     /// the same reason, in `switchToMinHeap`.
     async fn sought_ge(&mut self) -> Result<()> {
+        self.covering.skipped = false;
         for it in &mut self.iters {
             it.seek_ge(&self.target).await?;
         }
@@ -972,6 +978,7 @@ impl<F: Fs> Scan<F> {
 
     /// The same backwards: every source before the target, greatest on top.
     async fn sought_lt(&mut self) -> Result<()> {
+        self.covering.skipped = false;
         for it in &mut self.iters {
             it.seek_lt(&self.target).await?;
         }
@@ -1015,6 +1022,7 @@ impl<F: Fs> Scan<F> {
             self.sought_lt().await?;
             return self.retreat().await;
         }
+        self.covering.skipped = false;
         for it in &mut self.iters {
             it.last().await?;
         }
@@ -1115,10 +1123,10 @@ impl<F: Fs> Scan<F> {
             }
             // A deletion, so round again — and the buffers go back rather
             // than being dropped. Past the whole of it, when it was a range.
-            self.spare.push(next);
             if chosen.is_some() && self.covering.set {
-                self.skip_covered(Dir::Forward).await?;
+                self.skip_covered(Dir::Forward, &next.user).await?;
             }
+            self.spare.push(next);
         }
     }
 
@@ -1158,10 +1166,10 @@ impl<F: Fs> Scan<F> {
             }
             // A deletion, so round again — and the buffers go back rather
             // than being dropped. Past the whole of it, when it was a range.
-            self.spare.push(next);
             if chosen.is_some() && self.covering.set {
-                self.skip_covered(Dir::Reverse).await?;
+                self.skip_covered(Dir::Reverse, &next.user).await?;
             }
+            self.spare.push(next);
         }
     }
 
@@ -1175,7 +1183,33 @@ impl<F: Fs> Scan<F> {
     /// is, and the keys it holds in the span are decided one at a time as
     /// before. So are a memtable's: a memtable records no sequence numbers to
     /// decide that by, and holds at most a memtable's worth of keys.
-    async fn skip_covered(&mut self, dir: Dir) -> Result<()> {
+    ///
+    /// **Each skip is made from a key past the last one's**, going the way
+    /// the scan goes, since the keys a scan decides only ever move on until
+    /// it is positioned again. One that is not means a table holds its keys
+    /// out of order, and is refused as the corruption it is: a seek through
+    /// such a table can land on a key that sorts past the span and step from
+    /// it straight back into it, and without this the scan would skip from
+    /// the same key to the same landing for good. Stepping, which this
+    /// replaces, only ever moves a table forward through what it holds, and
+    /// so ends whatever order that is in.
+    async fn skip_covered(&mut self, dir: Dir, hidden: &[u8]) -> Result<()> {
+        let covering = &mut self.covering;
+        if covering.skipped {
+            let back = match dir {
+                Dir::Forward => hidden <= covering.skipped_from.as_slice(),
+                Dir::Reverse => hidden >= covering.skipped_from.as_slice(),
+            };
+            if back {
+                return Err(Error::Corrupt(format!(
+                    "a scan came back to {hidden:02x?} after skipping a range deletion past it, \
+                     so a table holds its keys out of order"
+                )));
+            }
+        }
+        covering.skipped_from.clear();
+        covering.skipped_from.extend_from_slice(hidden);
+        covering.skipped = true;
         let mut moved = false;
         for source in &mut self.iters {
             let Source::Level(level) = source else {

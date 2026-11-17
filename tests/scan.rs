@@ -1014,3 +1014,95 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         assert_eq!(ceiling.map(|f| f.key), want, "ceiling of k{i:04}~");
     }
 }
+
+/// A table whose keys are out of order ends a scan that skips a range
+/// tombstone over it, with an error or without one, rather than sending it
+/// round the same keys forever.
+///
+/// Found by the `open_corrupt` fuzz target, which skips checksums, as one bit
+/// pattern flipped in a key of `db-reads`' L6 table. Reproduced here with the
+/// block's checksum computed again, as a table written wrongly would carry
+/// one. The flipped key sorts after everything after it in the table, so a
+/// skip that seeks past an L0 tombstone lands on it, and the next step goes
+/// back into the span the tombstone hides: before the scan noticed it had
+/// been there, that was a skip, the same landing and the same step, for good.
+#[compio::test]
+async fn a_scan_over_keys_out_of_order_ends_rather_than_skipping_round_a_tombstone_forever() {
+    let (env, dir) = load("db-reads").await;
+    let fs: &SimFs = env.sim();
+    let path = dir.join("000019.sst");
+    let mut bytes = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-reads/000019.sst"),
+    )
+    .expect("the L6 table");
+
+    // The fuzz case's damage, and the checksum of the data block it lands
+    // in, found through the table's index.
+    let (at, mask) = (127, 0xd2);
+    bytes[at] ^= mask;
+    let footer = roble_format::Footer::decode(
+        &bytes[bytes.len() - roble_format::FOOTER_LEN..],
+        bytes.len() as u64,
+    )
+    .expect("footer");
+    let index = bytes
+        [footer.index.offset as usize..(footer.index.offset + footer.index.length) as usize]
+        .to_vec();
+    let mut entries = roble_format::block::Block::new(&index)
+        .expect("index")
+        .iter();
+    let mut fixed = false;
+    while let Some(entry) = entries.next() {
+        let (handle, _) =
+            roble_format::BlockHandle::decode(entry.expect("index entry").value).expect("handle");
+        let (start, end) = (
+            handle.offset as usize,
+            (handle.offset + handle.length) as usize,
+        );
+        if (start..end).contains(&at) {
+            let sum = footer
+                .checksum
+                .compute(&bytes[start..end], bytes[end])
+                .expect("checksum");
+            bytes[end + 1..end + 5].copy_from_slice(&sum.to_le_bytes());
+            fixed = true;
+        }
+    }
+    assert!(fixed, "byte {at} is in a data block");
+    let disk = fs.create(&path).await.expect("create");
+    let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
+    result.expect("write");
+    disk.close().await.expect("close");
+
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new().disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+    let mut scan = db.range(..).expect("scan");
+    // Forward and backward, a step at a time, each bounded well past the
+    // keys the store holds.
+    for forward in [true, false] {
+        let mut moved = if forward {
+            scan.first().await
+        } else {
+            scan.last().await
+        };
+        let mut steps = 0;
+        while moved.is_ok() && scan.is_valid() {
+            steps += 1;
+            assert!(
+                steps < 10_000,
+                "a {} scan is still going",
+                if forward { "forward" } else { "backward" }
+            );
+            moved = if forward {
+                scan.next().await
+            } else {
+                scan.prev().await
+            };
+        }
+    }
+}
