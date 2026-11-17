@@ -87,6 +87,7 @@ async fn the_replay_recovers_the_counters_a_store_resumes_from() {
     // against what the database must be rather than against a Go dump.
     let v = db.versions();
     assert_eq!(v.comparer_name, BYTEWISE);
+    assert_eq!(db.dir(), dir, "the directory it was opened in");
     assert_eq!(db.format_version(), 16, "the fixture is written at the pin");
     assert_eq!(db.manifest_filename(), "MANIFEST-000001");
 
