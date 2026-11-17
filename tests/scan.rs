@@ -677,7 +677,7 @@ async fn table_at(
     for key in keys {
         batch.put(key.as_bytes(), value).expect("put");
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let mut tables = vec![db.flush().await.expect("flush").expect("a table")];
     for from in 0..level {
         tables = db.compact(from, &tables).await.expect("compact");
@@ -705,7 +705,7 @@ async fn a_floor_or_ceiling_over_a_range_deletion_reads_past_it_not_through_it()
         batch
             .delete_range(b"k0100", b"k3900")
             .expect("delete range");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         db.flush().await.expect("flush").expect("a table");
     }
     let db = open_manual(&env, &dir).await;
@@ -757,15 +757,15 @@ async fn a_skip_past_a_range_deletion_keeps_what_the_deletion_does_not_hide() {
     // and another in the memtable.
     let mut batch = Batch::new();
     batch.delete_range(b"k010", b"k090").expect("delete range");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
     let mut batch = Batch::new();
     batch.put(b"k050", b"new").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     db.flush().await.expect("flush").expect("a table");
     let mut batch = Batch::new();
     batch.put(b"k060", b"new").expect("put");
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
 
     let mut visible: Vec<String> = all[..10].to_vec();
     visible.extend(["k050".to_string(), "k060".to_string()]);
@@ -847,7 +847,7 @@ async fn a_skip_past_a_range_deletion_passes_a_deeper_table_holding_a_later_key_
                 .put(format!("k{i:04}").as_bytes(), &[b'v'; 100])
                 .expect("put");
         }
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let table = db.flush().await.expect("flush").expect("a table");
         let l1 = db.compact(0, &[table]).await.expect("compact into L1");
         db.compact(1, &l1).await.expect("compact into L2");
@@ -857,7 +857,7 @@ async fn a_skip_past_a_range_deletion_passes_a_deeper_table_holding_a_later_key_
         batch
             .delete_range(b"k0100", b"k7900")
             .expect("delete range");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let table = db.flush().await.expect("flush").expect("a table");
         db.compact(0, &[table]).await.expect("compact into L1");
 
@@ -865,7 +865,7 @@ async fn a_skip_past_a_range_deletion_passes_a_deeper_table_holding_a_later_key_
         // then down into the L2 table at the span's edge.
         let mut batch = Batch::new();
         batch.put(b"k7950", b"later").expect("put");
-        db.write(&mut batch, true).await.expect("write");
+        db.write_raw(&mut batch, true).await.expect("write");
         let table = db.flush().await.expect("flush").expect("a table");
         let beside = db.compact(0, &[table]).await.expect("compact into L1");
         db.compact(1, &beside).await.expect("compact into L2");
@@ -948,7 +948,7 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         batch.put(&key, &[b'o'; 100]).expect("put");
         model.insert(key, vec![b'o'; 100]);
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     let l1 = db.compact(0, &[table]).await.expect("compact into L1");
     db.compact(1, &l1).await.expect("compact into L2");
@@ -966,7 +966,7 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         batch.put(&key, &[b'n'; 100]).expect("put");
         model.insert(key, vec![b'n'; 100]);
     }
-    db.write(&mut batch, true).await.expect("write");
+    db.write_raw(&mut batch, true).await.expect("write");
     let table = db.flush().await.expect("flush").expect("a table");
     let l1 = db.compact(0, &[table]).await.expect("compact into L1");
     assert!(
