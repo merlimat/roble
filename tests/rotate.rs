@@ -71,7 +71,7 @@ async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
 }
 
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {

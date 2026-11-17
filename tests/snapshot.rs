@@ -21,6 +21,7 @@
 //! does not do (§5, `tests/obsolete.rs`).
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
@@ -63,7 +64,7 @@ async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
 }
 
 /// Everything a scan walks, forwards.
-async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
+async fn walk<F: Fs>(scan: &mut roble::Scan<F>) -> Model {
     scan.first().await.expect("first");
     let mut out = Model::new();
     while scan.is_valid() {
@@ -74,7 +75,7 @@ async fn walk<D: Disk>(scan: &mut roble::Scan<D>) -> Model {
 }
 
 async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
-    walk(&mut db.scan().await.expect("scan")).await
+    walk(&mut db.range(..).expect("scan")).await
 }
 
 /// What the directory holds, sorted.
@@ -108,7 +109,7 @@ async fn a_snapshot_reads_what_it_saw_and_not_what_came_after() {
         .map(|(k, v)| (k.clone(), v.clone()))
         .expect("the fixture should hold something");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
 
     write(&db, |b| {
         b.put(&key, b"written after the snapshot").expect("put");
@@ -129,7 +130,7 @@ async fn a_snapshot_reads_what_it_saw_and_not_what_came_after() {
         "and should not see a key written after it"
     );
     assert_eq!(
-        walk(&mut snap.scan().expect("scan")).await,
+        walk(&mut snap.range(..).expect("scan")).await,
         before,
         "nor should a scan over it"
     );
@@ -160,8 +161,8 @@ async fn a_lookup_reaches_a_key_a_bounded_scan_cannot() {
         .cloned()
         .expect("the fixture should hold a key at or above \"g\"");
 
-    let snap = db.snapshot().await.expect("snapshot");
-    let seen = walk(&mut snap.scan_range(Some(b"a"), Some(b"g")).expect("scan")).await;
+    let snap = db.snapshot().expect("snapshot");
+    let seen = walk(&mut snap.range(&b"a"[..]..&b"g"[..]).expect("scan")).await;
 
     assert!(
         !seen.contains_key(&outside),
@@ -205,7 +206,7 @@ async fn a_snapshot_holds_every_table_against_the_sweep() {
         .collect();
     assert!(!high.is_empty(), "and with keys in them");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     db.compact(0, &beyond).await.expect("compact");
 
     let names = listing(env.sim(), &dir).await;
@@ -264,9 +265,9 @@ async fn a_snapshot_holds_the_tables_of_every_level() {
         );
     }
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     assert_eq!(
-        walk(&mut snap.scan().expect("scan")).await,
+        walk(&mut snap.range(..).expect("scan")).await,
         all,
         "a scan over the snapshot should read the whole store"
     );
@@ -285,7 +286,7 @@ async fn a_lookup_steps_past_a_newer_version_in_the_memtable() {
     let db = open_unscheduled(&env, &dir).await;
 
     write(&db, |b| b.put(b"/k", b"first").expect("put")).await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     write(&db, |b| b.put(b"/k", b"second").expect("put")).await;
 
     assert_eq!(
@@ -312,7 +313,7 @@ async fn a_lookup_takes_the_newest_version_a_table_holds() {
     write(&db, |b| b.put(b"/k", b"second").expect("put")).await;
     db.flush().await.expect("flush");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     assert_eq!(
         snap.lookup(b"/k").await.expect("lookup"),
         Some(b"second".to_vec()),
@@ -329,7 +330,7 @@ async fn a_deletion_after_the_snapshot_does_not_hide_the_value() {
         b.put(b"/ranged", b"r").expect("put");
     })
     .await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     write(&db, |b| {
         b.delete(b"/point").expect("delete");
         b.delete_range(b"/ranged", b"/ranged0")
@@ -374,7 +375,7 @@ async fn a_deletion_before_the_snapshot_hides_the_value() {
             .expect("delete range");
     })
     .await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
 
     assert_eq!(snap.lookup(b"/point").await.expect("lookup"), None);
     assert_eq!(snap.lookup(b"/ranged").await.expect("lookup"), None);
@@ -403,7 +404,7 @@ async fn a_tombstone_in_a_table_whose_filter_rejects_the_key_still_applies() {
     .await;
     db.flush().await.expect("flush");
 
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
     assert_eq!(
         snap.lookup(b"/k").await.expect("lookup"),
         None,
@@ -422,7 +423,7 @@ async fn a_snapshots_scan_is_bounded_the_way_a_stores_is() {
     let db = open_unscheduled(&env, &dir).await;
 
     let all = contents(&db).await;
-    let snap = db.snapshot().await.expect("snapshot");
+    let snap = db.snapshot().expect("snapshot");
 
     for (lower, upper) in [
         (None, None),
@@ -437,7 +438,15 @@ async fn a_snapshots_scan_is_bounded_the_way_a_stores_is() {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(
-            walk(&mut snap.scan_range(lower, upper).expect("scan")).await,
+            walk(
+                &mut snap
+                    .range((
+                        lower.map_or(Unbounded, Included),
+                        upper.map_or(Unbounded, Excluded),
+                    ))
+                    .expect("scan")
+            )
+            .await,
             expected,
             "bounds {lower:?}..{upper:?}"
         );

@@ -33,7 +33,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use roble::DEFAULT_OPEN_TABLES;
-use roble::{Caches, Comparison, Lookup};
+use roble::{Caches, Comparison, GetBuf};
 use roble_format::batch::Batch;
 
 /// An allocation at least this big is a block's: data blocks are written at
@@ -106,7 +106,7 @@ async fn a_missed_block_is_kept_in_the_buffer_it_was_read_into() {
     db.flush().await.expect("flush").expect("a table");
 
     let probe = b"k00500";
-    let mut buf = Lookup::new();
+    let mut buf = GetBuf::new();
     // Warm: the table opens and the buffer reaches the value's size. The
     // block cannot warm, which is the point.
     for _ in 0..50 {

@@ -44,12 +44,13 @@
 //! the word "prefix" where the encoding is.
 
 use std::cell::RefCell;
+use std::ops::RangeBounds;
 use std::rc::Rc;
 
 use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
 
-use crate::env::{Disk, Fs};
+use crate::env::Fs;
 use crate::error::Result;
 use crate::memtable::Memtable;
 use crate::metrics::Metrics;
@@ -63,7 +64,7 @@ use crate::version::Version;
 /// Made by [`Db::snapshot`]. Scans over it see what it saw, whatever the
 /// store does meanwhile, and [`Snapshot::lookup`] answers about any key at
 /// all rather than only the ones a scan's bounds take in.
-pub struct Snapshot<D: Disk> {
+pub struct Snapshot<F: Fs> {
     /// The version as it was, which says which tables there were and where.
     ///
     /// Holding it is what keeps the sweep off those tables, however many
@@ -72,7 +73,7 @@ pub struct Snapshot<D: Disk> {
     version: Rc<Version>,
     /// How the store opens a table, which a lookup and a scan both do as
     /// they reach one.
-    tables: Rc<dyn Opener<D>>,
+    tables: Rc<dyn Opener<F::Disk>>,
     /// The memtables as they were: the one writes go to, and the one a flush
     /// is writing out if there is one. Both keep being written to, and the
     /// sequence number below is what keeps the later writes out.
@@ -82,7 +83,7 @@ pub struct Snapshot<D: Disk> {
     metrics: Rc<Metrics>,
 }
 
-impl<D: Disk> Drop for Snapshot<D> {
+impl<F: Fs> Drop for Snapshot<F> {
     /// A snapshot that has gone away releases the whole version it was
     /// holding, which is the point of saying how many are open.
     fn drop(&mut self) {
@@ -90,21 +91,17 @@ impl<D: Disk> Drop for Snapshot<D> {
     }
 }
 
-impl<D: Disk> Snapshot<D> {
-    /// A scan over every key the snapshot holds.
-    pub fn scan(&self) -> Result<Scan<D>> {
-        self.scan_range(None, None)
-    }
-
-    /// A scan bounded below by `lower` (included) and above by `upper`
-    /// (excluded), as Pebble's bounds are.
+impl<F: Fs> Snapshot<F> {
+    /// A scan over the keys in `range` as the snapshot saw them, as
+    /// [`Db::range`](crate::Db::range) makes one over the store.
     ///
-    /// Made the way a store's is ([`Scan`]), over the version the snapshot
-    /// holds: it opens nothing until a seek lands in a table, and needs no
-    /// I/O to create. The snapshot goes on holding the whole version
-    /// whatever its scans' bounds, so a caller can scan a range and then look
-    /// up keys outside it.
-    pub fn scan_range(&self, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<Scan<D>> {
+    /// Made over the version the snapshot holds: it opens nothing until a
+    /// seek lands in a table, and needs no I/O to create. The snapshot goes
+    /// on holding the whole version whatever its scans' bounds, so a caller
+    /// can scan a range and then look up keys outside it.
+    pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<Scan<F>> {
+        let (lower, upper) = crate::scan::bounds(&range);
+        let (lower, upper) = (lower.as_deref(), upper.as_deref());
         let mut scan = Scan::empty(Some(Rc::clone(&self.metrics)));
         scan.rebuild(
             &self.version,
@@ -267,7 +264,7 @@ impl<F: Fs> Db<F> {
     /// So a snapshot is worth holding for as long as a caller is reading at
     /// one instant and no longer: while it lives, nothing the store writes
     /// over can be collected.
-    pub async fn snapshot(&self) -> Result<Snapshot<F::Disk>> {
+    pub fn snapshot(&self) -> Result<Snapshot<F>> {
         let version = Rc::clone(&self.versions().version);
         self.metrics.snapshots_open.add(1);
         Ok(Snapshot {

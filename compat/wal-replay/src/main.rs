@@ -415,10 +415,7 @@ async fn swept_run<F: roble::Fs>(db: &roble::Db<F>, dir: &PathBuf, before: &[Str
         fail("roble deleted nothing, so there is nothing for Pebble to miss");
     }
 
-    let mut scan = db
-        .scan()
-        .await
-        .unwrap_or_else(|e| fail(&format!("scan: {e}")));
+    let mut scan = db.range(..).unwrap_or_else(|e| fail(&format!("scan: {e}")));
     scan.first()
         .await
         .unwrap_or_else(|e| fail(&format!("first: {e}")));

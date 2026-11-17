@@ -95,7 +95,7 @@ pub struct Found {
 /// allocating. [`Db::get`] makes one per call, which is what a caller
 /// that wants its answer owned is paying for.
 #[derive(Debug, Default)]
-pub struct Lookup {
+pub struct GetBuf {
     key: Vec<u8>,
     value: Vec<u8>,
     /// The encoded internal key a seek targets.
@@ -125,10 +125,10 @@ pub struct Lookup {
     )>,
 }
 
-/// A parked [`crate::Scan`], of whatever disk it was last made for.
+/// A parked [`crate::Scan`], of whatever filesystem it was last made for.
 ///
 /// Parked, it holds nothing of a store — no version, table or memtable — so a
-/// caller can keep the [`Lookup`] it is in for as long as it likes without
+/// caller can keep the [`GetBuf`] it is in for as long as it likes without
 /// keeping a single file from the obsolete sweep.
 #[derive(Default)]
 struct KeptScan(Option<Box<dyn std::any::Any>>);
@@ -144,28 +144,28 @@ impl std::fmt::Debug for KeptScan {
 }
 
 impl KeptScan {
-    /// The scan, made for `D` if it was not already.
-    fn get<D: crate::env::Disk>(
+    /// The scan, made for `F` if it was not already.
+    fn get<F: Fs>(
         &mut self,
         metrics: &std::rc::Rc<crate::metrics::Metrics>,
-    ) -> &mut crate::scan::Scan<D> {
+    ) -> &mut crate::scan::Scan<F> {
         if !self
             .0
             .as_ref()
-            .is_some_and(|kept| kept.is::<crate::scan::Scan<D>>())
+            .is_some_and(|kept| kept.is::<crate::scan::Scan<F>>())
         {
-            self.0 = Some(Box::new(crate::scan::Scan::<D>::empty(Some(
+            self.0 = Some(Box::new(crate::scan::Scan::<F>::empty(Some(
                 std::rc::Rc::clone(metrics),
             ))));
         }
         self.0
             .as_mut()
             .and_then(|kept| kept.downcast_mut())
-            .expect("made for this disk just above")
+            .expect("made for this filesystem just above")
     }
 }
 
-impl Lookup {
+impl GetBuf {
     /// Working space that has not been used yet.
     pub fn new() -> Self {
         Self::default()
@@ -234,16 +234,16 @@ impl<F: Fs> Db<F> {
     /// Reads the key `how` says, or `None` if there is none.
     ///
     /// Allocates the answer and the scratch the read needed to find it.
-    /// [`Self::get_into`] is the same read into a [`Lookup`] the caller
+    /// [`Self::get_into`] is the same read into a [`GetBuf`] the caller
     /// keeps, which allocates neither once it is warm.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
-        let mut buf = Lookup::new();
+        let mut buf = GetBuf::new();
         Ok(self.get_into(key, how, &mut buf).await?.then(|| buf.take()))
     }
 
     /// Reads the key `how` says into `buf`, answering whether there was one.
     ///
-    /// On `true`, [`Lookup::key`] and [`Lookup::value`] hold the answer. On
+    /// On `true`, [`GetBuf::key`] and [`GetBuf::value`] hold the answer. On
     /// `false` both are empty, so the same buffer can be handed back call
     /// after call without a miss reading as the previous hit. What it holds
     /// after an `Err` is not defined.
@@ -251,7 +251,7 @@ impl<F: Fs> Db<F> {
     /// This is the allocation-free read: hand back the same `buf` and, once
     /// its buffers have reached the sizes the data needs, a lookup in a steady
     /// state allocates nothing at all.
-    pub async fn get_into(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
+    pub async fn get_into(&self, key: &[u8], how: Comparison, buf: &mut GetBuf) -> Result<bool> {
         let _timer = self.metrics.get.start();
         buf.key.clear();
         buf.value.clear();
@@ -277,7 +277,7 @@ impl<F: Fs> Db<F> {
     }
 
     /// A point lookup.
-    async fn equal(&self, user: &[u8], buf: &mut Lookup) -> Result<bool> {
+    async fn equal(&self, user: &[u8], buf: &mut GetBuf) -> Result<bool> {
         // **The version is held until the lookup has answered**, so that no
         // table chosen from it can be collected before it is read. The
         // tables are opened one at a time below, each an await, and a
@@ -319,10 +319,10 @@ impl<F: Fs> Db<F> {
     /// merge of their own, re-seeking every candidate table once per key they
     /// rejected; a scan steps instead, and skipping deleted keys is its job
     /// rather than this one's.
-    async fn positioned(&self, key: &[u8], how: Comparison, buf: &mut Lookup) -> Result<bool> {
+    async fn positioned(&self, key: &[u8], how: Comparison, buf: &mut GetBuf) -> Result<bool> {
         // Split so the answer, the probe and the scan can be held at once;
         // they are disjoint parts of the caller's one buffer.
-        let Lookup {
+        let GetBuf {
             key: found_key,
             value: found_value,
             target,
@@ -361,7 +361,7 @@ impl<F: Fs> Db<F> {
         // Through the scan the buffer keeps, rebuilt in its own allocations
         // and parked again however the seek went, so that it never holds the
         // store between two lookups.
-        let scan = scan.get::<F::Disk>(&self.metrics);
+        let scan = scan.get::<F>(&self.metrics);
         let found = async {
             self.rebuild_scan(scan, std::iter::empty(), lower, upper)?;
             match (lower, upper) {
@@ -386,11 +386,11 @@ impl<F: Fs> Db<F> {
     /// Newest by sequence number, across every level: an entry's level says
     /// nothing a trailer does not already say, and trailers are what the
     /// ordering is defined on.
-    async fn newest_for(&self, user: &[u8], buf: &mut Lookup) -> Result<Option<Candidate>> {
+    async fn newest_for(&self, user: &[u8], buf: &mut GetBuf) -> Result<Option<Candidate>> {
         // Split so the value being filled, the scratch being overwritten and
         // the list being walked can be held at once; they are disjoint parts
         // of the caller's one buffer.
-        let Lookup {
+        let GetBuf {
             value,
             target,
             tables,

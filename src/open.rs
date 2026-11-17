@@ -239,17 +239,17 @@ pub struct Db<F: Fs> {
 ///
 /// A store that shares a thread with others, or that wants Oxia's
 /// configuration, is opened with [`open_with`] instead (§8, §11).
-pub async fn open<E: Env>(env: &E, dir: &Path) -> Result<Db<E::Fs>> {
+pub async fn open<E: Env>(env: &E, dir: impl AsRef<Path>) -> Result<Db<E::Fs>> {
     open_with(env, dir, crate::options::Options::default()).await
 }
 
 /// Opens the database in `dir` as `options` says.
 pub async fn open_with<E: Env>(
     env: &E,
-    dir: &Path,
+    dir: impl AsRef<Path>,
     options: crate::options::Options<E::Fs>,
 ) -> Result<Db<E::Fs>> {
-    open_dir(env, dir, options, false).await
+    open_dir(env, dir.as_ref(), options, false).await
 }
 
 /// Opens the database in `dir` to read, beside whatever process may be
@@ -268,10 +268,10 @@ pub async fn open_with<E: Env>(
 /// §6, "Reading beside a writer").
 pub async fn open_read_only<E: Env>(
     env: &E,
-    dir: &Path,
+    dir: impl AsRef<Path>,
     options: crate::options::Options<E::Fs>,
 ) -> Result<Db<E::Fs>> {
-    open_dir(env, dir, options, true).await
+    open_dir(env, dir.as_ref(), options, true).await
 }
 
 async fn open_dir<E: Env>(

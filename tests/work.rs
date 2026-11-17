@@ -172,7 +172,7 @@ async fn a_paced_flush_writes_the_table_an_unpaced_one_would() {
         let db = ready_to_flush(&env, &dir, unit).await;
         db.flush().await.expect("flush").expect("a table");
 
-        let mut scan = db.scan().await.expect("scan");
+        let mut scan = db.range(..).expect("scan");
         scan.first().await.expect("first");
         let mut seen = Vec::new();
         while scan.is_valid() {
@@ -295,7 +295,7 @@ async fn pacing_changes_no_answer() {
             .collect();
         db.compact(0, &in_l0).await.expect("compact");
 
-        let mut scan = db.scan().await.expect("scan");
+        let mut scan = db.range(..).expect("scan");
         scan.first().await.expect("first");
         let mut seen = Vec::new();
         while scan.is_valid() {

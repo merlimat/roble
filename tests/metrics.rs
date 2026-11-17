@@ -280,7 +280,7 @@ async fn a_scan_counts_the_keys_it_steps_onto() {
     let db = roble::open_with(&env, &dir, options).await.expect("open");
 
     let mut walked = 0;
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     while scan.is_valid() {
         walked += 1;
@@ -585,8 +585,8 @@ async fn open_scans_are_counted_until_they_are_dropped() {
     let (env, dir) = load("db-twin-a").await;
     let db = roble::open_with(&env, &dir, options).await.expect("open");
 
-    let a = db.scan().await.expect("scan");
-    let b = db.scan().await.expect("scan");
+    let a = db.range(..).expect("scan");
+    let b = db.range(..).expect("scan");
     assert_eq!(
         collected(reader(), &tag).get("roble.scans.open").copied(),
         Some(2),
@@ -658,8 +658,8 @@ async fn open_snapshots_are_counted_until_they_are_dropped() {
     let (env, dir) = load("db-twin-a").await;
     let db = roble::open_with(&env, &dir, options).await.expect("open");
 
-    let a = db.snapshot().await.expect("snapshot");
-    let b = db.snapshot().await.expect("snapshot");
+    let a = db.snapshot().expect("snapshot");
+    let b = db.snapshot().expect("snapshot");
     assert_eq!(
         collected(reader(), &tag)
             .get("roble.snapshots.open")
@@ -668,7 +668,7 @@ async fn open_snapshots_are_counted_until_they_are_dropped() {
         "two snapshots are open"
     );
     // And a scan made from one is a scan like any other.
-    let scan = a.scan().expect("scan");
+    let scan = a.range(..).expect("scan");
     assert_eq!(
         collected(reader(), &tag).get("roble.scans.open").copied(),
         Some(1),
@@ -915,7 +915,7 @@ async fn a_compaction_still_takes_what_the_cache_already_has() {
     let table = db.flush().await.expect("flush").expect("a table");
 
     // Walk the whole table, so every one of its blocks is in the cache.
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     while scan.is_valid() {
         scan.next().await.expect("next");
@@ -948,7 +948,7 @@ async fn a_small_cache_reports_what_it_evicted() {
         .await
         .expect("open");
 
-    let mut scan = db.scan().await.expect("scan");
+    let mut scan = db.range(..).expect("scan");
     scan.first().await.expect("first");
     while scan.is_valid() {
         scan.next().await.expect("next");
@@ -1498,9 +1498,9 @@ async fn a_scan_opens_only_the_tables_its_seeks_land_in() {
 
     let opened = || lookups(reader(), &tag, "table").values().sum::<i64>();
     let before = opened();
-    let mut scan = db.scan().await.expect("scan");
-    let snapshot = db.snapshot().await.expect("snapshot");
-    let mut through = snapshot.scan().expect("a snapshot's scan");
+    let mut scan = db.range(..).expect("scan");
+    let snapshot = db.snapshot().expect("snapshot");
+    let mut through = snapshot.range(..).expect("a snapshot's scan");
     assert_eq!(
         opened() - before,
         0,
