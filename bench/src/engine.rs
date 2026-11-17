@@ -226,7 +226,7 @@ impl Store for Roble {
         // One cache handle for every shard, which is the arrangement Oxia
         // runs and the one §8 is built for: hundreds of shards in one budget.
         let caches = roble::Caches::new(
-            roble::cache::DEFAULT_OPEN_TABLES,
+            roble::DEFAULT_OPEN_TABLES,
             cfg.cache_mb as usize * 1024 * 1024,
         );
         let mut shards = Vec::with_capacity(cfg.shards);
@@ -676,13 +676,14 @@ impl Store for Rocks {
             // searching one table instead of three is most of why RocksDB
             // looked quickest at it. That is a setting, not an engine.
             options.set_write_buffer_size(cfg.memtable_mb as usize * 1024 * 1024);
-            options.set_target_file_size_base(roble::compact::TARGET_FILE_SIZE);
-            options.set_max_bytes_for_level_base(roble::pick::LBASE_MAX_BYTES);
+            options.set_target_file_size_base(roble::__private::TARGET_FILE_SIZE);
+            options.set_max_bytes_for_level_base(roble::__private::LBASE_MAX_BYTES);
             options.set_level_zero_file_num_compaction_trigger(
-                roble::pick::L0_COMPACTION_THRESHOLD as i32,
+                roble::__private::L0_COMPACTION_THRESHOLD as i32,
             );
-            options
-                .set_level_zero_stop_writes_trigger(roble::pick::L0_STOP_WRITES_THRESHOLD as i32);
+            options.set_level_zero_stop_writes_trigger(
+                roble::__private::L0_STOP_WRITES_THRESHOLD as i32,
+            );
             // `--no-compactions`. RocksDB then also stops counting L0
             // against the stop-writes trigger above
             // (`GetWriteStallConditionAndCause` checks

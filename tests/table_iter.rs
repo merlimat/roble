@@ -27,8 +27,8 @@
 
 use std::path::{Path, PathBuf};
 
+use roble::__private::OpenTable;
 use roble::sim::{SimEnv, SimFs};
-use roble::table::OpenTable;
 use roble::{Access, Caches, Disk, Fs, WriteBuf};
 use roble_format::block::Value;
 use roble_format::sst::{Table, TableWriter, WriterOptions};

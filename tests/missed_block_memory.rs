@@ -32,7 +32,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use roble::cache::DEFAULT_OPEN_TABLES;
+use roble::DEFAULT_OPEN_TABLES;
 use roble::{Caches, Comparison, Lookup};
 use roble_format::batch::Batch;
 

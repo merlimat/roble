@@ -554,7 +554,7 @@ async fn a_torn_record_in_an_earlier_log_is_refused() {
         .open(&dir.join("000004.log"), roble::Access::ReadOnly)
         .await
         .expect("open");
-    let whole = roble::env::read_all(&disk, ()).await.expect("read");
+    let whole = roble::__private::read_all(&disk, ()).await.expect("read");
     drop(disk);
     let disk = fs.create(&dir.join("000004.log")).await.expect("recreate");
     let (result, _) = disk
