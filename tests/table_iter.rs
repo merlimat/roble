@@ -175,8 +175,16 @@ async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
         Ok(_) => panic!("a table whose index reaches past its end opened"),
         Err(e) => e,
     };
+    // A format error, and underneath it the format crate's own corruption
+    // report, which is where the kind is.
+    use std::error::Error as _;
+    assert!(matches!(err, roble::Error::Format(_)), "got {err:?}");
     assert!(
-        matches!(err, roble::Error::Format(roble_format::Error::Corrupt(_))),
+        matches!(
+            err.source()
+                .and_then(|s| s.downcast_ref::<roble_format::Error>()),
+            Some(roble_format::Error::Corrupt(_))
+        ),
         "got {err:?}"
     );
 }

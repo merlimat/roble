@@ -32,7 +32,7 @@ pub enum Error {
     Locked,
     /// A file was not in the format roble reads, or holds a structure it
     /// refuses to read (DESIGN.md §3).
-    Format(roble_format::Error),
+    Format(FormatError),
     /// The database is valid Pebble, but uses something roble does not read:
     /// a format major version above the pin, a comparer other than bytewise,
     /// WAL failover (DESIGN.md §3).
@@ -46,7 +46,7 @@ pub enum Error {
     /// not hold.
     Corrupt(String),
     /// There is no database in the directory.
-    NotFound(String),
+    NoDatabase(String),
     /// The store was opened read-only, and this would change the directory
     /// ([`crate::open_read_only`]).
     ReadOnly,
@@ -54,6 +54,27 @@ pub enum Error {
     /// database has retired or not finished writing; opening again reads the
     /// database as it is now (DESIGN.md §6, "Reading beside a writer").
     Stale(String),
+}
+
+/// What [`Error::Format`] carries: a file roble could not read, and why.
+///
+/// Opaque, so that roble's error type does not change whenever the format
+/// crate's does. Its message says which structure was refused and why, and
+/// [`source`](std::error::Error::source) hands over `roble_format::Error`
+/// itself, for a caller that depends on that crate and wants the detail.
+#[derive(Debug)]
+pub struct FormatError(roble_format::Error);
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for FormatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
 }
 
 impl fmt::Display for Error {
@@ -64,7 +85,7 @@ impl fmt::Display for Error {
             Error::Format(e) => write!(f, "{e}"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt: {m}"),
-            Error::NotFound(m) => write!(f, "{m}"),
+            Error::NoDatabase(m) => write!(f, "{m}"),
             Error::ReadOnly => write!(f, "the database was opened read-only"),
             Error::Stale(m) => write!(f, "stale: {m}"),
         }
@@ -76,10 +97,13 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Locked => None,
-            Error::Format(e) => Some(e),
+            // The format crate's error, not the wrapper: the wrapper says
+            // nothing the error it wraps does not, and a chain walker would
+            // print the same line twice.
+            Error::Format(e) => Some(&e.0),
             Error::Unsupported(_)
             | Error::Corrupt(_)
-            | Error::NotFound(_)
+            | Error::NoDatabase(_)
             | Error::ReadOnly
             | Error::Stale(_) => None,
         }
@@ -92,9 +116,14 @@ impl From<io::Error> for Error {
     }
 }
 
+/// What lets `?` carry a format error out of the engine.
+///
+/// Hidden, because it names the format crate's type: it is for roble's own
+/// code, and not a way in that callers should come to rely on.
+#[doc(hidden)]
 impl From<roble_format::Error> for Error {
     fn from(e: roble_format::Error) -> Self {
-        Error::Format(e)
+        Error::Format(FormatError(e))
     }
 }
 
@@ -137,7 +166,7 @@ mod tests {
 
     /// The three that carry their own wording, unprefixed.
     ///
-    /// `NotFound` is a sentence already — "no database in /tmp/x: it holds no
+    /// `NoDatabase` is a sentence already — "no database in /tmp/x: it holds no
     /// marker..." — and prefixing it would read as a category where the text
     /// is the explanation. `Io` and `Format` defer to an error that has
     /// already said it better than a wrapper could.
@@ -146,10 +175,10 @@ mod tests {
         assert_eq!(Error::Io(io()).to_string(), io().to_string());
 
         let inner = roble_format::Error::Corrupt("a bad block".to_string());
-        assert_eq!(Error::Format(inner).to_string(), "corrupt: a bad block");
+        assert_eq!(Error::from(inner).to_string(), "corrupt: a bad block");
 
         assert_eq!(
-            Error::NotFound("no database in /tmp/x".to_string()).to_string(),
+            Error::NoDatabase("no database in /tmp/x".to_string()).to_string(),
             "no database in /tmp/x"
         );
         assert_eq!(
@@ -172,16 +201,31 @@ mod tests {
         assert_eq!(source.to_string(), io().to_string());
 
         let inner = roble_format::Error::Corrupt("a bad block".to_string());
-        let wrapped = Error::Format(inner);
+        let wrapped = Error::from(inner.clone());
         let source = wrapped.source().expect("a format error has a source");
-        assert!(source.to_string().contains("a bad block"), "{source}");
+        assert_eq!(
+            source.downcast_ref::<roble_format::Error>(),
+            Some(&inner),
+            "the source is the format crate's own error"
+        );
+        assert!(
+            source.source().is_none(),
+            "and the chain ends there, with the line said once"
+        );
+
+        // The wrapper on its own hands over the same error.
+        let Error::Format(format) = wrapped else {
+            unreachable!()
+        };
+        let source = format.source().expect("the wrapper has a source");
+        assert_eq!(source.downcast_ref::<roble_format::Error>(), Some(&inner));
 
         // And the ones that are the whole story have nothing underneath.
         for e in [
             Error::Locked,
             Error::Unsupported("x".to_string()),
             Error::Corrupt("x".to_string()),
-            Error::NotFound("x".to_string()),
+            Error::NoDatabase("x".to_string()),
         ] {
             assert!(e.source().is_none(), "{e} should have no source");
         }

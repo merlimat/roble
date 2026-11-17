@@ -156,7 +156,7 @@ impl<D: Disk> OpenTable<D> {
         // it, and a missing block there would otherwise be a silent "no
         // comparer named" rather than a refusal.
         let Some(props_handle) = metaindex.properties else {
-            return Err(Error::Format(roble_format::Error::Corrupt(
+            return Err(Error::from(roble_format::Error::Corrupt(
                 "table has no properties block".to_string(),
             )));
         };
@@ -661,7 +661,7 @@ fn within(handle: BlockHandle, size: u64) -> Result<BlockHandle> {
         .and_then(|span| handle.offset.checked_add(span));
     match end {
         Some(end) if end <= size => Ok(handle),
-        _ => Err(Error::Format(roble_format::Error::Corrupt(format!(
+        _ => Err(Error::from(roble_format::Error::Corrupt(format!(
             "block handle {handle:?} reaches past the end of a {size}-byte table"
         )))),
     }

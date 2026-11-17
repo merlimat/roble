@@ -58,7 +58,7 @@ pub use batch::IndexedBatch;
 pub use buf::{ReadBuf, WriteBuf};
 pub use cache::{BlockCache, Caches, DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
-pub use error::{Error, Result};
+pub use error::{Error, FormatError, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
 pub use open::{Opened, open, open_read_only, open_with};
 pub use options::Options;

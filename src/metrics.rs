@@ -184,7 +184,7 @@ const ERROR_TYPES: [&str; 8] = [
     "format",
     "unsupported",
     "corrupt",
-    "not_found",
+    "no_database",
     "read_only",
     "stale",
 ];
@@ -198,7 +198,7 @@ fn error_type(error: &crate::error::Error) -> usize {
         Format(_) => 2,
         Unsupported(_) => 3,
         Corrupt(_) => 4,
-        NotFound(_) => 5,
+        NoDatabase(_) => 5,
         ReadOnly => 6,
         Stale(_) => 7,
     }
