@@ -381,7 +381,7 @@ impl Memtable {
     /// users cannot reach and its tests cannot describe.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if key.len() < TRAILER_LEN {
-            return Err(Error::Format(roble_format::Error::Truncated {
+            return Err(Error::from(roble_format::Error::Truncated {
                 what: "internal key",
                 need: TRAILER_LEN,
                 have: key.len(),
@@ -658,7 +658,7 @@ impl MemtableCursor {
 /// is made against it.
 fn check(target: &[u8]) -> Result<()> {
     if target.len() < TRAILER_LEN {
-        return Err(Error::Format(roble_format::Error::Truncated {
+        return Err(Error::from(roble_format::Error::Truncated {
             what: "internal key",
             need: TRAILER_LEN,
             have: target.len(),

@@ -277,7 +277,7 @@ pub async fn open_with<E: Env>(
     // 5. Which MANIFEST.
     let manifest_marker = files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?
         .ok_or_else(|| {
-            Error::NotFound(format!(
+            Error::NoDatabase(format!(
                 "no database in {}: it holds no marker.{MARKER_MANIFEST}.* file",
                 dir.display()
             ))

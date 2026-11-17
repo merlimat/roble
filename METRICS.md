@@ -42,7 +42,7 @@ the caller's choosing.
 | `roble.operation.type` | `roble.write.operations` | `put`, `delete`, `delete_range` |
 | `roble.level` | `roble.level.*` | `0`–`6` |
 | `disk.io.direction` | `roble.compaction.*` | `read`, `write` |
-| `error.type` | `roble.*.errors` | `io`, `locked`, `format`, `unsupported`, `corrupt`, `not_found` |
+| `error.type` | `roble.*.errors` | `io`, `locked`, `format`, `unsupported`, `corrupt`, `no_database` |
 | `disk.io.direction` | `roble.disk.*` | `read`, `write` |
 | `roble.cache` | `roble.cache.*` | `block`, `table` |
 | `roble.cache.result` | `roble.cache.lookups` | `hit`, `miss` |

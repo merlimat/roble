@@ -395,8 +395,8 @@ async fn a_directory_with_no_manifest_marker_is_not_a_database() {
     .build()
     .await;
     match roble::open(&env, &dir).await {
-        Err(Error::NotFound(m)) => assert!(m.contains("no database in"), "got: {m}"),
-        other => panic!("expected NotFound, got {other:?}"),
+        Err(Error::NoDatabase(m)) => assert!(m.contains("no database in"), "got: {m}"),
+        other => panic!("expected NoDatabase, got {other:?}"),
     }
 }
 
