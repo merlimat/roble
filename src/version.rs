@@ -40,6 +40,7 @@ pub const BYTEWISE_COMPARER: &str = "leveldb.BytewiseComparator";
 /// decoded: they are compared far more often than they are read, and a
 /// round-trip through a decoded form is a chance to lose the trailer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct Table {
     /// Its file number, which is also its name: `NNNNNN.sst`.
     pub file_num: u64,
@@ -194,6 +195,7 @@ fn partition(tables: &[Table], before: impl Fn(&Table) -> Result<bool>) -> Resul
 
 /// Which tables are in the database, by level.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct Version {
     levels: Vec<Vec<Table>>,
 }
@@ -351,6 +353,7 @@ fn table_containing<'a>(tables: &'a [Table], user: &[u8]) -> Result<Option<&'a T
 /// Everything a MANIFEST establishes: the version, and the counters a store
 /// resumes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct VersionSet {
     /// The comparer the database was written with, which roble checks before
     /// trusting a single key.

@@ -1462,7 +1462,7 @@ impl<F: crate::env::Fs> crate::Db<F> {
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<()> {
-        let version = Rc::clone(&self.versions().version);
+        let version = Rc::clone(&self.version_set().version);
         let tables: Rc<dyn Opener<F::Disk>> = self.tables();
         scan.rebuild(
             &version,

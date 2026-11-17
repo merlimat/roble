@@ -300,7 +300,7 @@ impl<F: Fs> Db<F> {
     /// one instant and no longer: while it lives, nothing the store writes
     /// over can be collected.
     pub fn snapshot(&self) -> Result<Snapshot<F>> {
-        let version = Rc::clone(&self.versions().version);
+        let version = Rc::clone(&self.version_set().version);
         self.metrics.snapshots_open.add(1);
         Ok(Snapshot {
             version,

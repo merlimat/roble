@@ -36,6 +36,7 @@ mod create;
 mod destroy;
 mod env;
 mod flush;
+mod levels;
 mod memtable;
 mod metrics;
 mod obsolete;
@@ -60,6 +61,7 @@ pub use cache::{Caches, DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, FormatError, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
+pub use levels::{LevelInfo, TableInfo};
 pub use open::{Db, open, open_read_only, open_with};
 pub use options::Options;
 pub use pick::Pick;
@@ -71,9 +73,10 @@ pub use version::{Table, Version, VersionSet};
 /// What roble's own tests and benchmark reach inside the engine.
 ///
 /// Not part of the API: hidden from the documentation, and free to change in
-/// any release. The same goes for the `#[doc(hidden)]` methods on [`Db`] and
-/// for [`Pick`]: the maintenance and inspection calls the tests, the CLI,
-/// bench, compat and the fuzz targets drive by hand.
+/// any release. The same goes for the `#[doc(hidden)]` methods on [`Db`], for
+/// [`Pick`], and for [`VersionSet`], [`Version`] and [`Table`]: the
+/// maintenance and inspection calls the tests, the CLI, bench, compat and the
+/// fuzz targets drive by hand, and what they read the store's state through.
 #[doc(hidden)]
 pub mod __private {
     pub use crate::cache::{BlockCache, Clock};

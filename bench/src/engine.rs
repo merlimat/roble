@@ -377,23 +377,22 @@ impl Store for Roble {
 
     fn levels(&self) -> Option<[usize; 7]> {
         let mut counts = [0usize; 7];
-        for (level, tables) in self.db.versions().version.levels() {
-            counts[level as usize] = tables.len();
+        for level in self.db.levels().ok()? {
+            counts[level.level as usize] = level.tables.len();
         }
         Some(counts)
     }
 
     fn layout(&self) -> Option<Vec<TableInfo>> {
-        let versions = self.db.versions();
         let mut out = Vec::new();
-        for (level, tables) in versions.version.levels() {
-            for t in tables {
+        for level in self.db.levels().ok()? {
+            for t in level.tables {
                 out.push(TableInfo {
-                    level: level as usize,
+                    level: level.level as usize,
                     name: roble_files::table_filename(t.file_num),
                     size: t.size,
-                    smallest: t.smallest_user_key().unwrap_or_default().to_vec(),
-                    largest: t.largest_user_key().unwrap_or_default().to_vec(),
+                    smallest: t.smallest,
+                    largest: t.largest,
                 });
             }
         }

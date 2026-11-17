@@ -287,7 +287,7 @@ impl<F: Fs> Db<F> {
         // `Rc` taken and given back, and nothing allocated: what the sweep
         // reads is the note the compaction makes when it replaces a version
         // something holds (`crate::obsolete::Pinned`), not one made here.
-        let version = Rc::clone(&self.versions().version);
+        let version = Rc::clone(&self.version_set().version);
         // The range check both halves need, done once. They narrow it
         // differently from here — `newest_for` consults each table's filter
         // and `visible` must not, since a filter is built from point keys and

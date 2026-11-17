@@ -147,7 +147,7 @@ impl<F: Fs> Db<F> {
     /// above the answer below it.
     #[doc(hidden)]
     pub fn pick(&self) -> Option<Pick> {
-        let versions = self.versions();
+        let versions = self.version_set();
         let allowance = |level: u32| {
             if level == 0 {
                 self.l0_compaction_threshold()
@@ -215,7 +215,7 @@ impl<F: Fs> Db<F> {
     /// tables rather than bytes, so its excess is charged at what its tables
     /// weigh.
     pub fn compaction_debt(&self) -> u64 {
-        let versions = self.versions();
+        let versions = self.version_set();
         let mut debt = 0;
         for level in 0..NUM_LEVELS - 1 {
             let tables = versions.version.level(level);

@@ -91,7 +91,7 @@ impl<F: Fs> Db<F> {
         // the marker has. A crash before that leaves this MANIFEST an orphan
         // and the number free again, and the sweep collects the file.
         let (file_num, snapshot) = {
-            let versions = self.versions();
+            let versions = self.version_set();
             let file_num = versions.next_file_num;
             (file_num, snapshot_edit(&versions, file_num + 1))
         };

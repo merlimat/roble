@@ -183,19 +183,20 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
 /// Into a buffer, which a write cannot fail on, so what is written is not
 /// checked here. The buffer goes to the output once the read is done.
 fn tables(db: &Db, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
-    let versions = db.versions();
+    let levels = db.levels().at(dir)?;
     let _ = writeln!(
         out,
         "level\tfile\tsize\tseqs\tformat\tcompression\tentries\tdeletions\t\
          range-dels\traw\tratio\tsmallest\tlargest"
     );
-    for (level, tables) in versions.version.levels() {
-        for t in tables {
+    for level in &levels {
+        for t in &level.tables {
             let file = files::table_filename(t.file_num);
             let p = properties_of(&dir.join(&file))?;
             let _ = write!(
                 out,
-                "L{level}\t{file}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                "L{}\t{file}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                level.level,
                 t.size,
                 t.smallest_seq_num,
                 t.largest_seq_num,
@@ -207,9 +208,9 @@ fn tables(db: &Db, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
                 shown(p.raw()),
                 p.ratio()
             );
-            let _ = write_text(out, t.smallest_user_key().at(dir)?);
+            let _ = write_text(out, &t.smallest);
             let _ = out.write_all(b"\t");
-            let _ = write_text(out, t.largest_user_key().at(dir)?);
+            let _ = write_text(out, &t.largest);
             let _ = out.write_all(b"\n");
         }
     }
@@ -221,17 +222,16 @@ fn tables(db: &Db, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
 async fn stats(db: &Db, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
     let disk = db.disk_usage().await.at(dir)?;
     let (sublevels, levels, debt) = {
-        let versions = db.versions();
-        let version = &versions.version;
-        let sublevels = version.l0_sublevels().at(dir)?;
+        let found = db.levels().at(dir)?;
+        let sublevels = found[0].sublevels;
         let mut levels: Vec<Level> = Vec::new();
-        for (level, tables) in version.levels() {
+        for level in &found {
             let mut row = Level {
-                level,
-                tables: tables.len(),
+                level: level.level,
+                tables: level.tables.len(),
                 ..Level::default()
             };
-            for t in tables {
+            for t in &level.tables {
                 let p = properties_of(&dir.join(files::table_filename(t.file_num)))?;
                 row.bytes += t.size;
                 row.entries += p.entries.unwrap_or(0);
