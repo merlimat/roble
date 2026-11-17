@@ -69,6 +69,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use roble_format::block::Codec;
 use roble_format::manifest::{NUM_LEVELS, VersionEdit};
 use roble_format::rangedel::{self, Tombstone};
 use roble_format::sst::{TableWriter, WriterOptions};
@@ -248,6 +249,7 @@ impl<F: Fs> Db<F> {
             below,
             self.target_file_size(output_level),
             self.compaction_unit(),
+            self.compression(),
             async |chunk| {
                 let (bytes, last) = match chunk {
                     Chunk::More(bytes) => (bytes, None),
@@ -496,6 +498,7 @@ async fn merge<D: Disk>(
     below: &[(Vec<u8>, Vec<u8>)],
     target_bytes: u64,
     unit: u64,
+    compression: Codec,
     mut write: impl AsyncFnMut(Chunk) -> Result<Vec<u8>>,
 ) -> Result<()> {
     // The thread goes back to whatever else is ready every `unit` entries,
@@ -525,7 +528,7 @@ async fn merge<D: Disk>(
     // walking it would have to decide what an overlap meant.
     let tombstones = fragment(tables);
 
-    let mut open = Output::new(None)?;
+    let mut open = Output::new(None, compression)?;
     // Reused for every entry that survives the merge. A compaction reads
     // millions of them and already holds the encoded key it is writing, so
     // taking an owned entry per survivor meant allocating that key again,
@@ -568,8 +571,9 @@ async fn merge<D: Disk>(
             // output has not started yet may be a boundary, and after the
             // drops above every surviving user key appears exactly once, so
             // any of them will do.
-            if open.estimate >= target_bytes && !open.is_empty() {
-                let finished = std::mem::replace(&mut open, Output::new(Some(user.to_vec()))?);
+            if open.writer.estimated_size() >= target_bytes && !open.is_empty() {
+                let finished =
+                    std::mem::replace(&mut open, Output::new(Some(user.to_vec()), compression)?);
                 if let Some((bytes, bounds, entries)) = finished.finish(&tombstones, Some(user))? {
                     // To the table that has just been started: the buffer
                     // the last one's bytes went to the disk in is the one
@@ -610,21 +614,18 @@ struct Output {
     writer: TableWriter,
     bounds: Bounds,
     start: Option<Vec<u8>>,
-    /// Roughly how many bytes of keys and values have gone in, which is what
-    /// the target is compared against. The table itself is smaller once its
-    /// blocks are built, and larger by its index and filter; an estimate is
-    /// what Pebble splits on too.
-    estimate: u64,
     points: usize,
 }
 
 impl Output {
-    fn new(start: Option<Vec<u8>>) -> Result<Self> {
+    fn new(start: Option<Vec<u8>>, compression: Codec) -> Result<Self> {
         Ok(Output {
-            writer: TableWriter::new(WriterOptions::default())?,
+            writer: TableWriter::new(WriterOptions {
+                compression,
+                ..WriterOptions::default()
+            })?,
             bounds: Bounds::default(),
             start,
-            estimate: 0,
             points: 0,
         })
     }
@@ -634,7 +635,6 @@ impl Output {
     }
 
     fn add(&mut self, key: InternalKey<'_>, encoded: &[u8], value: &[u8]) -> Result<()> {
-        self.estimate += (encoded.len() + value.len()) as u64;
         self.points += 1;
         self.bounds.saw_key(encoded)?;
         self.bounds.saw_seq(key.seq_num);

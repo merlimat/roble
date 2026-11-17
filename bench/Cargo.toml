@@ -41,12 +41,13 @@ roble-format = { path = "../format" }
 # machine that has no encina checkout. The tag is what its release workflow
 # published, and the lockfile pins the commit behind it.
 encina = { git = "https://github.com/merlimat/encina", tag = "v0.4.1", optional = true }
-# LZ4 and Snappy are the compressions this benchmark can ask for; bindgen at
-# runtime avoids a pre-generated binding going stale against the local
-# libclang.
+# Snappy, LZ4 and Zstd are the compressions this benchmark can ask for;
+# bindgen at runtime avoids a pre-generated binding going stale against the
+# local libclang.
 rocksdb = { version = "0.25", default-features = false, features = [
     "snappy",
     "lz4",
+    "zstd",
     "bindgen-runtime",
 ], optional = true }
 

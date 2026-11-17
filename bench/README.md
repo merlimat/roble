@@ -555,9 +555,16 @@ cache is its own.
 values are random and give Snappy nothing to find — so without it every
 engine's compression setting is inert and the size column says nothing. A
 value is one random chunk repeated to fill it: 128 is incompressible, 8 is a
-sixteenfold repeat. roble's size does not move across that range, because its
-writer only ever writes `NoCompression`; RocksDB's falls by three to four and
-a half times.
+sixteenfold repeat. Over that range roble's settled store falls from 197.5 to
+68.4 and 36.4 MiB at 1.4 million records, and RocksDB's to 64.0 and 31.8.
+Until roble wrote Snappy below L0 its size did not move at all.
+
+**`--compression` picks the codec** — none, snappy, lz4 or zstd[:level] — for
+either engine, each in its own way: roble applies it to L1 and below and
+leaves L0 uncompressed (default snappy, Oxia's configuration), and refuses
+lz4, which Go Pebble cannot read; RocksDB applies it to every level (default
+snappy). With random values it only measures what each codec costs to find
+nothing; pair it with `--value-chunk`. DESIGN.md §14 has the sweep.
 
 **Values are pseudo-random by default.** A value made of one repeated byte compresses to
 nothing, and with one the size column reported Snappy saving 2.5× — a

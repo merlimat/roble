@@ -304,15 +304,30 @@ fn a_handle_past_the_end_of_u64_is_refused_by_block_compression() {
 /// What roble wrote has to read back as what it was handed: the cheap half of
 /// the round trip, with no Go toolchain in the loop. The expensive half — Go
 /// Pebble reading it — is `compat/sst-roundtrip`.
+/// Once per codec roble writes: the blocks differ, the entries must not.
 #[test]
 fn roble_reads_back_what_roble_wrote() {
-    use roble_format::block::Value;
+    use roble_format::block::Codec;
+    for codec in [
+        Codec::None,
+        Codec::Snappy,
+        Codec::Zstd(Codec::ZSTD_DEFAULT_LEVEL),
+        Codec::Zstd(1),
+        Codec::Zstd(19),
+    ] {
+        reads_back(codec);
+    }
+}
+
+fn reads_back(codec: roble_format::block::Codec) {
+    use roble_format::block::{Codec, Compression, Value};
     use roble_format::sst::{TableWriter, WriterOptions};
     use roble_format::{InternalKey, Kind};
 
     // Small blocks so the index is exercised rather than a single block.
     let opts = WriterOptions {
         block_size: 512,
+        compression: codec,
         ..Default::default()
     };
     let mut w = TableWriter::new(opts).expect("writer");
@@ -359,6 +374,24 @@ fn roble_reads_back_what_roble_wrote() {
     assert!(
         table.data_block_handles().expect("index").len() > 1,
         "the fixture is meant to span several data blocks"
+    );
+    // The codec reached the blocks, and the property names it as Pebble's
+    // profile would.
+    let expected_type = match codec {
+        Codec::None => Compression::None,
+        Codec::Snappy => Compression::Snappy,
+        Codec::Zstd(_) => Compression::Zstd,
+    };
+    for h in table.data_block_handles().expect("index") {
+        assert_eq!(
+            table.block_compression(h).expect("trailer"),
+            expected_type,
+            "{codec:?}"
+        );
+    }
+    assert_eq!(
+        table.properties().string("rocksdb.compression"),
+        Some(codec.property_name())
     );
 
     let mut got = Vec::new();

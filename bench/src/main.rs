@@ -116,6 +116,11 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   fill it (default: the whole value, so incompressible). 16
                   makes a 128-byte value eight copies of one chunk, which
                   Snappy halves — the dial between the two extremes §8 needs
+  --compression C none, snappy, lz4 or zstd[:level]. roble compresses L1 and
+                  below with it and leaves L0 uncompressed, as Oxia
+                  configures it (default snappy); it refuses lz4, which Go
+                  Pebble cannot read. RocksDB compresses every level with it
+                  (default snappy)
   --memtable-mb N bytes a memtable holds before a flush, in MiB (64). Set on
                   every engine that has one, because their own defaults differ
                   by sixteen times and the load phase then measures different
@@ -222,7 +227,7 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
     }
     println!(
         "{}: {} shards x {} batches x {} records, {}-byte values, {} MiB cache, \
-         wal={}, seed={}, keys={}{}",
+         wal={}, seed={}, keys={}, compression={}{}",
         S::NAME,
         cfg.shards,
         cfg.batches,
@@ -232,6 +237,8 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
         if cfg.wal { "on" } else { "off" },
         cfg.seed,
         cfg.distribution.name(),
+        cfg.compression
+            .map_or("the engine's default".to_string(), |c| format!("{c:?}")),
         if cfg.compactions {
             ""
         } else {
@@ -1331,6 +1338,39 @@ impl Keys {
     }
 }
 
+/// What `--compression` asked for, before an engine says whether it can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    /// Nothing compressed.
+    None,
+    /// Snappy.
+    Snappy,
+    /// LZ4, which RocksDB writes and Go Pebble cannot read.
+    Lz4,
+    /// Zstd at a level.
+    Zstd(i32),
+}
+
+impl Compression {
+    /// `none`, `snappy`, `lz4`, `zstd` or `zstd:<level>`.
+    fn parse(s: &str) -> Self {
+        match s.split_once(':') {
+            None if s == "none" => Compression::None,
+            None if s == "snappy" => Compression::Snappy,
+            None if s == "lz4" => Compression::Lz4,
+            None if s == "zstd" => Compression::Zstd(roble::Codec::ZSTD_DEFAULT_LEVEL),
+            Some(("zstd", level)) => Compression::Zstd(
+                level
+                    .parse()
+                    .unwrap_or_else(|_| fail(&format!("--compression: bad zstd level {level:?}"))),
+            ),
+            _ => fail(&format!(
+                "--compression: {s:?} is not none, snappy, lz4, zstd or zstd:<level>"
+            )),
+        }
+    }
+}
+
 /// What the run was asked for. The fields an engine needs to open itself or
 /// to build a record are public; the rest only the phases read.
 pub struct Config {
@@ -1344,6 +1384,9 @@ pub struct Config {
     pub value_bytes: usize,
     /// Bytes of random data each value is built from, repeated to fill it.
     pub value_chunk: usize,
+    /// What `--compression` asked for, if anything: each engine has its own
+    /// default.
+    pub compression: Option<Compression>,
     reads: usize,
     /// Cache for every shard together, in MiB.
     pub cache_mb: u64,
@@ -1380,6 +1423,7 @@ impl Config {
             records: 10000,
             value_bytes: 128,
             value_chunk: 0,
+            compression: None,
             reads: 100_000,
             cache_mb: 64,
             memtable_mb: 64,
@@ -1418,6 +1462,7 @@ impl Config {
                 "--records" => cfg.records = number(value(arg)) as usize,
                 "--value-bytes" => cfg.value_bytes = number(value(arg)) as usize,
                 "--value-chunk" => cfg.value_chunk = number(value(arg)) as usize,
+                "--compression" => cfg.compression = Some(Compression::parse(value(arg))),
                 "--reads" => cfg.reads = number(value(arg)) as usize,
                 "--cache-mb" => cfg.cache_mb = number(value(arg)),
                 "--memtable-mb" => cfg.memtable_mb = number(value(arg)),

@@ -42,8 +42,9 @@ mod compression;
 pub mod restart;
 
 pub use builder::{BlockBuilder, DEFAULT_RESTART_INTERVAL, INDEX_RESTART_INTERVAL, max_shared_len};
+pub(crate) use compression::Compressor;
 pub(crate) use compression::decode as decode_compressed;
-pub use compression::{Compression, Decoded};
+pub use compression::{Codec, Compression, Decoded};
 
 use crate::error::{Error, Result};
 use crate::key::InternalKey;

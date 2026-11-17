@@ -112,7 +112,10 @@ async fn a_compaction_holds_part_of_one_output_table() {
             .target_file_size(BASE)
             // Larger than the job below, so the write that loads it does not
             // flush part way through and leave two L0 tables.
-            .memtable_size(64 << 20),
+            .memtable_size(64 << 20)
+            // Uncompressed: the sizes this test needs are of values of one
+            // repeated byte, which compressed would be a fraction of them.
+            .compression(roble::Codec::None),
     )
     .await
     .expect("open");

@@ -70,6 +70,8 @@ pub use open::{Db, open, open_read_only, open_with};
 pub use options::Options;
 pub use pick::Pick;
 pub use read::{Comparison, Found, GetBuf};
+/// What [`Options::compression`] takes.
+pub use roble_format::block::Codec;
 pub use scan::Scan;
 pub use snapshot::Snapshot;
 pub use version::{Table, Version, VersionSet};

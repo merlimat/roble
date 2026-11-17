@@ -235,6 +235,8 @@ pub struct Db<F: Fs = crate::FileFs> {
     l0_stop_writes_threshold: u64,
     lbase_max_bytes: u64,
     target_file_size: u64,
+    /// What a compaction's tables are compressed with.
+    compression: roble_format::block::Codec,
     compaction_unit: u64,
     /// What replaying the MANIFEST established, and what a flush adds to.
     versions: std::cell::RefCell<VersionSet>,
@@ -547,6 +549,7 @@ async fn open_dir<E: Env>(
         lbase_max_bytes: options.lbase_max_bytes,
         compaction_unit: options.compaction_unit,
         target_file_size: options.target_file_size,
+        compression: options.compression,
         versions: std::cell::RefCell::new(versions),
     })
 }
@@ -1331,6 +1334,19 @@ impl<F: Fs> Db<F> {
         &self.compacting
     }
 
+    /// Waits until no compaction is underway.
+    ///
+    /// For a caller that drives compactions beside a task that also does,
+    /// and so finds [`Db::compact_once`] standing down because the task has
+    /// claimed what the picker chose: this is how it waits that merge out
+    /// rather than asking again in a loop. [`Db::compaction_wanted`] will
+    /// not do, because once the last merge finishes it waits for work that
+    /// may never come.
+    #[doc(hidden)]
+    pub async fn compaction_settled(&self) {
+        self.compacting.settled().await
+    }
+
     /// Waits until there is a memtable worth writing out.
     ///
     /// The other half of what a store hands to a task of its own, and the
@@ -1569,6 +1585,11 @@ impl<F: Fs> Db<F> {
     /// How many entries a compaction merges before it hands the thread back.
     pub(crate) fn compaction_unit(&self) -> u64 {
         self.compaction_unit
+    }
+
+    /// What a compaction's tables are compressed with.
+    pub(crate) fn compression(&self) -> roble_format::block::Codec {
+        self.compression
     }
 
     /// How large a table a compaction into `level` aims to write.

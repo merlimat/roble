@@ -35,7 +35,8 @@ use crate::varint;
 /// (`block.CompressionIndicator`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
-    /// 0, stored as-is. roble's own blocks are these.
+    /// 0, stored as-is: every block of L0, and any block compression did
+    /// not shrink enough to keep.
     None,
     /// 1, Snappy: what Oxia configures for L1 and below, and what Pebble
     /// falls back to below Pebblev6 (see [`Compression::MinLz`]).
@@ -106,6 +107,127 @@ impl Compression {
             Compression::MinLz => "minlz",
         }
     }
+}
+
+/// What a table writer compresses its data and index blocks with.
+///
+/// Only what Go Pebble reads at roble's pin: none, Snappy and Zstd. Pebble's
+/// own profiles for these are `NoCompression`, `SnappyCompression` and
+/// `ZstdCompression` (`sstable/block/compression.go`), the last at level 3;
+/// any level is accepted here, since the level is not recorded anywhere a
+/// reader looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Codec {
+    /// Every block stored as built, which keeps a cached block the bytes
+    /// that came off the disk (DESIGN.md §8).
+    #[default]
+    None,
+    /// Snappy, Pebble's default and what Oxia configures for L1 and below.
+    Snappy,
+    /// Zstd at the given level.
+    Zstd(i32),
+}
+
+impl Codec {
+    /// The level Pebble's `ZstdCompression` profile uses.
+    pub const ZSTD_DEFAULT_LEVEL: i32 = 3;
+
+    /// The profile name Pebble records as `rocksdb.compression`.
+    pub fn property_name(self) -> &'static str {
+        match self {
+            Codec::None => "NoCompression",
+            Codec::Snappy => "Snappy",
+            Codec::Zstd(_) => "ZSTD",
+        }
+    }
+}
+
+/// A block is stored uncompressed unless compressing it saved at least this
+/// percentage: `simpleCompressionProfile`'s `MinReductionPercent`, which is
+/// what each of the three profiles above uses.
+const MIN_REDUCTION_PERCENT: usize = 12;
+
+/// Compresses a writer's blocks, holding the buffers and the Zstd context
+/// from one block to the next.
+pub(crate) struct Compressor {
+    codec: Codec,
+    snappy: snap::raw::Encoder,
+    zstd: Option<zstd::bulk::Compressor<'static>>,
+    out: Vec<u8>,
+}
+
+impl std::fmt::Debug for Compressor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compressor")
+            .field("codec", &self.codec)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Compressor {
+    pub(crate) fn new(codec: Codec) -> Result<Self> {
+        let zstd = match codec {
+            Codec::Zstd(level) => Some(
+                zstd::bulk::Compressor::new(level)
+                    .map_err(|e| Error::Unsupported(format!("zstd level {level}: {e}")))?,
+            ),
+            _ => None,
+        };
+        Ok(Compressor {
+            codec,
+            snappy: snap::raw::Encoder::new(),
+            zstd,
+            out: Vec::new(),
+        })
+    }
+
+    /// The trailer's algorithm and the bytes to store for `block`: the
+    /// block itself when the codec is none or did not save
+    /// [`MIN_REDUCTION_PERCENT`] (`block.Compressor.Compress`).
+    pub(crate) fn compress<'a>(&'a mut self, block: &'a [u8]) -> Result<(Compression, &'a [u8])> {
+        let algorithm = match self.codec {
+            Codec::None => return Ok((Compression::None, block)),
+            Codec::Snappy => {
+                self.out.clear();
+                self.out.resize(snap::raw::max_compress_len(block.len()), 0);
+                let n = self
+                    .snappy
+                    .compress(block, &mut self.out)
+                    .map_err(|e| Error::Corrupt(format!("snappy compression: {e}")))?;
+                self.out.truncate(n);
+                Compression::Snappy
+            }
+            Codec::Zstd(_) => {
+                // RocksDB's convention, which `decode_zstd` reads back:
+                // the uncompressed length, then the frame.
+                self.out.clear();
+                put_uvarint(&mut self.out, block.len() as u64);
+                let prefix = self.out.len();
+                self.out
+                    .resize(prefix + zstd::zstd_safe::compress_bound(block.len()), 0);
+                let n = self
+                    .zstd
+                    .as_mut()
+                    .expect("a Zstd codec has a context")
+                    .compress_to_buffer(block, &mut self.out[prefix..])
+                    .map_err(|e| Error::Corrupt(format!("zstd compression: {e}")))?;
+                self.out.truncate(prefix + n);
+                Compression::Zstd
+            }
+        };
+        if self.out.len() * 100 > block.len() * (100 - MIN_REDUCTION_PERCENT) {
+            return Ok((Compression::None, block));
+        }
+        Ok((algorithm, &self.out))
+    }
+}
+
+fn put_uvarint(buf: &mut Vec<u8>, mut x: u64) {
+    while x >= 0x80 {
+        buf.push((x as u8) | 0x80);
+        x >>= 7;
+    }
+    buf.push(x as u8);
 }
 
 /// A block's bytes, borrowed when they were stored uncompressed.
@@ -206,10 +328,25 @@ fn decode_zstd(data: &[u8]) -> Result<Decoded<'static>> {
     // Pebble sizes the destination from the prefix and requires the frame to
     // fill it exactly, which is also the cheapest way to reject a lying prefix.
     let mut out = vec![0u8; len];
-    let mut decoder = ruzstd::decoding::FrameDecoder::new();
-    let written = decoder
-        .decode_all(frame, &mut out)
-        .map_err(|e| Error::Corrupt(format!("zstd block: {e}")))?;
+    // One decompression context per thread, kept: libzstd allocates one per
+    // call otherwise, which is a second allocation on every miss.
+    thread_local! {
+        static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let written = DECOMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(
+                zstd::bulk::Decompressor::new()
+                    .map_err(|e| Error::Corrupt(format!("zstd context: {e}")))?,
+            );
+        }
+        let decompressor = slot.as_mut().expect("just made");
+        decompressor
+            .decompress_to_buffer(frame, &mut out[..])
+            .map_err(|e| Error::Corrupt(format!("zstd block: {e}")))
+    })?;
     if written != len {
         return Error::corrupt(format!(
             "zstd block claims {len} bytes uncompressed but produced {written}"
@@ -334,6 +471,61 @@ mod tests {
                 text.contains(c.name()) && text.contains("no Pebble"),
                 "{c:?}: got {text:?}"
             );
+        }
+    }
+
+    /// What each codec writes, `decode` reads back as it was.
+    #[test]
+    fn every_codec_round_trips() {
+        let block: Vec<u8> = (0..4000u32)
+            .flat_map(|i| format!("/oxia/default/users/{:08} ", i % 97).into_bytes())
+            .collect();
+        for (codec, algorithm) in [
+            (Codec::Snappy, Compression::Snappy),
+            (Codec::Zstd(Codec::ZSTD_DEFAULT_LEVEL), Compression::Zstd),
+            (Codec::Zstd(1), Compression::Zstd),
+            (Codec::Zstd(19), Compression::Zstd),
+        ] {
+            let mut c = Compressor::new(codec).expect("compressor");
+            let (got, stored) = c.compress(&block).expect("compress");
+            assert_eq!(got, algorithm, "{codec:?}");
+            assert!(
+                stored.len() < block.len() / 2,
+                "{codec:?}: {}",
+                stored.len()
+            );
+            let stored = stored.to_vec();
+            let decoded = decode(got, &stored).expect("decode");
+            assert_eq!(decoded.as_slice(), &block[..], "{codec:?}");
+            // And again on the same compressor, whose buffer is reused.
+            let (_, again) = c.compress(&block[..1000]).expect("compress");
+            let again = again.to_vec();
+            assert_eq!(
+                decode(got, &again).expect("decode").as_slice(),
+                &block[..1000]
+            );
+        }
+    }
+
+    /// A block compression does not shrink by 12% is stored as built, with
+    /// the trailer saying so, which is what Pebble's `Compressor.Compress`
+    /// does — and an uncompressed block is the one a reader need not copy.
+    #[test]
+    fn a_block_that_does_not_compress_is_stored_as_built() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let noise: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for codec in [Codec::None, Codec::Snappy, Codec::Zstd(3)] {
+            let mut c = Compressor::new(codec).expect("compressor");
+            let (got, stored) = c.compress(&noise).expect("compress");
+            assert_eq!(got, Compression::None, "{codec:?}");
+            assert_eq!(stored, &noise[..], "{codec:?}");
         }
     }
 

@@ -320,7 +320,14 @@ or corrupting a Go reader; reading one means getting it right or failing loudly.
   on table format — and that is why reading the older formats stays in, since a
   long-lived database keeps them in its deep levels.
 
-Compression: roble reads none, Snappy and **Zstd**, and writes none and Snappy.
+Compression: roble reads and writes none, Snappy and **Zstd**. It writes them as
+Pebble's `NoCompression`, `SnappyCompression` and `ZstdCompression` profiles do
+at Pebblev4 (`sstable/layout.go`): data and index blocks compressed, the
+filter, range-deletion, properties and metaindex blocks never; a block that
+compression shrank by less than 12% stored as built (`MinReductionPercent`);
+and the profile name, `Snappy` or `ZSTD`, in `rocksdb.compression`. Go Pebble
+reads both back entry for entry (`compat/sst-roundtrip`'s `snappy` and `zstd`
+fixtures, each a mix of compressed and as-built blocks).
 The block indicator is RocksDB's numbering, not Pebble's internal `Algorithm`
 enum: zstd is **7** and MinLZ is 8, while 2 to 6 are zlib, bzip2, lz4, lz4hc and
 xpress, which Pebble never writes. Reading 2 as zstd — the obvious guess, since
@@ -330,9 +337,12 @@ wrong.
 A Zstd block is `uvarint(uncompressed_len)` followed by a standard Zstd frame
 (`internal/compression/zstd_nocgo.go`), RocksDB's convention, which Pebble
 keeps. A bare frame would decode happily with a stock reader, so this is a
-detail that only fails on real files. roble decodes through `ruzstd`, decode
-only, into a buffer sized from the prefix, as Pebble's own `DecompressInto`
-does; swapping it for the libzstd binding is one function if a benchmark asks.
+detail that only fails on real files. roble decodes through libzstd (the `zstd`
+crate), into a buffer sized from the prefix, as Pebble's own `DecompressInto`
+does, and encodes through it too. It used `ruzstd` to decode until it had to
+write Zstd: ruzstd's encoder implements only its fastest level, which is not
+the Zstd Pebble writes, and a measurement of Zstd against Snappy wants the
+real thing on both sides.
 
 **MinLZ is refused, because it cannot occur at the pin.** Pebble checks whether
 the table format supports the compression profile and, below Pebblev6, replaces
@@ -360,8 +370,10 @@ and MinLZ becomes live the moment the pin moves to Pebblev6 — at which point t
 `minlz` crate is already known good: 12 payloads at both levels, 24 pairs
 decoding byte-for-byte, 588 malformed inputs erroring without a panic. What it
 does *not* do is gate M2, which is what this document previously claimed.
-**Uncompressed is roble's default**, which is a format-legal choice and the one
-that keeps a cached block byte-for-byte its on-disk bytes (§8).
+**roble's default is Oxia's configuration** (§1): L0 uncompressed, L1 and
+below Snappy. `Options::compression` sets what a compaction writes, L1 and
+below — none, Snappy, or Zstd at a level; a flush writes L0 uncompressed
+whatever it says. §14 has the measurements behind the choice.
 
 ### The normative reference
 
@@ -403,7 +415,7 @@ cost a dead shard if Pebble ever produced one on its own.
 | Threading | One `!Send` store per thread, as encina: a compio runtime's, or whatever runs an env the caller implements. No locks or atomics outside wakers. Oxia already shards; a shard's store is owned by one thread. |
 | Memory | **Caches belong to the thread, not the store** (§8): the block cache and the table cache are created per thread and shared by every store on it, within one budget. This differs from encina, where each store has its own, and follows Oxia, where hundreds of shards share one cache. No `mmap`. Direct I/O is the goal and not yet the state: it needs aligned frames under the block cache (§8, §10), so v1 reads through the page cache, as Pebble does. |
 | Compaction | Cooperative on the owning thread by default, paced in units of work as encina paces a large merge, so a seeded run replays. Offload to a pool is a capability of the env, not a default (§9). |
-| Allocation | No allocation on the read path for an uncompressed block, which is cached as read. A compressed block costs one buffer per miss, which is why uncompressed is the default. Batches, iterator state and compaction buffers reuse their memory. |
+| Allocation | No allocation on the read path for an uncompressed block, which is cached as read — every L0 block. A compressed block, L1 and below by default, costs a second buffer per miss: the read, which is dropped, and the block it decompresses into, which the cache keeps. Batches, iterator state and compaction buffers reuse their memory. |
 | Keys and values | Byte strings, ordered bytewise. Limits are Pebble's, not roble's. Values are written in place; roble reads the value blocks Go writes but produces none (§3). **No custom comparator at all**: roble asserts the comparer name in the MANIFEST is `leveldb.BytewiseComparator` and refuses the database otherwise, `oxia-slash-spans` included. |
 | Snapshots | A snapshot pins a version and a sequence number, as Pebble's does. `checkpoint()` produces a directory Go Pebble opens. |
 
@@ -1254,10 +1266,9 @@ must be decompressed into a buffer, so a cached block is no longer the bytes
 that were read, and a miss allocates. Compression is recorded per block, so
 writing everything uncompressed is fully format-compatible, and it keeps
 in-place search, zero-copy reads and a cache whose budget is exact. **roble
-defaults to uncompressed and measures the trade**: Oxia already runs L0
-uncompressed, and its values are small records with shared structure, so the
-disk-space cost may be smaller than it looks. Reading Snappy and Zstd is
-required regardless, for files Go wrote (§3).
+measured the trade** (`bench --compression`, §14) and compresses L1 and below
+with Snappy by default, leaving L0 as read, which is how Oxia runs Pebble.
+Reading Snappy and Zstd is required regardless, for files Go wrote (§3).
 
 **As built, an uncompressed block is kept in the buffer it was read into** —
 which for a while it was not. A miss copied the block out of its read to drop
@@ -1924,27 +1935,91 @@ Ordered so that the compatibility risk is resolved before the engine exists.
 
 Stated rather than quietly decided:
 
-- **Uncompressed (§8) is measured now, and it is not a default — it is the only
-  setting.** `roble-format`'s writer puts `NoCompression` in every table's
-  properties and takes no option; the format crate decompresses Snappy and Zstd
-  on the way in, so roble reads a compressed table and can never write one.
-  That is a larger claim than "uncompressed by default" and §8 should say it.
+- **Compression (§8) is settled: Snappy below L0, L0 uncompressed** — Oxia's
+  own configuration, and now roble's default (`Options::compression`). Until
+  this, roble could read compressed tables and never write one, and held three
+  to four and a half times the disk of Pebble or RocksDB on compressible values
+  (`--value-chunk 32` and `8`) for no measurable read gain against a warm
+  cache. A store beyond memory is where it cost: the bytes that did not fit
+  were bytes read from the device.
 
-  `bench/`'s `--value-chunk` dials how compressible a value is — one random
-  chunk repeated to fill it — and over 240,000 records the answer is one-sided:
+  The choice is among what Go Pebble reads at the pin: none, Snappy and Zstd.
+  **LZ4 is not one of them** — Pebble's `CompressionIndicator.Algorithm`
+  panics on indicator 4 — so a table with one LZ4 block is a table Pebble
+  cannot open. MinLZ, the codec Pebble prefers on amd64, becomes writable
+  with Pebblev6 (§3). Both were measured anyway, as references.
 
-  | each value is | roble | Pebble | RocksDB |
+  CPU per 16 KiB data block, one core of the Linux VM, over 4,000 blocks of a
+  settled store whose values are a 32-byte chunk repeated four times
+  (decompression includes the buffer it lands in, as a miss pays):
+
+  | codec | stored | compress | decompress |
   |---|---|---|---|
-  | 128 random bytes | 33.9 MiB | 33.8 | 33.6 |
-  | a 32-byte chunk, 4x | **33.9 MiB** | 11.0 | 11.3 |
-  | an 8-byte chunk, 16x | **33.9 MiB** | 7.5 | 5.8 |
+  | none | 1.000 | — | 0.3 us (a copy) |
+  | Snappy | 0.340 | 5.5 us | 1.8 us |
+  | LZ4, reference | 0.333 | 6.6 us | 1.9 us |
+  | MinLZ fastest, reference | 0.331 | 7.8 us | 1.2 us |
+  | MinLZ balanced, reference | 0.320 | 15.0 us | 1.3 us |
+  | Zstd 1 | 0.295 | 15.9 us | 2.5 us |
+  | Zstd 3, Pebble's level | 0.292 | 22.6 us | 3.0 us |
+  | Zstd 6 | 0.289 | 44.9 us | 2.9 us |
 
-  roble holds three to four and a half times the disk of either, and gains
-  nothing measurable for it: its scan rate moves by 2% across that range, so
-  the decompression Pebble pays for does not show against a warm cache. Oxia's
-  values are serialized records, which sit inside that range rather than at
-  either end, so the cost is real for the workload roble exists to serve.
-  Writing Snappy is the obvious answer and it is not scheduled.
+  LZ4 buys nothing over Snappy here. On incompressible values every codec
+  stores the block as built (Pebble's 12% rule) and still pays to find that
+  out: Snappy 5.9 us a block, Zstd 3 79 us. MinLZ is the Rust `minlz` crate,
+  whose encoder is not Go's, so its row says what MinLZ is like rather than
+  what Pebble would write.
+
+  End to end, the beyond-memory scenario (six million records, one core,
+  512 MiB, `--value-chunk 32`), roble uncompressed against its new default,
+  with RocksDB at Snappy on every level beside them:
+
+  | | roble none | roble Snappy | RocksDB Snappy |
+  |---|---|---|---|
+  | store after settle | 846.5 MiB | **293.2** | 280.1 |
+  | settle cpu | 3.76 s | 3.48 | 1.11 |
+  | get | 43,588/s | **83,161** | 92,799 |
+  | floor | 40,692/s | **77,973** | 71,556 |
+  | scan-short | 14,390/s | **22,973** | 27,661 |
+
+  Snappy's compaction CPU is level with none's, within one round's noise:
+  3.48 s against 3.76 here, 4.15 against 3.69 in the earlier round — the CPU
+  compression spends is about what writing a third of the bytes saves. Every
+  roble settle figure in this item includes the bench's settle loop polling
+  the picker while the shard's own task merged — some 680,000 times a run.
+  It now waits instead (`Db::compaction_settled`), which took the Snappy
+  settle from 3.67 and 3.45 s to 2.92 and 2.72 in two interleaved rounds.
+  RocksDB's 1.11 s is not the same work either: its threads did most of the
+  merging during the load, whose row carries it (4.80 s against roble's
+  3.63), and its flushes compress where roble's L0 does not, so roble writes
+  1.83 GB across load and settle against RocksDB's 0.87. It
+  close to doubles every random read, because a third of the store is what
+  has to come from the disk. At `--value-chunk 8` Snappy's 156 MiB fits the
+  budget whole and `get` went from 45,952 to 425,180 a second (one round,
+  before the fix below). The
+  load row's size stays larger than RocksDB's because roble leaves L0
+  uncompressed and RocksDB does not.
+
+  **Zstd is an option, not the default.** It stores 13% less than Snappy at
+  `--value-chunk 32` (255 against 293 MiB) for 1.4x (level 1) to 2.2x
+  (level 3) the settle CPU, and once a store fits the budget its slower
+  decompression shows: at `--value-chunk 8`, Zstd 3's `get` was 324,397 a
+  second against Snappy's 425,180. On incompressible values it spends 2.3x
+  (level 1) and 3.5x (level 3) none's settle CPU for nothing. The Zstd rows
+  and that `--value-chunk 8` comparison are one round measured before the fix
+  below, when compressed tables were split smaller than their target.
+
+  **The fix:** a compaction split its outputs on the bytes of keys and values
+  that went in, which with compression closes every table at a fraction of
+  its target. It now splits on `TableWriter::estimated_size` — blocks as
+  stored, plus the open block and index — as Pebble's `EstimatedSize` does.
+  That moves uncompressed tables too, slightly: the estimate now counts the
+  blocks as built, prefix compression and index included, where it counted
+  raw keys and values.
+  One round per cell throughout; the noise a single round carries under this
+  standard (`bench/README.md`) is far below a 1.9x read change but not below
+  the few-percent differences in the in-cache scenario, which moved within
+  noise for every codec.
 - **Cooperative compaction (§9)** is a bet on small shards. The offload path is
   designed but unbuilt; the benchmark decides whether it gets built, and the
   `cpu s` column is where to look — a cooperative compaction's cost lands on

@@ -691,9 +691,10 @@ async fn fetch<D: Disk>(
         // **The read is the block, less its trailer**, so the buffer it was
         // read into is the one kept. A stored block's bytes are the first
         // `length` of its span, and an uncompressed one is those bytes as they
-        // are — which is every block roble writes. This used to copy them out
-        // to drop the five trailing bytes: a second block-sized allocation and
-        // a 16 KiB copy on every miss, for a buffer then thrown away.
+        // are — which is every L0 block roble writes. This used to copy them
+        // out to drop the five trailing bytes: a second block-sized
+        // allocation and a 16 KiB copy on every miss, for a buffer then
+        // thrown away.
         Decoded::Borrowed(block) => {
             debug_assert!(
                 std::ptr::eq(block.as_ptr(), raw.as_ptr()),

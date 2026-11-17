@@ -838,6 +838,9 @@ async fn a_skip_past_a_range_deletion_passes_a_deeper_table_holding_a_later_key_
             .create_if_missing(true)
             .disable_automatic_compactions(true)
             .target_file_size(64 << 10)
+            // Uncompressed: the sizes this test needs are of values of one
+            // repeated byte, which compressed would be a fraction of them.
+            .compression(roble::Codec::None)
     };
     {
         let db = roble::open_with(&env, &dir, options()).await.expect("open");
@@ -937,7 +940,10 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         Options::new()
             .create_if_missing(true)
             .disable_automatic_compactions(true)
-            .target_file_size(16 << 10),
+            .target_file_size(16 << 10)
+            // Uncompressed: the sizes this test needs are of values of one
+            // repeated byte, which compressed would be a fraction of them.
+            .compression(roble::Codec::None),
     )
     .await
     .expect("open");
