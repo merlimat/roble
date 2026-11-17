@@ -74,6 +74,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a static musl binary, and it builds for its
+      # own host unless told otherwise. Address Sanitizer cannot link against a
+      # static libc, so the target is the toolchain's host, named explicitly.
+      - name: Name the target triple
+        run: |
+          echo "FUZZ_TRIPLE=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
       # Every target builds the same crate, so they share one build cache.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,7 +101,7 @@ jobs:
       - name: Fuzz for ${{ env.SECONDS_PER_TARGET }} seconds
         working-directory: format
         run: >-
-          cargo fuzz run ${{ matrix.target }} --
+          cargo fuzz run --target "$FUZZ_TRIPLE" ${{ matrix.target }} --
           -max_total_time=${{ env.SECONDS_PER_TARGET }}
           -malloc_limit_mb=256
 
@@ -114,7 +120,7 @@ jobs:
       - name: Minimise the corpus
         if: success() && github.event_name != 'pull_request'
         working-directory: format
-        run: cargo fuzz cmin ${{ matrix.target }}
+        run: cargo fuzz cmin --target "$FUZZ_TRIPLE" ${{ matrix.target }}
       - name: Save the corpus
         if: success() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
