@@ -55,19 +55,19 @@ use crate::error::Result;
 use crate::open::Opened;
 use crate::version::Version;
 
-/// How many tables L0 may hold before a write waits for it to drain.
+/// How deep L0 may grow, in layers, before a write waits for it to drain.
 ///
-/// Pebble's `L0StopWritesThreshold`, and the same twelve. Pebble counts
-/// sublevels where roble counts tables, which roble has no sublevels to tell
-/// apart yet; until it has, every L0 table is a sublevel of its own and the
-/// two numbers are the same number.
+/// Pebble's `L0StopWritesThreshold`, and the same twelve, counted the way
+/// Pebble counts it: in sublevels (`l0_depth`), not in tables. Twelve
+/// tables a read crosses in one seek are one layer and do not stop a write.
 pub const L0_STOP_WRITES_THRESHOLD: u64 = 12;
 
-/// How many tables L0 may hold before it is worth compacting.
+/// How deep L0 may grow, in layers, before it is worth compacting.
 ///
-/// Pebble's `L0CompactionThreshold`. L0 is counted rather than measured
-/// because its tables overlap: what makes L0 expensive is that a read
-/// consults every one of them, whatever they weigh.
+/// Pebble's `L0CompactionThreshold`, counted in sublevels (`l0_depth`) like
+/// the stop-writes line. L0 is counted rather than measured because its
+/// tables overlap: what makes L0 expensive is that a read consults every
+/// layer, whatever the tables in it weigh.
 pub const L0_COMPACTION_THRESHOLD: u64 = 4;
 
 /// How many bytes L1 may hold.
