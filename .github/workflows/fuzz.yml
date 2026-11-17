@@ -15,8 +15,8 @@
 name: Fuzz
 
 # The fuzzing of DESIGN.md §12: the format crate's decoders one file at a
-# time (format/fuzz/README.md), and the engine opening a damaged database
-# and answering against a model (fuzz/README.md).
+# time (format/fuzz/README.md), and the engine opening a damaged database,
+# answering against a model, and surviving a failing disk (fuzz/README.md).
 #
 # A pull request that touches either crate gets a minute per target: long
 # enough to catch a decoder that now panics on something the corpus already
@@ -85,6 +85,7 @@ jobs:
           - { crate: format, dir: format, target: block_cursor }
           - { crate: engine, dir: ., target: open_corrupt }
           - { crate: engine, dir: ., target: model }
+          - { crate: engine, dir: ., target: crash }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

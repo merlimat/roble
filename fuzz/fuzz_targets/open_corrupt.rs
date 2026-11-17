@@ -31,14 +31,14 @@
 
 #![no_main]
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::PathBuf;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use roble::sim::SimEnv;
-use roble::{Comparison, Db, Disk, Fs, Options, WriteBuf};
+use roble::{Comparison, Db, Fs, Options};
 use roble_format::batch::Batch;
+use roble_fuzz::{Files, fixtures, install};
 
 #[derive(Arbitrary, Debug)]
 struct Case {
@@ -86,36 +86,6 @@ impl Name {
         let ok = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0']);
         ok.then_some(name)
     }
-}
-
-type Files = Vec<(String, Vec<u8>)>;
-
-/// The golden databases, read once.
-fn fixtures() -> &'static [Files] {
-    static FIXTURES: OnceLock<Vec<Files>> = OnceLock::new();
-    FIXTURES.get_or_init(|| {
-        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/golden");
-        let mut dbs: Vec<PathBuf> = std::fs::read_dir(&golden)
-            .expect("tests/golden")
-            .map(|e| e.expect("entry").path())
-            .filter(|p| p.is_dir())
-            .collect();
-        dbs.sort();
-        dbs.iter()
-            .map(|db| {
-                let mut files: Files = std::fs::read_dir(db)
-                    .expect("a golden database")
-                    .map(|e| {
-                        let e = e.expect("entry");
-                        let name = e.file_name().into_string().expect("UTF-8 name");
-                        (name, std::fs::read(e.path()).expect("read"))
-                    })
-                    .collect();
-                files.sort();
-                files
-            })
-            .collect()
-    })
 }
 
 fn mutate(files: &mut Files, m: &Mutation) {
@@ -226,17 +196,8 @@ async fn run(case: Case) {
     }
 
     let env = SimEnv::new();
-    let fs = env.sim();
     let dir = PathBuf::from("/db");
-    fs.mkdir_all(&dir).await.expect("mkdir");
-    for (name, bytes) in files {
-        let disk = fs.create(&dir.join(name)).await.expect("create");
-        let (r, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
-        r.expect("write");
-        disk.sync(()).await.expect("sync");
-        disk.close().await.expect("close");
-    }
-    fs.sync_dir(&dir).await.expect("sync dir");
+    install(env.sim(), &dir, &files).await;
 
     let options = Options::new().disable_automatic_compactions(true);
     let opened = if case.read_only {
