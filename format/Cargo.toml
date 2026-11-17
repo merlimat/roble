@@ -1,9 +1,8 @@
 [package]
 name = "roble-format"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
 description = "Encodes and decodes Pebble's on-disk formats. No I/O, no async, no engine."
 
 [dependencies]
