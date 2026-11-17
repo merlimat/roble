@@ -73,28 +73,24 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
         DbCommand::Put { key, value } => {
             let db = open(dir, true).await?;
             let mut batch = Batch::new();
-            batch.put(&key, &value).map_err(|e| format_at(dir, &e))?;
+            batch.put(&key, &value).at(dir)?;
             write(&db, dir, &mut batch).await?;
         }
         DbCommand::Delete { key } => {
             let db = open(dir, false).await?;
             let mut batch = Batch::new();
-            batch.delete(&key).map_err(|e| format_at(dir, &e))?;
+            batch.delete(&key).at(dir)?;
             write(&db, dir, &mut batch).await?;
         }
         DbCommand::DeleteRange { start, end } => {
             let db = open(dir, false).await?;
             let mut batch = Batch::new();
-            batch
-                .delete_range(&start, &end)
-                .map_err(|e| format_at(dir, &e))?;
+            batch.delete_range(&start, &end).at(dir)?;
             write(&db, dir, &mut batch).await?;
         }
         DbCommand::Get { key, hexdump } => {
             let found = reading(dir, async |db| {
-                db.get(&key, Comparison::Equal)
-                    .await
-                    .map_err(|e| at(dir, &e))
+                db.get(&key, Comparison::Equal).await.at(dir)
             })
             .await?;
             let Some(found) = found else {
@@ -123,12 +119,12 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
                     let mut scan = db
                         .scan_range(start.as_deref(), end.as_deref())
                         .await
-                        .map_err(|e| at(dir, &e))?;
+                        .at(dir)?;
                     match &from {
                         Some(key) => scan.seek_ge(key).await,
                         None => scan.first().await,
                     }
-                    .map_err(|e| at(dir, &e))?;
+                    .at(dir)?;
                     while scan.is_valid() {
                         let (key, value) = (scan.key(), scan.value());
                         if hexdump {
@@ -144,7 +140,7 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
                         next.push(0);
                         from = Some(next);
                         stale = 0;
-                        scan.next().await.map_err(|e| at(dir, &e))?;
+                        scan.next().await.at(dir)?;
                     }
                     Ok(())
                 }
@@ -181,18 +177,21 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
 }
 
 /// Prints the table `tables` gives: a row for each table the version names.
-fn tables(db: &Opened<FileFs>, dir: &Path, out: &mut impl Write) -> Result<()> {
+///
+/// Into a buffer, which a write cannot fail on, so what is written is not
+/// checked here. The buffer goes to the output once the read is done.
+fn tables(db: &Opened<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
     let versions = db.versions();
-    writeln!(
+    let _ = writeln!(
         out,
         "level\tfile\tsize\tseqs\tformat\tcompression\tentries\tdeletions\t\
          range-dels\traw\tratio\tsmallest\tlargest"
-    )?;
+    );
     for (level, tables) in versions.version.levels() {
         for t in tables {
             let file = files::table_filename(t.file_num);
             let p = properties_of(&dir.join(&file))?;
-            write!(
+            let _ = write!(
                 out,
                 "L{level}\t{file}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
                 t.size,
@@ -205,23 +204,24 @@ fn tables(db: &Opened<FileFs>, dir: &Path, out: &mut impl Write) -> Result<()> {
                 shown(p.range_deletions),
                 shown(p.raw()),
                 p.ratio()
-            )?;
-            write_text(out, t.smallest_user_key().map_err(|e| at(dir, &e))?)?;
-            out.write_all(b"\t")?;
-            write_text(out, t.largest_user_key().map_err(|e| at(dir, &e))?)?;
-            out.write_all(b"\n")?;
+            );
+            let _ = write_text(out, t.smallest_user_key().at(dir)?);
+            let _ = out.write_all(b"\t");
+            let _ = write_text(out, t.largest_user_key().at(dir)?);
+            let _ = out.write_all(b"\n");
         }
     }
     Ok(())
 }
 
-/// Prints the summary `stats` gives, then the table of levels.
-async fn stats(db: &Opened<FileFs>, dir: &Path, out: &mut impl Write) -> Result<()> {
-    let disk = db.disk_usage().await.map_err(|e| at(dir, &e))?;
+/// Prints the summary `stats` gives, then the table of levels, into a buffer
+/// as [`tables`] does.
+async fn stats(db: &Opened<FileFs>, dir: &Path, out: &mut Vec<u8>) -> Result<()> {
+    let disk = db.disk_usage().await.at(dir)?;
     let (sublevels, levels, debt) = {
         let versions = db.versions();
         let version = &versions.version;
-        let sublevels = version.l0_sublevels().map_err(|e| at(dir, &e))?;
+        let sublevels = version.l0_sublevels().at(dir)?;
         let mut levels: Vec<Level> = Vec::new();
         for (level, tables) in version.levels() {
             let mut row = Level {
@@ -252,22 +252,22 @@ async fn stats(db: &Opened<FileFs>, dir: &Path, out: &mut impl Write) -> Result<
         None => "none".to_string(),
     };
 
-    writeln!(out, "format version  {:>24}", db.format_version)?;
-    writeln!(out, "manifest        {:>24}", db.manifest_filename())?;
-    writeln!(out, "wal             {wal:>24}")?;
-    writeln!(out, "unflushed bytes {:>24}", db.unflushed_bytes())?;
-    writeln!(out, "disk usage      {disk:>24}")?;
-    writeln!(out, "tables          {table_count:>24}")?;
-    writeln!(out, "table bytes     {table_bytes:>24}")?;
-    writeln!(out, "table entries   {entries:>24}")?;
-    writeln!(out, "l0 sublevels    {sublevels:>24}")?;
-    writeln!(out, "compaction debt {debt:>24}")?;
-    writeln!(out, "next compaction {next:>24}")?;
+    let _ = writeln!(out, "format version  {:>24}", db.format_version);
+    let _ = writeln!(out, "manifest        {:>24}", db.manifest_filename());
+    let _ = writeln!(out, "wal             {wal:>24}");
+    let _ = writeln!(out, "unflushed bytes {:>24}", db.unflushed_bytes());
+    let _ = writeln!(out, "disk usage      {disk:>24}");
+    let _ = writeln!(out, "tables          {table_count:>24}");
+    let _ = writeln!(out, "table bytes     {table_bytes:>24}");
+    let _ = writeln!(out, "table entries   {entries:>24}");
+    let _ = writeln!(out, "l0 sublevels    {sublevels:>24}");
+    let _ = writeln!(out, "compaction debt {debt:>24}");
+    let _ = writeln!(out, "next compaction {next:>24}");
 
-    writeln!(
+    let _ = writeln!(
         out,
         "\nlevel     tables            bytes    share      entries    deletions    ratio"
-    )?;
+    );
     for l in levels {
         let share = if table_bytes == 0 {
             0.0
@@ -275,11 +275,11 @@ async fn stats(db: &Opened<FileFs>, dir: &Path, out: &mut impl Write) -> Result<
             100.0 * l.bytes as f64 / table_bytes as f64
         };
         let ratio = ratio(Some(l.raw), Some(l.data));
-        writeln!(
+        let _ = writeln!(
             out,
             "{:>5} {:>10} {:>16} {share:>7.1}% {:>12} {:>12} {ratio:>8}",
             l.level, l.tables, l.bytes, l.entries, l.deletions
-        )?;
+        );
     }
     Ok(())
 }
@@ -347,50 +347,54 @@ fn properties_of(path: &Path) -> Result<TableProperties> {
     use roble_format::{BlockHandle, ChecksumType, FOOTER_LEN, Footer};
     use std::io::{Read, Seek, SeekFrom};
 
-    let failed = |e: &dyn std::fmt::Display| Error::Message(format!("{}: {e}", path.display()));
     // A table the version names and the directory no longer holds is one the
     // process writing the database retired after this one read the version.
     let file = std::fs::File::open(path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => Error::Stale(format!(
-            "{}: {e}: the process writing the database retired it",
+            "{}: stale: {e}: the process writing the database retired it",
             path.display()
         )),
-        _ => failed(&e),
+        _ => Error::Message(format!("{}: {e}", path.display())),
     })?;
     let read_at = |offset: u64, len: u64| -> Result<Vec<u8>> {
         let mut buf = vec![0; len as usize];
         let mut file = &file;
         file.seek(SeekFrom::Start(offset))
             .and_then(|_| file.read_exact(&mut buf))
-            .map_err(|e| failed(&e))?;
+            .at(path)?;
         Ok(buf)
     };
     let block = |handle: BlockHandle, checksum: ChecksumType| -> Result<Vec<u8>> {
         let fetched = read_at(handle.offset, handle.span_len())?;
         Ok(decode_fetched(&fetched, handle.offset, checksum)
-            .map_err(|e| failed(&e))?
+            .at(path)?
             .as_slice()
             .to_vec())
     };
 
-    let size = file.metadata().map_err(|e| failed(&e))?.len();
+    let size = file.metadata().at(path)?.len();
     let tail_len = (FOOTER_LEN as u64).min(size);
     let tail = read_at(size - tail_len, tail_len)?;
-    let footer = Footer::decode(&tail, size).map_err(|e| failed(&e))?;
+    let footer = Footer::decode(&tail, size).at(path)?;
     let meta = block(footer.metaindex, footer.checksum)?;
-    let metaindex =
-        Metaindex::parse(&Block::new(&meta).map_err(|e| failed(&e))?).map_err(|e| failed(&e))?;
+    let metaindex = Metaindex::parse(&Block::new(&meta).at(path)?).at(path)?;
+    // Untested, with a reason (§12): every writer that exists emits a
+    // properties block, so a metaindex without one is a table built by hand.
+    // The engine refuses such a table when it opens one too, and is untested
+    // there for the same reason.
     let Some(handle) = metaindex.properties else {
-        return Err(failed(&"the table has no properties block"));
+        return Err(Error::Message(format!(
+            "{}: the table has no properties block",
+            path.display()
+        )));
     };
     let bytes = block(handle, footer.checksum)?;
-    let p =
-        Properties::decode(&Block::new(&bytes).map_err(|e| failed(&e))?).map_err(|e| failed(&e))?;
-    let number = |name: &str| p.uvarint(name).map_err(|e| failed(&e));
+    let p = Properties::decode(&Block::new(&bytes).at(path)?).at(path)?;
+    let number = |name: &str| p.uvarint(name).at(path);
     Ok(TableProperties {
         format: footer.format.name(),
         compression: p.string("rocksdb.compression").unwrap_or("-").to_string(),
-        entries: p.num_entries().map_err(|e| failed(&e))?,
+        entries: p.num_entries().at(path)?,
         deletions: number("rocksdb.deleted.keys")?,
         range_deletions: number("rocksdb.num.range-deletions")?,
         raw_keys: number("rocksdb.raw.key.size")?,
@@ -410,9 +414,7 @@ async fn open(dir: &Path, create: bool) -> Result<Opened<FileFs>> {
         a_database_in(dir)?;
     }
     let options = Options::<FileFs>::default().create_if_missing(create);
-    roble::open_with(&DefaultEnv, dir, options)
-        .await
-        .map_err(|e| at(dir, &e))
+    roble::open_with(&DefaultEnv, dir, options).await.at(dir)
 }
 
 /// Opens the database in `dir` to read, beside any process that has it open
@@ -421,19 +423,19 @@ async fn open_read_only(dir: &Path) -> Result<Opened<FileFs>> {
     a_database_in(dir)?;
     roble::open_read_only(&DefaultEnv, dir, Options::default())
         .await
-        .map_err(|e| at(dir, &e))
+        .at(dir)
 }
 
 /// Refuses a directory that holds no database, in the words the command
 /// uses for it whether it reads or writes.
 fn a_database_in(dir: &Path) -> Result<()> {
-    let listing = std::fs::read_dir(dir).map_err(|e| at_path(dir, &e))?;
+    let listing = std::fs::read_dir(dir).at(dir)?;
     let names: Vec<String> = listing
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    let marker = files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)
-        .map_err(|e| format_at(dir, &e))?;
+    let marker =
+        files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST).at(dir)?;
     if marker.is_none() {
         return Err(Error::Message(format!(
             "{}: no database here",
@@ -466,23 +468,40 @@ async fn reading<T>(
 /// Writes `batch` and waits for it to be synced: the process exits straight
 /// after, so anything less would leave the write to the machine staying up.
 async fn write(db: &Opened<FileFs>, dir: &Path, batch: &mut Batch) -> Result<()> {
-    db.write(batch, true).await.map_err(|e| at(dir, &e))
+    db.write(batch, true).await.at(dir)
 }
 
-fn at(dir: &Path, e: &roble::Error) -> Error {
-    let m = format!("{}: {e}", dir.display());
-    match e {
-        roble::Error::Stale(_) => Error::Stale(m),
-        _ => Error::Message(m),
+/// Names the directory or file an error is about: every message this
+/// command prints starts with the path it concerns.
+///
+/// A method rather than a `map_err` at each call, so that what turns an error
+/// into a message is written once for each kind of error there is.
+trait At<T> {
+    fn at(self, path: &Path) -> Result<T>;
+}
+
+impl<T> At<T> for roble::Result<T> {
+    fn at(self, path: &Path) -> Result<T> {
+        self.map_err(|e| {
+            let m = format!("{}: {e}", path.display());
+            match e {
+                roble::Error::Stale(_) => Error::Stale(m),
+                _ => Error::Message(m),
+            }
+        })
     }
 }
 
-fn format_at(dir: &Path, e: &roble_format::Error) -> Error {
-    Error::Message(format!("{}: {e}", dir.display()))
+impl<T> At<T> for roble_format::Result<T> {
+    fn at(self, path: &Path) -> Result<T> {
+        self.map_err(|e| Error::Message(format!("{}: {e}", path.display())))
+    }
 }
 
-fn at_path(dir: &Path, e: &io::Error) -> Error {
-    Error::Message(format!("{}: {e}", dir.display()))
+impl<T> At<T> for io::Result<T> {
+    fn at(self, path: &Path) -> Result<T> {
+        self.map_err(|e| Error::Message(format!("{}: {e}", path.display())))
+    }
 }
 
 /// Decodes an argument, in which `\xNN` stands for the byte with hex value
@@ -608,6 +627,23 @@ mod tests {
                 assert_eq!(got, whole.uvarint(property).unwrap(), "{name} {property}");
             }
         }
+    }
+
+    /// A table that has gone is stale, since the process writing the
+    /// database retires tables; anything else that stops it opening is not.
+    #[test]
+    fn a_table_that_cannot_be_opened_says_why() {
+        let gone = properties_of(Path::new("/nonexistent/000001.sst"));
+        assert!(
+            matches!(gone, Err(Error::Stale(_))),
+            "a missing table is stale"
+        );
+        // A path no file system takes.
+        let refused = properties_of(Path::new("table\0.sst"));
+        assert!(
+            matches!(&refused, Err(Error::Message(m)) if m.contains("table")),
+            "the refusal names the table"
+        );
     }
 
     #[test]

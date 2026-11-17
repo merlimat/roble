@@ -196,6 +196,7 @@ fn usage_and_bad_arguments_behave() {
         vec!["manifest", "dump"],
         vec!["sst", "dump", "--nonsense", "x"],
         vec!["put", r"\x0g", "v"],
+        vec!["put", r"\q", "v"],
     ] {
         let out = roble(&args);
         assert_eq!(
@@ -845,4 +846,89 @@ fn reads_carry_on_beside_a_writer_that_compacts() {
     stop.store(true, Ordering::Relaxed);
     let rounds = writer.join().expect("the writer");
     assert!(rounds > 0, "the writer never wrote");
+}
+
+/// A database whose keys `k000`..`k199` are in several L1 tables, written
+/// by the engine directly, and the file of the last of them.
+fn a_database_in_several_tables() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let runtime = compio::runtime::Runtime::new().expect("runtime");
+    let last = runtime.block_on(async {
+        let options = roble::Options::default()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .target_file_size(1024);
+        let db = roble::open_with(&roble::DefaultEnv, &path, options)
+            .await
+            .expect("open");
+        let mut batch = roble_format::batch::Batch::new();
+        for i in 0..200 {
+            batch
+                .put(format!("k{i:03}").as_bytes(), &[b'v'; 64])
+                .expect("put");
+        }
+        db.write(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush");
+        let l0: Vec<u64> = db
+            .versions()
+            .version
+            .level(0)
+            .iter()
+            .map(|t| t.file_num)
+            .collect();
+        let out = db.compact(0, &l0).await.expect("compact");
+        assert!(out.len() > 2, "the compaction should split: {out:?}");
+        *out.last().unwrap()
+    });
+    let file = path.join(roble_format::files::table_filename(last));
+    (dir, file)
+}
+
+/// A table the version names and the directory has lost stays lost however
+/// often a read opens the database again: the read gives up, after the
+/// retries a writer retiring files would have been given, and says why.
+#[test]
+fn a_read_gives_up_on_a_table_that_stays_gone() {
+    let (db, last) = a_database_in_several_tables();
+    std::fs::remove_file(&last).expect("remove the last table");
+
+    // A scan prints what it reads before the table it cannot open, once each,
+    // and every reopening resumes after the last key it printed.
+    let out = on(db.path(), &["scan"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(stderr(&out).contains("stale"), "{}", stderr(&out));
+    let text = stdout(&out);
+    let keys: Vec<&str> = text
+        .lines()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
+    assert!(
+        !keys.is_empty(),
+        "the scan printed nothing before the lost table"
+    );
+    let mut sorted = keys.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(keys, sorted, "a key was printed twice or out of order");
+
+    for args in [&["get", "k199"][..], &["stats"], &["tables"]] {
+        let out = on(db.path(), args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(stdout(&out).is_empty(), "{args:?}: {}", stdout(&out));
+        assert!(stderr(&out).contains("stale"), "{args:?}: {}", stderr(&out));
+    }
+}
+
+/// A marker file the format crate cannot read is refused with the directory
+/// it was found in, before anything is opened.
+#[test]
+fn a_directory_with_an_unreadable_marker_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("marker.bad"), b"").expect("write");
+    let out = on(tmp.path(), &["get", "k"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = stderr(&out);
+    assert!(err.contains("marker.bad"), "{err}");
+    assert!(err.contains(tmp.path().to_str().unwrap()), "{err}");
 }
