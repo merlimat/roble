@@ -48,6 +48,7 @@ const VERSION_LEN: usize = 4;
 
 /// The table format, which decides how a block's entries are laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TableFormat {
     /// `TableFormatRocksDBv2`, the oldest a Pebble database can hold.
     RocksDBv2,

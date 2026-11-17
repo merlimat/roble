@@ -79,6 +79,11 @@ const CUSTOM_TAG_SYNTHETIC_SUFFIX: u64 = 68;
 const CUSTOM_TAG_BLOB_REFERENCES: u64 = 69;
 
 /// A table added to a level by an edit.
+///
+/// Not `#[non_exhaustive]`, and on purpose: its fields are the MANIFEST tags
+/// Pebble writes at the pinned format, so one more is a new format to read,
+/// which is a breaking change whatever this struct says. Left open, it can
+/// still be built as a literal with `..Default::default()`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NewTable {
     /// The level the table enters.
@@ -102,6 +107,8 @@ pub struct NewTable {
 }
 
 /// One MANIFEST record: a change to the set of files.
+///
+/// Not `#[non_exhaustive]`, for the reason [`NewTable`] is not.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VersionEdit {
     /// The comparer the database was created with.

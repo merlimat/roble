@@ -34,6 +34,7 @@ use crate::varint;
 /// The algorithm named by a block's trailer byte
 /// (`block.CompressionIndicator`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     /// 0, stored as-is. roble's own blocks are these.
     None,
