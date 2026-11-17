@@ -21,8 +21,10 @@
 //! `open` of a directory with no database in it is an error or a database
 //! (§6, `crate::create`).
 
-use opentelemetry::KeyValue;
+#[cfg(feature = "opentelemetry")]
 use opentelemetry::metrics::MeterProvider;
+
+use crate::metrics::{KeyValue, NanoMeter};
 
 use crate::cache::Caches;
 use crate::env::Fs;
@@ -56,7 +58,7 @@ pub struct Options<F: Fs> {
     /// below it twice as large.
     pub(crate) target_file_size: u64,
     /// Where the store's metrics go, if anywhere (`crate::metrics`).
-    pub(crate) meter: Option<nanometer::Meter>,
+    pub(crate) meter: Option<NanoMeter>,
     /// Attributes added to every series, after `roble.store`.
     pub(crate) metric_attributes: Vec<KeyValue>,
 }
@@ -264,6 +266,7 @@ impl<F: Fs> Options<F> {
     /// [`metric_attributes`](Self::metric_attributes). Histograms export only
     /// through nanometer's `Producer`, which the app registers with its
     /// metric reader: see [nanometer](https://docs.rs/nanometer).
+    #[cfg(feature = "opentelemetry")]
     pub fn meter_provider<P: MeterProvider + ?Sized>(mut self, provider: &P) -> Self {
         self.meter = Some(nanometer::Meter::new(provider, crate::metrics::SCOPE));
         self
@@ -272,6 +275,7 @@ impl<F: Fs> Options<F> {
     /// Adds `attributes` to every series of the store's metrics, after
     /// `roble.store`: one of them with that key replaces the store's
     /// directory.
+    #[cfg(feature = "opentelemetry")]
     pub fn metric_attributes(mut self, attributes: &[KeyValue]) -> Self {
         self.metric_attributes.extend_from_slice(attributes);
         self

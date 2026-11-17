@@ -230,6 +230,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Clock<K, V> {
     }
 
     /// Records the handles this cache reports through, and its budget.
+    #[cfg(feature = "opentelemetry")]
     pub(crate) fn record_into(
         &mut self,
         metrics: std::rc::Rc<crate::metrics::CacheMetrics>,
@@ -417,6 +418,7 @@ impl<F: Fs> Caches<F> {
     /// facts about the thread, and a series per store would be the same
     /// number repeated. Which store *looked* in it is the store's own
     /// `roble.cache.lookups`.
+    #[cfg(feature = "opentelemetry")]
     pub fn meter_provider<P: opentelemetry::metrics::MeterProvider + ?Sized>(
         self,
         provider: &P,

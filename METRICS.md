@@ -21,6 +21,10 @@ let db = open_with(&DefaultEnv, "data/shard-7".as_ref(), options).await?;
 - The metrics come under the instrumentation scope `roble`.
 - roble uses `opentelemetry` 0.33.1, the version nanometer pins, so the app's
   provider must come from that version too.
+- All of this is the `opentelemetry` feature, on by default. An app that wants
+  no metrics, or uses another `opentelemetry` and cannot share the pin, turns it
+  off with `default-features = false`: `meter_provider` and
+  `metric_attributes` are then gone, and neither crate is in its dependency tree.
 - Counters and up-down counters export through any provider. Histograms export
   only through nanometer's `Producer`, which the app registers with its metric
   reader: see nanometer's README, under **Exporting histograms**.
