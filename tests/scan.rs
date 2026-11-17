@@ -29,7 +29,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Disk, Fs, Options, Scan, WriteBuf};
+use roble::{Comparison, Disk, Fs, Options, Scan, WriteBuf};
 use roble_format::batch::Batch;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -647,6 +647,462 @@ async fn a_range_reads_what_a_btreemap_range_reads_for_every_kind_of_bound() {
             }
             backward.reverse();
             assert_eq!(backward, expected, "backward over {lower:?}..{upper:?}");
+        }
+    }
+}
+
+/// Opens the store at `dir` with no automatic compactions, so a test decides
+/// which level each table ends up in.
+async fn open_manual(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
+    roble::open_with(
+        env,
+        dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open")
+}
+
+/// Writes `keys` with a value of `value`, flushes them and compacts the table
+/// down to `level`.
+async fn table_at(
+    db: &roble::Db<SimFs>,
+    keys: impl Iterator<Item = String>,
+    value: &[u8],
+    level: u32,
+) {
+    let mut batch = Batch::new();
+    for key in keys {
+        batch.put(key.as_bytes(), value).expect("put");
+    }
+    db.write_raw(&mut batch, true).await.expect("write");
+    let mut tables = vec![db.flush().await.expect("flush").expect("a table")];
+    for from in 0..level {
+        tables = db.compact(from, &tables).await.expect("compact");
+    }
+}
+
+/// A floor landing inside a deleted tenth-to-nine-tenths of a table, and a
+/// ceiling the same, read a block or two and not the whole of what was
+/// deleted: the levels the tombstone hides are moved past it at once, rather
+/// than stepped through key by key with every block on the way read.
+///
+/// 4,000 keys of 100 bytes are some 27 blocks of 16 KiB in L2, and the
+/// tombstone in L0 covers all but the first and last hundred keys. Before the
+/// skip, the floor of `k2000` read the 13 blocks from there down to `k0099`.
+/// Measured after a reopen, with the tables opened and the first and last
+/// blocks read by two gets, so what is counted is the seek alone.
+#[compio::test]
+async fn a_floor_or_ceiling_over_a_range_deletion_reads_past_it_not_through_it() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    {
+        let db = open_manual(&env, &dir).await;
+        table_at(&db, (0..4000).map(|i| format!("k{i:04}")), &[b'v'; 100], 2).await;
+        let mut batch = Batch::new();
+        batch
+            .delete_range(b"k0100", b"k3900")
+            .expect("delete range");
+        db.write_raw(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush").expect("a table");
+    }
+    let db = open_manual(&env, &dir).await;
+    for key in [b"k0000", b"k3999"] {
+        db.get(key, Comparison::Equal)
+            .await
+            .expect("get")
+            .expect("there");
+    }
+    let fs: &SimFs = env.sim();
+
+    let before = fs.bytes_read();
+    let floor = db.get(b"k2000", Comparison::Floor).await.expect("floor");
+    let floor_read = fs.bytes_read() - before;
+    assert_eq!(floor.map(|f| f.key), Some(b"k0099".to_vec()), "floor");
+
+    let before = fs.bytes_read();
+    let ceiling = db
+        .get(b"k2000", Comparison::Ceiling)
+        .await
+        .expect("ceiling");
+    let ceiling_read = fs.bytes_read() - before;
+    assert_eq!(ceiling.map(|f| f.key), Some(b"k3900".to_vec()), "ceiling");
+
+    // The block the seek lands in, and at most one more where the level comes
+    // out of the span; the 13 blocks of the span itself are not read.
+    for (what, read) in [("floor", floor_read), ("ceiling", ceiling_read)] {
+        assert!(
+            read <= 2 * 17 * 1024,
+            "a {what} through the deleted span read {read} bytes, more than two blocks"
+        );
+    }
+}
+
+/// What a skip past a range tombstone must leave alone, in both directions:
+/// keys written into the span after the tombstone — in the memtable, and in
+/// a table of their own flushed after the one holding it — and a snapshot
+/// taken before the tombstone, which does not see it at all.
+#[compio::test]
+async fn a_skip_past_a_range_deletion_keeps_what_the_deletion_does_not_hide() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = open_manual(&env, &dir).await;
+    let all: Vec<String> = (0..100).map(|i| format!("k{i:03}")).collect();
+    table_at(&db, all.iter().cloned(), b"old", 2).await;
+    let before = db.snapshot().expect("snapshot");
+
+    // The tombstone in an L0 table of its own, a rewrite in a newer L0 table,
+    // and another in the memtable.
+    let mut batch = Batch::new();
+    batch.delete_range(b"k010", b"k090").expect("delete range");
+    db.write_raw(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+    let mut batch = Batch::new();
+    batch.put(b"k050", b"new").expect("put");
+    db.write_raw(&mut batch, true).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+    let mut batch = Batch::new();
+    batch.put(b"k060", b"new").expect("put");
+    db.write_raw(&mut batch, true).await.expect("write");
+
+    let mut visible: Vec<String> = all[..10].to_vec();
+    visible.extend(["k050".to_string(), "k060".to_string()]);
+    visible.extend(all[90..].iter().cloned());
+
+    async fn walk<F: Fs>(mut scan: Scan<F>) -> (Vec<String>, Vec<String>) {
+        let mut forward = Vec::new();
+        scan.first().await.expect("first");
+        while scan.is_valid() {
+            forward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
+            scan.next().await.expect("next");
+        }
+        let mut backward = Vec::new();
+        scan.last().await.expect("last");
+        while scan.is_valid() {
+            backward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
+            scan.prev().await.expect("prev");
+        }
+        backward.reverse();
+        (forward, backward)
+    }
+    let (forward, backward) = walk(db.range(..).expect("scan")).await;
+    assert_eq!(forward, visible, "forward");
+    assert_eq!(backward, visible, "backward");
+    let (forward, backward) = walk(before.range(..).expect("scan")).await;
+    assert_eq!(forward, all, "forward, at the snapshot");
+    assert_eq!(backward, all, "backward, at the snapshot");
+
+    for (probe, how, want) in [
+        ("k080", Comparison::Floor, "k060"),
+        ("k055", Comparison::Floor, "k050"),
+        ("k049", Comparison::Floor, "k009"),
+        ("k011", Comparison::Ceiling, "k050"),
+        ("k051", Comparison::Ceiling, "k060"),
+        ("k061", Comparison::Ceiling, "k090"),
+    ] {
+        let found = db.get(probe.as_bytes(), how).await.expect("get");
+        assert_eq!(
+            found.map(|f| String::from_utf8(f.key).expect("utf8")),
+            Some(want.to_string()),
+            "{how:?} of {probe}"
+        );
+        let found = before.get(probe.as_bytes(), how).await.expect("get");
+        assert_eq!(
+            found.map(|f| String::from_utf8(f.key).expect("utf8")),
+            Some(probe.to_string()),
+            "{how:?} of {probe} at the snapshot"
+        );
+    }
+}
+
+/// The skip past a tombstone in L1 passes L2 whole, the table at the span's
+/// far edge included, although that table also holds a key written after the
+/// tombstone: one just past the span, compacted down beside the keys the
+/// tombstone hides. Its newest sequence number is above the tombstone's, so
+/// only the level order says the keys it holds inside the span are older —
+/// and only the level order lets a seek that lands in it, or crosses into it,
+/// out without stepping through them.
+///
+/// Tables of 256 KiB in L2, so that it is several of them and the skip
+/// crosses more than one, and the edge table holds well over a thousand of
+/// the hidden keys: stepped, a floor from the top of its share of the span
+/// reads a dozen blocks.
+#[compio::test]
+async fn a_skip_past_a_range_deletion_passes_a_deeper_table_holding_a_later_key_beside_it() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let options = || {
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .target_file_size(64 << 10)
+    };
+    {
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+        let mut batch = Batch::new();
+        for i in 0..8000 {
+            batch
+                .put(format!("k{i:04}").as_bytes(), &[b'v'; 100])
+                .expect("put");
+        }
+        db.write_raw(&mut batch, true).await.expect("write");
+        let table = db.flush().await.expect("flush").expect("a table");
+        let l1 = db.compact(0, &[table]).await.expect("compact into L1");
+        db.compact(1, &l1).await.expect("compact into L2");
+
+        // The tombstone, into L1.
+        let mut batch = Batch::new();
+        batch
+            .delete_range(b"k0100", b"k7900")
+            .expect("delete range");
+        db.write_raw(&mut batch, true).await.expect("write");
+        let table = db.flush().await.expect("flush").expect("a table");
+        db.compact(0, &[table]).await.expect("compact into L1");
+
+        // A later key past the span, into L1 beside the tombstone's table and
+        // then down into the L2 table at the span's edge.
+        let mut batch = Batch::new();
+        batch.put(b"k7950", b"later").expect("put");
+        db.write_raw(&mut batch, true).await.expect("write");
+        let table = db.flush().await.expect("flush").expect("a table");
+        let beside = db.compact(0, &[table]).await.expect("compact into L1");
+        db.compact(1, &beside).await.expect("compact into L2");
+    }
+    let db = roble::open_with(&env, &dir, options()).await.expect("open");
+    {
+        let versions = db.versions();
+        let (l1, l2) = (versions.version.level(1), versions.version.level(2));
+        assert_eq!(l1.len(), 1, "the tombstone's table alone in L1");
+        assert!(l2.len() >= 3, "L2 is several tables, not {}", l2.len());
+        let edge = l2
+            .iter()
+            .find(|t| t.largest_seq_num > l1[0].largest_seq_num)
+            .expect("an L2 table holding the later key");
+        let smallest = edge.smallest_user_key().expect("smallest");
+        assert!(
+            smallest > b"k0100".as_slice() && smallest < b"k7300".as_slice(),
+            "the later key's table reaches well into the span: it starts at {:?}",
+            String::from_utf8_lossy(smallest)
+        );
+    }
+    for key in [b"k0000", b"k7999"] {
+        db.get(key, Comparison::Equal)
+            .await
+            .expect("get")
+            .expect("there");
+    }
+    let fs: &SimFs = env.sim();
+
+    // A floor from the top of the edge table's share of the span, and a
+    // ceiling that has to cross into it.
+    for (key, how, want) in [
+        (b"k7899~".as_slice(), Comparison::Floor, b"k0099".as_slice()),
+        (
+            b"k4000".as_slice(),
+            Comparison::Ceiling,
+            b"k7900".as_slice(),
+        ),
+    ] {
+        let before = fs.bytes_read();
+        let found = db.get(key, how).await.expect("get");
+        let read = fs.bytes_read() - before;
+        assert_eq!(found.map(|f| f.key), Some(want.to_vec()), "{how:?}");
+        // A block or two, and a table the seek lands in opened: 17 and 20
+        // KB, against 115 KB for the floor stepped through the edge table.
+        assert!(
+            read <= 2 * 17 * 1024,
+            "a {how:?} through the deleted span read {read} bytes"
+        );
+    }
+}
+
+/// A tombstone cut across several L1 tables, with keys written after it
+/// under every part, and the last part compacted down into L2: the later
+/// keys there stay in reach of every scan and seek.
+///
+/// The skip trusts the span of the tombstone the open table holds, so this
+/// is the case that would break if a table's part reached past its own
+/// bounds — the first part, still in L1, would then send L2 past the later
+/// keys under the last. Compaction clips each part to its table (§5), which
+/// this pins.
+#[compio::test]
+async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_the_rest() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .target_file_size(16 << 10),
+    )
+    .await
+    .expect("open");
+    let mut model = Model::new();
+    let mut batch = Batch::new();
+    for i in 0..4000 {
+        let key = format!("k{i:04}").into_bytes();
+        batch.put(&key, &[b'o'; 100]).expect("put");
+        model.insert(key, vec![b'o'; 100]);
+    }
+    db.write_raw(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    let l1 = db.compact(0, &[table]).await.expect("compact into L1");
+    db.compact(1, &l1).await.expect("compact into L2");
+
+    // The tombstone and, after it in the same batch, a key in every four of
+    // the span: enough to split the L1 output, with the tombstone cut across
+    // the pieces.
+    let mut batch = Batch::new();
+    batch
+        .delete_range(b"k0100", b"k3900")
+        .expect("delete range");
+    model.retain(|k, _| k.as_slice() < b"k0100".as_slice() || k.as_slice() >= b"k3900".as_slice());
+    for i in (101..3900).step_by(4) {
+        let key = format!("k{i:04}").into_bytes();
+        batch.put(&key, &[b'n'; 100]).expect("put");
+        model.insert(key, vec![b'n'; 100]);
+    }
+    db.write_raw(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    let l1 = db.compact(0, &[table]).await.expect("compact into L1");
+    assert!(
+        l1.len() >= 3,
+        "the span cut across L1, not {} tables",
+        l1.len()
+    );
+    db.compact(1, &l1[l1.len() - 1..])
+        .await
+        .expect("compact the last part into L2");
+
+    let want: Vec<String> = model
+        .keys()
+        .map(|k| String::from_utf8(k.clone()).expect("utf8"))
+        .collect();
+    let mut scan = db.range(..).expect("scan");
+    let mut forward = Vec::new();
+    scan.first().await.expect("first");
+    while scan.is_valid() {
+        forward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
+        scan.next().await.expect("next");
+    }
+    assert_eq!(forward, want, "forward");
+    let mut backward = Vec::new();
+    scan.last().await.expect("last");
+    while scan.is_valid() {
+        backward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
+        scan.prev().await.expect("prev");
+    }
+    backward.reverse();
+    assert_eq!(backward, want, "backward");
+
+    // Every seek a floor or a ceiling makes from inside the span, against
+    // the model.
+    for i in (100..3900).step_by(7) {
+        let probe = format!("k{i:04}~").into_bytes();
+        let floor = db.get(&probe, Comparison::Floor).await.expect("floor");
+        let want = model
+            .range(..probe.clone())
+            .next_back()
+            .map(|(k, _)| k.clone());
+        assert_eq!(floor.map(|f| f.key), want, "floor of k{i:04}~");
+        let ceiling = db.get(&probe, Comparison::Ceiling).await.expect("ceiling");
+        let want = model.range(probe.clone()..).next().map(|(k, _)| k.clone());
+        assert_eq!(ceiling.map(|f| f.key), want, "ceiling of k{i:04}~");
+    }
+}
+
+/// A table whose keys are out of order ends a scan that skips a range
+/// tombstone over it, with an error or without one, rather than sending it
+/// round the same keys forever.
+///
+/// Found by the `open_corrupt` fuzz target, which skips checksums, as one bit
+/// pattern flipped in a key of `db-reads`' L6 table. Reproduced here with the
+/// block's checksum computed again, as a table written wrongly would carry
+/// one. The flipped key sorts after everything after it in the table, so a
+/// skip that seeks past an L0 tombstone lands on it, and the next step goes
+/// back into the span the tombstone hides: before the scan noticed it had
+/// been there, that was a skip, the same landing and the same step, for good.
+#[compio::test]
+async fn a_scan_over_keys_out_of_order_ends_rather_than_skipping_round_a_tombstone_forever() {
+    let (env, dir) = load("db-reads").await;
+    let fs: &SimFs = env.sim();
+    let path = dir.join("000019.sst");
+    let mut bytes = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-reads/000019.sst"),
+    )
+    .expect("the L6 table");
+
+    // The fuzz case's damage, and the checksum of the data block it lands
+    // in, found through the table's index.
+    let (at, mask) = (127, 0xd2);
+    bytes[at] ^= mask;
+    let footer = roble_format::Footer::decode(
+        &bytes[bytes.len() - roble_format::FOOTER_LEN..],
+        bytes.len() as u64,
+    )
+    .expect("footer");
+    let index = bytes
+        [footer.index.offset as usize..(footer.index.offset + footer.index.length) as usize]
+        .to_vec();
+    let mut entries = roble_format::block::Block::new(&index)
+        .expect("index")
+        .iter();
+    let mut fixed = false;
+    while let Some(entry) = entries.next() {
+        let (handle, _) =
+            roble_format::BlockHandle::decode(entry.expect("index entry").value).expect("handle");
+        let (start, end) = (
+            handle.offset as usize,
+            (handle.offset + handle.length) as usize,
+        );
+        if (start..end).contains(&at) {
+            let sum = footer
+                .checksum
+                .compute(&bytes[start..end], bytes[end])
+                .expect("checksum");
+            bytes[end + 1..end + 5].copy_from_slice(&sum.to_le_bytes());
+            fixed = true;
+        }
+    }
+    assert!(fixed, "byte {at} is in a data block");
+    let disk = fs.create(&path).await.expect("create");
+    let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
+    result.expect("write");
+    disk.close().await.expect("close");
+
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new().disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+    let mut scan = db.range(..).expect("scan");
+    // Forward and backward, a step at a time, each bounded well past the
+    // keys the store holds.
+    for forward in [true, false] {
+        let mut moved = if forward {
+            scan.first().await
+        } else {
+            scan.last().await
+        };
+        let mut steps = 0;
+        while moved.is_ok() && scan.is_valid() {
+            steps += 1;
+            assert!(
+                steps < 10_000,
+                "a {} scan is still going",
+                if forward { "forward" } else { "backward" }
+            );
+            moved = if forward {
+                scan.next().await
+            } else {
+                scan.prev().await
+            };
         }
     }
 }

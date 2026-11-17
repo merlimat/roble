@@ -804,7 +804,16 @@ with equal starts sharing an end and carrying strictly decreasing sequence
 numbers, which Pebble enforces when writing and roble enforces in both
 directions. Unlike encina, which drops covered subtrees and
 leaves nothing behind, every later read in that range checks the tombstone until
-compaction drops it. That is the cost the format chooses for us (§2).
+compaction drops it. That is the cost the format chooses for us (§2). What a
+scan does not pay is a step for each key the tombstone hides: once it decides
+one, every level the tombstone wholly hides is sought past the range in one
+move, as Pebble's merging iterator does (`crate::scan`). Wholly hidden is the
+level order for a tombstone in L1 or below — every deeper level's keys in its
+range are older — and the version's sequence numbers for one in a memtable or
+L0, whose tables below are checked to be older than it. So a floor or a scan
+crossing a deleted range costs a seek a level, where it once stepped and read
+through every key of the range. A memtable's keys are still stepped: it
+records no sequence numbers to skip them by, and holds a memtable's worth.
 
 ### Iterators
 

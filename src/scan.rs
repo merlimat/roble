@@ -43,6 +43,15 @@
 //! iterators keep their place, so a run of deleted keys costs a step each
 //! rather than a seek each (§6).
 //!
+//! **A run a range tombstone covers costs a seek a level, not a step a key.**
+//! Point deletions have to be stepped over, since each one says only that
+//! its own key is gone. A range tombstone says which keys are gone all at
+//! once, so when it decides a key the merge moves every level it wholly
+//! hides to the far side of it ([`Scan::skip_covered`]) — Pebble's merging
+//! iterator does the same, in `isNextEntryDeleted` and `isPrevEntryDeleted`.
+//! Without it a `floor` landing above a deleted tenth of a store stepped
+//! back through every key of that tenth, reading every block of it.
+//!
 //! Two rewrites of this loop were built, measured and thrown away: lending a
 //! value rather than copying it into the caller's buffer (1.01), and
 //! replacing the two passes over the sources with a single merged stream
@@ -66,12 +75,12 @@ use roble_format::InternalKey;
 use roble_format::key::{self, Kind};
 
 use crate::env::{Disk, Fs};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::read::successor_into;
 use std::cell::RefCell;
 
 use crate::memtable::{Memtable, MemtableCursor};
-use crate::table::{OpenTable, TableIter, covered_by_tombstone, is_deletion};
+use crate::table::{OpenTable, TableIter, covering_tombstone, is_deletion};
 use crate::version::{Table, Version};
 use roble_format::TableFormat;
 use roble_format::block::restart::DataCursor;
@@ -391,6 +400,72 @@ impl<D: Disk> Level<D> {
         Ok(())
     }
 
+    /// Moves the level to the far side of a range tombstone numbered `seq`
+    /// over `start..end`, if everything it would pass on the way is hidden by
+    /// it, and says whether it moved. The level is on an entry inside the
+    /// span, or waiting at a table that starts (forward) or ends (backward)
+    /// inside it. `from` is the level of the table the tombstone came from,
+    /// or `None` for a memtable's.
+    ///
+    /// Hidden is known one of two ways, both without opening anything.
+    ///
+    /// **By level, for a tombstone in L1 or below**: every key of a deeper
+    /// level inside its span is older than it. That is the order an LSM keeps
+    /// and Pebble's merging iterator skips on: a key written after the
+    /// tombstone reaches the tombstone's level only by a compaction that takes
+    /// the tombstone's table along, since that table's bounds take in the key,
+    /// so it never gets below. It is what lets the skip pass a deeper table
+    /// that also holds keys written later *outside* the span — the table at
+    /// either edge of it, once later writes nearby have been compacted down —
+    /// which the numbers below cannot tell from one holding them inside it.
+    ///
+    /// **By sequence numbers, for any other**: every table between where the
+    /// level is and the edge of the span holds nothing newer than the
+    /// tombstone, which the version records. That covers a memtable's
+    /// tombstone, older than nothing in any table, and L0's, which holds the
+    /// table of every level below to the same test rather than to the order:
+    /// L0 is compacted whole, so everything below it is older than all of it
+    /// — except after a partial pick through the hidden `Db::compact`, which
+    /// is the one way to put newer keys under an older table, and is kept out
+    /// of the order's reach here for that reason.
+    ///
+    /// The table the tombstone came from always holds it, and so is never
+    /// older than it: its level steps as before. So does a level above the
+    /// tombstone with keys written after it, which are the ones it does not
+    /// hide.
+    async fn skip(
+        &mut self,
+        dir: Dir,
+        start: &[u8],
+        end: &[u8],
+        seq: u64,
+        from: Option<u32>,
+        target: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let below = from.is_some_and(|from| from >= 1 && self.level > from);
+        if !below {
+            let metas = self.metas();
+            let passed = match dir {
+                Dir::Forward => &metas[self.at..crate::version::starting_below(metas, end)?],
+                Dir::Reverse => &metas[crate::version::ending_below(metas, start)?..=self.at],
+            };
+            if !passed.iter().all(|t| t.largest_seq_num < seq) {
+                return Ok(false);
+            }
+        }
+        match dir {
+            Dir::Forward => {
+                key::search_key_into(end, target);
+                self.seek_ge(target).await?;
+            }
+            Dir::Reverse => {
+                key::search_key_into(start, target);
+                self.seek_lt(target).await?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Positions on the level's last entry.
     async fn last(&mut self) -> Result<()> {
         self.deferred = None;
@@ -622,6 +697,36 @@ impl Bound {
     }
 }
 
+/// The range tombstone that hid the key the merge last decided, in buffers
+/// the scan keeps: the span and sequence number [`Scan::skip_covered`] moves
+/// the levels past, and the level of the table it came from (`None` for a
+/// memtable's).
+///
+/// And the key the last skip was made from, since the scan was positioned,
+/// which the next one has to be past (`Scan::skip_covered`).
+#[derive(Default)]
+struct Covering {
+    start: Vec<u8>,
+    end: Vec<u8>,
+    seq: u64,
+    from: Option<u32>,
+    set: bool,
+    skipped_from: Vec<u8>,
+    skipped: bool,
+}
+
+impl Covering {
+    fn record(&mut self, start: &[u8], end: &[u8], seq: u64, from: Option<u32>) {
+        self.start.clear();
+        self.start.extend_from_slice(start);
+        self.end.clear();
+        self.end.extend_from_slice(end);
+        self.seq = seq;
+        self.from = from;
+        self.set = true;
+    }
+}
+
 /// A scan over the tables of a version.
 ///
 /// Forward and reverse, optionally bounded. The bounds are half-open as
@@ -667,6 +772,7 @@ pub struct Scan<F: Fs = crate::FileFs> {
     scratch: Vec<u8>,
     dir: Dir,
     current: Option<Current>,
+    covering: Covering,
     /// What a [`Scan::rebuild`] builds the next sources out of: the block
     /// cursors of the levels it took apart, and the key buffers of its
     /// memtable sources.
@@ -695,6 +801,7 @@ impl<F: Fs> Scan<F> {
             scratch: Vec::new(),
             dir: Dir::Forward,
             current: None,
+            covering: Covering::default(),
             cursors: Vec::new(),
             mem_keys: Vec::new(),
             open: false,
@@ -861,6 +968,7 @@ impl<F: Fs> Scan<F> {
     /// it left them, and this is where that is said. Pebble pairs them for
     /// the same reason, in `switchToMinHeap`.
     async fn sought_ge(&mut self) -> Result<()> {
+        self.covering.skipped = false;
         for it in &mut self.iters {
             it.seek_ge(&self.target).await?;
         }
@@ -870,6 +978,7 @@ impl<F: Fs> Scan<F> {
 
     /// The same backwards: every source before the target, greatest on top.
     async fn sought_lt(&mut self) -> Result<()> {
+        self.covering.skipped = false;
         for it in &mut self.iters {
             it.seek_lt(&self.target).await?;
         }
@@ -913,6 +1022,7 @@ impl<F: Fs> Scan<F> {
             self.sought_lt().await?;
             return self.retreat().await;
         }
+        self.covering.skipped = false;
         for it in &mut self.iters {
             it.last().await?;
         }
@@ -1012,7 +1122,10 @@ impl<F: Fs> Scan<F> {
                 return Ok(());
             }
             // A deletion, so round again — and the buffers go back rather
-            // than being dropped.
+            // than being dropped. Past the whole of it, when it was a range.
+            if chosen.is_some() && self.covering.set {
+                self.skip_covered(Dir::Forward, &next.user).await?;
+            }
             self.spare.push(next);
         }
     }
@@ -1052,9 +1165,82 @@ impl<F: Fs> Scan<F> {
                 return Ok(());
             }
             // A deletion, so round again — and the buffers go back rather
-            // than being dropped.
+            // than being dropped. Past the whole of it, when it was a range.
+            if chosen.is_some() && self.covering.set {
+                self.skip_covered(Dir::Reverse, &next.user).await?;
+            }
             self.spare.push(next);
         }
+    }
+
+    /// Moves every level still inside the span of the tombstone that hid
+    /// the last key to its far side, where [`Level::skip`] finds that the
+    /// tombstone hides everything on the way, and puts the heap right.
+    ///
+    /// Called after the hidden key has been taken, so every source is past
+    /// it already; what is left in the span is what this saves stepping
+    /// through. A level the tombstone does not wholly hide stays where it
+    /// is, and the keys it holds in the span are decided one at a time as
+    /// before. So are a memtable's: a memtable records no sequence numbers to
+    /// decide that by, and holds at most a memtable's worth of keys.
+    ///
+    /// **Each skip is made from a key past the last one's**, going the way
+    /// the scan goes, since the keys a scan decides only ever move on until
+    /// it is positioned again. One that is not means a table holds its keys
+    /// out of order, and is refused as the corruption it is: a seek through
+    /// such a table can land on a key that sorts past the span and step from
+    /// it straight back into it, and without this the scan would skip from
+    /// the same key to the same landing for good. Stepping, which this
+    /// replaces, only ever moves a table forward through what it holds, and
+    /// so ends whatever order that is in.
+    async fn skip_covered(&mut self, dir: Dir, hidden: &[u8]) -> Result<()> {
+        let covering = &mut self.covering;
+        if covering.skipped {
+            let back = match dir {
+                Dir::Forward => hidden <= covering.skipped_from.as_slice(),
+                Dir::Reverse => hidden >= covering.skipped_from.as_slice(),
+            };
+            if back {
+                return Err(Error::Corrupt(format!(
+                    "a scan came back to {hidden:02x?} after skipping a range deletion past it, \
+                     so a table holds its keys out of order"
+                )));
+            }
+        }
+        covering.skipped_from.clear();
+        covering.skipped_from.extend_from_slice(hidden);
+        covering.skipped = true;
+        let mut moved = false;
+        for source in &mut self.iters {
+            let Source::Level(level) = source else {
+                continue;
+            };
+            if !level.is_valid() {
+                continue;
+            }
+            let inside = {
+                let user = InternalKey::decode(level.key())?.user_key;
+                self.covering.start.as_slice() <= user && user < self.covering.end.as_slice()
+            };
+            if inside
+                && level
+                    .skip(
+                        dir,
+                        &self.covering.start,
+                        &self.covering.end,
+                        self.covering.seq,
+                        self.covering.from,
+                        &mut self.target,
+                    )
+                    .await?
+            {
+                moved = true;
+            }
+        }
+        if moved {
+            self.heap.rebuild(&self.iters, dir)?;
+        }
+        Ok(())
     }
 
     /// Steps every source over every version of `user`, returning the newest
@@ -1145,8 +1331,10 @@ impl<F: Fs> Scan<F> {
         Ok(chosen)
     }
 
-    /// Whether the newest version of `user` is a live value.
-    fn visible(&self, user: &[u8], seq: u64, kind: Kind) -> Result<bool> {
+    /// Whether the newest version of `user` is a live value — and when a
+    /// range tombstone says it is not, that tombstone, in `self.covering`.
+    fn visible(&mut self, user: &[u8], seq: u64, kind: Kind) -> Result<bool> {
+        self.covering.set = false;
         if is_deletion(kind) {
             return Ok(false);
         }
@@ -1156,8 +1344,10 @@ impl<F: Fs> Scan<F> {
         for source in &self.iters {
             if let Source::Level(level) = source
                 && let Some(table) = level.table()
-                && covered_by_tombstone(std::slice::from_ref(table), user, seq)?
+                && let Some(t) = covering_tombstone(table, user, seq)
             {
+                self.covering
+                    .record(&t.start, &t.end, t.seq_num, Some(level.level));
                 return Ok(false);
             }
         }
@@ -1170,6 +1360,7 @@ impl<F: Fs> Scan<F> {
                     && t.start.as_slice() <= user
                     && user < t.end.as_slice()
                 {
+                    self.covering.record(&t.start, &t.end, t.seq_num, None);
                     return Ok(false);
                 }
             }
