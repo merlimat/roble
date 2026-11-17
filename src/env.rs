@@ -56,8 +56,8 @@ pub enum Access {
     ReadOnly,
 }
 
-/// Where a store runs: what opens its files, and what runs the tasks a caller
-/// starts beside it.
+/// Where a store runs: what opens its files, and what runs its background
+/// tasks.
 ///
 /// [`DefaultEnv`](crate::DefaultEnv) keeps databases in the file system, on the
 /// current compio runtime. A caller that runs its own I/O — a scheduler
@@ -72,18 +72,17 @@ pub trait Env {
 
     /// Runs `task` beside the store until it ends.
     ///
-    /// roble never calls it: the tasks that flush and compact in the
-    /// background are the caller's (see [`Db::flush_wanted`] and
-    /// [`Db::compaction_wanted`]), and this is where a caller generic over
-    /// its env starts them, so that the same code runs on the file system in
-    /// production and under a simulator, on whatever executor that brings.
+    /// How a store opened to write starts the two tasks that flush and
+    /// compact it in the background, so that they run on whatever executor
+    /// the env brings: the current compio runtime for the file system, a
+    /// seeded one under a simulator. They end when the store is closed or
+    /// dropped ([`Db::close`]).
     ///
     /// Required rather than defaulted, because a default would have to pick
     /// compio, and an env that forgot to override it would run its tasks
     /// somewhere it never chose.
     ///
-    /// [`Db::flush_wanted`]: crate::Db::flush_wanted
-    /// [`Db::compaction_wanted`]: crate::Db::compaction_wanted
+    /// [`Db::close`]: crate::Db::close
     fn spawn(&self, task: impl Future<Output = ()> + 'static);
 }
 

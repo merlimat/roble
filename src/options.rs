@@ -41,6 +41,9 @@ pub struct Options<F: Fs = crate::FileFs> {
     /// Whether a flush leaves the compaction the picker chose for the
     /// caller to run.
     pub(crate) disable_automatic_compactions: bool,
+    /// Whether a store opened to write runs its flushes and merges in tasks
+    /// of its own.
+    pub(crate) background_tasks: bool,
     /// How many bytes a memtable holds before a write writes it out.
     pub(crate) memtable_size: u64,
     /// How large the MANIFEST may grow before a flush replaces it.
@@ -70,6 +73,7 @@ impl<F: Fs> Default for Options<F> {
             disable_wal: false,
             create_if_missing: false,
             disable_automatic_compactions: false,
+            background_tasks: true,
             memtable_size: crate::memtable::MEMTABLE_SIZE,
             max_manifest_bytes: crate::rotate::MAX_MANIFEST_BYTES,
             l0_compaction_threshold: crate::pick::L0_COMPACTION_THRESHOLD,
@@ -143,18 +147,31 @@ impl<F: Fs> Options<F> {
         self
     }
 
-    /// Leaves compaction entirely to the caller.
+    /// Stops the store from compacting on its own.
     ///
-    /// Pebble's `DisableAutomaticCompactions`, and wanted for the same two
-    /// reasons: a test that drives compaction by hand needs the store to
-    /// hold still, and a caller that would rather compact when it knows it
-    /// is idle needs the store not to decide for it. `compact_once` is
-    /// still there for both.
+    /// Pebble's `DisableAutomaticCompactions`. A flush no longer runs the
+    /// merge the picker chose, a write no longer waits for one at L0's
+    /// depth, and the store spawns no task to run them: what a test that
+    /// drives compaction by hand needs, so that the store holds still.
     ///
     /// A store with this set still *reports* that it has fallen behind, in
     /// `roble.compaction.debt`. It simply does nothing about it.
     pub fn disable_automatic_compactions(mut self, disable: bool) -> Self {
         self.disable_automatic_compactions = disable;
+        self
+    }
+
+    /// Whether the store flushes and compacts in tasks of its own: true by
+    /// default.
+    ///
+    /// Not part of the API. Off, nothing is spawned, and the store flushes
+    /// and merges inside the writes that need it, as it does for any work
+    /// its tasks are not there to take: what a test that counts operations
+    /// or drives the store by hand needs, and what the CLI and the
+    /// benchmark's inline mode run.
+    #[doc(hidden)]
+    pub fn background_tasks(mut self, on: bool) -> Self {
+        self.background_tasks = on;
         self
     }
 

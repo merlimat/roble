@@ -1443,7 +1443,7 @@ impl<F: crate::env::Fs> crate::Db<F> {
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Scan<F>> {
-        let mut scan = Scan::empty(Some(Rc::clone(&self.metrics)));
+        let mut scan = Scan::empty(Some(Rc::clone(&self.store.metrics)));
         self.rebuild_scan(&mut scan, extra.into_iter(), lower, upper)?;
         Ok(scan)
     }

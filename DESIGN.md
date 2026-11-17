@@ -1554,16 +1554,17 @@ worse answer than letting the caller have what it asked for.
 line tells whoever is waiting that there is a memtable to write out (§5); a
 flush that has written a table tells whoever is waiting that there is a merge
 to run, and runs it where it stands if nobody is. `Db::flush_wanted` and
-`Db::compaction_wanted` are the waiting, and the tasks are the
-**caller's**:
+`Db::compaction_wanted` are the waiting, and the store opened to write spawns
+the two tasks that wait, through `Env::spawn`:
 
 ```rust
-for (worker, work) in [(Rc::clone(&db), Flush), (Rc::clone(&db), Merge)] {
+for work in [Flush, Merge] {
+    let worker = db.task_handle(); // the same state, counted until it ends
     env.spawn(async move {
         while worker.running() {
             match work {
-                Flush => { worker.flush_wanted().await; let _ = worker.flush().await; }
-                Merge => { worker.compaction_wanted().await; let _ = worker.compact_once().await; }
+                Flush => { worker.flush_wanted().await; /* if running: */ let _ = worker.flush().await; }
+                Merge => { worker.compaction_wanted().await; /* if running: */ let _ = worker.compact_once().await; }
             }
         }
     });
@@ -1573,28 +1574,39 @@ for (worker, work) in [(Rc::clone(&db), Flush), (Rc::clone(&db), Merge)] {
 Two waits and not one, because the two have to be able to run at the same
 time. A merge is the longest thing a store does and holds no permit while it
 runs, so a flush can go through the middle of one — but only if something is
-there to run it, and one task cannot be in two places. A store given only the
-merge task flushes inside its writes a memtable later.
+there to run it, and one task cannot be in two places. A store told to leave
+compaction to its caller (`disable_automatic_compactions`) spawns only the
+flush task.
 
-The store spawns nothing itself, and that is a decision rather than an
-omission. `Env::spawn` takes a `'static` future and a store's methods take
-`&self`, so a task the store spawned would have to hold the store — and then
-dropping the store would not release the directory until that task had
-finished, which `Drop` cannot wait for. A store that spawned would need a
-`close().await`, and a lifecycle roble does not otherwise have. The caller
-already owns its tasks and owns stopping them, so the division is: roble says
-when, the caller says where. It keeps §12 intact as well, because no operation
-count in a failure sweep then depends on when a runtime chose to poll a
-detached task.
+**The tasks hold the store's state, not the caller's handle.** `Env::spawn`
+takes a `'static` future, so `Db` is a handle on an `Rc` of the state, and
+each task holds a handle of its own on the same `Rc`. That is what makes
+shutting down a question with two answers:
 
-**`Db::stop` is the half of "owns stopping them" the caller cannot write
-for itself.** A parked task is woken by what it is parked on and by nothing
-else, and both of these park on the store — so a store with no way to say
-"nothing more is coming" is a store its own tasks hold for ever, and a
-directory nothing unlocks. After `stop` both waits return at once,
-`Db::running` is false, the loops end, and the last task to let go is what
-lets the store be dropped. Nothing else changes: a stopped store still reads,
-still writes, and still flushes and compacts inside its writes.
+- **`Db::close().await`** stops the tasks, waits for the flush or merge in
+  flight to finish and both tasks to end, and then releases the directory.
+  It is Pebble's `Close`, and the shutdown that lets the directory be opened
+  again at once.
+- **Dropping the handle** stops the tasks too, but `Drop` cannot wait. If
+  neither task is inside a flush or a merge, it releases the directory there
+  and then: a task that is only parked does nothing more once woken but see
+  the store stopped and end, and what it holds is state no file is open for
+  writing in. If one is, the lock goes with the state, when that work has
+  finished — so nobody opens the directory while files are still being
+  written in it.
+
+A failure in the background has nobody to be returned to. A failed flush is
+asked for again after the next write, and one that keeps failing reaches a
+write at the budget, which flushes inline and gets the error itself; a failed
+merge is not asked for again until the version changes. Both are logged and
+counted.
+
+The tasks are not part of the API, and nor are the waits: a test that pins
+which side does the work turns the store's own off
+(`Options::background_tasks(false)`, hidden) and runs the loop by hand, and
+the CLI, which does one thing and exits, opens without them. That keeps §12
+intact as well: a failure sweep that counts operations can ask for a store
+whose operations do not depend on when a runtime polls a detached task.
 
 Both waits are level-triggered and asked again on every poll, so a task that
 starts after the work appeared is told at once rather than waiting for an
@@ -1710,6 +1722,7 @@ while scan.is_valid() { /* scan.key(), scan.value() */ scan.next().await?; }
 let other = snap.get(b"/sessions/7", Comparison::Equal).await?;   // outside those bounds
 
 db.checkpoint("snapshots/3").await?;   // a directory Go Pebble opens
+db.close().await?;                     // background work done, directory released
 
 // A shard arriving on this node, where Oxia cannot tell new from returning.
 let db = roble::open_with(&env, dir, Options::new().create_if_missing(true)).await?;
@@ -1730,7 +1743,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
 | `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `range` and `get` on it (§6) |
 | `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
-| `Flush`, `Delete`, `DiskSpaceUsage` | `flush`, `destroy`, `disk_usage` |
+| `Flush`, `Close`, `Delete`, `DiskSpaceUsage` | `flush`, `close`, `destroy`, `disk_usage` |
 | `pebble.Open` of a shard's path, new or returning | `open_with` with `create_if_missing` (§6) |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
 | `SyncData`, `UseWAL` | `Sync` on commit, and `disable_wal` in `Options` (§4) |
