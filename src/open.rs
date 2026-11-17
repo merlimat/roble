@@ -1707,11 +1707,6 @@ impl<F: Fs> Opened<F> {
         self.versions.borrow()
     }
 
-    /// The caches this store draws on, for tests that check what they hold.
-    pub fn caches_for_test(&self) -> &crate::cache::Caches<F> {
-        &self.caches
-    }
-
     /// The open reader for one table, from the cache or freshly opened.
     ///
     /// Opening one reads its footer, metaindex, properties, index, filter and

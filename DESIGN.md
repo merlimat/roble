@@ -1683,7 +1683,7 @@ this trait is the same seam it already relies on.
 ## 11. API sketch
 
 ```rust
-let caches = Caches::new(CacheOptions::default().block_cache_bytes(512 << 20));
+let caches = Caches::new(DEFAULT_OPEN_TABLES, 512 << 20);   // open tables, block bytes
 let db = open_with(&DefaultEnv, "data/shard-3", Options::new().caches(caches)).await?;
 
 let mut batch = db.batch();            // indexed: readable through itself

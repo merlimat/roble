@@ -150,13 +150,13 @@ async fn destroy_lets_go_of_the_table_readers() {
     scan.first().await.expect("first");
     drop(scan);
     assert!(
-        caches.open_tables() > 0,
+        caches.tables_held() > 0,
         "reading should have left tables in the cache"
     );
 
     db.destroy().await.expect("destroy");
     assert_eq!(
-        caches.open_tables(),
+        caches.tables_held(),
         0,
         "and a destroy should have let go of every one of them"
     );

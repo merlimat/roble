@@ -56,7 +56,7 @@ mod file;
 
 pub use batch::IndexedBatch;
 pub use buf::{ReadBuf, WriteBuf};
-pub use cache::{BlockCache, Caches, DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
+pub use cache::{Caches, DEFAULT_BLOCK_BYTES, DEFAULT_OPEN_TABLES};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, FormatError, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
@@ -74,10 +74,16 @@ pub use version::{Table, Version, VersionSet};
 /// any release.
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::cache::Clock;
+    pub use crate::cache::{BlockCache, Clock};
     pub use crate::compact::TARGET_FILE_SIZE;
     pub use crate::env::read_all;
     pub use crate::memtable::Memtable;
     pub use crate::pick::{L0_COMPACTION_THRESHOLD, L0_STOP_WRITES_THRESHOLD, LBASE_MAX_BYTES};
     pub use crate::table::OpenTable;
+
+    /// One store's view of `caches`' block cache, for a test that opens an
+    /// [`OpenTable`] on its own.
+    pub fn block_cache<F: crate::Fs>(caches: &crate::Caches<F>, store: u64) -> BlockCache {
+        caches.blocks(store)
+    }
 }

@@ -433,15 +433,16 @@ impl<F: Fs> Caches<F> {
     }
 
     /// One store's view of the block cache.
-    pub fn blocks(&self, store: u64) -> BlockCache {
+    pub(crate) fn blocks(&self, store: u64) -> BlockCache {
         BlockCache {
             clock: Rc::clone(&self.blocks),
             store,
         }
     }
 
-    /// How many bytes of blocks are held.
-    pub fn block_bytes(&self) -> usize {
+    /// How many bytes of blocks are held, against the `block_bytes` budget
+    /// [`Caches::new`] was given.
+    pub fn block_bytes_held(&self) -> usize {
         self.blocks.borrow().used()
     }
 
@@ -454,19 +455,19 @@ impl<F: Fs> Caches<F> {
     ///
     /// Handed out once per store, so that two stores sharing a cache cannot
     /// read each other's tables through a file number they both use.
-    pub fn new_store_id(&self) -> u64 {
+    pub(crate) fn new_store_id(&self) -> u64 {
         let id = self.next_store.get();
         self.next_store.set(id + 1);
         id
     }
 
     /// The open table for one store's `file_num`, if it is still held.
-    pub fn table(&self, store: u64, file_num: u64) -> Option<Rc<OpenTable<F::Disk>>> {
+    pub(crate) fn table(&self, store: u64, file_num: u64) -> Option<Rc<OpenTable<F::Disk>>> {
         self.tables.borrow_mut().get(&TableKey { store, file_num })
     }
 
     /// Holds an open table, evicting another if the count is full.
-    pub fn hold_table(&self, store: u64, file_num: u64, table: Rc<OpenTable<F::Disk>>) {
+    pub(crate) fn hold_table(&self, store: u64, file_num: u64, table: Rc<OpenTable<F::Disk>>) {
         self.tables
             .borrow_mut()
             .insert(TableKey { store, file_num }, table, 1);
@@ -477,14 +478,15 @@ impl<F: Fs> Caches<F> {
     /// What the obsolete sweep calls before deleting a table: the cache
     /// holds a reader for as long as its budget allows, and a reader nobody
     /// is reading is not a reason to keep a file on disk (§5).
-    pub fn forget_table(&self, store: u64, file_num: u64) {
+    pub(crate) fn forget_table(&self, store: u64, file_num: u64) {
         self.tables
             .borrow_mut()
             .remove(&TableKey { store, file_num });
     }
 
-    /// How many tables are open.
-    pub fn open_tables(&self) -> usize {
+    /// How many tables are held open, against the `open_tables` budget
+    /// [`Caches::new`] was given.
+    pub fn tables_held(&self) -> usize {
         self.tables.borrow().len()
     }
 }
