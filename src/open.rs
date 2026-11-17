@@ -1443,9 +1443,11 @@ impl<F: Fs> Db<F> {
     /// once, [`Db::running`] is false, and the last task to let go is what
     /// lets the store's state be freed.
     ///
-    /// Nothing else changes: a store that has been stopped still reads,
-    /// still writes, and still flushes and compacts inside its writes, which
-    /// is what it does for any work no task is there to take.
+    /// Nothing else changes, but for one thing: a store that has been
+    /// stopped still reads, still writes, and still flushes inside its
+    /// writes, but a flush no longer goes on to the merge nobody is waiting
+    /// for, since closing waits for the flush in flight and should not wait
+    /// for a merge it started.
     #[doc(hidden)]
     pub fn stop(&self) {
         self.store.stopped.set(true);

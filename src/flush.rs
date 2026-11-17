@@ -141,10 +141,12 @@ impl<F: Fs> Db<F> {
         if flushed.is_some() {
             // Handed to whoever is waiting to be told there is work, and run
             // here only if nobody is (§9,
-            // `crate::open::Db::compaction_wanted`). A store whose
-            // caller runs a task for this stops paying for merges in its
-            // writes; a store without one is exactly as it was.
-            if !self.version_changed() {
+            // `crate::open::Db::compaction_wanted`). A store with its merge
+            // task waiting stops paying for merges in its writes; a store
+            // without one is exactly as it was. And not at all once the store
+            // is stopping: the flush closing waits for is the last thing it
+            // waits for, not the start of a merge.
+            if !self.version_changed() && self.running() {
                 self.maybe_compact().await;
             }
         }

@@ -121,7 +121,6 @@ async fn into_a_flush(env: &SimEnv, db: &Db<SimFs>) -> usize {
         before + 1,
         "the flush should have done one operation and be paused at its second"
     );
-    assert_eq!(in_l0(db), 0, "and so not have landed");
     written
 }
 
@@ -161,6 +160,7 @@ async fn closing_waits_for_the_flush_in_flight_and_then_lets_go() {
     settle().await;
 
     let written = into_a_flush(&env, &db).await;
+    assert_eq!(in_l0(&db), 0, "the flush should not have landed yet");
 
     db.close().await.expect("close");
 
@@ -205,6 +205,7 @@ async fn dropping_a_busy_store_keeps_the_directory_until_its_work_is_done() {
     let db = open(&env, &dir).await.expect("open");
     settle().await;
     into_a_flush(&env, &db).await;
+    assert_eq!(in_l0(&db), 0, "the flush should not have landed yet");
     drop(db);
 
     // Asked of the lock itself, which does not suspend: an open would hand
@@ -263,6 +264,7 @@ async fn destroying_a_store_waits_for_its_flush_before_removing_files() {
     let db = open(&env, &dir).await.expect("open");
     settle().await;
     into_a_flush(&env, &db).await;
+    assert_eq!(in_l0(&db), 0, "the flush should not have landed yet");
 
     db.destroy().await.expect("destroy");
     settle().await;
@@ -288,4 +290,47 @@ async fn a_store_opened_to_read_runs_no_tasks() {
         .await
         .expect("open read-only");
     ro.close().await.expect("close");
+}
+
+#[compio::test]
+async fn closing_finishes_the_flush_in_flight_without_starting_a_merge() {
+    // A flush that lands with nobody waiting for the merge it makes due runs
+    // that merge where it stands. While the store is closing nobody is: the
+    // merge task has been told to end. So the flush closing waits for has to
+    // stop at the flush, or closing would wait out a whole merge it started.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let merging = || {
+        options()
+            .disable_automatic_compactions(false)
+            .l0_compaction_threshold(2)
+    };
+    let db = roble::open_with(&env, &dir, merging()).await.expect("open");
+    settle().await;
+
+    // One table in L0, one short of the line, written by hand. Its key falls
+    // inside the range the next flush writes, so the two overlap and count
+    // as two layers rather than one (§9).
+    put(&db, 5).await.expect("write");
+    db.flush().await.expect("flush").expect("a table");
+    settle().await;
+    assert_eq!(
+        in_l0(&db),
+        1,
+        "one table is below the line, so nothing merged"
+    );
+
+    // The second, in flight when the store closes.
+    into_a_flush(&env, &db).await;
+    assert_eq!(in_l0(&db), 1, "the flush should not have landed yet");
+    db.close().await.expect("close");
+
+    let db = roble::open_with(&env, &dir, merging().background_tasks(false))
+        .await
+        .expect("reopen");
+    assert_eq!(
+        in_l0(&db),
+        2,
+        "the flush landed and nothing merged it: L0 holds both tables"
+    );
 }

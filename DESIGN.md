@@ -952,9 +952,9 @@ value, which does two things. The lock is held until the last name is gone, so
 there is no moment at which the database is half there and unowned — Oxia's
 closes first and removes afterwards, which leaves that window open. And it
 needs no permit, unlike every other change: an outstanding borrow forbids the
-move, and a store shared into a task of its own is behind an `Rc` that has to
-be sole-owned first (§10), so there is no way to ask for a destroy while the
-store is busy. A `Scan` or a `Snapshot` may outlive it, holding readers and no
+move, and the store's own background tasks are wound down — the flush or merge
+in flight finished, both tasks ended — before the first file goes, so there is
+no way to ask for a destroy while the store is busy. A `Scan` or a `Snapshot` may outlive it, holding readers and no
 borrow; they write nothing, so the removal is none of their business. It does
 not flush on the way out, as
 Oxia's `Close` does: a memtable written into a table that is removed in the
@@ -1447,10 +1447,9 @@ flush fills; below L0 the levels trade off, because the picker's next answer
 is whichever is furthest past its allowance. What a flush deliberately does
 *not* do is drain a backlog it did not create, since its caller is waiting on
 it — Pebble answers that with the stop-writes thresholds a write stalls on,
-and roble owes those. And what still has no trigger at all is an **idle**
-store draining a backlog: nothing runs a compaction behind the caller's back,
-which needs a store that can be handed to a task of its own — an ownership
-question rather than a pacing one.
+and roble owes those. An **idle** store drains its backlog in its own merge
+task, which asks the picker again whenever the version changes (§9, "Flushing
+and compacting in tasks of their own").
 
 Compaction is the cost encina does not pay, and the only background CPU work in
 roble. Leveled, with L0 counted in sublevels, and a **picker** — the component that
