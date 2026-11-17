@@ -392,9 +392,9 @@ fn manifest_dump(path: &Path) -> Result<String> {
     let _ = writeln!(out, "size {}", bytes.len());
 
     // A MANIFEST's records are legacy-framed and carry no log number.
-    let mut reader = RecordReader::new(&bytes, 0);
+    let reader = RecordReader::new(&bytes, 0);
     let mut edits = Vec::new();
-    while let Some(record) = reader.next() {
+    for record in reader {
         let record = record.map_err(|e| {
             Error::Message(format!("{}: record {}: {e}", path.display(), edits.len()))
         })?;

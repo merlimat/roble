@@ -49,9 +49,9 @@ fn wal_log_num() -> u32 {
 }
 
 fn read_records(bytes: &[u8], log_num: u32) -> Vec<Vec<u8>> {
-    let mut r = RecordReader::new(bytes, log_num);
+    let r = RecordReader::new(bytes, log_num);
     let mut out = Vec::new();
-    while let Some(rec) = r.next() {
+    for rec in r {
         out.push(rec.unwrap_or_else(|e| panic!("record {}: {e}", out.len())));
     }
     out
@@ -82,10 +82,10 @@ fn roble_reads_the_wal_go_pebble_wrote() {
     // this is the framing and the batch repr agreeing with each other on real
     // Pebble output rather than only on roble's own.
     for (i, rec) in records.iter().enumerate() {
-        let mut r = roble_format::batch::Batch::read(rec)
+        let r = roble_format::batch::Batch::read(rec)
             .unwrap_or_else(|e| panic!("record {i} is not a batch repr: {e}"));
         let mut entries = 0;
-        while let Some(e) = r.next() {
+        for e in r {
             e.unwrap_or_else(|e| panic!("record {i}, entry {entries}: {e}"));
             entries += 1;
         }

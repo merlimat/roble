@@ -692,9 +692,9 @@ async fn read_version_edits<F: Fs>(
     // The file number is passed even though a MANIFEST's chunks are legacy and
     // carry none, so that one which turns out to be recyclable is checked
     // rather than waved through.
-    let mut reader = RecordReader::new(&bytes, file_num as u32);
+    let reader = RecordReader::new(&bytes, file_num as u32);
     let mut edits = Vec::new();
-    while let Some(record) = reader.next() {
+    for record in reader {
         let record = record.map_err(|e| {
             let m = format!("{}: record {}: {e}", path.display(), edits.len());
             if read_only {
@@ -2114,9 +2114,9 @@ fn internal_key(encoded: &[u8]) -> Result<String> {
 /// log replay, a caller's own — and only the bytes are common to all of them.
 fn iter_kinds(repr: &[u8]) -> Result<Vec<usize>> {
     use roble_format::key::Kind;
-    let mut reader = roble_format::batch::Batch::read(repr)?;
+    let reader = roble_format::batch::Batch::read(repr)?;
     let mut out = Vec::new();
-    while let Some(entry) = reader.next() {
+    for entry in reader {
         out.push(match entry?.kind {
             Kind::RangeDelete => 2,
             Kind::Delete | Kind::SingleDelete | Kind::DeleteSized => 1,
