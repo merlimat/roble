@@ -95,15 +95,18 @@ const LOG_NUM: u64 = 2;
 
 /// Writes an empty database into `dir`, whose listing is `names`.
 ///
-/// Refuses a directory holding any `marker.` file. Two of them are what this
-/// is about to write, so one already there means either a database — which
-/// `open` would have found, and this would be overwriting — or the remains
-/// of a creation that did not finish, which the two markers cannot be told
-/// apart from because an iteration written twice with different values is
-/// ambiguous rather than wrong. Pebble refuses the same case, through
-/// `ErrorIfNotPristine`.
+/// Refuses a directory holding any `marker.` file, unless it is the remains
+/// of a creation that did not finish. Two markers are what this is about to
+/// write, so one already there means either a database whose manifest marker
+/// is missing — which this would be overwriting — or a creation that
+/// stopped between its two markers. That one is finished rather than
+/// refused: a refusal would leave a directory that neither `open` nor this
+/// will ever touch again, where the database it was meant to be holds
+/// nothing anyone wrote ([`unfinished`]).
 pub(crate) async fn create<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Result<()> {
-    if let Some(marker) = names.iter().find(|n| n.starts_with("marker.")) {
+    if let Some(marker) = names.iter().find(|n| n.starts_with("marker."))
+        && !unfinished(fs, dir, names).await?
+    {
         return Err(Error::Unsupported(format!(
             "will not create a database in {}: it already holds {marker}",
             dir.display()
@@ -159,6 +162,43 @@ pub(crate) async fn create<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Resul
     .await?;
     crate::rotate::move_marker(fs, dir, MARKER_MANIFEST, 1, &manifest).await?;
     Ok(())
+}
+
+/// Whether `names` is what a creation that stopped before its manifest
+/// marker leaves, and nothing else.
+///
+/// Only this creation's own files, by name — no table, no other log or
+/// MANIFEST, and the format marker at the iteration and value written above
+/// — and the log empty. A database that lost its manifest marker after a
+/// write reached the log has the same names, and the empty log is what
+/// tells the two apart: writing over that log would discard an acknowledged
+/// write. Anything a database grows beyond this, a table or a second log,
+/// is a name a creation never writes. Everything here is rewritten whole, so
+/// what the leftovers hold beyond their names does not matter.
+async fn unfinished<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Result<bool> {
+    let log = files::log_filename(LOG_NUM);
+    let own = [
+        "LOCK".to_string(),
+        files::manifest_filename(MANIFEST_NUM),
+        log.clone(),
+        files::marker_filename(
+            MARKER_FORMAT_VERSION,
+            1,
+            &files::format_version_value(FORMAT_VERSION_PIN),
+        ),
+    ];
+    if !names.iter().all(|n| own.contains(n)) {
+        return Ok(false);
+    }
+    if !names.contains(&log) {
+        return Ok(true);
+    }
+    let disk = fs
+        .open(&dir.join(&log), crate::env::Access::ReadOnly)
+        .await?;
+    let len = disk.len().await;
+    disk.close().await?;
+    Ok(len? == 0)
 }
 
 /// Writes `bytes` to a new file and makes both the bytes and the name

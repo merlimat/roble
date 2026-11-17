@@ -1083,13 +1083,20 @@ in place it must not be written. `checkpoint` does the same, for the same
 reason — written the other way round, a checkpoint interrupted between the two
 left a directory an open read as a database whose format version had never been
 recorded, which is the one case that message is for. Both orders leave an
-unfinished directory refused; only one of them describes what is there.
+unfinished directory that an open refuses; only one of them describes what is
+there.
 
-**A directory holding any `marker.` file is refused rather than written into.**
-What is there is either a database this would overwrite or a creation that did
-not finish, and one marker cannot say which, so the operator clears the
-directory. This is deliberately Pebble's answer too — `ErrorIfNotPristine`
-exists to error in exactly the retried-creation case.
+**A directory holding a `marker.` file is refused rather than written into,
+unless it is a creation that did not finish.** A marker means either a database
+this would overwrite or a creation that stopped between its two markers. The
+second is told apart by holding nothing else: only the creation's own names —
+`LOCK`, `MANIFEST-000001`, `000002.log` and `marker.format-version.000001.016`
+— with the log empty. Such a directory holds nothing anyone wrote, so a
+creation finishes it, rewriting every file whole. Refusing it instead would
+leave a directory no open will ever read again: a failure between the
+markers, and every later `create_if_missing` open failed. Anything more — a table, a later iteration of
+a marker, a log holding a write a database acknowledged before losing its
+manifest marker — is refused, and the operator clears the directory.
 
 Two numbers are worth stating. The MANIFEST takes file number 1 and the log 2,
 as Pebble's do, and the edit says 3 comes next, so the first flush numbers its
