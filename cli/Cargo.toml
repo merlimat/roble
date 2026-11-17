@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Inspects Pebble's files: roble sst dump and roble manifest dump."
+description = "Puts, gets, scans and deletes the entries of a roble database, and inspects Pebble's files"
 
 [[bin]]
 name = "roble"
@@ -16,10 +16,13 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
+compio = "0.19.2"
+roble = { path = "..", version = "0.0.0-dev" }
 roble-format = { path = "../format", version = "0.0.0-dev" }
 
 [dev-dependencies]
 roble-format = { path = "../format" }
+tempfile = "3"
 
 [lints]
 workspace = true

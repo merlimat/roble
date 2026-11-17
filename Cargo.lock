@@ -1259,7 +1259,10 @@ version = "0.0.0-dev"
 dependencies = [
  "clap",
  "clap_complete",
+ "compio",
+ "roble",
  "roble-format",
+ "tempfile",
 ]
 
 [[package]]
