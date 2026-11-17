@@ -95,9 +95,9 @@ impl<F: Fs> Db<F> {
     /// are in the one that replaced it, and carry higher sequence numbers.
     ///
     /// A flush is also where the store notices it has too many tables, so a
-    /// flush that wrote one runs the compaction the picker chose before
-    /// returning, unless [`crate::Options::disable_automatic_compactions`]
-    /// says otherwise (§9, `crate::pick`). The number here names the table
+    /// flush that wrote one hands the compaction the picker chose to the
+    /// store's merge task, or runs it before returning if that task is not
+    /// there to take it (§9, `crate::pick`). The number here names the table
     /// *this flush wrote*, which that compaction may already have merged
     /// away — a caller holding it has a file number and not a promise.
     ///
