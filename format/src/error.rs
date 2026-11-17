@@ -46,6 +46,13 @@ pub enum Error {
     Unsupported(String),
     /// A structure was malformed.
     Corrupt(String),
+    /// The caller asked for something no input could make right: a range
+    /// whose start is not below its end, keys added out of order, a
+    /// sequence number past the largest one the format holds.
+    ///
+    /// Not [`Error::Corrupt`], which says the bytes are damaged: nothing
+    /// here was read, and nothing on disk is wrong.
+    InvalidArgument(String),
 }
 
 impl fmt::Display for Error {
@@ -64,6 +71,7 @@ impl fmt::Display for Error {
             ),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt: {m}"),
+            Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
         }
     }
 }
@@ -81,5 +89,9 @@ impl Error {
 
     pub(crate) fn unsupported<T>(msg: impl Into<String>) -> Result<T> {
         Err(Error::Unsupported(msg.into()))
+    }
+
+    pub(crate) fn invalid_argument<T>(msg: impl Into<String>) -> Result<T> {
+        Err(Error::InvalidArgument(msg.into()))
     }
 }
