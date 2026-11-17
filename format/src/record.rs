@@ -71,7 +71,7 @@ const WAL_SYNC_LAST: u8 = 12;
 
 /// Which chunk layout a type byte selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireFormat {
+pub(crate) enum WireFormat {
     /// Types 1 to 4: no log number. What the MANIFEST uses.
     Legacy,
     /// Types 5 to 8: a four-byte log number. What the WAL uses at the pin.

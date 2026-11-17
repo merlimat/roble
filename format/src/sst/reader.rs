@@ -62,6 +62,7 @@ impl Metaindex {
     /// tables [`Table::open`] does. Putting the refusals here rather than in
     /// the caller is what stops one path from reading a table the other turns
     /// away.
+    #[doc(hidden)]
     pub fn parse(block: &Block<'_>) -> Result<Metaindex> {
         let parsed = parse_metaindex(block)?;
 
@@ -412,6 +413,7 @@ fn decode_block_at(
 /// Public because an engine that fetched the index block itself has to parse
 /// it the same way, and a second implementation of this is a second place for
 /// a two-level index to be read wrongly.
+#[doc(hidden)]
 pub fn index_entries_of(block: &Block<'_>) -> Result<Vec<IndexEntry>> {
     let mut out = Vec::new();
     // The raw iterator: an index separator is an internal key, but its value
@@ -440,6 +442,7 @@ pub fn index_entries_of(block: &Block<'_>) -> Result<Vec<IndexEntry>> {
 /// by that block and not the next. The golden corpus cannot tell the two
 /// apart, because it probes with search keys whose trailer no real separator
 /// carries, so this is pinned by the unit test below instead.
+#[doc(hidden)]
 pub fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<usize> {
     let (mut lo, mut hi) = (0usize, index.len());
     while lo < hi {
@@ -457,6 +460,7 @@ pub fn first_block_at_or_after(index: &[IndexEntry], target: &[u8]) -> Result<us
 ///
 /// Public for the engine's own seeks: a kind refused when a table is scanned
 /// and served when it is sought would be worse than either.
+#[doc(hidden)]
 pub fn check_kind(key: crate::InternalKey<'_>) -> Result<()> {
     // MERGE first, and that order is the whole of why it is said twice.
     // `is_accepted` does not list MERGE, so the general refusal below catches
@@ -478,6 +482,7 @@ pub fn check_kind(key: crate::InternalKey<'_>) -> Result<()> {
 
 /// One entry of a table's index.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct IndexEntry {
     /// An encoded internal key at or above every key in the block.
     pub separator: Vec<u8>,

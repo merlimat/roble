@@ -22,6 +22,7 @@
 //!
 //! Regenerate with `cd harness && go run ./golden-sst ../format/tests/golden`.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use roble_format::sst::Table;
@@ -59,7 +60,7 @@ fn roble_dump_matches_go_pebble() {
 
         let actual =
             roble_format::dump_table(&bytes).unwrap_or_else(|e| panic!("{name}: dump: {e}"));
-        if let Some(diff) = roble_format::first_difference(&expected, &actual) {
+        if let Some(diff) = first_difference(&expected, &actual) {
             panic!("{name}: roble's dump differs from Go Pebble's\n{diff}");
         }
     }
@@ -585,4 +586,116 @@ fn a_table_without_a_filter_has_no_filter_block() {
         table.properties().string("rocksdb.filter.policy").is_none(),
         "and says so in its properties"
     );
+}
+
+/// The first differing line between two dumps, which is far more use than two
+/// several-hundred-line blobs.
+fn first_difference(expected: &str, actual: &str) -> Option<String> {
+    let mut out = String::new();
+    for (i, (e, a)) in expected.lines().zip(actual.lines()).enumerate() {
+        if e != a {
+            writeln!(out, "  line {}:", i + 1).expect("String");
+            writeln!(out, "    expected: {e}").expect("String");
+            writeln!(out, "    actual:   {a}").expect("String");
+            return Some(out);
+        }
+    }
+    let (e, a) = (expected.lines().count(), actual.lines().count());
+    if e == a {
+        return None;
+    }
+    writeln!(out, "  expected {e} lines, got {a}").expect("String");
+    let (label, extra) = if a > e {
+        ("actual only", actual.lines().skip(e).take(3))
+    } else {
+        ("expected only", expected.lines().skip(a).take(3))
+    };
+    for line in extra {
+        writeln!(out, "    {label}: {line}").expect("String");
+    }
+    Some(out)
+}
+
+/// `first_difference` explains a failure, so these run it on purpose: the
+/// golden test only ever takes its "no difference" path while it passes.
+mod first_difference_explains {
+    use super::first_difference;
+
+    /// Two dumps that agree have no first difference.
+    ///
+    /// This is the only path the golden test takes while it passes, which is why
+    /// everything below it had never run: a function whose whole job is to
+    /// explain a failure is dead code until something fails, and then it is
+    /// the only thing anyone reads.
+    #[test]
+    fn dumps_that_agree_have_no_difference() {
+        let text = "format pebblev4\nentries 2\n";
+        assert_eq!(first_difference(text, text), None);
+        assert_eq!(first_difference("", ""), None);
+    }
+
+    #[test]
+    fn a_differing_line_is_named_by_its_number() {
+        let expected = "format pebblev4\nchecksum crc32c\nentries 2\n";
+        let actual = "format pebblev4\nchecksum xxhash64\nentries 2\n";
+        let diff = first_difference(expected, actual).expect("they differ");
+        // One-based, and the second line is line 2 rather than 1 or 3. An
+        // off-by-one here sends whoever is debugging to the wrong line of a
+        // several-hundred-line dump.
+        assert!(diff.contains("line 2:"), "got {diff}");
+        assert!(diff.contains("expected: checksum crc32c"), "got {diff}");
+        assert!(diff.contains("actual:   checksum xxhash64"), "got {diff}");
+        // And it stops at the first one rather than listing everything.
+        assert!(!diff.contains("entries"), "got {diff}");
+    }
+
+    #[test]
+    fn the_very_first_line_is_line_one() {
+        let diff = first_difference("a\nb\n", "z\nb\n").expect("they differ");
+        assert!(diff.contains("line 1:"), "got {diff}");
+    }
+
+    #[test]
+    fn a_dump_that_is_longer_says_so_and_shows_what_is_extra() {
+        let expected = "a\nb\n";
+        let actual = "a\nb\nc\nd\ne\nf\n";
+        let diff = first_difference(expected, actual).expect("they differ in length");
+        assert!(diff.contains("expected 2 lines, got 6"), "got {diff}");
+        // Three lines of the extra, which is enough to recognise what arrived
+        // without reprinting the blob this function exists to avoid.
+        for line in ["actual only: c", "actual only: d", "actual only: e"] {
+            assert!(diff.contains(line), "got {diff}");
+        }
+        assert!(!diff.contains("actual only: f"), "only three, got {diff}");
+    }
+
+    #[test]
+    fn a_dump_that_is_shorter_says_what_is_missing() {
+        let expected = "a\nb\nc\nd\n";
+        let actual = "a\nb\n";
+        let diff = first_difference(expected, actual).expect("they differ in length");
+        assert!(diff.contains("expected 4 lines, got 2"), "got {diff}");
+        assert!(diff.contains("expected only: c"), "got {diff}");
+        assert!(diff.contains("expected only: d"), "got {diff}");
+    }
+
+    #[test]
+    fn a_differing_line_is_reported_ahead_of_a_differing_length() {
+        // Both are wrong at once, which is the usual case when a dump has
+        // gone off the rails partway through. The line is the useful fact —
+        // the length follows from it — so it is the one reported.
+        let expected = "a\nb\nc\n";
+        let actual = "a\nZ\n";
+        let diff = first_difference(expected, actual).expect("they differ");
+        assert!(diff.contains("line 2:"), "got {diff}");
+        assert!(!diff.contains("lines, got"), "got {diff}");
+    }
+
+    #[test]
+    fn a_trailing_newline_is_not_a_difference() {
+        // `lines()` drops it either way, and a dump built with `writeln!`
+        // always has one. Reporting it as a mismatch would make every
+        // hand-written expectation fail for a reason nobody could see.
+        assert_eq!(first_difference("a\nb\n", "a\nb"), None);
+    }
 }

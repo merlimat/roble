@@ -40,6 +40,7 @@ pub struct Properties {
 
 impl Properties {
     /// Decodes a properties block.
+    #[doc(hidden)]
     pub fn decode(block: &Block<'_>) -> Result<Self> {
         let mut raw = BTreeMap::new();
         let mut iter = block.iter();

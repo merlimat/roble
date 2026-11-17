@@ -87,7 +87,7 @@ pub fn hash(b: &[u8]) -> u32 {
 }
 
 /// `calculateProbes`: `bitsPerKey * ln(2)`, rounded down, clamped to 1..=30.
-pub fn probes_for(bits_per_key: usize) -> u8 {
+pub(crate) fn probes_for(bits_per_key: usize) -> u8 {
     let n = (bits_per_key as f64 * 0.69) as u32;
     n.clamp(1, 30) as u8
 }

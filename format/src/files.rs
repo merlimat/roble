@@ -43,6 +43,7 @@ use crate::error::{Error, Result};
 /// constants around it are an `iota` chain with unexported entries in it. The
 /// Go harness asserts the symbol equals this number, so a Pebble upgrade that
 /// renumbers it fails there rather than somewhere subtler.
+#[doc(hidden)]
 pub const FORMAT_VERSION_PIN: u64 = 16;
 
 /// The oldest format major version Pebble itself will open, its

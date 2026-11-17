@@ -40,10 +40,10 @@ use crate::error::{Error, Result};
 use crate::key::{InternalKey, Kind, SEQ_NUM_MAX, TRAILER_LEN};
 
 /// `metaRangeDelV2Name`: the fragmented range-deletion block.
-pub const META_NAME_V2: &[u8] = b"rocksdb.range_del2";
+pub(crate) const META_NAME_V2: &[u8] = b"rocksdb.range_del2";
 
 /// `metaRangeDelV1Name`: the unfragmented block, which Pebble refuses.
-pub const META_NAME_V1: &[u8] = b"rocksdb.range_del";
+pub(crate) const META_NAME_V1: &[u8] = b"rocksdb.range_del";
 
 /// One range tombstone: `[start, end)` deleted as of `seq_num`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +191,7 @@ fn check_fragmented(prev: &Tombstone, next: &Tombstone) -> Result<()> {
 
 /// Builds a v2 range-deletion block.
 #[derive(Debug, Default)]
+#[doc(hidden)]
 pub struct Builder {
     tombstones: Vec<Tombstone>,
 }

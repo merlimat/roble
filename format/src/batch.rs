@@ -50,7 +50,7 @@ const COUNT_OFFSET: usize = 8;
 ///
 /// Mirrors the switch in `batchrepr.Reader.Next`. `SETWITHDEL` is absent from
 /// it, which is easy to miss because the kind plainly involves a value.
-pub fn kind_has_value(kind: Kind) -> bool {
+pub(crate) fn kind_has_value(kind: Kind) -> bool {
     matches!(
         kind,
         Kind::Set
