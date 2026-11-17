@@ -36,8 +36,8 @@
 //!
 //! What carries over is the part that makes a run reproducible: buffers are
 //! owned and handed back, so a disk that keeps one cannot make roble touch
-//! memory it still lends; and nothing reads the clock unless
-//! [`Env::real_time`] says it may.
+//! memory it still lends; and the store reads no clock, but for the
+//! latencies a meter provider asks it to time.
 
 use std::future::Future;
 use std::io;
@@ -56,8 +56,8 @@ pub enum Access {
     ReadOnly,
 }
 
-/// Where a store runs: what opens its files, runs its tasks, and lets it read
-/// the clock, or not.
+/// Where a store runs: what opens its files, and what runs the tasks a caller
+/// starts beside it.
 ///
 /// [`DefaultEnv`](crate::DefaultEnv) keeps databases in the file system, on the
 /// current compio runtime. A caller that runs its own I/O — a scheduler
@@ -71,16 +71,20 @@ pub trait Env {
     fn fs(&self) -> &Self::Fs;
 
     /// Runs `task` beside the store until it ends.
-    fn spawn(&self, task: impl Future<Output = ()> + 'static);
-
-    /// Whether the store may read the real clock: false by default.
     ///
-    /// Compaction is paced in units of work rather than by the clock so that a
-    /// seeded run replays (§9). An env that returns true lets the store pace
-    /// by time instead, which is faster and not reproducible.
-    fn real_time(&self) -> bool {
-        false
-    }
+    /// roble never calls it: the tasks that flush and compact in the
+    /// background are the caller's (see [`Db::flush_wanted`] and
+    /// [`Db::compaction_wanted`]), and this is where a caller generic over
+    /// its env starts them, so that the same code runs on the file system in
+    /// production and under a simulator, on whatever executor that brings.
+    ///
+    /// Required rather than defaulted, because a default would have to pick
+    /// compio, and an env that forgot to override it would run its tasks
+    /// somewhere it never chose.
+    ///
+    /// [`Db::flush_wanted`]: crate::Db::flush_wanted
+    /// [`Db::compaction_wanted`]: crate::Db::compaction_wanted
+    fn spawn(&self, task: impl Future<Output = ()> + 'static);
 }
 
 /// What a directory listing says about one entry.

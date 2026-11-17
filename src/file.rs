@@ -90,10 +90,6 @@ impl Env for DefaultEnv {
     fn spawn(&self, task: impl Future<Output = ()> + 'static) {
         compio::runtime::spawn(task).detach();
     }
-
-    fn real_time(&self) -> bool {
-        true
-    }
 }
 
 /// The file system, as [`DefaultEnv`] sees it.

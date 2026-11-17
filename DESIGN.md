@@ -1410,9 +1410,8 @@ that out.
 A compaction is paced in units of work (`crate::work`): every
 `Options::compaction_unit` entries it hands the executor back and resumes, so
 a reader or a writer on the same core waits a slice rather than a merge. The
-unit is entries and not time, because §10 lets a store read the clock only
-where the env allows it, and a job that yielded on a timer would stop a seeded
-run replaying.
+unit is entries and not time, because §10 keeps a store off the clock, and a
+job that yielded on a timer would stop a seeded run replaying.
 
 **The walk of the memtable a flush writes out is paced by the same unit**, and
 for the same reason once a flush runs beside the writes rather than inside
@@ -1679,8 +1678,9 @@ Pebble's scheduling and clock, so the two must be separable.
 
 Everything else carries over: buffers are owned and returned, a disk that keeps
 one cannot make roble touch memory it lends, a read in flight is polled from a
-slot without a boxed future, and `real_time()` decides whether the store may
-read the clock at all. One owner per directory, through `LOCK`, and any
+slot without a boxed future, and the store reads no clock — encina's
+`real_time()` switch is not carried over, since nothing here paces by time, and
+the one read left is the latency a meter provider asks to have timed. One owner per directory, through `LOCK`, and any
 number of readers beside it, which take no lock (§6, "Reading beside a
 writer").
 

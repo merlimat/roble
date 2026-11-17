@@ -281,26 +281,9 @@ both!(a_read_only_open_cannot_be_written_through, |fs, dir| {
 });
 
 #[compio::test]
-async fn the_simulator_does_not_read_the_clock_and_the_file_system_does() {
-    // §9: compaction paces by units of work under the simulator, so that a
-    // seed replays, and by the clock in production, which is faster and not
-    // reproducible. The contrast is the guarantee, so it is what this pins: a
-    // SimEnv that started reading the clock, or a DefaultEnv that stopped,
-    // would cost a replay without failing anything else here.
-    assert!(
-        roble::DefaultEnv.real_time(),
-        "the file system env paces by the clock"
-    );
-    assert!(
-        !SimEnv::new().real_time(),
-        "a simulated run must not read the clock"
-    );
-}
-
-#[compio::test]
 async fn a_spawned_task_runs_on_the_current_runtime() {
-    // Compaction hands work to the env rather than awaiting it inline (§9), so
-    // what the env owes its caller is that a detached task is actually polled.
+    // A caller starts its flush and compaction loops through the env, so what
+    // the env owes it is that a detached task is actually polled.
     let ran = std::rc::Rc::new(std::cell::Cell::new(false));
     let flag = ran.clone();
     roble::DefaultEnv.spawn(async move { flag.set(true) });

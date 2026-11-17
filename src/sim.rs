@@ -580,8 +580,7 @@ impl Disk for SimDisk {
     }
 }
 
-/// An env over a [`SimFs`], which runs tasks on the current compio runtime and
-/// never reads the clock.
+/// An env over a [`SimFs`], which runs tasks on the current compio runtime.
 #[derive(Clone, Debug, Default)]
 pub struct SimEnv {
     fs: SimFs,
@@ -609,7 +608,4 @@ impl Env for SimEnv {
     fn spawn(&self, task: impl Future<Output = ()> + 'static) {
         compio::runtime::spawn(task).detach();
     }
-
-    // Deliberately not overridden: a simulated run must not read the clock, so
-    // that the same seed replays the same way (§9).
 }
