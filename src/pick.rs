@@ -252,6 +252,7 @@ impl<F: Fs> Opened<F> {
     /// Returns the output tables' file numbers, empty if nothing was worth
     /// compacting or if the merge dropped everything it read.
     pub async fn compact_once(&self) -> Result<Vec<u64>> {
+        self.writable()?;
         let Some(plan) = self.plan_picked().await? else {
             return Ok(Vec::new());
         };

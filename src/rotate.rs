@@ -79,6 +79,7 @@ impl<F: Fs> Opened<F> {
     /// Returns the new MANIFEST's name. A flush does this for itself once the
     /// file it is appending to has grown past [`Opened::max_manifest_bytes`].
     pub async fn rotate_manifest(&self) -> Result<String> {
+        self.writable()?;
         let change = self.changes().begin().await;
         self.rotate_inner(&change).await
     }

@@ -47,6 +47,13 @@ pub enum Error {
     Corrupt(String),
     /// There is no database in the directory.
     NoDatabase(String),
+    /// The store was opened read-only, and this would change the directory
+    /// ([`crate::open_read_only`]).
+    ReadOnly,
+    /// A store opened read-only needed a file the process writing the
+    /// database has retired or not finished writing; opening again reads the
+    /// database as it is now (DESIGN.md §6, "Reading beside a writer").
+    Stale(String),
 }
 
 /// What [`Error::Format`] carries: a file roble could not read, and why.
@@ -79,6 +86,8 @@ impl fmt::Display for Error {
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt: {m}"),
             Error::NoDatabase(m) => write!(f, "{m}"),
+            Error::ReadOnly => write!(f, "the database was opened read-only"),
+            Error::Stale(m) => write!(f, "stale: {m}"),
         }
     }
 }
@@ -92,7 +101,11 @@ impl std::error::Error for Error {
             // nothing the error it wraps does not, and a chain walker would
             // print the same line twice.
             Error::Format(e) => Some(&e.0),
-            Error::Unsupported(_) | Error::Corrupt(_) | Error::NoDatabase(_) => None,
+            Error::Unsupported(_)
+            | Error::Corrupt(_)
+            | Error::NoDatabase(_)
+            | Error::ReadOnly
+            | Error::Stale(_) => None,
         }
     }
 }
@@ -138,6 +151,16 @@ mod tests {
         assert_eq!(
             Error::Unsupported("range keys".to_string()).to_string(),
             "unsupported: range keys"
+        );
+        // "stale:" means try again, which a reader beside a writer should,
+        // and is not damage.
+        assert_eq!(
+            Error::Stale("000004.sst is gone".to_string()).to_string(),
+            "stale: 000004.sst is gone"
+        );
+        assert_eq!(
+            Error::ReadOnly.to_string(),
+            "the database was opened read-only"
         );
     }
 

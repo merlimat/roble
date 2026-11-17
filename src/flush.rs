@@ -116,6 +116,7 @@ impl<F: Fs> Opened<F> {
     /// `tests/metrics.rs` does not collect histograms at all, for the
     /// separate reason written at the top of it.
     pub async fn flush(&self) -> Result<Option<u64>> {
+        self.writable()?;
         // Taken for the flush and let go of before the compaction, which
         // takes its own and holds it only to decide and to record (§9): a
         // flush that kept the permit across a merge is a flush every write

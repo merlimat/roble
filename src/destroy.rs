@@ -77,6 +77,7 @@ impl<F: Fs> Opened<F> {
     /// still reading keeps its bytes until that reader is dropped, exactly as
     /// it does when the obsolete sweep retires one. The name goes either way.
     pub async fn destroy(self) -> Result<Vec<String>> {
+        self.writable()?;
         let names: Vec<String> = self
             .fs()
             .list(&self.dir)
