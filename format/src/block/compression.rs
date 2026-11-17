@@ -137,7 +137,17 @@ pub(crate) fn decode(compression: Compression, data: &[u8]) -> Result<Decoded<'_
         Compression::None => Ok(Decoded::Borrowed(data)),
         Compression::Snappy => {
             // Pebble uses the Snappy *block* format, whose uncompressed length
-            // is a varint at the head of the payload.
+            // is a varint at the head of the payload. `decompress_vec` sizes
+            // its buffer from that varint, up to 4 GiB, so it is held to what
+            // the block could produce first, as a Zstd block's is.
+            let len = snap::raw::decompress_len(data)
+                .map_err(|e| Error::Corrupt(format!("snappy block: {e}")))?;
+            if len > data.len().saturating_mul(SNAPPY_MAX_EXPANSION) {
+                return Error::corrupt(format!(
+                    "snappy block claims {len} bytes uncompressed from {} bytes",
+                    data.len()
+                ));
+            }
             let mut dec = snap::raw::Decoder::new();
             match dec.decompress_vec(data) {
                 Ok(v) => Ok(Decoded::Owned(v)),
@@ -156,6 +166,22 @@ pub(crate) fn decode(compression: Compression, data: &[u8]) -> Result<Decoded<'_
     }
 }
 
+/// The most a byte of Snappy block can decode to, rounded up.
+///
+/// The densest element is a copy with a two-byte offset: three bytes that
+/// repeat up to 64 (the Snappy format description, "Copy with 2-byte
+/// offset"). Literals decode to fewer bytes than they take, and the other
+/// copies to fewer per byte.
+const SNAPPY_MAX_EXPANSION: usize = 22;
+
+/// The most a byte of Zstd frame can decode to.
+///
+/// The densest a frame gets is a run of RLE blocks: a three-byte block header
+/// and one byte of content, repeated up to the 128 KiB a block may hold
+/// (RFC 8878 §3.1.1.2). That is 32 KiB of output for each byte of input, and
+/// every other block type, and the frame header, decode to less per byte.
+const ZSTD_MAX_EXPANSION: usize = 128 * 1024 / 4;
+
 /// Decodes a Zstd block: `uvarint(uncompressed_len)` then a Zstd frame.
 ///
 /// The length prefix is RocksDB's convention, which Pebble keeps
@@ -164,14 +190,25 @@ pub(crate) fn decode(compression: Compression, data: &[u8]) -> Result<Decoded<'_
 /// easy to get wrong in a way that only fails on real files.
 fn decode_zstd(data: &[u8]) -> Result<Decoded<'static>> {
     let (len, prefix) = varint::uvarint(data)?;
+    let frame = &data[prefix..];
+    // The length sizes the allocation below, and it is read from the table, so
+    // it is held to what the frame could produce before anything is
+    // allocated: one past what memory holds aborts the process.
     let len = usize::try_from(len)
-        .map_err(|_| Error::Corrupt(format!("zstd block claims {len} bytes uncompressed")))?;
+        .ok()
+        .filter(|&len| len <= frame.len().saturating_mul(ZSTD_MAX_EXPANSION))
+        .ok_or_else(|| {
+            Error::Corrupt(format!(
+                "zstd block claims {len} bytes uncompressed from a {}-byte frame",
+                frame.len()
+            ))
+        })?;
     // Pebble sizes the destination from the prefix and requires the frame to
     // fill it exactly, which is also the cheapest way to reject a lying prefix.
     let mut out = vec![0u8; len];
     let mut decoder = ruzstd::decoding::FrameDecoder::new();
     let written = decoder
-        .decode_all(&data[prefix..], &mut out)
+        .decode_all(frame, &mut out)
         .map_err(|e| Error::Corrupt(format!("zstd block: {e}")))?;
     if written != len {
         return Error::corrupt(format!(
@@ -184,6 +221,44 @@ fn decode_zstd(data: &[u8]) -> Result<Decoded<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Snappy block's header says how long it is uncompressed, and can
+    /// claim up to 4 GiB. A buffer that size is not something a few bytes of
+    /// block may ask for, so the claim is refused before it is allocated.
+    #[test]
+    fn a_snappy_length_no_block_could_produce_is_refused() {
+        // 0x80 0x80 0x80 0x80 0x08 is 2 GiB, then four bytes of literal.
+        let data = [0x80, 0x80, 0x80, 0x80, 0x08, 0x0c, b'a', b'b', b'c', b'd'];
+        let err = decode(Compression::Snappy, &data).expect_err("an impossible length");
+        assert!(
+            format!("{err}").contains("snappy block claims"),
+            "got {err:?}"
+        );
+    }
+
+    /// A Zstd block says how long it is uncompressed, and that length is read
+    /// from the table. A lie that large must be refused before it sizes an
+    /// allocation: one past what memory can hold aborts the process, which no
+    /// caller can recover from.
+    #[test]
+    fn a_zstd_length_no_frame_could_produce_is_refused() {
+        for claim in [1u64 << 62, 1 << 40, 1 << 30] {
+            let mut data = Vec::new();
+            let mut v = claim;
+            while v >= 0x80 {
+                data.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            data.push(v as u8);
+            // Thirty-two bytes of frame cannot expand to a gigabyte.
+            data.extend_from_slice(&[0u8; 32]);
+            let err = decode(Compression::Zstd, &data).expect_err("an impossible length");
+            assert!(
+                format!("{err}").contains("zstd block claims"),
+                "{claim}: got {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn indicator_values_are_rocksdbs() {

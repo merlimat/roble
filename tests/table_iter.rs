@@ -115,6 +115,80 @@ async fn try_open_bytes(bytes: Vec<u8>) -> (SimEnv, roble::Result<OpenTable<robl
     (env, OpenTable::open(1, disk, caches.blocks(0)).await)
 }
 
+/// An index names its blocks by handle, and a handle is read from the table.
+/// One that reaches past the end of the file has to be refused when the table
+/// is opened: a read sized from it would ask for that many bytes, and a
+/// length past what memory holds aborts the process rather than failing.
+///
+/// The index block is checksummed, so the bad handle is put in a block of its
+/// own with a checksum that matches, appended, and named by a new footer. That
+/// way what reaches the engine is a table every check before this one passes.
+#[compio::test]
+async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
+    use roble_format::{BlockBuilder, FOOTER_LEN, InternalKey, Kind};
+
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    for (i, k) in [b"/oxia/a", b"/oxia/b"].iter().enumerate() {
+        let key = InternalKey {
+            user_key: &k[..],
+            seq_num: i as u64 + 1,
+            kind: Kind::Set,
+            obsolete: false,
+        };
+        w.add(key, b"value").expect("add");
+    }
+    let bytes = w.finish().expect("finish");
+    let table = Table::open(&bytes).expect("a table roble wrote");
+    let footer = *table.footer();
+    let separator = table.index_entries().expect("index")[0].separator.clone();
+
+    // One entry, naming a block at offset zero far longer than the file.
+    let mut handle = Vec::new();
+    for v in [0u64, 1 << 60] {
+        put_uvarint(&mut handle, v);
+    }
+    let mut index = BlockBuilder::new(1);
+    index.add(&separator, &handle, 0, None, false);
+    let index = index.finish().to_vec();
+
+    let at = bytes.len() - FOOTER_LEN;
+    let mut patched = bytes[..at].to_vec();
+    patched.extend_from_slice(&index);
+    patched.push(0); // no compression
+    let sum = footer.checksum.compute(&index, 0).expect("checksum");
+    patched.extend_from_slice(&sum.to_le_bytes());
+
+    // The footer as it was, with the index handle pointing at the new block.
+    let mut tail = bytes[at..].to_vec();
+    let mut handles = Vec::new();
+    put_uvarint(&mut handles, footer.metaindex.offset);
+    put_uvarint(&mut handles, footer.metaindex.length);
+    put_uvarint(&mut handles, at as u64);
+    put_uvarint(&mut handles, index.len() as u64);
+    let version_at = FOOTER_LEN - 12;
+    tail[1..version_at].fill(0);
+    tail[1..1 + handles.len()].copy_from_slice(&handles);
+    patched.extend_from_slice(&tail);
+
+    let (_env, opened) = try_open_bytes(patched).await;
+    let err = match opened {
+        Ok(_) => panic!("a table whose index reaches past its end opened"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, roble::Error::Format(roble_format::Error::Corrupt(_))),
+        "got {err:?}"
+    );
+}
+
+fn put_uvarint(dst: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        dst.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    dst.push(v as u8);
+}
+
 #[compio::test]
 async fn an_iterator_walks_a_whole_table_both_ways() {
     for name in FIXTURES {

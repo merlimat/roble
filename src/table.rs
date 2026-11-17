@@ -141,8 +141,13 @@ impl<D: Disk> OpenTable<D> {
         }
         let footer = Footer::decode(&tail, size)?;
 
-        let meta_bytes =
-            fetch(&disk, metrics.as_deref(), footer.metaindex, footer.checksum).await?;
+        let meta_bytes = fetch(
+            &disk,
+            metrics.as_deref(),
+            within(footer.metaindex, size)?,
+            footer.checksum,
+        )
+        .await?;
         let metaindex = Metaindex::parse(&Block::new(&meta_bytes)?)?;
 
         // Untested, with a reason (§12): every writer that exists emits a
@@ -155,7 +160,13 @@ impl<D: Disk> OpenTable<D> {
                 "table has no properties block".to_string(),
             )));
         };
-        let props_bytes = fetch(&disk, metrics.as_deref(), props_handle, footer.checksum).await?;
+        let props_bytes = fetch(
+            &disk,
+            metrics.as_deref(),
+            within(props_handle, size)?,
+            footer.checksum,
+        )
+        .await?;
         let properties = Properties::decode(&Block::new(&props_bytes)?)?;
         if let Some(name) = properties.comparer_name()
             && name != BYTEWISE_COMPARER
@@ -167,35 +178,62 @@ impl<D: Disk> OpenTable<D> {
         }
 
         // The index, with a two-level one flattened as it is read.
-        let top_bytes = fetch(&disk, metrics.as_deref(), footer.index, footer.checksum).await?;
+        let top_bytes = fetch(
+            &disk,
+            metrics.as_deref(),
+            within(footer.index, size)?,
+            footer.checksum,
+        )
+        .await?;
         let top = index_entries_of(&Block::new(&top_bytes)?)?;
         let index = if properties.is_two_level_index()? {
             let mut flat = Vec::new();
             for partition in top {
-                let part =
-                    fetch(&disk, metrics.as_deref(), partition.handle, footer.checksum).await?;
+                let part = fetch(
+                    &disk,
+                    metrics.as_deref(),
+                    within(partition.handle, size)?,
+                    footer.checksum,
+                )
+                .await?;
                 flat.extend(index_entries_of(&Block::new(&part)?)?);
             }
             flat
         } else {
             top
         };
+        for entry in &index {
+            within(entry.handle, size)?;
+        }
 
         let filter = match metaindex.filter {
-            Some(h) => Some(fetch(&disk, metrics.as_deref(), h, footer.checksum).await?),
+            Some(h) => {
+                Some(fetch(&disk, metrics.as_deref(), within(h, size)?, footer.checksum).await?)
+            }
             None => None,
         };
         let tombstones = match metaindex.range_del {
             Some(h) => {
-                let bytes = fetch(&disk, metrics.as_deref(), h, footer.checksum).await?;
+                let bytes =
+                    fetch(&disk, metrics.as_deref(), within(h, size)?, footer.checksum).await?;
                 roble_format::rangedel::decode(&Block::new(&bytes)?)?
             }
             None => Vec::new(),
         };
         let value_blocks = match &metaindex.value_index {
             Some(vi) => {
-                let bytes = fetch(&disk, metrics.as_deref(), vi.handle, footer.checksum).await?;
-                vi.decode_rows(&bytes)?
+                let bytes = fetch(
+                    &disk,
+                    metrics.as_deref(),
+                    within(vi.handle, size)?,
+                    footer.checksum,
+                )
+                .await?;
+                let rows = vi.decode_rows(&bytes)?;
+                for &h in &rows {
+                    within(h, size)?;
+                }
+                rows
             }
             None => Vec::new(),
         };
@@ -603,6 +641,29 @@ impl<D: Disk> OpenTable<D> {
         let bytes = self.block(*block_handle, Caching::Keep).await?;
         out.extend_from_slice(roble_format::value_block::value_in_block(&bytes, handle)?);
         Ok(())
+    }
+}
+
+/// Refuses a handle that reaches past the end of a `size`-byte table.
+///
+/// Every block read is sized from its handle, and the handle is read from the
+/// table, so one reaching past the end would size a read of bytes the file
+/// does not have — and one long enough, an allocation that aborts the process
+/// rather than failing. Each handle is checked here, once, as the table is
+/// opened, and so the reads that follow need not check it again. Checked in
+/// full, trailer included, because not every handle went through
+/// `BlockHandle::decode`'s bound: a value block's is a row of fixed-width
+/// integers.
+fn within(handle: BlockHandle, size: u64) -> Result<BlockHandle> {
+    let end = handle
+        .length
+        .checked_add(TRAILER_SIZE as u64)
+        .and_then(|span| handle.offset.checked_add(span));
+    match end {
+        Some(end) if end <= size => Ok(handle),
+        _ => Err(Error::Format(roble_format::Error::Corrupt(format!(
+            "block handle {handle:?} reaches past the end of a {size}-byte table"
+        )))),
     }
 }
 

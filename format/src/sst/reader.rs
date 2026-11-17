@@ -228,8 +228,13 @@ impl<'a> Table<'a> {
         // check in `decode_block_at`: a handle reaching past the end is
         // refused at the footer, before anything asks what a block was
         // compressed with.
-        let at = usize::try_from(handle.offset + handle.length)
-            .map_err(|_| Error::Corrupt(format!("block offset {} too large", handle.offset)))?;
+        // Checked, because the handle is the caller's: one built by hand
+        // never went through `BlockHandle::decode`'s bound.
+        let at = handle
+            .offset
+            .checked_add(handle.length)
+            .and_then(|at| usize::try_from(at).ok())
+            .ok_or_else(|| Error::Corrupt(format!("block handle {handle:?} is too large")))?;
         match self.bytes.get(at) {
             Some(&b) => Compression::from_byte(b),
             None => Error::truncated("block trailer", at + 1, self.bytes.len()),
