@@ -32,21 +32,38 @@
 //! names, because nothing stalls yet — a counter for an event that cannot
 //! happen says nothing, and it arrives with the waiting it counts.
 //!
+//! Without the `opentelemetry` feature none of this can be given a provider:
+//! [`off`] stands in for nanometer with handles that cannot exist, so every
+//! `Option` of one is `None` and the code below is the same either way.
+//!
 //! [nanometer]: https://docs.rs/nanometer
 
 use std::cell::Cell;
 use std::path::Path;
 
+#[cfg(feature = "opentelemetry")]
+pub(crate) use nanometer::Meter as NanoMeter;
+#[cfg(feature = "opentelemetry")]
 use nanometer::{
     CounterDef, HistogramDef, LatencyDef, LocalCounter, LocalHistogram, LocalLatency,
     LocalUpDownCounter, Timer, UpDownCounterDef,
 };
-use opentelemetry::KeyValue;
+#[cfg(feature = "opentelemetry")]
+pub(crate) use opentelemetry::KeyValue;
+
+#[cfg(not(feature = "opentelemetry"))]
+use off::{
+    CounterDef, HistogramDef, LatencyDef, LocalCounter, LocalHistogram, LocalLatency,
+    LocalUpDownCounter, Timer, UpDownCounterDef,
+};
+#[cfg(not(feature = "opentelemetry"))]
+pub(crate) use off::{KeyValue, Meter as NanoMeter};
 
 use crate::env::Fs;
 use crate::options::Options;
 
 /// The instrumentation scope of roble's metrics.
+#[cfg(feature = "opentelemetry")]
 pub(crate) const SCOPE: &str = "roble";
 
 const WRITE_DURATION: LatencyDef = LatencyDef::new("roble.write.duration")
@@ -143,12 +160,15 @@ const DISK_SYNC_DURATION: LatencyDef =
 const CACHE_LOOKUPS: CounterDef = CounterDef::new("roble.cache.lookups")
     .unit("{lookup}")
     .description("Tables and blocks the store looked for in a cache");
+#[cfg(feature = "opentelemetry")]
 const CACHE_USAGE: UpDownCounterDef = UpDownCounterDef::new("roble.cache.usage")
     .unit("{by}")
     .description("What the caches hold: bytes for blocks, open readers for tables");
+#[cfg(feature = "opentelemetry")]
 const CACHE_LIMIT: UpDownCounterDef = UpDownCounterDef::new("roble.cache.limit")
     .unit("{by}")
     .description("What the caches may hold: bytes for blocks, open readers for tables");
+#[cfg(feature = "opentelemetry")]
 const CACHE_EVICTIONS: CounterDef = CounterDef::new("roble.cache.evictions")
     .unit("{entry}")
     .description("Entries evicted from a cache to make room");
@@ -212,7 +232,7 @@ const LEVELS: usize = roble_format::manifest::NUM_LEVELS as usize;
 /// Creates a store's metric handles, with its attributes.
 #[derive(Clone, Default)]
 pub(crate) struct Meter {
-    meter: Option<nanometer::Meter>,
+    meter: Option<NanoMeter>,
     attributes: Vec<KeyValue>,
 }
 
@@ -435,7 +455,9 @@ impl Metrics {
 }
 
 /// Which of the two caches a handle describes.
+#[cfg(feature = "opentelemetry")]
 pub(crate) const BLOCK_CACHE: usize = 0;
+#[cfg(feature = "opentelemetry")]
 pub(crate) const TABLE_CACHE: usize = 1;
 
 /// Which of [`Metrics::write_stalls`] a wait was: a write short of room in a
@@ -488,6 +510,7 @@ pub struct CacheMetrics {
 
 impl CacheMetrics {
     /// Handles for caches exporting through `provider`, with `attributes`.
+    #[cfg(feature = "opentelemetry")]
     pub(crate) fn new<P: opentelemetry::metrics::MeterProvider + ?Sized>(
         provider: &P,
         attributes: &[KeyValue],
@@ -603,5 +626,116 @@ impl Latency {
     /// no clock anywhere.
     pub(crate) fn start(&self) -> Option<Timer<'_>> {
         self.0.as_ref().map(|l| l.start())
+    }
+}
+
+/// What stands in for nanometer without the `opentelemetry` feature.
+///
+/// The same names, so the code above compiles unchanged, and handles that are
+/// uninhabited: no value of one can be made, so every `Option` of one is
+/// `None`, every record is a branch on that, and none of it reads a clock.
+//
+// Its builders mirror nanometer's whole, so some go unused here.
+#[cfg(not(feature = "opentelemetry"))]
+#[allow(dead_code)]
+mod off {
+    use std::convert::Infallible;
+    use std::marker::PhantomData;
+
+    /// An attribute, which nothing will ever read.
+    #[derive(Clone, Debug)]
+    pub(crate) struct KeyValue;
+
+    impl KeyValue {
+        pub(crate) fn new<K, V>(_key: K, _value: V) -> Self {
+            KeyValue
+        }
+    }
+
+    /// A metric's name, unit and description, kept nowhere.
+    macro_rules! def {
+        ($($name:ident),*) => {$(
+            #[derive(Clone, Copy)]
+            pub(crate) struct $name;
+
+            impl $name {
+                pub(crate) const fn new(_name: &'static str) -> Self {
+                    $name
+                }
+                pub(crate) const fn unit(self, _unit: &'static str) -> Self {
+                    self
+                }
+                pub(crate) const fn description(self, _text: &'static str) -> Self {
+                    self
+                }
+            }
+        )*};
+    }
+    def!(CounterDef, HistogramDef, LatencyDef, UpDownCounterDef);
+
+    impl HistogramDef {
+        pub(crate) const fn bytes(_name: &'static str) -> Self {
+            HistogramDef
+        }
+        pub(crate) const fn counts(_name: &'static str) -> Self {
+            HistogramDef
+        }
+    }
+
+    /// A meter, of which there are none.
+    #[derive(Clone)]
+    pub(crate) enum Meter {}
+
+    impl Meter {
+        pub(crate) fn counter(&self, _: CounterDef, _: &[KeyValue]) -> LocalCounter {
+            match *self {}
+        }
+        pub(crate) fn up_down_counter(
+            &self,
+            _: UpDownCounterDef,
+            _: &[KeyValue],
+        ) -> LocalUpDownCounter {
+            match *self {}
+        }
+        pub(crate) fn histogram(&self, _: HistogramDef, _: &[KeyValue]) -> LocalHistogram {
+            match *self {}
+        }
+        pub(crate) fn latency(&self, _: LatencyDef, _: &[KeyValue]) -> LocalLatency {
+            match *self {}
+        }
+    }
+
+    pub(crate) enum LocalCounter {}
+    pub(crate) enum LocalUpDownCounter {}
+    pub(crate) enum LocalHistogram {}
+    pub(crate) enum LocalLatency {}
+    pub(crate) struct Timer<'a>(Infallible, PhantomData<&'a ()>);
+
+    // As nanometer's does, so that ending one early reads the same here.
+    impl Drop for Timer<'_> {
+        fn drop(&mut self) {
+            match self.0 {}
+        }
+    }
+
+    impl LocalCounter {
+        pub(crate) fn add(&self, _: u64) {
+            match *self {}
+        }
+    }
+    impl LocalUpDownCounter {
+        pub(crate) fn add(&self, _: i64) {
+            match *self {}
+        }
+    }
+    impl LocalHistogram {
+        pub(crate) fn record(&self, _: u64) {
+            match *self {}
+        }
+    }
+    impl LocalLatency {
+        pub(crate) fn start(&self) -> Timer<'_> {
+            match *self {}
+        }
     }
 }

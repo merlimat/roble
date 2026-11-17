@@ -41,6 +41,10 @@ jobs:
       # what keeps both from decaying one allow at a time.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # Metrics are a default feature; without it the engine swaps nanometer
+      # for handles that cannot exist, and that build has to keep compiling.
+      - run: cargo clippy -p roble --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo test -p roble --no-default-features --locked
 
   go:
     name: Go harness

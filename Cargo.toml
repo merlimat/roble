@@ -14,10 +14,23 @@ compio = { version = "0.19.2", features = ["fs"] }
 # crates behind it — are not wanted. Silent, and reading no clock, unless a
 # subscriber is installed (§10).
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-nanometer = "0.1"
+nanometer = { version = "0.1", optional = true }
 # The version nanometer pins.
-opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"], optional = true }
 roble-format = { path = "format", version = "0.0.0-dev" }
+
+# Metrics through OpenTelemetry (METRICS.md), on by default. Without it the
+# options that take a meter provider do not exist, every handle records
+# nothing, and the dependency tree holds no opentelemetry — whose exact pin,
+# set by nanometer, an application would otherwise have to match.
+[features]
+default = ["opentelemetry"]
+opentelemetry = ["dep:nanometer", "dep:opentelemetry"]
+
+# The one test that needs a meter provider.
+[[test]]
+name = "metrics"
+required-features = ["opentelemetry"]
 
 [dev-dependencies]
 compio = { version = "0.19.2", features = ["fs", "macros"] }
