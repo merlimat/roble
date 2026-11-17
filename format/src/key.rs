@@ -199,7 +199,16 @@ pub fn compare(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
 }
 
 /// Encodes an internal key: the user key, then the little-endian trailer.
+///
+/// `seq_num` must be at most [`SEQ_NUM_MAX`]: the trailer has 56 bits for it,
+/// and the bits above them would be shifted out, leaving a different number
+/// with nothing to say so. Checked in debug builds only, since every caller
+/// passes a number an engine handed out.
 pub fn encode(user_key: &[u8], seq_num: u64, kind: Kind) -> Vec<u8> {
+    debug_assert!(
+        seq_num <= SEQ_NUM_MAX,
+        "sequence number {seq_num} past SEQ_NUM_MAX"
+    );
     encode_with_trailer(user_key, (seq_num << 8) | kind.to_byte() as u64)
 }
 
@@ -207,8 +216,13 @@ pub fn encode(user_key: &[u8], seq_num: u64, kind: Kind) -> Vec<u8> {
 ///
 /// A memtable builds one of these for every entry a write applies and copies
 /// it into its arena straight away, so a fresh `Vec` per entry was an
-/// allocation per write with nothing to keep.
+/// allocation per write with nothing to keep. `seq_num` is held to
+/// [`SEQ_NUM_MAX`] as [`encode`]'s is.
 pub fn encode_into(user_key: &[u8], seq_num: u64, kind: Kind, out: &mut Vec<u8>) {
+    debug_assert!(
+        seq_num <= SEQ_NUM_MAX,
+        "sequence number {seq_num} past SEQ_NUM_MAX"
+    );
     out.clear();
     out.reserve(user_key.len() + TRAILER_LEN);
     out.extend_from_slice(user_key);
