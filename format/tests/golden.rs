@@ -282,6 +282,25 @@ fn a_corrupt_block_fails_its_checksum() {
     );
 }
 
+/// `block_compression` takes any handle a caller has, not only one this table
+/// decoded, so it cannot rely on the decoder having bounded it.
+#[test]
+fn a_handle_past_the_end_of_u64_is_refused_by_block_compression() {
+    let bytes = std::fs::read(golden_dir().join("simple.sst")).expect("read simple.sst");
+    let table = Table::open(&bytes).expect("open");
+    let handle = roble_format::BlockHandle {
+        offset: u64::MAX,
+        length: 1,
+    };
+    let err = table
+        .block_compression(handle)
+        .expect_err("a handle no table reaches");
+    assert!(
+        matches!(err, roble_format::Error::Corrupt(_)),
+        "got {err:?}"
+    );
+}
+
 /// What roble wrote has to read back as what it was handed: the cheap half of
 /// the round trip, with no Go toolchain in the loop. The expensive half — Go
 /// Pebble reading it — is `compat/sst-roundtrip`.

@@ -193,6 +193,22 @@ mod tests {
         f
     }
 
+    /// The footer is the one structure in a table no checksum covers, so a
+    /// flipped bit in a handle reaches this check as it is. An offset and a
+    /// length whose sum is past `u64::MAX` must be refused, not added.
+    #[test]
+    fn a_handle_past_the_end_of_u64_is_refused() {
+        let mut f = footer_of(PEBBLE_MAGIC, 4);
+        // The metaindex handle: offset u64::MAX - 2 in ten varint bytes,
+        // then length 10 in one. The index handle after it is zero.
+        let mut handle = vec![0xff; 9];
+        handle.extend_from_slice(&[0x01, 0x0a]);
+        handle[0] = 0xfd;
+        f[1..1 + handle.len()].copy_from_slice(&handle);
+        let err = Footer::decode(&f, 1 << 20).expect_err("an overflowing handle");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+    }
+
     /// Every version roble reads, decoded from the footer that names it.
     ///
     /// The corpus carries tables at v1 through v4, so these are pinned there

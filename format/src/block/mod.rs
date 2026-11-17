@@ -102,13 +102,30 @@ pub struct BlockHandle {
 
 impl BlockHandle {
     /// Decodes a handle, returning it and the bytes consumed.
+    ///
+    /// Refuses one whose end, trailer included, is past `u64::MAX`. The two
+    /// varints are read from a table, and every reader adds them, so this is
+    /// where an end no file can have is caught rather than at each sum.
     pub fn decode(src: &[u8]) -> Result<(Self, usize)> {
         let (offset, n1) = varint::uvarint(src)?;
         let (length, n2) = varint::uvarint(&src[n1..])?;
-        Ok((BlockHandle { offset, length }, n1 + n2))
+        let handle = BlockHandle { offset, length };
+        if handle.end().is_none() {
+            return Error::corrupt(format!("block handle {handle:?} ends past u64::MAX"));
+        }
+        Ok((handle, n1 + n2))
+    }
+
+    /// Where the block's trailer ends, or `None` past `u64::MAX`.
+    fn end(self) -> Option<u64> {
+        self.length
+            .checked_add(TRAILER_SIZE as u64)
+            .and_then(|span| self.offset.checked_add(span))
     }
 
     /// The span the block occupies on disk, data plus trailer.
+    ///
+    /// Cannot overflow for a handle [`decode`](Self::decode) returned.
     pub fn span_len(self) -> u64 {
         self.length + TRAILER_SIZE as u64
     }
@@ -415,6 +432,34 @@ mod tests {
             b.add(k, v, 0, None, false);
         }
         b.finish().to_vec()
+    }
+
+    /// A handle is two varints read from a table, so nothing stops one from
+    /// naming a block whose end, trailer included, is past `u64::MAX`. Every
+    /// reader adds the two, so the handle is refused where it is decoded.
+    #[test]
+    fn a_handle_whose_end_overflows_is_refused() {
+        let mut src = Vec::new();
+        for v in [u64::MAX - TRAILER_SIZE as u64, 1] {
+            put_uvarint(&mut src, v);
+        }
+        let err = BlockHandle::decode(&src).expect_err("an end past u64::MAX");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+
+        // One byte less and it fits, so the bound is exact.
+        let mut src = Vec::new();
+        for v in [u64::MAX - TRAILER_SIZE as u64 - 1, 1] {
+            put_uvarint(&mut src, v);
+        }
+        BlockHandle::decode(&src).expect("an end at u64::MAX");
+    }
+
+    fn put_uvarint(dst: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            dst.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        dst.push(v as u8);
     }
 
     #[test]
