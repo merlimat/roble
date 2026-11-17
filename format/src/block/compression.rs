@@ -493,11 +493,8 @@ mod tests {
             let mut c = Compressor::new(codec).expect("compressor");
             let (got, stored) = c.compress(&block).expect("compress");
             assert_eq!(got, algorithm, "{codec:?}");
-            assert!(
-                stored.len() < block.len() / 2,
-                "{codec:?}: {}",
-                stored.len()
-            );
+            let len = stored.len();
+            assert!(len < block.len() / 2, "{codec:?}: {len}");
             let stored = stored.to_vec();
             let decoded = decode(got, &stored).expect("decode");
             assert_eq!(decoded.as_slice(), &block[..], "{codec:?}");
@@ -509,6 +506,14 @@ mod tests {
                 &block[..1000]
             );
         }
+    }
+
+    /// What a `TableWriter`'s `Debug` shows of its compressor: the codec, and
+    /// nothing of the buffers or the Zstd context behind it.
+    #[test]
+    fn a_compressor_prints_its_codec() {
+        let c = Compressor::new(Codec::Zstd(3)).expect("compressor");
+        assert_eq!(format!("{c:?}"), "Compressor { codec: Zstd(3), .. }");
     }
 
     /// A block compression does not shrink by 12% is stored as built, with
