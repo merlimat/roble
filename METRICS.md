@@ -46,7 +46,7 @@ the caller's choosing.
 | `roble.operation.type` | `roble.write.operations` | `put`, `delete`, `delete_range` |
 | `roble.level` | `roble.level.*` | `0`–`6` |
 | `disk.io.direction` | `roble.compaction.*` | `read`, `write` |
-| `error.type` | `roble.*.errors` | `io`, `locked`, `format`, `unsupported`, `corrupt`, `no_database`, `read_only`, `stale` |
+| `error.type` | `roble.*.errors` | `io`, `locked`, `format`, `unsupported`, `corrupt`, `no_database`, `read_only`, `stale`, `invalid_argument` |
 | `disk.io.direction` | `roble.disk.*` | `read`, `write` |
 | `roble.cache` | `roble.cache.*` | `block`, `table` |
 | `roble.cache.result` | `roble.cache.lookups` | `hit`, `miss` |

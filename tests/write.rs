@@ -674,3 +674,27 @@ async fn single_writes_on_the_store_read_back_as_a_model_would() {
     }
     assert_eq!(contents(&no_wal).await, model, "and should change nothing");
 }
+
+#[compio::test]
+async fn an_empty_or_inverted_range_is_the_callers_mistake() {
+    // Not `Format`, which says a file could not be read, and not `Corrupt`:
+    // nothing was read, and nothing on disk is wrong.
+    let (env, dir) = load("db-simple").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    let before = contents(&db).await;
+
+    let err = db
+        .delete_range(b"/z", b"/a", roble::Durability::NoSync)
+        .await
+        .expect_err("an inverted range");
+    assert!(matches!(err, roble::Error::InvalidArgument(_)), "{err:?}");
+    assert!(err.to_string().starts_with("invalid argument: "), "{err}");
+
+    let mut batch = db.indexed_batch();
+    let err = batch
+        .delete_range(b"/a", b"/a")
+        .expect_err("an empty range");
+    assert!(matches!(err, roble::Error::InvalidArgument(_)), "{err:?}");
+
+    assert_eq!(contents(&db).await, before, "and nothing changed");
+}

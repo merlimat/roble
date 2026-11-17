@@ -143,7 +143,7 @@ impl Batch {
     /// `DeleteRange`: the value is the exclusive end key.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<()> {
         if start >= end {
-            return Error::corrupt(format!(
+            return Error::invalid_argument(format!(
                 "delete_range start {:?} is not below its end {:?}",
                 String::from_utf8_lossy(start),
                 String::from_utf8_lossy(end)
@@ -205,7 +205,7 @@ impl Batch {
     fn bump_count(&mut self) -> Result<()> {
         let next = match self.count().checked_add(1) {
             Some(n) => n,
-            None => return Error::corrupt("batch would exceed 2^32 - 1 entries"),
+            None => return Error::invalid_argument("batch would exceed 2^32 - 1 entries"),
         };
         self.repr[COUNT_OFFSET..HEADER_LEN].copy_from_slice(&next.to_le_bytes());
         Ok(())
@@ -411,6 +411,20 @@ mod tests {
             }
         }
         assert!(err.is_some(), "a short batch must not read as complete");
+    }
+
+    /// A range whose start is not below its end is the caller's mistake, and
+    /// says so: `Corrupt` would send whoever reads it looking for damage on
+    /// disk that is not there.
+    #[test]
+    fn an_empty_or_inverted_range_is_an_invalid_argument() {
+        let mut b = Batch::new();
+        for (start, end) in [(&b"/a"[..], &b"/a"[..]), (b"/z", b"/a")] {
+            let err = b.delete_range(start, end).expect_err("refused");
+            assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+            assert!(err.to_string().starts_with("invalid argument: "), "{err}");
+        }
+        assert!(b.is_empty(), "and nothing was added");
     }
 
     /// An entry that fails to decode has no length to step over, so the

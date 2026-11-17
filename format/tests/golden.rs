@@ -417,7 +417,25 @@ fn the_writer_refuses_what_roble_does_not_write() {
         kind: Kind::Set,
         obsolete: false,
     };
-    assert!(w.add(earlier, b"v").is_err(), "descending keys must fail");
+    // The caller's mistake, not damage: nothing was read.
+    assert!(
+        matches!(
+            w.add(earlier, b"v"),
+            Err(roble_format::Error::InvalidArgument(_))
+        ),
+        "descending keys must fail, as an invalid argument"
+    );
+
+    // As does a sequence number past the largest the trailer holds.
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    let too_large = InternalKey {
+        seq_num: roble_format::key::SEQ_NUM_MAX + 1,
+        ..key(Kind::Set, false)
+    };
+    assert!(matches!(
+        w.add(too_large, b"v"),
+        Err(roble_format::Error::InvalidArgument(_))
+    ));
 }
 
 /// A MERGE key is refused wherever it is met, and for its own reason.
