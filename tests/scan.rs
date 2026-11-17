@@ -29,7 +29,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, Options, Scan, WriteBuf};
+use roble::{Comparison, Disk, Fs, GetBuf, Options, Scan, WriteBuf};
 use roble_format::batch::Batch;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -1103,6 +1103,98 @@ async fn a_scan_over_keys_out_of_order_ends_rather_than_skipping_round_a_tombsto
             } else {
                 scan.prev().await
             };
+        }
+    }
+}
+
+/// A level that moves onto a table holding nothing but a range deletion
+/// offers nothing from the table it left.
+///
+/// Such a table has no data blocks, so positioning its iterator never reaches
+/// the block cursor. A level opened it on the cursor kept from the table it
+/// had been on, and went on offering that table's entry as the new one's. On
+/// the second `first` over the store below, L1 offered `k01` from the table
+/// it had left, never `k00`, so the merge took L2's older `k00` in its place;
+/// taking `k01` from L1 next panicked, since the deletion's table has no
+/// block to read a value from. A floor or a ceiling through a kept `GetBuf`
+/// is the same seek on the same kept cursor.
+///
+/// Found by the `model` fuzz target, on `db-reads` with a lone range deletion
+/// flushed into a table of its own at the head of L1. A scan's first
+/// positioning opens that table on a fresh cursor and is right, so it is
+/// every one after it that is checked here.
+#[compio::test]
+async fn a_level_moving_onto_a_table_of_only_a_range_deletion_offers_nothing_from_the_one_it_left()
+{
+    let env = SimEnv::new();
+    let db = open_manual(&env, Path::new("/db")).await;
+    let keys = || (0..10).map(|i| format!("k{i:02}"));
+    table_at(&db, keys(), b"old", 2).await;
+    table_at(&db, keys(), b"new", 1).await;
+    let mut batch = Batch::new();
+    batch.delete_range(b"a", b"b").expect("delete range");
+    db.write_raw(&mut batch, true).await.expect("write");
+    let lone = db.flush().await.expect("flush").expect("a table");
+    db.compact(0, &[lone]).await.expect("compact into L1");
+    let levels = db.levels().expect("levels");
+    let l1 = &levels[1].tables;
+    assert_eq!(
+        (
+            l1.len(),
+            l1[0].smallest.as_slice(),
+            l1[0].largest.as_slice()
+        ),
+        (2, b"a".as_slice(), b"b".as_slice()),
+        "L1 starts with the range deletion's table"
+    );
+
+    let model: BTreeMap<String, String> = keys().map(|k| (k, "new".to_string())).collect();
+    let want: Vec<(String, String)> = model.clone().into_iter().collect();
+    let mut scan = db.range(..).expect("scan");
+    for walk in 0..3 {
+        let mut forward = Vec::new();
+        scan.first().await.expect("first");
+        while let Some(at) = on_key(&scan) {
+            forward.push(at);
+            scan.next().await.expect("next");
+        }
+        assert_eq!(forward, want, "forward, walk {walk}");
+        let mut backward = Vec::new();
+        scan.last().await.expect("last");
+        while let Some(at) = on_key(&scan) {
+            backward.push(at);
+            scan.prev().await.expect("prev");
+        }
+        backward.reverse();
+        assert_eq!(backward, want, "backward, walk {walk}");
+        scan.seek_ge(b"a5").await.expect("seek_ge");
+        assert_eq!(
+            on_key(&scan),
+            Some(want[0].clone()),
+            "seek_ge into the deletion, walk {walk}"
+        );
+    }
+
+    let mut buf = GetBuf::new();
+    for probe in ["k05", "a5", "k05~", "a5", "a", "k05"] {
+        for how in [Comparison::Floor, Comparison::Ceiling] {
+            let got = db
+                .get_into(probe.as_bytes(), how, &mut buf)
+                .await
+                .expect("get")
+                .then(|| {
+                    (
+                        String::from_utf8_lossy(buf.key()).into_owned(),
+                        String::from_utf8_lossy(buf.value()).into_owned(),
+                    )
+                });
+            let probe = probe.to_string();
+            let want = match how {
+                Comparison::Floor => model.range(..=probe.clone()).next_back(),
+                _ => model.range(probe.clone()..).next(),
+            }
+            .map(|(k, v)| (k.clone(), v.clone()));
+            assert_eq!(got, want, "{how:?} of {probe}");
         }
     }
 }
