@@ -85,6 +85,16 @@ pub struct Snapshot<F: Fs = crate::FileFs> {
     metrics: Rc<Metrics>,
 }
 
+/// The sequence number it reads at, and how much it holds open.
+impl<F: Fs> std::fmt::Debug for Snapshot<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("seq", &self.seq)
+            .field("memtables", &self.memtables.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<F: Fs> Drop for Snapshot<F> {
     /// A snapshot that has gone away releases the whole version it was
     /// holding, which is the point of saying how many are open.

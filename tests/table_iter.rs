@@ -201,6 +201,25 @@ fn put_uvarint(dst: &mut Vec<u8>, mut v: u64) {
 }
 
 #[compio::test]
+async fn a_table_and_its_iterator_print_which_table_they_are() {
+    // What `{:?}` shows: which table, and how much of it is in memory, not
+    // the blocks themselves (`tests/debug.rs` has the public types).
+    let (_env, table) = open(FIXTURES[0]).await;
+    let printed = format!("{table:?}");
+    assert!(
+        printed.contains("OpenTable") && printed.contains("file_num"),
+        "{printed}"
+    );
+
+    let mut it = table.iter();
+    it.first().await.expect("first");
+    let printed = format!("{it:?}");
+    assert!(printed.contains("block: 0"), "{printed}");
+    let entry = it.entry().await.expect("entry");
+    assert!(format!("{entry:?}").starts_with("Entry"));
+}
+
+#[compio::test]
 async fn an_iterator_walks_a_whole_table_both_ways() {
     for name in FIXTURES {
         let bytes = std::fs::read(sst_path(name)).expect("read fixture");
@@ -398,7 +417,7 @@ async fn an_empty_table_has_nowhere_to_go_but_still_holds_its_tombstones() {
 async fn a_table_written_with_another_comparer_is_refused() {
     let bytes = std::fs::read(sst_path("refuse-comparer")).expect("read fixture");
     let (_env, opened) = try_open_bytes(bytes).await;
-    let err = opened.err().expect("a foreign comparer must be refused");
+    let err = opened.expect_err("a foreign comparer must be refused");
     let text = format!("{err}");
     assert!(
         text.contains("oxia-slash-spans") && text.contains("leveldb.BytewiseComparator"),

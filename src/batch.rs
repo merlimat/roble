@@ -284,6 +284,17 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     }
 }
 
+/// How much it holds, not the entries: a batch can be a whole replicated
+/// write, and its repr is what [`IndexedBatch::as_bytes`] is for.
+impl<F: Fs> std::fmt::Debug for IndexedBatch<'_, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexedBatch")
+            .field("count", &self.count())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<F: Fs> Db<F> {
     /// A batch that can be read back through itself before it commits.
     ///
