@@ -115,12 +115,11 @@ fn table(case: TableCase) {
     points.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     let fragments = fragment(&tombstones(&case.tombstones));
 
-    let mut w = TableWriter::new(WriterOptions {
-        block_size: usize::from(case.block_size),
-        filter_bits_per_key: case.filter.then_some(10),
-        ..WriterOptions::default()
-    })
-    .expect("a writer");
+    let mut w = TableWriter::new(
+        WriterOptions::default()
+            .block_size(usize::from(case.block_size))
+            .filter_bits_per_key(case.filter.then_some(10)),
+    );
     for (k, seq, kind, v) in &points {
         let ikey = InternalKey {
             user_key: k,

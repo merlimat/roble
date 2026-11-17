@@ -397,7 +397,7 @@ async fn build_table<D: Disk>(
     file_num: u64,
     unit: u64,
 ) -> Result<(u64, NewTable)> {
-    let mut writer = TableWriter::new(WriterOptions::default())?;
+    let mut writer = TableWriter::new(WriterOptions::default());
     // Where the next chunk goes, and in the end how large the table is.
     let mut at = 0u64;
 

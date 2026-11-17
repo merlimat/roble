@@ -312,11 +312,7 @@ fn roble_reads_back_what_roble_wrote() {
     use roble_format::{InternalKey, Kind};
 
     // Small blocks so the index is exercised rather than a single block.
-    let opts = WriterOptions {
-        block_size: 512,
-        ..Default::default()
-    };
-    let mut w = TableWriter::new(opts).expect("writer");
+    let mut w = TableWriter::new(WriterOptions::default().block_size(512));
 
     let mut expected = Vec::new();
     for i in 0..300u64 {
@@ -396,7 +392,7 @@ fn the_writer_refuses_what_roble_does_not_write() {
         obsolete,
     };
     for kind in [Kind::Merge, Kind::RangeKeySet, Kind::Excise] {
-        let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+        let mut w = TableWriter::new(WriterOptions::default());
         assert!(
             w.add(key(kind, false), b"v").is_err(),
             "{} should be refused",
@@ -405,11 +401,11 @@ fn the_writer_refuses_what_roble_does_not_write() {
     }
     // The obsolete bit is never set, because setting it wrongly makes a Go
     // reader skip a live key.
-    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    let mut w = TableWriter::new(WriterOptions::default());
     assert!(w.add(key(Kind::Set, true), b"v").is_err());
 
     // Out-of-order keys are caught at write time, not discovered at read time.
-    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    let mut w = TableWriter::new(WriterOptions::default());
     w.add(key(Kind::Set, false), b"v").expect("first key");
     let earlier = InternalKey {
         user_key: b"/a",
@@ -427,7 +423,7 @@ fn the_writer_refuses_what_roble_does_not_write() {
     );
 
     // As does a sequence number past the largest the trailer holds.
-    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    let mut w = TableWriter::new(WriterOptions::default());
     let too_large = InternalKey {
         seq_num: roble_format::key::SEQ_NUM_MAX + 1,
         ..key(Kind::Set, false)
@@ -538,6 +534,36 @@ fn the_reader_refuses_a_foreign_comparer_too() {
     );
 }
 
+/// A writer told to write no filter writes none, and one left at the
+/// default writes Oxia's: a table without a filter is legal, but every point
+/// lookup on it reads a block to answer "not here".
+#[test]
+fn the_filter_is_written_unless_turned_off() {
+    use roble_format::sst::{TableWriter, WriterOptions};
+    use roble_format::{InternalKey, Kind};
+
+    let key = InternalKey {
+        user_key: b"/oxia/a",
+        seq_num: 1,
+        kind: Kind::Set,
+        obsolete: false,
+    };
+    for (opts, filtered) in [
+        (WriterOptions::default(), true),
+        (WriterOptions::default().filter_bits_per_key(None), false),
+    ] {
+        let mut w = TableWriter::new(opts);
+        w.add(key, b"v").expect("add");
+        let bytes = w.finish().expect("finish");
+        let table = Table::open(&bytes).expect("open");
+        assert_eq!(
+            table.filter_block().expect("filter block").is_some(),
+            filtered,
+            "{opts:?}"
+        );
+    }
+}
+
 /// A table with no point key answers every read, rather than refusing them.
 ///
 /// The shape is the one `compat/sst-roundtrip` round-trips as `rangedel-only`
@@ -553,7 +579,7 @@ fn the_reader_refuses_a_foreign_comparer_too() {
 fn a_table_with_no_point_key_answers_every_read() {
     use roble_format::sst::{TableWriter, WriterOptions};
 
-    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    let mut w = TableWriter::new(WriterOptions::default());
     w.add_range_deletion(b"/oxia/a", b"/oxia/z", 5)
         .expect("tombstone");
     let bytes = w.finish().expect("finish");

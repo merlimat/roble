@@ -625,7 +625,7 @@ struct Output {
 impl Output {
     fn new(start: Option<Vec<u8>>) -> Result<Self> {
         Ok(Output {
-            writer: TableWriter::new(WriterOptions::default())?,
+            writer: TableWriter::new(WriterOptions::default()),
             bounds: Bounds::default(),
             start,
             estimate: 0,

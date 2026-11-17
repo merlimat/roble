@@ -215,11 +215,7 @@ fn main() {
         "fixture", "entries", "bytes", "blocks"
     );
     for f in fixtures() {
-        let opts = WriterOptions {
-            block_size: f.block_size,
-            ..Default::default()
-        };
-        let mut w = TableWriter::new(opts).expect("writer");
+        let mut w = TableWriter::new(WriterOptions::default().block_size(f.block_size));
         for (user_key, seq_num, kind, value) in &f.entries {
             w.add(
                 InternalKey {

@@ -56,28 +56,49 @@ pub const CONCATENATE_MERGER: &str = "pebble.concatenate";
 /// Oxia's block size, and so roble's default (DESIGN.md §1).
 pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024;
 
-/// How a table is written.
+/// The one table format roble writes.
+///
+/// Pebblev4, the newest format Oxia's Pebble reads and the one it writes
+/// (DESIGN.md §3). A reader takes Pebblev1 to v4; a writer has no reason to
+/// produce anything older.
+const FORMAT: TableFormat = TableFormat::Pebblev4;
+
+/// How a table is written: [`Default`], then the setters for what differs.
+///
+/// Its fields are private, so a setter added later is not a breaking change
+/// for a caller that built one. There is no format to choose: roble writes
+/// Pebblev4 only.
 #[derive(Debug, Clone, Copy)]
 pub struct WriterOptions {
-    /// The target size of a data block, before its trailer.
-    pub block_size: usize,
-    /// The table format. Only [`TableFormat::Pebblev4`] is written.
-    pub format: TableFormat,
-    /// Bits per key for the bloom filter, or `None` to write no filter block.
-    ///
-    /// A table without one is format-legal and Go Pebble reads it, but it
-    /// throws away the point-lookup filtering Oxia configures, so the default
-    /// matches Oxia's `bloom.FilterPolicy(10)` (DESIGN.md §1).
-    pub filter_bits_per_key: Option<usize>,
+    block_size: usize,
+    filter_bits_per_key: Option<usize>,
 }
 
 impl Default for WriterOptions {
     fn default() -> Self {
         WriterOptions {
             block_size: DEFAULT_BLOCK_SIZE,
-            format: TableFormat::Pebblev4,
             filter_bits_per_key: Some(filter::DEFAULT_BITS_PER_KEY),
         }
+    }
+}
+
+impl WriterOptions {
+    /// The target size of a data block, before its trailer:
+    /// [`DEFAULT_BLOCK_SIZE`] by default.
+    pub fn block_size(mut self, bytes: usize) -> Self {
+        self.block_size = bytes;
+        self
+    }
+
+    /// Bits per key for the bloom filter, or `None` to write no filter block.
+    ///
+    /// A table without one is format-legal and Go Pebble reads it, but it
+    /// throws away the point-lookup filtering Oxia configures, so the default
+    /// matches Oxia's `bloom.FilterPolicy(10)` (DESIGN.md §1).
+    pub fn filter_bits_per_key(mut self, bits: Option<usize>) -> Self {
+        self.filter_bits_per_key = bits;
+        self
     }
 }
 
@@ -118,15 +139,8 @@ pub struct TableWriter {
 
 impl TableWriter {
     /// A writer with the given options.
-    pub fn new(opts: WriterOptions) -> Result<Self> {
-        if opts.format != TableFormat::Pebblev4 {
-            return Error::unsupported(format!(
-                "roble writes {} only, not {}",
-                TableFormat::Pebblev4.name(),
-                opts.format.name()
-            ));
-        }
-        Ok(TableWriter {
+    pub fn new(opts: WriterOptions) -> Self {
+        TableWriter {
             opts,
             buf: Vec::new(),
             taken: 0,
@@ -142,7 +156,7 @@ impl TableWriter {
             data_size: 0,
             range_del: rangedel::Builder::new(),
             filter: opts.filter_bits_per_key.map(FilterBuilder::new),
-        })
+        }
     }
 
     /// Adds a point entry.
@@ -179,13 +193,13 @@ impl TableWriter {
             self.flush_data_block()?;
         }
 
-        let value_prefix = if self.opts.format.has_value_prefix() && key.kind == Kind::Set {
+        let value_prefix = if FORMAT.has_value_prefix() && key.kind == Kind::Set {
             // kv.go: valueKindIsInPlaceValue, plus setHasSameKeyPrefixMask.
             Some(if same_key_prefix { 0x20 } else { 0x00 })
         } else {
             None
         };
-        let max_shared = max_shared_len(self.opts.format, &self.prev_key, &encoded);
+        let max_shared = max_shared_len(FORMAT, &self.prev_key, &encoded);
         self.data
             .add(&encoded, value, max_shared, value_prefix, same_key_prefix);
 
