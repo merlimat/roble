@@ -113,6 +113,7 @@ impl<F: Fs> Opened<F> {
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
+        self.writable()?;
         let Some(plan) = self.plan(level, file_nums).await? else {
             return Err(Error::Unsupported(format!(
                 "{file_nums:?} are already being compacted out of L{level}"

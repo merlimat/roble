@@ -47,6 +47,13 @@ pub enum Error {
     Corrupt(String),
     /// There is no database in the directory.
     NotFound(String),
+    /// The store was opened read-only, and this would change the directory
+    /// ([`crate::open_read_only`]).
+    ReadOnly,
+    /// A store opened read-only needed a file the process writing the
+    /// database has retired or not finished writing; opening again reads the
+    /// database as it is now (DESIGN.md §6, "Reading beside a writer").
+    Stale(String),
 }
 
 impl fmt::Display for Error {
@@ -58,6 +65,8 @@ impl fmt::Display for Error {
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt: {m}"),
             Error::NotFound(m) => write!(f, "{m}"),
+            Error::ReadOnly => write!(f, "the database was opened read-only"),
+            Error::Stale(m) => write!(f, "stale: {m}"),
         }
     }
 }
@@ -68,7 +77,11 @@ impl std::error::Error for Error {
             Error::Io(e) => Some(e),
             Error::Locked => None,
             Error::Format(e) => Some(e),
-            Error::Unsupported(_) | Error::Corrupt(_) | Error::NotFound(_) => None,
+            Error::Unsupported(_)
+            | Error::Corrupt(_)
+            | Error::NotFound(_)
+            | Error::ReadOnly
+            | Error::Stale(_) => None,
         }
     }
 }

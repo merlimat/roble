@@ -178,13 +178,15 @@ const ERROR_TYPE: &str = "error.type";
 ///
 /// OpenTelemetry asks for a low-cardinality classification rather than a
 /// message, and roble's error kinds already are one.
-const ERROR_TYPES: [&str; 6] = [
+const ERROR_TYPES: [&str; 8] = [
     "io",
     "locked",
     "format",
     "unsupported",
     "corrupt",
     "not_found",
+    "read_only",
+    "stale",
 ];
 
 /// Which of [`ERROR_TYPES`] an error is.
@@ -197,6 +199,8 @@ fn error_type(error: &crate::error::Error) -> usize {
         Unsupported(_) => 3,
         Corrupt(_) => 4,
         NotFound(_) => 5,
+        ReadOnly => 6,
+        Stale(_) => 7,
     }
 }
 

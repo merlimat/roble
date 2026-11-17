@@ -360,6 +360,7 @@ impl<F: Fs> Opened<F> {
     /// A table a reader is still open for is left for a later sweep, and the
     /// table cache's own reader is let go of first (§5).
     pub async fn remove_obsolete_files(&self) -> Result<Vec<String>> {
+        self.writable()?;
         let change = self.changes().begin().await;
         self.sweep(&change).await
     }

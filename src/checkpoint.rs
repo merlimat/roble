@@ -66,6 +66,9 @@ impl<F: Fs> Opened<F> {
     /// what a checkpoint is: a directory as of a moment, and the moment is
     /// the flush.
     pub async fn checkpoint(&self, dir: &Path) -> Result<()> {
+        // The flush below would refuse too; refused here so that a reader
+        // does not depend on the order of what follows.
+        self.writable()?;
         // Before the permit, not under it: a flush takes it for itself, and
         // what this needs the permit for is that the version it is about to
         // describe stays the version while its tables are being linked.

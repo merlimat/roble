@@ -42,7 +42,15 @@
 //! Step 4 before step 6 is the part worth keeping: a database written above
 //! the pin must be refused for being above the pin, not for whatever its
 //! MANIFEST happens to trip over first.
+//!
+//! [`open_read_only`] walks the same steps without 1, 3 and 8: it takes no
+//! lock, creates nothing and deletes nothing, so it can read a directory
+//! another process is writing to. What that costs is that the writer may
+//! retire a file the reader still needs, which the reader reports as
+//! [`Error::Stale`] rather than as damage (DESIGN.md §6, "Reading beside a
+//! writer").
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use roble_format::files::{
@@ -84,8 +92,12 @@ const SEQ_NUM_START: u64 = 10;
 /// from: the memtables, caches and iterator tree are built on top of it.
 /// Dropping it releases the directory lock.
 pub struct Opened<F: Fs> {
-    // Held, not used: dropping it is what releases the directory.
-    _lock: F::Lock,
+    // Held, not used: dropping it is what releases the directory. None for a
+    // store opened read-only, which takes no lock.
+    _lock: Option<F::Lock>,
+    /// Whether this store was opened by [`open_read_only`], and so refuses
+    /// everything that would change the directory.
+    read_only: bool,
     /// The filesystem the database's files are opened in.
     ///
     /// Owned rather than borrowed, so that a store is a `'static` value and
@@ -230,20 +242,57 @@ pub async fn open_with<E: Env>(
     dir: &Path,
     options: crate::options::Options<E::Fs>,
 ) -> Result<Opened<E::Fs>> {
+    open_dir(env, dir, options, false).await
+}
+
+/// Opens the database in `dir` to read, beside whatever process may be
+/// writing to it.
+///
+/// It takes no lock, and it creates, writes and deletes nothing in the
+/// directory: `create_if_missing` is not acted on, the logs are replayed into
+/// a memtable of its own, and nothing obsolete is swept. Everything that
+/// would change the directory — a write, a flush, a compaction, a rotation,
+/// a checkpoint, a sweep, a destroy — fails with [`Error::ReadOnly`].
+///
+/// It reads the database as of the open, and does not follow the writer
+/// after it. The writer does not know it is there, so it may delete a table
+/// or a log this store still needs; the open or the read that finds it gone
+/// fails with [`Error::Stale`], and the answer is to open again (DESIGN.md
+/// §6, "Reading beside a writer").
+pub async fn open_read_only<E: Env>(
+    env: &E,
+    dir: &Path,
+    options: crate::options::Options<E::Fs>,
+) -> Result<Opened<E::Fs>> {
+    open_dir(env, dir, options, true).await
+}
+
+async fn open_dir<E: Env>(
+    env: &E,
+    dir: &Path,
+    options: crate::options::Options<E::Fs>,
+    read_only: bool,
+) -> Result<Opened<E::Fs>> {
     // Cloned, not borrowed: the store outlives this call and is meant to be
     // ownable by a task of its own (§10).
     let fs = env.fs().clone();
+    let create_if_missing = options.create_if_missing && !read_only;
 
     // The directory itself, when the caller has said it may not be there.
     // Ahead of the lock because the lock is a file inside it; an open that
     // was not asked to create anything is left to fail on the lock, which is
     // what a mistyped path should do.
-    if options.create_if_missing {
+    if create_if_missing {
         fs.mkdir_all(dir).await?;
     }
 
-    // 1. The lock comes first, so nothing below races a second owner.
-    let lock = fs.lock(&dir.join("LOCK")).await?;
+    // 1. The lock comes first, so nothing below races a second owner. A
+    //    reader takes none: the owner is exactly who it means to read beside.
+    let lock = if read_only {
+        None
+    } else {
+        Some(fs.lock(&dir.join("LOCK")).await?)
+    };
 
     // 2. One listing, and every question answered from it.
     let entries = fs.list(dir).await?;
@@ -259,7 +308,7 @@ pub async fn open_with<E: Env>(
     //    and asking it here rather than acting on step 4's refusal is what
     //    keeps "there is no database" apart from the several other reasons a
     //    directory can be refused.
-    if options.create_if_missing
+    if create_if_missing
         && files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?.is_none()
     {
         crate::create::create(&fs, dir, &names).await?;
@@ -297,12 +346,22 @@ pub async fn open_with<E: Env>(
     }
 
     // 6. Replay it.
-    let edits = read_version_edits(&fs, &dir.join(&manifest_filename), parsed.file_num).await?;
+    let edits = read_version_edits(
+        &fs,
+        &dir.join(&manifest_filename),
+        parsed.file_num,
+        read_only,
+    )
+    .await?;
     let versions = VersionSet::replay(&edits)?;
 
     // Every table the version names has to be in the directory. A checkpoint
     // that was streamed short, or a file deleted by hand, shows up here rather
     // than as a missing key much later.
+    //
+    // Not for a reader: the listing was taken before the MANIFEST was read,
+    // so a flush in between names a table the listing never saw. A table
+    // that really has gone shows up when a read opens it, as stale.
     let present: std::collections::BTreeSet<u64> = names
         .iter()
         .filter_map(|n| files::parse_filename(n))
@@ -311,7 +370,7 @@ pub async fn open_with<E: Env>(
         .collect();
     for (level, tables) in versions.version.levels() {
         for t in tables {
-            if !present.contains(&t.file_num) {
+            if !read_only && !present.contains(&t.file_num) {
                 return Err(Error::Corrupt(format!(
                     "L{level} table {} is in the MANIFEST but not in {}",
                     t.file_num,
@@ -332,6 +391,7 @@ pub async fn open_with<E: Env>(
         &names,
         versions.min_unflushed_log_num,
         &mut memtable,
+        read_only,
     )
     .await?;
 
@@ -343,18 +403,24 @@ pub async fn open_with<E: Env>(
     //    so no log it deletes is one the replay still needed, and its
     //    failure is swallowed: a leftover file is no reason to refuse a
     //    database that reads.
-    let live = crate::obsolete::Live::of(&versions, parsed.file_num, &names)?;
-    // No reader can be open yet: the store being opened has made none, and
-    // another process holding the directory is what the lock refuses.
-    let swept = crate::obsolete::remove_obsolete(
-        &fs,
-        dir,
-        &names,
-        &live,
-        &std::collections::BTreeSet::new(),
-    )
-    .await
-    .unwrap_or_default();
+    //    A reader skips it: what is obsolete is the writer's to delete.
+    let swept = if read_only {
+        Vec::new()
+    } else {
+        let live = crate::obsolete::Live::of(&versions, parsed.file_num, &names)?;
+        // No reader can be open yet: the store being opened has made none,
+        // and another process holding the directory is what the lock
+        // refuses.
+        crate::obsolete::remove_obsolete(
+            &fs,
+            dir,
+            &names,
+            &live,
+            &std::collections::BTreeSet::new(),
+        )
+        .await
+        .unwrap_or_default()
+    };
 
     // The next sequence number never goes backwards: a write replay brought
     // back must not be overwritten by one numbered the same (§6). And never
@@ -374,10 +440,21 @@ pub async fn open_with<E: Env>(
     // skipped the replay above: the records already in a log were
     // acknowledged when they were written, whatever this store has been
     // asked to do from here (§6).
+    //
+    // A reader opens it only to read, so that it says which log is current;
+    // nothing it does appends to it.
     let log = match replayed.tail.filter(|_| !options.disable_wal) {
         Some((log_num, at)) => {
             let path = dir.join(roble_format::files::log_filename(log_num));
-            let disk = fs.open(&path, Access::ReadWrite).await?;
+            let access = if read_only {
+                Access::ReadOnly
+            } else {
+                Access::ReadWrite
+            };
+            let disk = fs
+                .open(&path, access)
+                .await
+                .map_err(retired(read_only, &path))?;
             Some(Log {
                 disk: std::rc::Rc::new(disk),
                 log_num,
@@ -415,9 +492,11 @@ pub async fn open_with<E: Env>(
         metrics: std::rc::Rc::clone(&metrics),
         readers: std::rc::Rc::clone(&readers),
         entries: Default::default(),
+        read_only,
     });
     Ok(Opened {
         _lock: lock,
+        read_only,
         metrics,
         fs,
         store_id,
@@ -530,9 +609,37 @@ fn read_format_version(names: &[String]) -> Result<u64> {
     Ok(version)
 }
 
+/// Turns a file that has gone into [`Error::Stale`], for a reader.
+///
+/// A store with the lock deletes only what no version it can still read
+/// names, so a file it needs and cannot find is damage, and stays an I/O
+/// error. A reader holds no lock, and the file it cannot find is one the
+/// writer retired after the reader read the version naming it.
+pub(crate) fn retired(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Error + '_ {
+    move |e| match e {
+        Error::Io(e) if read_only && e.kind() == io::ErrorKind::NotFound => Error::Stale(format!(
+            "{} is gone: the process writing the database retired it",
+            path.display()
+        )),
+        e => e,
+    }
+}
+
 /// Reads every version edit in a MANIFEST.
-async fn read_version_edits<F: Fs>(fs: &F, path: &Path, file_num: u64) -> Result<Vec<VersionEdit>> {
-    let disk = fs.open(path, Access::ReadOnly).await?;
+///
+/// A reader may find the writer halfway through appending to it, so for a
+/// reader a record that does not read is stale rather than corrupt: opening
+/// again reads it whole, or, if it is damage, keeps failing on it.
+async fn read_version_edits<F: Fs>(
+    fs: &F,
+    path: &Path,
+    file_num: u64,
+    read_only: bool,
+) -> Result<Vec<VersionEdit>> {
+    let disk = fs
+        .open(path, Access::ReadOnly)
+        .await
+        .map_err(retired(read_only, path))?;
     let bytes = read_all(&disk, Default::default()).await?;
 
     // The file number is passed even though a MANIFEST's chunks are legacy and
@@ -542,7 +649,12 @@ async fn read_version_edits<F: Fs>(fs: &F, path: &Path, file_num: u64) -> Result
     let mut edits = Vec::new();
     while let Some(record) = reader.next() {
         let record = record.map_err(|e| {
-            Error::Corrupt(format!("{}: record {}: {e}", path.display(), edits.len()))
+            let m = format!("{}: record {}: {e}", path.display(), edits.len());
+            if read_only {
+                Error::Stale(m)
+            } else {
+                Error::Corrupt(m)
+            }
         })?;
         edits.push(VersionEdit::decode(&record)?);
     }
@@ -592,12 +704,20 @@ struct Replayed {
 /// same file would mean deciding what the bytes after it were meant to be,
 /// and the answer that loses no data either way is to stop at the last record
 /// that reads (§6).
+///
+/// A reader is beside a writer that may still be appending to a log that is
+/// no longer the last: a flush creates the next log before the writes in
+/// flight on the old one have finished. So for a reader a torn record in an
+/// earlier log is stale rather than corrupt, and so is an earlier log that
+/// grew while the later ones were read — what it gained is older than what
+/// they hold, and replaying one without the other would be a hole.
 async fn replay_logs<F: Fs>(
     fs: &F,
     dir: &Path,
     names: &[String],
     min_unflushed_log_num: u64,
     memtable: &mut crate::memtable::Memtable,
+    read_only: bool,
 ) -> Result<Replayed> {
     let mut logs: Vec<(u64, &String)> = names
         .iter()
@@ -612,8 +732,14 @@ async fn replay_logs<F: Fs>(
         highest_seq: 0,
     };
     let last = logs.len().saturating_sub(1);
+    // The earlier logs a reader replayed, and how long each was when it did.
+    let mut earlier = Vec::new();
     for (i, (log_num, name)) in logs.iter().enumerate() {
-        let disk = fs.open(&dir.join(name), Access::ReadOnly).await?;
+        let path = dir.join(name);
+        let disk = fs
+            .open(&path, Access::ReadOnly)
+            .await
+            .map_err(retired(read_only, &path))?;
         let bytes = read_all(&disk, Default::default()).await?;
         let mut reader = RecordReader::new(&bytes, *log_num as u32);
 
@@ -649,6 +775,12 @@ async fn replay_logs<F: Fs>(
                         // without checking the claim.
                         break;
                     }
+                    if read_only {
+                        return Err(Error::Stale(format!(
+                            "{name}: {e}, and a later log exists: the process writing the \
+                             database may still have been appending to it"
+                        )));
+                    }
                     return Err(Error::Corrupt(format!(
                         "{name}: {e}. A later log exists, so this one was complete when it \
                          was written, and what it holds cannot be told from what it lost"
@@ -658,6 +790,16 @@ async fn replay_logs<F: Fs>(
         }
         if i == last {
             out.tail = Some((*log_num, good));
+        } else if read_only {
+            earlier.push((name, disk, bytes.len() as u64));
+        }
+    }
+    for (name, disk, read) in earlier {
+        if disk.len().await? != read {
+            return Err(Error::Stale(format!(
+                "{name} grew while the logs after it were read: the process writing the \
+                 database was still appending to it"
+            )));
         }
     }
     Ok(out)
@@ -697,6 +839,7 @@ impl<F: Fs> Opened<F> {
 
     /// The body of [`Opened::write`], so one place counts what it returned.
     async fn write_inner(&self, batch: &mut roble_format::batch::Batch, sync: bool) -> Result<()> {
+        self.writable()?;
         // Refused before anything is stamped, so a write that cannot keep
         // its promise changes nothing. Pebble refuses this too, and the
         // reason is the same: with no log there is nowhere for a sync to
@@ -1167,7 +1310,8 @@ impl<F: Fs> Opened<F> {
                 return std::task::Poll::Pending;
             }
             let held = self.unflushed_bytes() as u64;
-            if self.flush_failed.get() || held == 0 || held < self.flush_line() {
+            // A reader never flushes, however much its replay brought back.
+            if self.read_only || self.flush_failed.get() || held == 0 || held < self.flush_line() {
                 self.flush_waiters.park(cx);
                 return std::task::Poll::Pending;
             }
@@ -1203,6 +1347,18 @@ impl<F: Fs> Opened<F> {
     /// condition the examples on the two waits are written around.
     pub fn running(&self) -> bool {
         !self.stopped.get()
+    }
+
+    /// Refuses a change to the directory if this store was opened read-only
+    /// ([`open_read_only`]).
+    ///
+    /// Called first by everything public that writes, flushes, compacts,
+    /// rotates, sweeps or destroys, before it has taken anything.
+    pub(crate) fn writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
     }
 
     /// Takes account of a flush that failed (§5).
@@ -1265,7 +1421,8 @@ impl<F: Fs> Opened<F> {
                 self.compacting.park(cx);
                 return std::task::Poll::Pending;
             }
-            if self.compaction_failed.get() || self.pick().is_none() {
+            // A reader never compacts, whatever the picker would choose.
+            if self.read_only || self.compaction_failed.get() || self.pick().is_none() {
                 self.compaction_waiters.park(cx);
                 return std::task::Poll::Pending;
             }
@@ -1642,6 +1799,9 @@ pub(crate) struct Tables<F: Fs> {
     /// A count a scan learns joins the estimate at the store's next recount,
     /// since a scan cannot reach the version to make one.
     entries: std::cell::RefCell<std::collections::BTreeMap<u64, u64>>,
+    /// Whether the store is a reader beside a writer, for which a table that
+    /// has gone is stale rather than lost ([`retired`]).
+    read_only: bool,
 }
 
 impl<F: Fs> Tables<F> {
@@ -1660,7 +1820,11 @@ impl<F: Fs> Tables<F> {
     ) -> Result<(std::rc::Rc<crate::table::OpenTable<F::Disk>>, bool)> {
         self.metrics.cache_lookups[crate::metrics::TABLE_MISS].add(1);
         let path = self.dir.join(roble_format::files::table_filename(file_num));
-        let disk = self.fs.open(&path, Access::ReadOnly).await?;
+        let disk = self
+            .fs
+            .open(&path, Access::ReadOnly)
+            .await
+            .map_err(retired(self.read_only, &path))?;
         let table = std::rc::Rc::new(
             crate::table::OpenTable::open_metered(
                 file_num,

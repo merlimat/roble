@@ -155,7 +155,13 @@ impl Fs for FileFs {
         while let Some(d) = stack.pop() {
             for entry in std::fs::read_dir(&d)? {
                 let entry = entry?;
-                let meta = entry.metadata()?;
+                // A file deleted between the listing and here is one a
+                // writer retired, which a reader beside it will see: it no
+                // longer takes any space.
+                let meta = match entry.metadata() {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    meta => meta?,
+                };
                 if meta.is_dir() {
                     stack.push(entry.path());
                 } else {

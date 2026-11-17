@@ -988,6 +988,58 @@ than opening without it**: ignoring one silently discards writes that were
 already acknowledged. With `disable_wal` there is nothing to replay and the
 database opens as of the last flush.
 
+### Reading beside a writer
+
+`open_read_only(env, dir, options)` opens a database to read while another
+process holds it open to write, as encina's `ReadOnlyDb` does. It walks the
+same steps as `open_with` but three: it takes no lock, creates nothing
+(`create_if_missing` is not acted on), and sweeps nothing obsolete. It replays
+the MANIFEST and the logs into a memtable of its own, opens every file to read
+only, and refuses everything that would change the directory — `write`,
+`flush`, `compact`, `compact_once`, `rotate_manifest`, `checkpoint`,
+`remove_obsolete_files`, `destroy` — with `Error::ReadOnly`. It reads the
+database as of the open and does not follow the writer after it.
+
+**The writer does not know it is there**, so nothing holds back the writer's
+deletions for it, and the reader must expect a file it needs to go. The answer
+is the simplest honest one: **a reader that needs a file the writer has retired
+fails with `Error::Stale`, and the caller opens again**, a bounded number of
+times. The new open reads the version that is current, which names files that
+are there. Each case:
+
+- **A table, a log or the MANIFEST that has gone** by the time the reader opens
+  it is stale rather than an I/O error. The writer deletes only what no version
+  it can still read names, so for a store with the lock such a file is damage
+  and stays an error; for a reader it is a version that has moved on. A table
+  is opened when a read first reaches it, so this can come from a `get` or a
+  scan long after the open. A file already open keeps its bytes where the
+  filesystem allows it, as POSIX does.
+- **The table check is skipped.** An open with the lock refuses a version that
+  names a table the directory does not hold. A reader lists the directory
+  before it reads the MANIFEST, so a flush in between names a table the listing
+  never saw. The listing stays first all the same, because the logs to replay
+  come from it: a newer listing beside an older MANIFEST would replay only the
+  newer log and leave a hole without an error. A table that really has gone
+  shows up when a read reaches it.
+- **A record that does not read** is stale in the MANIFEST, which the writer
+  may be appending to, and in a log that is not the last. A flush creates the
+  next log before the writes in flight on the old one have finished, so the
+  reader can find that older log torn.
+- **An older log that grew while the newer ones were read** is stale too. The
+  reader can read the older log, miss a write that lands in it afterwards, and
+  then see later writes in the newer log, which is a hole. So once the replay
+  is done, the reader checks that every log but the last is still the length
+  it read. If it is, any write still to land there comes after everything the
+  reader saw.
+
+Real damage looks the same as a race to a reader, and is told apart by
+persisting: it fails every open, and the error says what it met. The command-line
+tool's `get`, `scan`, `stats` and `tables` open read-only and retry a stale
+read up to ten times, as encina's do. A scan that has printed entries resumes
+after the last key it printed, so what it prints across a retry is not one
+snapshot: the entries before the retry are as of one open, and those after
+it as of the next.
+
 ### Creating a database
 
 `open_with(.., Options::new().create_if_missing(true))` writes a database where
@@ -1618,7 +1670,9 @@ Pebble's scheduling and clock, so the two must be separable.
 Everything else carries over: buffers are owned and returned, a disk that keeps
 one cannot make roble touch memory it lends, a read in flight is polled from a
 slot without a boxed future, and `real_time()` decides whether the store may
-read the clock at all. One owner per directory, through `LOCK`.
+read the clock at all. One owner per directory, through `LOCK`, and any
+number of readers beside it, which take no lock (§6, "Reading beside a
+writer").
 
 Oxia injects a `vfs.FS` today, including `vfs.NewCrashableMem` in its tests, so
 this trait is the same seam it already relies on.

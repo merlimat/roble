@@ -60,7 +60,7 @@ pub use cache::{BlockCache, Caches};
 pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
-pub use open::{Opened, open, open_with};
+pub use open::{Opened, open, open_read_only, open_with};
 pub use options::Options;
 pub use pick::Pick;
 pub use read::{Comparison, Found, Lookup};
