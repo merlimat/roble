@@ -138,6 +138,7 @@ impl BlockHandle {
 /// bytes that follow are the value itself or a handle into a value block. roble
 /// writes only in-place values but must read both (DESIGN.md §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Value<'a> {
     /// The bytes are the value.
     InPlace(&'a [u8]),

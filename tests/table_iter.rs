@@ -64,6 +64,7 @@ fn expected(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
                 Value::InPlace(b) => b.to_vec(),
                 Value::ValueHandle(h) => table.resolve_value(&value_blocks, h)?,
                 Value::BlobHandle(_) => panic!("a blob handle is above roble's pin"),
+                other => panic!("a value the golden tables do not hold: {other:?}"),
             };
             // Re-encoded with the **raw** trailer, obsolete bit included.
             // `InternalKey` splits that bit out into a field of its own, so

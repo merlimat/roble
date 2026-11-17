@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 
 /// The checksum over a block, from the first byte of the footer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChecksumType {
     /// `ChecksumTypeCRC32c`, Pebble's default and the only one roble writes.
     Crc32c,
