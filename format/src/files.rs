@@ -303,6 +303,48 @@ impl fmt::Display for MarkerName<'_> {
 mod tests {
     use super::*;
 
+    /// The names errors and dumps call each kind of file by. An error that
+    /// says "a MANIFEST" where it meant a table would send whoever reads it
+    /// to the wrong file.
+    #[test]
+    fn every_file_type_has_the_name_errors_use() {
+        let names: Vec<&str> = [
+            FileType::Table,
+            FileType::Log,
+            FileType::LogFailover,
+            FileType::Manifest,
+            FileType::Options,
+            FileType::Lock,
+            FileType::Temp,
+            FileType::Blob,
+        ]
+        .into_iter()
+        .map(FileType::name)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "table",
+                "log",
+                "failover log",
+                "MANIFEST",
+                "OPTIONS",
+                "LOCK",
+                "temporary file",
+                "blob file"
+            ]
+        );
+    }
+
+    /// A marker prints as the file name it was parsed from, so an error that
+    /// names one names a file that is actually in the directory.
+    #[test]
+    fn a_marker_prints_as_its_file_name() {
+        let filename = "marker.manifest.000003.MANIFEST-000007";
+        let marker = parse_marker(filename).expect("a marker");
+        assert_eq!(marker.to_string(), filename);
+    }
+
     #[test]
     fn file_names_parse_as_pebble_spells_them() {
         let cases: &[(&str, Option<(FileType, u64)>)] = &[
