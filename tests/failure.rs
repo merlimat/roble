@@ -510,3 +510,116 @@ async fn a_store_that_is_told_to_carry_on_still_leaves_a_database_that_opens() {
         );
     }
 }
+
+/// Two flushes in a row that each fail before their edit lands, with a
+/// crash after each, and a synced write between them.
+///
+/// The first failure is what sets the trap. A flush creates the log the
+/// store moves to before it writes the edit that retires the old one, so a
+/// crash in between leaves that log in the directory and its number in no
+/// MANIFEST. The reopen replays it and carries on writing to it; the number
+/// is still the MANIFEST's next one, unless the open ratchets past the files
+/// it lists as Pebble does (`TestOpenRatchetsNextFileNum`).
+///
+/// The second flush is where the trap springs. It takes that same number for
+/// its new log and creates it — over the log holding the write it is meant
+/// to be flushing. A crash before its edit lands leaves the MANIFEST
+/// pointing at the older log, and the replay finds the write gone though it
+/// was acknowledged and synced.
+///
+/// Says whether the first reopen was writing to a log its MANIFEST has not
+/// heard of, which is the state the trap needs.
+async fn flush_fails_twice(env: &SimEnv, dir: &Path, first: u64, second: u64) -> bool {
+    let db = roble::open_with(env, dir, flush_options())
+        .await
+        .expect("create");
+    db.put(b"a", b"written").await.expect("put a");
+    db.flush().await.expect("flush a");
+    db.put(b"b", b"written").await.expect("put b");
+
+    env.sim().fail_at(first);
+    let _ = db.flush().await;
+    env.sim().stop_failing();
+    drop(db);
+    env.sim().crash();
+
+    let db = roble::open_with(env, dir, flush_options())
+        .await
+        .expect("the first reopen");
+    let current = db
+        .current_log()
+        .expect("a store with a WAL writes to a log");
+    let orphan = current > db.versions().min_unflushed_log_num;
+    db.put(b"c", b"written").await.expect("put c");
+    env.sim().fail_at(second);
+    let _ = db.flush().await;
+    env.sim().stop_failing();
+    drop(db);
+    env.sim().crash();
+    orphan
+}
+
+/// A store whose flushes run only when [`flush_fails_twice`] asks for one.
+fn flush_options() -> Options<SimFs> {
+    Options::new()
+        .create_if_missing(true)
+        .background_tasks(false)
+}
+
+/// How many operations the flush in [`flush_fails_twice`] makes when nothing
+/// fails.
+async fn flush_operations() -> u64 {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(&env, &dir, flush_options())
+        .await
+        .expect("create");
+    db.put(b"a", b"written").await.expect("put a");
+    db.flush().await.expect("flush a");
+    db.put(b"b", b"written").await.expect("put b");
+    let before = env.sim().ops();
+    db.flush().await.expect("flush b");
+    env.sim().ops() - before
+}
+
+#[compio::test]
+async fn a_reopen_after_an_interrupted_flush_never_writes_over_a_log_it_replayed() {
+    let total = flush_operations().await;
+    assert!(
+        total >= 8,
+        "a flush of {total} operations is too thin to sweep"
+    );
+
+    let mut orphaned = 0u64;
+    for first in 1..=total {
+        for second in 1..=total {
+            let env = SimEnv::new();
+            let dir = PathBuf::from("/db");
+            if flush_fails_twice(&env, &dir, first, second).await {
+                orphaned += 1;
+            }
+
+            let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                panic!("flushes failed at {first} and {second}: the reopen: {e}")
+            });
+            let found = contents(&db).await;
+            let keys: Vec<&[u8]> = found.keys().map(Vec::as_slice).collect();
+            // Every one of them was synced before it was acknowledged, so a
+            // crash may take none of them.
+            assert_eq!(
+                keys,
+                [b"a".as_slice(), b"b", b"c"],
+                "flushes failed at operations {first} and {second} of {total}"
+            );
+        }
+    }
+
+    // The guard that keeps this from passing for the wrong reason: if no
+    // first failure ever left the reopen writing to a log the MANIFEST does
+    // not name, the second flush was never near the number it could reuse.
+    assert!(
+        orphaned > 0,
+        "no failure of the first flush left its new log behind, so nothing here \
+         tested the reopen that writes to it"
+    );
+}

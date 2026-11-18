@@ -88,8 +88,8 @@ impl<F: Fs> Db<F> {
     /// The rotation proper, for a caller that already holds the permit.
     pub(crate) async fn rotate_inner(&self, _change: &Change<'_>) -> Result<String> {
         // The number is taken but not spent: nothing in memory moves until
-        // the marker has. A crash before that leaves this MANIFEST an orphan
-        // and the number free again, and the sweep collects the file.
+        // the marker has. A crash before that leaves this MANIFEST an orphan,
+        // which the next open moves the counter past and the sweep collects.
         let (file_num, snapshot) = {
             let versions = self.version_set();
             let file_num = versions.next_file_num;

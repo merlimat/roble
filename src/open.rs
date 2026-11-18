@@ -33,7 +33,8 @@
 //!    **before** trusting any structure inside the files.
 //! 5. Read `marker.manifest.*`, which names the MANIFEST to replay. No marker
 //!    means no database.
-//! 6. Replay that MANIFEST into a version, then check the comparer.
+//! 6. Replay that MANIFEST into a version, then check the comparer, and move
+//!    the next file number past every file the listing holds.
 //! 7. Replay the logs the version leaves unflushed, so every acknowledged
 //!    write is back in the memtable before anyone can read.
 //! 8. Collect what the MANIFEST no longer refers to, which is where a flush
@@ -395,7 +396,27 @@ async fn open_dir<E: Env>(
         read_only,
     )
     .await?;
-    let versions = VersionSet::replay(&edits)?;
+    let mut versions = VersionSet::replay(&edits)?;
+
+    // No number the directory already holds is handed out again. The
+    // MANIFEST's counter is only as new as its last edit, and a flush creates
+    // its log before that edit lands: a crash in between leaves a log the
+    // replay below carries on writing to, under the very number the counter
+    // says is next. The next flush would create its log there — over the
+    // records it is meant to be flushing.
+    //
+    // Pebble's `Open` ratchets the same way, past every name it can parse
+    // and past `minUnflushedLogNum` (`markFileNumUsed`). From this listing,
+    // taken before the sweep, on purpose: an obsolete file is no less a file
+    // whose number is spent, and a sweep that fails leaves it behind.
+    let spent = names
+        .iter()
+        .filter_map(|n| files::parse_filename(n))
+        .map(|p| p.file_num)
+        .chain([versions.min_unflushed_log_num]);
+    for file_num in spent {
+        versions.next_file_num = versions.next_file_num.max(file_num + 1);
+    }
 
     // Every table the version names has to be in the directory. A checkpoint
     // that was streamed short, or a file deleted by hand, shows up here rather

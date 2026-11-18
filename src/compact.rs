@@ -410,8 +410,10 @@ impl<F: Fs> Db<F> {
     ///
     /// What a number taken by a compaction that then fails costs is that it
     /// is never used: the in-memory counter is past it and the MANIFEST's is
-    /// not, so the next open hands it out again, by which time the sweep has
-    /// collected the file it named. Pebble skips numbers the same way.
+    /// not. The next open hands it out again only if the file it named never
+    /// reached the directory; one that did, the open moves past
+    /// (`crate::open`), and the sweep collects. Pebble skips numbers the same
+    /// way.
     async fn take_file_num(&self, writing: &mut crate::obsolete::Writing<'_>) -> u64 {
         let _change = self.changes().begin().await;
         let mut versions = self.versions_mut();
