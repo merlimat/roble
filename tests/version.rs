@@ -324,3 +324,192 @@ async fn a_table_meets_a_scans_bounds_as_the_bounds_are_written() {
         "and a scan inside the table's range reaches it"
     );
 }
+
+/// One command of a datadriven file: the command line, its input lines, and
+/// the output written under it.
+struct Case {
+    line: usize,
+    command: String,
+    input: Vec<String>,
+    expected: String,
+}
+
+/// Splits a file in the format of cockroachdb/datadriven, the one Pebble's
+/// test data is written in. An output runs to the first blank line, or,
+/// when it opens with a second `----`, to a closing `----` pair.
+fn cases(text: &str) -> Vec<Case> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        let at = i + 1;
+        let command = line.to_string();
+        i += 1;
+        let mut input = Vec::new();
+        while i < lines.len() && lines[i] != "----" {
+            input.push(lines[i].to_string());
+            i += 1;
+        }
+        i += 1;
+        let mut expected = Vec::new();
+        if lines.get(i) == Some(&"----") {
+            i += 1;
+            while i + 1 < lines.len() && !(lines[i] == "----" && lines[i + 1] == "----") {
+                expected.push(lines[i]);
+                i += 1;
+            }
+            i += 2;
+        } else {
+            while i < lines.len() && !lines[i].trim().is_empty() {
+                expected.push(lines[i]);
+                i += 1;
+            }
+        }
+        out.push(Case {
+            line: at,
+            command,
+            input,
+            expected: expected.join("\n"),
+        });
+    }
+    out
+}
+
+/// An internal key as Pebble's `ParseInternalKey` writes it: `user.KIND.seq`.
+fn pebble_key(s: &str) -> (Vec<u8>, Kind, u64) {
+    let mut parts = s.rsplitn(3, '.');
+    let seq = parts.next().expect("a sequence number");
+    let kind = parts.next().expect("a kind");
+    let user = parts.next().expect("a user key");
+    let kind = match kind {
+        "SET" => Kind::Set,
+        "DEL" => Kind::Delete,
+        "RANGEDEL" => Kind::RangeDelete,
+        other => panic!("a kind this test does not know: {other}"),
+    };
+    (
+        user.as_bytes().to_vec(),
+        kind,
+        seq.parse().expect("a sequence number"),
+    )
+}
+
+/// A table as Pebble's L0 sublevel test reads one, `000009:a.SET.10-b.SET.10`
+/// and any flags after it: the sequence numbers are the bounds' own, except
+/// that an exclusive end takes the start's, as there (`parseMeta`).
+fn pebble_table(line: &str) -> NewTable {
+    let (num, rest) = line.trim().split_once(':').expect("a table is num:bounds");
+    let bounds = rest.split_whitespace().next().expect("the bounds");
+    let (smallest, largest) = bounds.split_once('-').expect("smallest-largest");
+    let (lo, lo_kind, lo_seq) = pebble_key(smallest);
+    let (hi, hi_kind, hi_seq) = pebble_key(largest);
+    let exclusive = hi_kind == Kind::RangeDelete && hi_seq == SEQ_NUM_MAX;
+    NewTable {
+        level: 0,
+        file_num: num.parse().expect("a file number"),
+        size: 256,
+        smallest: key::encode(&lo, lo_seq, lo_kind),
+        largest: key::encode(&hi, hi_seq, hi_kind),
+        smallest_seq_num: lo_seq,
+        largest_seq_num: if exclusive { lo_seq } else { hi_seq },
+        marked_for_compaction: false,
+        creation_time: 0,
+    }
+}
+
+/// L0's sublevels, judged against Pebble's own test cases.
+///
+/// `tests/pebble/l0_sublevels` is Pebble's
+/// `internal/manifest/testdata/l0_sublevels` at the pin, unchanged
+/// (`tests/pebble/README.md`). Every `define` and `add-l0-files` prints, first,
+/// how many sublevels Pebble's `newL0Sublevels` makes of L0, and the count is
+/// all of it roble uses: the write stall and the picker are charged by it
+/// (§9). So each is replayed as a version and `l0_sublevels` has to give the
+/// same number. The levels below L0 are left out, since a sublevel is a
+/// matter of L0 alone and the rest of each case is about compaction picking,
+/// which roble does its own way.
+///
+/// Skipped: a `define no_initialize`, whose sublevels the case writes out by
+/// hand rather than having Pebble compute them, and the two `add-l0-files`
+/// whose output is Pebble refusing its incremental shortcut. Their files
+/// still join L0, as in Pebble's driver, so the cases after them are judged
+/// with them there.
+#[compio::test]
+async fn roble_counts_the_sublevels_pebble_counts() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/l0_sublevels");
+    let text = std::fs::read_to_string(&path).expect("Pebble's L0 sublevel test data");
+
+    let mut l0: Vec<NewTable> = Vec::new();
+    let mut judged = 0;
+    for case in cases(&text) {
+        let initialize = match case.command.split_whitespace().next() {
+            Some("define") => {
+                l0.clear();
+                !case.command.contains("no_initialize")
+            }
+            Some("add-l0-files") => true,
+            _ => continue,
+        };
+        // Only L0's tables, under `L0` or an `L0.n` heading; an
+        // `add-l0-files` has no heading and is all L0.
+        let mut in_l0 = case.command.starts_with("add-l0-files");
+        for line in &case.input {
+            let line = line.trim();
+            if line.starts_with('L') && line.len() <= 4 {
+                in_l0 = line.starts_with("L0");
+            } else if in_l0 {
+                l0.push(pebble_table(line));
+            }
+        }
+        if !initialize || case.expected.starts_with("pebble: ") {
+            continue;
+        }
+
+        let want: usize = case
+            .expected
+            .split("sublevels: ")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "line {}: no sublevel count in {:?}",
+                    case.line, case.expected
+                )
+            });
+        let got = VersionSet::replay(&[VersionEdit {
+            comparer_name: Some(BYTEWISE.to_string()),
+            min_unflushed_log_num: Some(0),
+            obsolete_prev_log_num: None,
+            next_file_num: Some(l0.iter().map(|t| t.file_num).max().unwrap_or(0) + 1),
+            last_seq_num: Some(
+                l0.iter()
+                    .map(|t| t.smallest_seq_num.max(t.largest_seq_num))
+                    .max()
+                    .unwrap_or(0),
+            ),
+            deleted_tables: Vec::new(),
+            new_tables: l0.clone(),
+        }])
+        .unwrap_or_else(|e| panic!("line {}: the version: {e}", case.line))
+        .version
+        .l0_sublevels()
+        .expect("the sublevels");
+        assert_eq!(
+            got,
+            want,
+            "line {}: {} over\n{}",
+            case.line,
+            case.command,
+            case.input.join("\n")
+        );
+        judged += 1;
+    }
+    // Every case but the skipped ones, so a parser that lost some fails here.
+    assert_eq!(judged, 37, "the cases of {}", path.display());
+}
