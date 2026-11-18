@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/merlimat/roble/main/assets/logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/merlimat/roble/main/assets/logo.svg" alt="roble logo: an oak whose foliage is stacked levels, each holding more tables than the one above" width="160">
+  </picture>
+</p>
+
 # roble
 
 An embedded, ordered key-value store in Rust whose files are
