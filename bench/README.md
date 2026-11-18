@@ -5,6 +5,10 @@ small records, a store per shard, batches per write, point and ordered
 lookups, scans in both directions, short range scans, YCSB's six mixes and a
 checkpoint.
 
+**The results are in [results/](results/README.md)**: each session's CSVs,
+charts drawn from them, and every number as a table, regenerated with
+`python3 bench/results/render.py`.
+
 **Go Pebble is not here, and that is a loss worth stating plainly.** It had a
 driver of its own under `harness/bench`, written to these phases and this key
 shape, and it has been removed. `cmd/pebble`'s own benchmarks do not replace

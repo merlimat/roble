@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 758 484" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" rx="10" fill="#ffffff"/>
+<text x="16" y="26" font-size="16" font-weight="600" fill="#1f2328">Single shard: every phase</text>
+<text x="16" y="45" font-size="11.5" fill="#57606a">records, keys or lookups a second; each row scaled to its fastest</text>
+<rect x="118" y="55" width="10" height="10" rx="2" fill="#41704A"/><text x="132" y="64" font-size="11.5" fill="#1f2328">roble</text>
+<rect x="190" y="55" width="10" height="10" rx="2" fill="#8A6BB0"/><text x="204" y="64" font-size="11.5" fill="#1f2328">Pebble</text>
+<rect x="270" y="55" width="10" height="10" rx="2" fill="#6B7C93"/><text x="284" y="64" font-size="11.5" fill="#1f2328">RocksDB</text>
+<rect x="358" y="55" width="10" height="10" rx="2" fill="#C98A2E"/><text x="372" y="64" font-size="11.5" fill="#1f2328">encina</text>
+<text x="108" y="100.0" font-size="12" text-anchor="end" fill="#1f2328">load</text>
+<rect x="118" y="74" width="233.3" height="9" rx="2" fill="#41704A"/>
+<text x="356.3" y="82" font-size="9.5" fill="#57606a">201.8k</text>
+<rect x="118" y="85" width="404.0" height="9" rx="2" fill="#8A6BB0"/>
+<text x="527.0" y="93" font-size="9.5" fill="#57606a">349.5k</text>
+<rect x="118" y="96" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="104" font-size="9.5" fill="#57606a">484.4k</text>
+<rect x="118" y="107" width="93.6" height="9" rx="2" fill="#C98A2E"/>
+<text x="216.6" y="115" font-size="9.5" fill="#57606a">80.9k</text>
+<text x="108" y="156.0" font-size="12" text-anchor="end" fill="#1f2328">scan</text>
+<rect x="118" y="130" width="110.4" height="9" rx="2" fill="#41704A"/>
+<text x="233.4" y="138" font-size="9.5" fill="#57606a">7.46M</text>
+<rect x="118" y="141" width="377.3" height="9" rx="2" fill="#8A6BB0"/>
+<text x="500.3" y="149" font-size="9.5" fill="#57606a">25.49M</text>
+<rect x="118" y="152" width="191.4" height="9" rx="2" fill="#6B7C93"/>
+<text x="314.4" y="160" font-size="9.5" fill="#57606a">12.93M</text>
+<rect x="118" y="163" width="560.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="683.0" y="171" font-size="9.5" fill="#57606a">37.84M</text>
+<text x="108" y="212.0" font-size="12" text-anchor="end" fill="#1f2328">scan-rev</text>
+<rect x="118" y="186" width="284.3" height="9" rx="2" fill="#41704A"/>
+<text x="407.3" y="194" font-size="9.5" fill="#57606a">3.38M</text>
+<rect x="118" y="197" width="560.0" height="9" rx="2" fill="#8A6BB0"/>
+<text x="683.0" y="205" font-size="9.5" fill="#57606a">6.65M</text>
+<rect x="118" y="208" width="442.3" height="9" rx="2" fill="#6B7C93"/>
+<text x="565.3" y="216" font-size="9.5" fill="#57606a">5.25M</text>
+<text x="122" y="227" font-size="9.5" fill="#8c959f">—</text>
+<text x="108" y="268.0" font-size="12" text-anchor="end" fill="#1f2328">get</text>
+<rect x="118" y="242" width="211.9" height="9" rx="2" fill="#41704A"/>
+<text x="334.9" y="250" font-size="9.5" fill="#57606a">870.4k</text>
+<rect x="118" y="253" width="158.7" height="9" rx="2" fill="#8A6BB0"/>
+<text x="281.7" y="261" font-size="9.5" fill="#57606a">652.0k</text>
+<rect x="118" y="264" width="191.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="314.0" y="272" font-size="9.5" fill="#57606a">784.8k</text>
+<rect x="118" y="275" width="560.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="683.0" y="283" font-size="9.5" fill="#57606a">2.30M</text>
+<text x="108" y="324.0" font-size="12" text-anchor="end" fill="#1f2328">floor</text>
+<rect x="118" y="298" width="73.2" height="9" rx="2" fill="#41704A"/>
+<text x="196.2" y="306" font-size="9.5" fill="#57606a">339.8k</text>
+<rect x="118" y="309" width="69.6" height="9" rx="2" fill="#8A6BB0"/>
+<text x="192.6" y="317" font-size="9.5" fill="#57606a">322.8k</text>
+<rect x="118" y="320" width="92.1" height="9" rx="2" fill="#6B7C93"/>
+<text x="215.1" y="328" font-size="9.5" fill="#57606a">427.3k</text>
+<rect x="118" y="331" width="560.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="683.0" y="339" font-size="9.5" fill="#57606a">2.60M</text>
+<text x="108" y="380.0" font-size="12" text-anchor="end" fill="#1f2328">get-cold</text>
+<rect x="118" y="354" width="238.4" height="9" rx="2" fill="#41704A"/>
+<text x="361.4" y="362" font-size="9.5" fill="#57606a">5.4k</text>
+<rect x="118" y="365" width="560.0" height="9" rx="2" fill="#8A6BB0"/>
+<text x="683.0" y="373" font-size="9.5" fill="#57606a">12.6k</text>
+<rect x="118" y="376" width="525.9" height="9" rx="2" fill="#6B7C93"/>
+<text x="648.9" y="384" font-size="9.5" fill="#57606a">11.8k</text>
+<rect x="118" y="387" width="124.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="247.0" y="395" font-size="9.5" fill="#57606a">2.8k</text>
+<text x="108" y="436.0" font-size="12" text-anchor="end" fill="#1f2328">checkpoint</text>
+<rect x="118" y="410" width="449.7" height="9" rx="2" fill="#41704A"/>
+<text x="572.7" y="418" font-size="9.5" fill="#57606a">685</text>
+<rect x="118" y="421" width="348.6" height="9" rx="2" fill="#8A6BB0"/>
+<text x="471.6" y="429" font-size="9.5" fill="#57606a">531</text>
+<rect x="118" y="432" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="440" font-size="9.5" fill="#57606a">853</text>
+<text x="122" y="451" font-size="9.5" fill="#8c959f">—</text>
+</svg>
