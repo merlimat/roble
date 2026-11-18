@@ -461,6 +461,13 @@ own engine options and exposes only `--cache` and `--disable-wal`:
 - Its keys are `user` plus an FNV hash plus a ten-byte MVCC suffix, built in
   `makeKey` with no flag to change them.
 - `Filter utility: 0.0%` in every run above.
+- **Its durability is not roble's in that table.** `pebble bench ycsb` writes
+  with `pebble.Sync` and the WAL on unless given `--disable-wal`
+  (`cmd/pebble/ycsb.go`, `db.go`), which then turns the WAL off and syncs
+  nothing; it has no mode between the two. The roble column was this
+  harness's default at the time, the WAL on with every YCSB write unsynced:
+  `--wal buffered` today. For the same durability on both sides, run
+  `pebble bench ycsb --disable-wal` beside `roble-bench --wal off`.
 
 So this is Pebble on CockroachDB's workload with CockroachDB's settings, and
 the right way to read the table is that **none of those six pairs is a

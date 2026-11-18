@@ -63,6 +63,15 @@ pub enum Access {
 /// current compio runtime. A caller that runs its own I/O — a scheduler
 /// ordering the requests of several shards, or a simulation replaying a run
 /// from its seed — implements this trait and [`Fs`] instead.
+///
+/// # Implementing it
+///
+/// [`Env`], [`Fs`] and [`Disk`] are the three traits a caller implements to
+/// put a store on I/O of its own. None of their futures is `Send`, and none
+/// has to be: a store belongs to one thread (§10), and so does everything it
+/// awaits. An implementation can hold `Rc`s and `RefCell`s and should not
+/// pay for atomics it will never need. The futures are `impl Future` rather
+/// than boxed, so a call costs what the implementation's own future costs.
 pub trait Env {
     /// The filesystem this env opens files in.
     type Fs: Fs;
@@ -87,7 +96,12 @@ pub trait Env {
 }
 
 /// What a directory listing says about one entry.
+///
+/// An [`Fs`] of the caller's own builds these with [`DirEntry::new`]: the
+/// type is `#[non_exhaustive]`, so a field added later is not a breaking
+/// change.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DirEntry {
     /// The entry's name within the directory it was listed from.
     pub name: PathBuf,
@@ -97,11 +111,32 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+impl DirEntry {
+    /// An entry named `name`, of `size` bytes, a directory if `is_dir`.
+    pub fn new(name: impl Into<PathBuf>, size: u64, is_dir: bool) -> Self {
+        DirEntry {
+            name: name.into(),
+            size,
+            is_dir,
+        }
+    }
+}
+
 /// How much space a directory's files take.
+///
+/// Built with [`DiskUsage::new`], for the same reason as [`DirEntry`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiskUsage {
     /// Bytes used by the files in the directory, recursively.
     pub used_bytes: u64,
+}
+
+impl DiskUsage {
+    /// `used_bytes` bytes.
+    pub fn new(used_bytes: u64) -> Self {
+        DiskUsage { used_bytes }
+    }
 }
 
 /// The filesystem a database lives in: Pebble's `vfs.FS` in Rust terms.
@@ -191,7 +226,10 @@ pub trait Disk: Sized + 'static {
     /// schedule takes `()`.
     ///
     /// An LSM has more use for this than encina does: a compaction's reads
-    /// should not delay a lookup's.
+    /// should not delay a lookup's. So far, though, roble passes only
+    /// `Default::default()` on every request, so a disk gains nothing yet by
+    /// having more than one class; the parameter is here so that giving
+    /// compactions a lower one later is not a change to the trait.
     type Class: Copy + Ord + Default + 'static;
 
     /// The file's length in bytes.

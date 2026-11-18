@@ -21,7 +21,11 @@ use std::io;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// What went wrong.
+///
+/// `#[non_exhaustive]`, so that a kind of failure added later is not a
+/// breaking change: a `match` on it needs a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The filesystem or the device failed.
     Io(io::Error),

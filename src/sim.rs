@@ -371,11 +371,11 @@ impl Fs for SimFs {
         let mut out = Vec::new();
         for (path, file) in &state.files {
             if SimFs::parent_of(path) == dir {
-                out.push(DirEntry {
-                    name: PathBuf::from(path.file_name().unwrap_or_default()),
-                    size: file.live.len() as u64,
-                    is_dir: false,
-                });
+                out.push(DirEntry::new(
+                    path.file_name().unwrap_or_default(),
+                    file.live.len() as u64,
+                    false,
+                ));
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -413,7 +413,7 @@ impl Fs for SimFs {
             .filter(|(p, _)| p.starts_with(dir))
             .map(|(_, f)| f.live.len() as u64)
             .sum();
-        Ok(DiskUsage { used_bytes })
+        Ok(DiskUsage::new(used_bytes))
     }
 
     async fn lock(&self, path: &Path) -> Result<SimLock> {
