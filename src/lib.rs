@@ -12,19 +12,80 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! roble: an embedded, ordered key-value store whose files are Pebble's.
+//! An embedded, ordered key-value store whose files are
+//! [Pebble](https://github.com/cockroachdb/pebble)'s: a database roble writes
+//! is one Go Pebble v2.1.7 opens, and the other way round.
 //!
-//! See `DESIGN.md`. This crate is the engine; [`roble_format`] encodes and
-//! decodes the files, with no I/O of its own.
+//! This crate is the engine. [`roble_format`] encodes and decodes the files,
+//! with no I/O of its own.
 //!
-//! So far it holds the seam the engine sits on — the [`Env`] a store runs in,
-//! the [`Fs`] it opens files in, and the [`Disk`] that holds one of them
-//! (§10) — and, on top of it, [`open`], which reads a database directory:
-//! its markers, and its MANIFEST replayed into a [`Version`] (§6).
+//! # Where to start
 //!
-//! [`DefaultEnv`] is the file system on compio; `sim`, behind the feature of
-//! that name, is an in-memory filesystem that can be made to fail or crash at
-//! any single operation, which is how §12 tests the failure paths.
+//! - [`open_with`] opens a database directory, creating one if
+//!   [`Options::create_if_missing`] says so, and returns a [`Db`].
+//! - [`Db::put`], [`Db::delete`] and [`Db::delete_range`] write one change;
+//!   [`Db::indexed_batch`] builds an [`IndexedBatch`] of several, readable
+//!   through before it commits. Each write says its [`Durability`].
+//! - [`Db::get`] finds a key, or the nearest one on either side of it
+//!   ([`Comparison`]); [`Db::range`] makes a [`Scan`] that steps forwards or
+//!   backwards; [`Db::snapshot`] holds one instant for reads that must agree.
+//! - [`Db::flush`] writes the memtable out, which is what makes a write
+//!   durable with the WAL off ([`Options::disable_wal`]);
+//!   [`Db::checkpoint`] copies the database to a directory Go Pebble opens;
+//!   [`Db::close`] stops the store and lets go of the directory.
+//!
+//! ```no_run
+//! use roble::{Comparison, DefaultEnv, Durability, Options};
+//!
+//! # async fn example() -> roble::Result<()> {
+//! let options = Options::new().create_if_missing(true);
+//! let db = roble::open_with(&DefaultEnv, "data/shard-0", options).await?;
+//!
+//! db.put(b"/users/alice", b"1", Durability::Sync).await?;
+//!
+//! let mut batch = db.indexed_batch();
+//! batch.put(b"/users/bob", b"2")?;
+//! batch.delete(b"/users/carol")?;
+//! batch.commit(Durability::NoSync).await?;
+//!
+//! // The greatest key at or below `/users/b`, which is alice.
+//! let floor = db.get(b"/users/b", Comparison::Floor).await?;
+//! assert_eq!(floor.map(|f| f.key), Some(b"/users/alice".to_vec()));
+//!
+//! let mut scan = db.range(&b"/users/"[..]..&b"/users0"[..])?;
+//! scan.first().await?;
+//! while scan.is_valid() {
+//!     println!("{:?} = {:?}", scan.key(), scan.value());
+//!     scan.next().await?;
+//! }
+//!
+//! db.close().await
+//! # }
+//! ```
+//!
+//! # One thread per store
+//!
+//! A [`Db`] and everything it hands out — [`Scan`], [`Snapshot`],
+//! [`IndexedBatch`], [`Caches`] — are `!Send` and `!Sync`: a store belongs to
+//! the thread that opened it, as in a thread-per-core server, and needs no
+//! locks for it. It flushes and compacts in two tasks it spawns on that
+//! thread through [`Env::spawn`], which hand the thread back every so often
+//! while they work. [`DefaultEnv`] runs on the current
+//! [compio](https://docs.rs/compio) runtime and keeps databases in the file
+//! system. Many stores can share one thread and, through [`Caches`], one
+//! budget of open tables and cached blocks.
+//!
+//! # Testing against failures
+//!
+//! All I/O goes through [`Fs`] and [`Disk`]. Behind the `sim` feature,
+//! `roble::sim` is an in-memory filesystem that can be made to fail or crash
+//! at any single operation, for an application's own crash tests.
+//!
+//! # Design
+//!
+//! Section numbers (§3, §6, …) throughout refer to
+//! [DESIGN.md](https://github.com/merlimat/roble/blob/main/DESIGN.md) in the
+//! repository, which is not part of this crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

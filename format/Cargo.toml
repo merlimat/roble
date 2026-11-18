@@ -2,8 +2,13 @@
 name = "roble-format"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "Encodes and decodes Pebble's on-disk formats. No I/O, no async, no engine."
+keywords = ["pebble", "sstable", "lsm", "rocksdb", "wal"]
+categories = ["database-implementations", "encoding", "parser-implementations"]
 
 [dependencies]
 # CRC-32C for the block checksum Pebble writes by default (sstable/block: the

@@ -196,7 +196,10 @@ pub struct FileLock {
     _file: File,
 }
 
-/// One file of a database, read and written without the OS page cache.
+/// One file of a database, read and written through the OS page cache.
+///
+/// Not direct I/O: the note at the top of this module says why a Pebble file
+/// cannot be read that way without an aligning layer under it.
 #[derive(Debug)]
 pub struct FileDisk {
     file: File,
