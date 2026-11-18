@@ -1886,6 +1886,16 @@ in both directions.
 - **Format fuzzing.** `roble-format` round-trips blocks, tables, version edits
   and batch reprs under `cargo fuzz`, and decodes arbitrary bytes without
   panicking — the corpus seeded from the golden files.
+- **Damage is refused by the checksum, with the checksum on.** The fuzz
+  targets turn checksums off and accept any error; the other half is that a
+  flipped byte in any block is caught. `format/tests/corruption.rs` damages
+  every block of every golden table in turn, across both checksum types and
+  all three compressions, and the read has to fail with a checksum mismatch
+  naming that block. `tests/corruption.rs` does the same to the blocks of
+  two `db-reads` tables under a store, through its table and block caches:
+  every `get`, both scans and a compaction must each give the undamaged
+  store's answer or that mismatch, something must notice every block, and a
+  compaction that fails must leave the version as it was.
 - **Model-based property tests**, as encina's: random sequences of writes,
   deletes, range deletes, gets under every comparison, scans forward and
   reverse, flushes, compactions and reopens, checked against a `BTreeMap`, with
