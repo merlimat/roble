@@ -134,6 +134,28 @@ jobs:
             exit 1
           fi
 
+      # Pebble's own test cases that roble's tests run, copied with Pebble's
+      # licence. They are judged against roble only while they are the cases
+      # Pebble has at the pin, so a Pebble upgrade that left them behind fails
+      # here rather than going on testing the old rule.
+      - name: the Pebble test data is still Pebble's at the pin
+        run: |
+          pebble="$(cd harness && go mod download github.com/cockroachdb/pebble/v2 && go list -m -f '{{.Dir}}' github.com/cockroachdb/pebble/v2)"
+          status=0
+          for pair in \
+            "tests/pebble/l0_sublevels:internal/manifest/testdata/l0_sublevels" \
+            "format/tests/pebble/fragmenter:internal/keyspan/testdata/fragmenter" \
+            "tests/pebble/LICENSE:LICENSE" \
+            "format/tests/pebble/LICENSE:LICENSE"; do
+            ours="${pair%%:*}"
+            theirs="$pebble/${pair#*:}"
+            if ! diff -u "$theirs" "$ours"; then
+              echo "::error file=$ours::not Pebble's at the pin; copy it again from $theirs"
+              status=1
+            fi
+          done
+          exit $status
+
       # Pebble's answers to the read probes, and the shape of the database they
       # are asked of: the generator refuses to write a fixture that collapsed
       # into one level, so a drift that flattened it fails here rather than

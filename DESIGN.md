@@ -1844,6 +1844,15 @@ in both directions.
   length and their leading bytes rather than whole: what a seek can get wrong
   about a value is the range it reads it from, and the values themselves are
   already pinned byte for byte by the scan.
+- **Pebble's own test cases, where roble claims Pebble's rule.** Where a
+  piece of roble is a pure function Pebble also tests in its own test data,
+  roble runs Pebble's cases rather than writing its own: L0's sublevel count
+  (`tests/pebble/l0_sublevels`, every `define` and `add-l0-files`) and
+  range-deletion fragmenting (`format/tests/pebble/fragmenter`, every
+  `build`). The files are copied unchanged, with Pebble's licence beside them,
+  and CI fails if they stop being the files at the pin. Only what roble shares
+  is compared: the sublevel count, not Pebble's compaction picking, and the
+  fragments, not how the test draws them.
 - **Whole-database fixtures.** A file can be pinned on its own; a database
   cannot. Which table sits at which level exists only once a format-version
   marker, a manifest marker and a MANIFEST are put together and the MANIFEST's
