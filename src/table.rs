@@ -1053,6 +1053,45 @@ pub fn is_deletion(kind: roble_format::key::Kind) -> bool {
     matches!(kind, Kind::Delete | Kind::SingleDelete | Kind::DeleteSized)
 }
 
+/// The kind a key's newest entry, of kind `newest`, is written as when an
+/// older entry of the same key, of kind `older`, is dropped beneath it in the
+/// same flush or compaction.
+///
+/// Both changes are for a SingleDelete, which in Pebble's compaction cancels
+/// exactly one Set beneath it and nothing more. Neither changes a read: a
+/// SETWITHDEL reads as its Set, and a SINGLEDEL as a Delete already.
+///
+/// - **A SET over a DEL, SINGLEDEL or DELSIZED becomes a SETWITHDEL**, as in
+///   Pebble's `setNext` (`internal/compact/iterator.go`), with a Set in
+///   between not stopping the search. A later SingleDelete that meets a
+///   SETWITHDEL acts as a Delete. One that meets a plain SET cancels that Set
+///   alone, and with the deletion gone an older value in a deeper level would
+///   come back. Pebble skips a deletion a range tombstone covers; roble does
+///   not, which can only make a SETWITHDEL Pebble would have left a SET.
+/// - **A SINGLEDEL over anything becomes a DEL.** The entry it drops was what
+///   it was meant to cancel, or something that was already hiding the older
+///   versions. Either way, left a SINGLEDEL it would go on to cancel the next
+///   Set beneath it, in a deeper level, and the one under that would come
+///   back. Pebble's `singleDeleteNext` does this over a DEL, DELSIZED or
+///   SETWITHDEL, and over a Set elides both and carries on with what is
+///   older; roble writes one entry per key, so a Delete is what it can write
+///   that hides all of them, and it changes no answer.
+///
+/// Every other kind is written as it is. Both results are kinds this leaves
+/// alone, so applying it once per older entry gives the same as applying it
+/// once.
+pub(crate) fn written_over(
+    newest: roble_format::key::Kind,
+    older: roble_format::key::Kind,
+) -> roble_format::key::Kind {
+    use roble_format::key::Kind;
+    match newest {
+        Kind::Set if is_deletion(older) => Kind::SetWithDelete,
+        Kind::SingleDelete => Kind::Delete,
+        kind => kind,
+    }
+}
+
 /// Whether any table's range tombstone covers `user` with a sequence number
 /// above `seq`.
 ///

@@ -50,8 +50,26 @@ import (
 const seed = 20261111
 
 func main() {
+	if len(os.Args) == 4 && os.Args[1] == "check" {
+		if err := check(os.Args[2], os.Args[3]); err != nil {
+			fail(err)
+		}
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "single-delete" {
+		if err := singleDelete(os.Args[2]); err != nil {
+			fail(err)
+		}
+		return
+	}
+	if len(os.Args) == 4 && os.Args[1] == "stays-deleted" {
+		if err := staysDeleted(os.Args[2], []byte(os.Args[3])); err != nil {
+			fail(err)
+		}
+		return
+	}
 	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: read-probes <output-dir>")
+		fmt.Fprintln(os.Stderr, "usage: read-probes <output-dir> | read-probes check <db-dir> <golden-dir> | read-probes single-delete <db-dir> | read-probes stays-deleted <db-dir> <key>")
 		os.Exit(2)
 	}
 	out := os.Args[1]
@@ -78,6 +96,199 @@ func main() {
 		fail(err)
 	}
 	fmt.Printf("db-reads: %d probe keys\n", len(probesFor(keys)))
+}
+
+// check asks the probes and scans of a copy of db-reads that something else
+// has rewritten, and requires the answers Pebble gave over the original,
+// committed in golden. Then Pebble compacts the whole copy itself and is
+// asked again.
+//
+// `compat/wal-replay --kinds` is what hands it a copy: one roble compacted so
+// that roble's own tables carry SINGLEDEL, DELSIZED and SETWITHDEL. The
+// first round says Pebble reads those tables as roble meant them. The
+// second says Pebble's compaction, which cancels a SINGLEDEL against the Set
+// below it, leaves the answers unchanged. CheckLevels in between is Pebble's
+// own check of the level invariant over what roble wrote. Neither round
+// issues a SingleDelete of its own, so neither can see a Set that should
+// have become a SETWITHDEL and did not; `single-delete` is the check that
+// does.
+func check(dir, golden string) error {
+	keys := alphabet()
+	wantProbes, err := os.ReadFile(filepath.Join(golden, "db-reads.probes"))
+	if err != nil {
+		return err
+	}
+	wantScans, err := os.ReadFile(filepath.Join(golden, "db-reads.scans"))
+	if err != nil {
+		return err
+	}
+	compare := func(when string) error {
+		probes, err := probe(dir, keys)
+		if err != nil {
+			return fmt.Errorf("%s: %w", when, err)
+		}
+		if err := same(when, "db-reads.probes", probes, string(wantProbes)); err != nil {
+			return err
+		}
+		scans, err := scanDump(dir, keys)
+		if err != nil {
+			return fmt.Errorf("%s: %w", when, err)
+		}
+		return same(when, "db-reads.scans", scans, string(wantScans))
+	}
+
+	if err := compare("as roble left it"); err != nil {
+		return err
+	}
+
+	opts := &pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+	}
+	levelOptions(opts)
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		return fmt.Errorf("Pebble could not open the database roble compacted: %w", err)
+	}
+	if err := db.CheckLevels(nil); err != nil {
+		db.Close()
+		return fmt.Errorf("the level invariant does not hold over what roble wrote: %w", err)
+	}
+	if err := db.Compact(context.Background(), []byte{}, []byte{0xff, 0xff, 0xff, 0xff}, false); err != nil {
+		db.Close()
+		return fmt.Errorf("Pebble could not compact what roble wrote: %w", err)
+	}
+	// Otherwise the second round would ask Pebble about roble's tables again
+	// and test nothing new.
+	levels, err := db.SSTables()
+	if err != nil {
+		db.Close()
+		return err
+	}
+	for level, tables := range levels[:len(levels)-1] {
+		if len(tables) > 0 {
+			db.Close()
+			return fmt.Errorf("Pebble's compaction left %d tables in L%d", len(tables), level)
+		}
+	}
+	if err := db.Close(); err != nil {
+		return err
+	}
+
+	if err := compare("after Pebble compacted it"); err != nil {
+		return err
+	}
+	fmt.Println("\nVERDICT: Go Pebble reads, checks and compacts the SINGLEDEL, DELSIZED and SETWITHDEL roble wrote, and its probe answers do not change")
+	return nil
+}
+
+// singleDelete issues the SingleDelete of s1 that Pebble allows over a copy
+// of db-reads roble has compacted, lets Pebble compact it, and requires s1
+// to stay deleted.
+//
+// It is allowed because s1 was Set exactly once since its last SingleDelete.
+// After `compat/wal-replay --kinds` that Set sits in a table roble wrote,
+// over the SINGLEDEL it buried, with s1's first Set still in a deeper level.
+// Pebble's compaction lets a SingleDelete cancel a plain SET and nothing
+// more, so had roble written that Set as one, the first value would come
+// back. A SETWITHDEL, which is what Pebble itself writes there, turns the
+// SingleDelete into a Delete instead.
+func singleDelete(dir string) error {
+	opts := &pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+	}
+	levelOptions(opts)
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		return fmt.Errorf("Pebble could not open the database roble compacted: %w", err)
+	}
+	defer db.Close()
+	if err := db.SingleDelete([]byte("s1"), pebble.Sync); err != nil {
+		return err
+	}
+	if err := db.Flush(); err != nil {
+		return err
+	}
+	if err := db.Compact(context.Background(), []byte{}, []byte{0xff, 0xff, 0xff, 0xff}, false); err != nil {
+		return fmt.Errorf("Pebble could not compact what roble wrote: %w", err)
+	}
+	v, closer, err := db.Get([]byte("s1"))
+	switch {
+	case errors.Is(err, pebble.ErrNotFound):
+	case err != nil:
+		return err
+	default:
+		defer closer.Close()
+		return fmt.Errorf("s1 came back as %q after a SingleDelete and a compaction: roble wrote a SET where Pebble writes a SETWITHDEL", v)
+	}
+	fmt.Println("\nVERDICT: a SingleDelete Pebble issues over what roble compacted deletes the key when Pebble compacts next, and nothing older comes back")
+	return nil
+}
+
+// staysDeleted requires key to be deleted in dir, then lets Pebble compact
+// the whole database and requires it again.
+//
+// `compat/wal-replay --single-delete` hands it a database where roble
+// compacted a SingleDelete over the DEL it buried, with older values of the
+// key in deeper levels. Pebble's compaction lets a SINGLEDEL cancel the one
+// Set it meets and nothing more, so had roble left it a SINGLEDEL, the value
+// under that Set would come back here. A DEL, which is what Pebble turns
+// such a SINGLEDEL into, hides them all.
+func staysDeleted(dir string, key []byte) error {
+	opts := &pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+	}
+	levelOptions(opts)
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		return fmt.Errorf("Pebble could not open the database roble wrote: %w", err)
+	}
+	defer db.Close()
+	absent := func(when string) error {
+		v, closer, err := db.Get(key)
+		switch {
+		case errors.Is(err, pebble.ErrNotFound):
+			return nil
+		case err != nil:
+			return err
+		default:
+			defer closer.Close()
+			return fmt.Errorf("%s: %s reads as %q, though roble deleted it", when, key, v)
+		}
+	}
+	if err := absent("as roble left it"); err != nil {
+		return err
+	}
+	if err := db.CheckLevels(nil); err != nil {
+		return fmt.Errorf("the level invariant does not hold over what roble wrote: %w", err)
+	}
+	if err := db.Compact(context.Background(), []byte{}, []byte{0xff, 0xff, 0xff, 0xff}, false); err != nil {
+		return fmt.Errorf("Pebble could not compact what roble wrote: %w", err)
+	}
+	if err := absent("after Pebble compacted it"); err != nil {
+		return err
+	}
+	fmt.Printf("\nVERDICT: %s stays deleted when Pebble compacts the SingleDelete roble wrote as a DEL\n", key)
+	return nil
+}
+
+// same fails with the first line where got leaves want.
+func same(when, name, got, want string) error {
+	if got == want {
+		return nil
+	}
+	g, w := strings.Split(got, "\n"), strings.Split(want, "\n")
+	for i := 0; i < len(g) && i < len(w); i++ {
+		if g[i] != w[i] {
+			return fmt.Errorf("%s: %s differs at line %d:\n  now:  %q\n  was:  %q", when, name, i+1, g[i], w[i])
+		}
+	}
+	return fmt.Errorf("%s: %s differs in length: %d lines now, %d before", when, name, len(g), len(w))
 }
 
 // alphabet is small on purpose: with few distinct keys, a few hundred
@@ -107,7 +318,7 @@ func alphabet() [][]byte {
 //
 // SINGLEDEL is only defined when the key was Set exactly once since its last
 // deletion; DELSIZED is only defined when the size given is the real one.
-// Both are kinds roble reads and never writes (§3), and leaving them out
+// Both are kinds roble reads and never creates (§3), and leaving them out
 // entirely would mean the engine's view of a deletion was only ever tested
 // against the ordinary DELETE. So they get an exact, legal sequence each, on
 // keys the random rounds never touch.

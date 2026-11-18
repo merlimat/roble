@@ -61,13 +61,15 @@ pub enum Kind {
     Set,
     /// `MERGE`, 2. Refused by the table reader: Oxia configures no merger.
     Merge,
-    /// `SINGLEDEL`, 7. Read, never written.
+    /// `SINGLEDEL`, 7. Read, never created; a compaction carries one it read,
+    /// or writes a `DEL` for it over an older version of its key it drops.
     SingleDelete,
     /// `RANGEDEL`, 15.
     RangeDelete,
     /// `SEPARATOR`, 17, which appears only as an index separator.
     Separator,
-    /// `SETWITHDEL`, 18.
+    /// `SETWITHDEL`, 18. Written for a Set that a flush or compaction lays
+    /// over a deletion of its key it drops, as Pebble's `setNext` does.
     SetWithDelete,
     /// `RANGEKEYDEL`, 19. Refused: Oxia creates no range keys.
     RangeKeyDelete,
@@ -77,7 +79,7 @@ pub enum Kind {
     RangeKeySet,
     /// `INGESTSST`, 22. Refused: Oxia does not ingest.
     IngestSst,
-    /// `DELSIZED`, 23. Read, never written.
+    /// `DELSIZED`, 23. Read, never created; a compaction carries one it read.
     DeleteSized,
     /// `EXCISE`, 24. Refused: Oxia does not excise.
     Excise,

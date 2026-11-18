@@ -557,3 +557,122 @@ async fn overlapping_range_deletions_can_be_flushed() {
     let db = roble::open(&env, &dir).await.expect("reopen");
     assert_eq!(contents(&db).await, before, "a reopen changed an answer");
 }
+
+/// What kind each user key's entry in a table has, from the format crate's
+/// dump: `entry <seq> <kind> <key> [value]`, keyed by the key as text.
+fn kinds_in(dump: &str) -> BTreeMap<String, String> {
+    dump.lines()
+        .filter_map(|l| l.strip_prefix("entry "))
+        .map(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            let key = (0..fields[2].len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&fields[2][i..i + 2], 16).expect("hex") as char)
+                .collect();
+            (key, fields[1].to_string())
+        })
+        .collect()
+}
+
+#[compio::test]
+async fn a_set_written_over_a_deletion_in_the_same_memtable_is_flushed_as_setwithdel() {
+    // Pebble's flush runs its compaction iterator, whose `setNext` turns a
+    // SET into a SETWITHDEL when an older DEL, SINGLEDEL or DELSIZED of the
+    // same key goes in the same pass. The kind is what tells a later
+    // SingleDelete that something may still lie below the Set it meets, so
+    // that it acts as a Delete rather than cancelling that one Set. A flush
+    // that kept only the newest Set as a plain SET, while an older value sat
+    // in a table beneath, would let a SingleDelete Pebble is allowed to issue
+    // bring that older value back.
+    let env = SimEnv::new();
+    let db = created(&env).await;
+    let mut batch = Batch::new();
+    batch.put(b"d", b"old").expect("put");
+    batch.delete(b"d").expect("delete");
+    batch.put(b"d", b"new").expect("put");
+    batch.put(b"s", b"old").expect("put");
+    batch.single_delete(b"s").expect("single_delete");
+    batch.put(b"s", b"new").expect("put");
+    batch.put(b"z", b"old").expect("put");
+    batch.delete_sized(b"z", 3).expect("delete_sized");
+    batch.put(b"z", b"new").expect("put");
+    // A Set between the newest and the deletion does not stop it: Pebble
+    // walks every older entry of the key until it meets one.
+    batch.delete(b"m").expect("delete");
+    batch.put(b"m", b"mid").expect("put");
+    batch.put(b"m", b"new").expect("put");
+    // Neither of these met a deletion, so both stay what they were written.
+    batch.put(b"p", b"old").expect("put");
+    batch.put(b"p", b"new").expect("put");
+    batch.put(b"n", b"new").expect("put");
+    batch.put(b"x", b"old").expect("put");
+    batch.delete(b"x").expect("delete");
+    db.write_raw(&mut batch, true).await.expect("write");
+    let file_num = db.flush().await.expect("flush").expect("a table");
+
+    let bytes = env
+        .sim()
+        .durable(&Path::new("/db").join(format!("{file_num:06}.sst")))
+        .expect("the table is on disk");
+    let dump = roble_format::dump_table(&bytes).expect("dump");
+    let kinds = kinds_in(&dump);
+    let want: BTreeMap<String, String> = [
+        ("d", "setwithdel"),
+        ("m", "setwithdel"),
+        ("n", "set"),
+        ("p", "set"),
+        ("s", "setwithdel"),
+        ("x", "del"),
+        ("z", "setwithdel"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert_eq!(kinds, want, "the flushed table:\n{dump}");
+
+    // A SETWITHDEL reads as the Set it is.
+    for key in [&b"d"[..], b"m", b"s", b"z"] {
+        assert_eq!(
+            db.get(key, Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"new".to_vec()),
+        );
+    }
+}
+
+#[compio::test]
+async fn a_single_delete_over_an_older_version_in_the_same_memtable_is_flushed_as_del() {
+    // A SINGLEDEL, in Pebble's compaction, cancels exactly the one Set it
+    // meets beneath it. Flushed over an older version it drops, it would be
+    // left to cancel the next Set below that instead — in a deeper level,
+    // with the one under it coming back. Written as a DEL, it hides them all,
+    // and no read can tell the difference. With nothing older beside it in
+    // the memtable it stays what it is.
+    let env = SimEnv::new();
+    let db = created(&env).await;
+    let mut batch = Batch::new();
+    batch.put(b"q", b"old").expect("put");
+    batch.single_delete(b"q").expect("single_delete");
+    batch.delete(b"t").expect("delete");
+    batch.single_delete(b"t").expect("single_delete");
+    batch.single_delete(b"r").expect("single_delete");
+    db.write_raw(&mut batch, true).await.expect("write");
+    let file_num = db.flush().await.expect("flush").expect("a table");
+
+    let bytes = env
+        .sim()
+        .durable(&Path::new("/db").join(format!("{file_num:06}.sst")))
+        .expect("the table is on disk");
+    let dump = roble_format::dump_table(&bytes).expect("dump");
+    let want: BTreeMap<String, String> = [("q", "del"), ("r", "singledel"), ("t", "del")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(kinds_in(&dump), want, "the flushed table:\n{dump}");
+
+    for key in [&b"q"[..], b"r", b"t"] {
+        assert_eq!(db.get(key, Comparison::Equal).await.expect("get"), None);
+    }
+}

@@ -96,3 +96,28 @@ for mode in log flushed rotated compacted settled no-wal swept checkpoint create
   (cd ../../harness && go run ./verify-wal "$verify" "$mode")
   echo
 done
+
+# The kinds roble reads and never writes itself: roble compacts db-reads so
+# that its own output carries SINGLEDEL, DELSIZED and SETWITHDEL, and Pebble
+# has to give the answers it gave over the original, then compact the result
+# and give them again.
+db="$out/kinds"
+cp -R ../../tests/golden/db-reads "$db"
+chmod -R u+w "$db"
+cargo run --release --quiet -p wal-replay -- "$db" --kinds
+echo
+# A copy first: the SingleDelete has to meet roble's tables, not the ones
+# Pebble's own compaction in the check replaces them with.
+cp -R "$db" "$out/kinds-single-delete"
+(cd ../../harness && go run ./read-probes check "$db" ../tests/golden)
+(cd ../../harness && go run ./read-probes single-delete "$out/kinds-single-delete")
+echo
+
+# The other half: a SingleDelete roble itself compacts over the DEL it
+# buries, with two older values of the key below. roble writes it as a DEL,
+# and Pebble's compaction must not let it cancel one value and uncover the
+# other. Created from nothing, since no fixture has two values under a DEL.
+db="$out/single-delete"
+cargo run --release --quiet -p wal-replay -- "$db" --single-delete
+echo
+(cd ../../harness && go run ./read-probes stays-deleted "$db" k)
