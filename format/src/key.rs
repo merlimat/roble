@@ -202,8 +202,10 @@ pub fn compare(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
 ///
 /// `seq_num` must be at most [`SEQ_NUM_MAX`]: the trailer has 56 bits for it,
 /// and the bits above them would be shifted out, leaving a different number
-/// with nothing to say so. Checked in debug builds only, since every caller
-/// passes a number an engine handed out.
+/// with nothing to say so. Checked in debug builds only: a number read from
+/// disk is held to it where it is read ([`crate::batch::seq_num_of`],
+/// [`crate::manifest::VersionEdit::decode`]), and roble refuses a write that
+/// would number past it.
 pub fn encode(user_key: &[u8], seq_num: u64, kind: Kind) -> Vec<u8> {
     debug_assert!(
         seq_num <= SEQ_NUM_MAX,

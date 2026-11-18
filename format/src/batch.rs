@@ -241,13 +241,23 @@ pub struct Entry<'a> {
 /// For a batch read back out of a log: replay has to use the number the batch
 /// was written with, not a fresh one, or a key would come back with a
 /// different age than it had.
+///
+/// Refuses a header whose entries would be numbered past
+/// [`key::SEQ_NUM_MAX`](crate::key::SEQ_NUM_MAX): no writer hands those out,
+/// and a key built from one would lose the bits the trailer has no room for.
 pub fn seq_num_of(repr: &[u8]) -> Result<u64> {
     if repr.len() < HEADER_LEN {
         return Error::truncated("batch header", HEADER_LEN, repr.len());
     }
-    Ok(u64::from_le_bytes(
-        repr[..COUNT_OFFSET].try_into().expect("8 bytes"),
-    ))
+    let seq = u64::from_le_bytes(repr[..COUNT_OFFSET].try_into().expect("8 bytes"));
+    let count = u32::from_le_bytes(repr[COUNT_OFFSET..HEADER_LEN].try_into().expect("4 bytes"));
+    let last = seq.checked_add(u64::from(count.saturating_sub(1)));
+    match last {
+        Some(last) if last <= crate::key::SEQ_NUM_MAX => Ok(seq),
+        _ => Error::corrupt(format!(
+            "batch of {count} entries at sequence number {seq} runs past the largest one a key holds"
+        )),
+    }
 }
 
 /// Walks a batch representation's entries.
@@ -411,6 +421,30 @@ mod tests {
             }
         }
         assert!(err.is_some(), "a short batch must not read as complete");
+    }
+
+    /// A log record's header names the number its first entry was written
+    /// at. One whose entries would run past the largest number a key's
+    /// trailer holds was written by nothing, and is refused before a key is
+    /// built from it (the open_corrupt fuzz target found one).
+    #[test]
+    fn a_header_numbered_past_the_trailer_is_refused() {
+        let mut b = Batch::new();
+        b.put(b"/a", b"1").expect("put");
+        b.put(b"/b", b"2").expect("put");
+        let max = crate::key::SEQ_NUM_MAX;
+
+        b.set_seq_num(max - 1);
+        assert_eq!(
+            seq_num_of(b.as_bytes()).expect("its last is the largest"),
+            max - 1
+        );
+
+        for seq in [max, max + 1, u64::MAX] {
+            b.set_seq_num(seq);
+            let err = seq_num_of(b.as_bytes()).expect_err("runs past the largest");
+            assert!(matches!(err, Error::Corrupt(_)), "{seq}: {err:?}");
+        }
     }
 
     /// A range whose start is not below its end is the caller's mistake, and
