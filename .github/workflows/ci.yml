@@ -144,6 +144,7 @@ jobs:
           status=0
           for pair in \
             "tests/pebble/l0_sublevels:internal/manifest/testdata/l0_sublevels" \
+            "tests/pebble/range_del:testdata/range_del" \
             "format/tests/pebble/fragmenter:internal/keyspan/testdata/fragmenter" \
             "tests/pebble/LICENSE:LICENSE" \
             "format/tests/pebble/LICENSE:LICENSE"; do

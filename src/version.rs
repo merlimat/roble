@@ -166,8 +166,21 @@ impl Table {
 /// For a level below L0 only. Those hold disjoint ranges in key order
 /// ([`apply`] keeps them so), which makes the tables ending below a key a
 /// prefix of the level and lets a binary search find where it stops.
+///
+/// **A table whose largest bound is the exclusive sentinel at `user` ends
+/// below it** ([`Table::largest_is_exclusive`]). That is the table before a
+/// compaction's split inside a range deletion: its tombstone is clipped to
+/// end at `user` and the next table starts there, so it holds nothing at
+/// `user` and the next one may. Pebble's `findFileGE` comes out the same
+/// way, comparing internal keys, where the sentinel sorts before every key
+/// at its user key. Counted as reaching `user`, it made `get` read that
+/// table and not the next, and answer for the first key of the next table
+/// with whatever older version a lower level held.
 pub(crate) fn ending_below(tables: &[Table], user: &[u8]) -> Result<usize> {
-    partition(tables, |t| Ok(t.largest_user_key()? < user))
+    partition(tables, |t| {
+        let largest = t.largest_user_key()?;
+        Ok(largest < user || (largest == user && t.largest_is_exclusive()?))
+    })
 }
 
 /// How many of a level's tables start below `user`: the index of the first

@@ -1875,7 +1875,8 @@ in both directions.
   roble runs Pebble's cases rather than writing its own: L0's sublevel count
   (`tests/pebble/l0_sublevels`, every `define` and `add-l0-files`) and
   range-deletion fragmenting (`format/tests/pebble/fragmenter`, every
-  `build`). The files are copied unchanged, with Pebble's licence beside them,
+  `build`), and reads over hand-built LSMs of range deletions across
+  memtables and levels (`tests/pebble/range_del`, its `get` and `iter`). The files are copied unchanged, with Pebble's licence beside them,
   and CI fails if they stop being the files at the pin. Only what roble shares
   is compared: the sublevel count, not Pebble's compaction picking, and the
   fragments, not how the test draws them.

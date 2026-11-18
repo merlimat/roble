@@ -932,6 +932,106 @@ async fn a_tombstone_outside_a_table_is_not_written_into_it() {
 }
 
 #[compio::test]
+async fn a_get_at_the_key_a_split_tombstone_ends_at_reads_the_table_that_starts_there() {
+    // The tables a split inside a range deletion leaves (the test below)
+    // meet at one user key: the first ends at the exclusive sentinel there,
+    // the second starts there, often with a live key. A lookup has to read
+    // the second. It read the first, whose largest bound it took to reach the
+    // key, found nothing, and answered from the level below: the key's older
+    // version, deleted and written again since. A scan got it right, which
+    // is all `contents` checks, so every comparison is asked of every key.
+    let (env, dir) = load("db-twin-a").await;
+    let db = open_splitting(&env, &dir, 4096).await;
+
+    // Older versions below, then a tombstone over them and newer versions on
+    // top, merged together so the output splits with the tombstone across
+    // every boundary.
+    let mut old = Batch::new();
+    for i in 0..120 {
+        old.put(format!("s{i:04}").as_bytes(), b"old").expect("put");
+    }
+    let deep = flush_batch(&db, &mut old).await;
+    let l1 = db.compact(0, &[deep]).await.expect("compact");
+    db.compact(1, &l1).await.expect("compact");
+
+    let value = vec![b'v'; 200];
+    let mut fresh = Batch::new();
+    fresh
+        .delete_range(b"s0000", b"s9999")
+        .expect("delete_range");
+    for i in 0..120 {
+        fresh
+            .put(format!("s{i:04}").as_bytes(), &value)
+            .expect("put");
+    }
+    let top = flush_batch(&db, &mut fresh).await;
+    let outputs = db.compact(0, &[top]).await.expect("compact");
+    let in_l1: Vec<roble::Table> = db.versions().version.level(1).to_vec();
+    let starts: Vec<Vec<u8>> = in_l1
+        .windows(2)
+        .filter(|p| p[0].largest_is_exclusive().expect("exclusive"))
+        .map(|p| p[1].smallest_user_key().expect("smallest").to_vec())
+        .collect();
+    assert!(
+        !starts.is_empty(),
+        "no table ended at an exclusive sentinel, so nothing here tests the rule: {outputs:?}"
+    );
+
+    let model = contents(&db).await;
+    let pair = |(k, v): (&Vec<u8>, &Vec<u8>)| (k.clone(), v.clone());
+    for i in 0..121 {
+        let k = format!("s{i:04}").into_bytes();
+        for probe in [k.clone(), [k.clone(), vec![0]].concat()] {
+            for (how, want) in [
+                (
+                    Comparison::Equal,
+                    model.get(&probe).map(|v| (probe.clone(), v.clone())),
+                ),
+                (
+                    Comparison::Floor,
+                    model.range(..=probe.clone()).next_back().map(pair),
+                ),
+                (
+                    Comparison::Ceiling,
+                    model.range(probe.clone()..).next().map(pair),
+                ),
+                (
+                    Comparison::Lower,
+                    model.range(..probe.clone()).next_back().map(pair),
+                ),
+                (
+                    Comparison::Higher,
+                    model
+                        .range((
+                            std::ops::Bound::Excluded(probe.clone()),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .map(pair),
+                ),
+            ] {
+                let got = db
+                    .get(&probe, how)
+                    .await
+                    .expect("get")
+                    .map(|f| (f.key, f.value));
+                assert!(
+                    got == want,
+                    "{how:?} of {:?}{}: found {:?}",
+                    String::from_utf8_lossy(&probe),
+                    if starts.contains(&probe) {
+                        ", where a table starts after a split"
+                    } else {
+                        ""
+                    },
+                    got.map(|(k, v)| (String::from_utf8_lossy(&k).into_owned(), v.len()))
+                );
+            }
+        }
+    }
+}
+
+#[compio::test]
 async fn a_tombstone_across_a_split_leaves_tables_that_touch() {
     // The shape this whole change turns on. A range deletion that spans a
     // split is clipped at the boundary, so the table before it ends at the
