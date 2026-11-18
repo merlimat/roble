@@ -121,3 +121,12 @@ db="$out/single-delete"
 cargo run --release --quiet -p wal-replay -- "$db" --single-delete
 echo
 (cd ../../harness && go run ./read-probes stays-deleted "$db" k)
+echo
+
+# Pebble's megabyte keys from testdata/large_keys: a block holds one or two,
+# every separator and table bound is a megabyte, and the edit naming the
+# tables spans dozens of the MANIFEST's blocks.
+db="$out/large-keys"
+cargo run --release --quiet -p wal-replay -- "$db" --large-keys
+echo
+(cd ../../harness && go run ./verify-wal "$db" large-keys)

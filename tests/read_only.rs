@@ -409,10 +409,12 @@ async fn a_reader_does_not_take_the_lock() {
     let _db = writer(&sim_env).await;
 }
 
-/// A torn record at the end of the MANIFEST is corruption to the writer and
-/// stale to a reader, which may have caught the writer appending an edit.
+/// A torn record at the end of the MANIFEST is stale to a reader, which may
+/// have caught the writer appending an edit, and to the writer the end of
+/// the MANIFEST: an edit a crash cut short, never acknowledged, as Pebble
+/// reads it (`tests/open.rs` tears one at every byte).
 #[compio::test]
-async fn a_torn_manifest_is_corrupt_to_the_writer_and_stale_to_a_reader() {
+async fn a_torn_manifest_is_stale_to_a_reader_and_an_unfinished_edit_to_the_writer() {
     let sim_env = SimEnv::new();
     let db = writer(&sim_env).await;
     put(&db, b"a", b"1").await;
@@ -431,7 +433,16 @@ async fn a_torn_manifest_is_corrupt_to_the_writer_and_stale_to_a_reader() {
 
     let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
     assert!(matches!(reader(&env).await, Err(Error::Stale(_))));
-    assert!(matches!(reopen(&sim_env).await, Err(Error::Corrupt(_))));
+    let db = reopen(&sim_env)
+        .await
+        .expect("the writer opens to the edits before it");
+    assert_eq!(get(&db, b"a").await.expect("get"), Some(b"1".to_vec()));
+    // And moved to a fresh MANIFEST, which a reader reads whole.
+    db.flush().await.expect("flush");
+    assert!(
+        reader(&env).await.is_ok(),
+        "the reader should read the fresh MANIFEST"
+    );
 }
 
 /// A reader does not check the version's tables against its listing, which a

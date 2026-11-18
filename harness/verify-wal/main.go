@@ -40,7 +40,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|compacted|settled|no-wal|swept|checkpoint|created]")
+		fmt.Fprintln(os.Stderr, "usage: verify-wal <database-dir> [log|flushed|rotated|compacted|settled|no-wal|swept|checkpoint|created|large-keys]")
 		os.Exit(2)
 	}
 	dir := os.Args[1]
@@ -129,6 +129,8 @@ func main() {
 		fmt.Println("\nVERDICT: Go Pebble reads a database roble has deleted obsolete files from")
 	case "checkpoint":
 		fmt.Println("\nVERDICT: Go Pebble opens a checkpoint roble wrote, with no OPTIONS file and no logs")
+	case "large-keys":
+		fmt.Println("\nVERDICT: Go Pebble reads megabyte keys roble flushed, compacted and named in a MANIFEST spanning dozens of blocks")
 	case "created":
 		fmt.Println("\nVERDICT: Go Pebble opens a database roble created from an empty directory, every byte of it roble's")
 	default:
@@ -151,7 +153,9 @@ func readExpectation(path string) ([]pair, [][]byte, error) {
 	var pairs []pair
 	var deleted [][]byte
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	// A line holds a key and a value in hex, and the large-keys run's keys
+	// are a megabyte each.
+	scanner.Buffer(make([]byte, 1<<20), 1<<23)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		switch {
