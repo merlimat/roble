@@ -124,7 +124,7 @@ async fn a_checkpoint_takes_the_memtable_with_it() {
     // there is no log in the directory to carry what the memtable held, and
     // Oxia runs with the WAL off (§4).
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, Options::new().disable_wal(true))
+    let db = roble::open_with(&env, &dir, Options::new().wal(roble::Wal::Off))
         .await
         .expect("open");
     let mut model = contents(&db).await;
@@ -142,7 +142,7 @@ async fn a_checkpoint_takes_the_memtable_with_it() {
         "and the checkpoint should have written it out on the way"
     );
 
-    let copy = roble::open_with(&env, &at, Options::new().disable_wal(true))
+    let copy = roble::open_with(&env, &at, Options::new().wal(roble::Wal::Off))
         .await
         .expect("open the checkpoint");
     assert_eq!(

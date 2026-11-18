@@ -117,7 +117,7 @@ async fn contents<F: Fs>(db: &roble::Db<F>) -> Model {
 /// scheduling is the subject.
 fn options(wal: bool) -> Options<SimFs> {
     let o = Options::new().disable_automatic_compactions(true);
-    if wal { o } else { o.disable_wal(true) }
+    if wal { o } else { o.wal(roble::Wal::Off) }
 }
 
 /// Writes `n` keys under `prefix`, and says what they were.

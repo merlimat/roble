@@ -70,7 +70,7 @@ so the series are there at zero before anything has gone wrong.
 | `roble.write.stall.duration` | latency | s | Time such a write spent waiting, by `roble.stall.reason` |
 | `roble.memtable.size` | up-down counter | By | Bytes of writes that no table holds yet |
 
-A store opened with `disable_wal` records no `roble.wal.append.duration` at all,
+A store opened with `Wal::Off` records no `roble.wal.append.duration` at all,
 because nothing is appended: its durability is `flush`'s (§4).
 
 ## Reading

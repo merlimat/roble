@@ -137,8 +137,13 @@ Creates the store at DIR/<engine>, which must not exist yet.
                   are comparable; latest is YCSB D's, where the newest records
                   are the hottest. uniform reproduces a number measured before
                   there was a choice
-  --no-wal        turn the WAL off, as Oxia runs it: a flush is then the
-                  only durability point, and a commit syncs nothing
+  --wal MODE      how every write reaches the log, for every engine: off
+                  (no log, as Oxia runs it: a flush is then the only
+                  durability point), buffered (appended and left to the OS
+                  to sync) or synced (synced before the write returns)
+                  (buffered). encina has no log to configure, and every
+                  write it makes is durable
+  --no-wal        --wal off
   --no-compactions  compact nothing, so the read phases see L0 exactly as
                   the flushes left it. Without it the shape a run reads
                   depends on how far a clock-paced compaction got before
@@ -245,7 +250,7 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
         cfg.records,
         cfg.value_bytes,
         cfg.cache_mb,
-        if cfg.wal { "on" } else { "off" },
+        cfg.wal.name(),
         cfg.seed,
         cfg.distribution.name(),
         cfg.compression
@@ -261,7 +266,7 @@ async fn run<S: Store>(cfg: &Config, path: &Path) {
     // flushes the drive's own write cache; compio's and RocksDB's are
     // `fsync`, which does not. On Linux — which is what Oxia runs — they all
     // are, and the load rows are comparable.
-    if cfg.wal && cfg.wants("load") && cfg!(target_os = "macos") {
+    if cfg.wal == WalMode::Synced && cfg.wants("load") && cfg!(target_os = "macos") {
         println!("note: on macOS Pebble's sync is F_FULLFSYNC where this engine's is fsync, so");
         println!("note: the load row is not comparable with Pebble's. Run every engine with");
         println!("note: --no-wal, which is Oxia's own configuration, for a load row that is.");
@@ -364,7 +369,7 @@ async fn load<S: Store>(cfg: &Config, shards: &[S], out: Output) {
         for b in 0..cfg.batches {
             let at = Instant::now();
             store
-                .write_batch(cfg, s, b * cfg.records, cfg.records, cfg.wal)
+                .write_batch(cfg, s, b * cfg.records, cfg.records)
                 .await;
             report.saw(at.elapsed());
             report.count += cfg.records as u64;
@@ -438,7 +443,7 @@ async fn delete<S: Store>(cfg: &Config, shards: &[S]) {
     for (s, store) in shards.iter().enumerate() {
         for span in deleted_spans(&deleted) {
             store
-                .delete_range(&key_for(s, span.start), &key_for(s, span.end), cfg.wal)
+                .delete_range(cfg, &key_for(s, span.start), &key_for(s, span.end))
                 .await;
             deletions += 1;
         }
@@ -669,7 +674,7 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
                 // The write half of a read-modify-write, which is the only
                 // thing separating F from a plain read.
                 if op == Op::Rmw {
-                    shards[s].write_batch(cfg, s, i, 1, false).await;
+                    shards[s].write_batch(cfg, s, i, 1).await;
                 }
             }
             // The value is the one this record already had, because
@@ -678,12 +683,12 @@ async fn ycsb<S: Store>(cfg: &Config, shards: &[S], out: Output) {
             // measured; no engine here deduplicates identical values.
             Op::Update => {
                 let i = keys[s].next(&mut rng);
-                shards[s].write_batch(cfg, s, i, 1, false).await;
+                shards[s].write_batch(cfg, s, i, 1).await;
             }
             Op::Insert => {
                 let i = next_insert[s];
                 next_insert[s] += 1;
-                shards[s].write_batch(cfg, s, i, 1, false).await;
+                shards[s].write_batch(cfg, s, i, 1).await;
                 // Only now, so that nothing reads the key before it is there.
                 keys[s].grow();
             }
@@ -1089,6 +1094,42 @@ fn hash_key(mut key: u64) -> u64 {
         key >>= 8;
     }
     h
+}
+
+/// How every write of a run reaches the engine's write-ahead log.
+///
+/// One setting for every engine, so that a row compares the same promise:
+/// roble's `Wal`, and RocksDB's `disable_wal` and `sync` set from it. encina
+/// has neither, and every write it makes is durable whatever this says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WalMode {
+    /// No log: a flush is the only durability point, as Oxia runs Pebble.
+    Off,
+    /// Appended to the log, which is left to the OS to sync.
+    Buffered,
+    /// Appended to the log and synced before the write returns.
+    Synced,
+}
+
+impl WalMode {
+    fn parse(name: &str) -> Self {
+        match name {
+            "off" => WalMode::Off,
+            "buffered" => WalMode::Buffered,
+            "synced" => WalMode::Synced,
+            other => fail(&format!(
+                "--wal takes off, buffered or synced, not {other:?}"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            WalMode::Off => "off",
+            WalMode::Buffered => "buffered",
+            WalMode::Synced => "synced",
+        }
+    }
 }
 
 /// Which keys a read phase asks for.
@@ -1504,8 +1545,8 @@ pub struct Config {
     pub workload: String,
     /// How long a timed phase runs for, at least, in seconds.
     pub min_seconds: f64,
-    /// Whether the WAL is on, which is also whether a commit syncs.
-    pub wal: bool,
+    /// How every write reaches the log.
+    pub wal: WalMode,
     /// Whether the engine may compact on its own, rather than only when
     /// `settle` drives it.
     pub compactions: bool,
@@ -1541,7 +1582,7 @@ impl Config {
             scans: "zipf:1-1000".to_string(),
             workload: "B".to_string(),
             min_seconds: 10.0,
-            wal: true,
+            wal: WalMode::Buffered,
             compactions: true,
             layout: false,
             reuse: false,
@@ -1605,8 +1646,9 @@ impl Config {
                             .collect(),
                     );
                 }
+                "--wal" => cfg.wal = WalMode::parse(value(arg)),
                 "--no-wal" => {
-                    cfg.wal = false;
+                    cfg.wal = WalMode::Off;
                     took_value = false;
                 }
                 "--no-compactions" => {

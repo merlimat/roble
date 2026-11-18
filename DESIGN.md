@@ -169,7 +169,7 @@ contract roble has to meet.
 | Reads | Point lookups, and lookups under a comparison: floor, ceiling, lower, higher. Forward and reverse range scans. Prefix iteration that also reads the keys outside the prefix, by seeking. |
 | Deletes | Point deletes, and `DeleteRange` over key ranges. |
 | Shape of a node | Hundreds of shards per process, one store per (namespace, shard), all sharing one block cache. Memtables are 4 MiB, blocks 16 KiB, bloom filters 10 bits per key. |
-| Durability | **Oxia disables Pebble's WAL** (`DisableWAL: !UseWAL` in `kv_pebble.go`: "WAL is kept outside the KV store"). Oxia's replication log is the source of truth; the store need only be durable at `Flush()`, and Oxia replays everything after that. `SyncData` decides whether a commit syncs. roble works both ways: the WAL is on by default, and `disable_wal` is what Oxia sets (§4). |
+| Durability | **Oxia disables Pebble's WAL** (`DisableWAL: !UseWAL` in `kv_pebble.go`: "WAL is kept outside the KV store"). Oxia's replication log is the source of truth; the store need only be durable at `Flush()`, and Oxia replays everything after that. `SyncData` decides whether a commit syncs, for every commit alike. roble takes both as one store setting: `Wal::Synced` by default, and `Wal::Off` is what Oxia sets (§4). |
 | Snapshots | `db.Checkpoint(dir)`, whose files are streamed to a follower in 1 MiB chunks and written straight into a fresh database directory, which is then opened. |
 | Compression | L0 uncompressed, L1 and below Snappy. No merge operator. |
 | Key-encoding conversion | Oxia converts a database to the configured key encoding inside `pebble.Open`, writing the new one with 64 KiB blocks and `GoodCompression`, and leaves an `oxia-key-encoding-format` marker in the database directory — a file Pebble knows nothing about, which `Checkpoint` output then also carries (§3, §12). |
@@ -411,7 +411,7 @@ cost a dead shard if Pebble ever produced one on its own.
 | Topic | Decision |
 |---|---|
 | Format | Pebble's, pinned at §3. roble defines no format of its own, and has no format version of its own. |
-| Durability | **A WAL, on by default.** `write(batch, sync)` appends the batch repr to the log as one record, syncs it if asked, and then applies it to the memtable; `flush()` writes a table, installs the version edit, and retires the logs that edit covers. `disable_wal` skips the log entirely, which is what Oxia sets: then `flush()` is the only durability point. A WAL is an integral part of an LSM rather than a feature of this workload, and roble has to read Pebble's logs regardless, so it is in v1 (M3) rather than deferred — but the no-WAL path is tested as a first-class configuration, because it is the one Oxia runs (§1). |
+| Durability | **A WAL, synced by default.** A write appends the batch repr to the log as one record, syncs it if the store's `Wal` setting is `Synced`, and then applies it to the memtable; `flush()` writes a table, installs the version edit, and retires the logs that edit covers. The setting is the store's and not each write's, as Oxia configures Pebble: `Wal::Synced` (the default), `Wal::Buffered` (appended, left to the OS to sync), or `Wal::Off`, which skips the log entirely and is what Oxia sets: then `flush()` is the only durability point. A WAL is an integral part of an LSM rather than a feature of this workload, and roble has to read Pebble's logs regardless, so it is in v1 (M3) rather than deferred — but the no-WAL path is tested as a first-class configuration, because it is the one Oxia runs (§1). |
 | Threading | One `!Send` store per thread, as encina: a compio runtime's, or whatever runs an env the caller implements. No locks or atomics outside wakers. Oxia already shards; a shard's store is owned by one thread. |
 | Memory | **Caches belong to the thread, not the store** (§8): the block cache and the table cache are created per thread and shared by every store on it, within one budget. This differs from encina, where each store has its own, and follows Oxia, where hundreds of shards share one cache. No `mmap`. Direct I/O is the goal and not yet the state: it needs aligned frames under the block cache (§8, §10), so v1 reads through the page cache, as Pebble does. |
 | Compaction | Cooperative on the owning thread by default, paced in units of work as encina paces a large merge, so a seeded run replays. Offload to a pool is a capability of the env, not a default (§9). |
@@ -439,7 +439,7 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   record chunks. A write is logged before it is in a memtable, so nothing is
   readable that is not recoverable; a memtable rotation rotates the log, and a
   flush retires every log the version edit's minimum unflushed log number leaves
-  behind. With `disable_wal` none of this exists and `flush()` is the only
+  behind. With `Wal::Off` none of this exists and `flush()` is the only
   durability point (§4, §6).
 - **Memtables are skiplists over an arena**, keyed by internal key (user key,
   sequence number, kind). Range deletions are kept apart from the point keys,
@@ -661,16 +661,21 @@ zero until commit stamps it, and stamping it touches nothing but the header.
 And which kinds carry a value is not inferable from the kind: `SETWITHDEL`
 does not, while `DELSIZED` does (`batchrepr.Reader.Next`).
 
-`write()` assigns sequence numbers, appends the repr to the log as one record,
-syncs the log if `sync` is set, and then applies the entries to the memtable — in
-that order, so nothing is ever readable that a replay would not recover. One
-write at a time, because that span is where the sequence number and the log
-offset are both chosen and both committed to (§5). With
-`disable_wal` the log step is skipped and durability is `flush()`'s job alone
-(§4). A `sync` is then **refused** rather than ignored, which is what Pebble
-does (`DB.Apply`: "pebble: WAL disabled") and the correction this document
-needed: a caller that asked for durability and got `Ok` would have none, and
-finding out would mean losing the write.
+A write assigns sequence numbers, appends the repr to the log as one record,
+syncs the log if the store's `Wal` setting is `Synced`, and then applies the
+entries to the memtable — in that order, so nothing is ever readable that a
+replay would not recover. One write at a time, because that span is where the
+sequence number and the log offset are both chosen and both committed to (§5).
+With `Wal::Off` the log step is skipped and durability is `flush()`'s job alone
+(§4).
+
+**Durability is the store's, not each write's.** Oxia configures Pebble once
+— `UseWAL` and `SyncData` — and makes every commit with those write options,
+so a per-write flag would be one argument on every call that Oxia never
+varies. It would also have one combination that means nothing: a synced write
+with no log to sync, which an earlier version refused at run time, as Pebble
+does (`DB.Apply`: "pebble: WAL disabled"). As one `Wal` setting with three
+values there is nothing to refuse.
 
 A write that finds the store **at** `Options::memtable_size` writes a memtable
 out before applying its own batch, which rotates the log with it (§5). Pebble
@@ -1015,7 +1020,7 @@ A torn record at the tail of the last log is the ordinary shape of a crash and
 ends the replay; a torn record anywhere else, or a chunk whose log number belongs
 to an older file, is corruption. **roble refuses a log it cannot replay rather
 than opening without it**: ignoring one silently discards writes that were
-already acknowledged. With `disable_wal` there is nothing to replay and the
+already acknowledged. With `Wal::Off` there is nothing to replay and the
 database opens as of the last flush.
 
 ### Reading beside a writer
@@ -1161,7 +1166,7 @@ its tail. Telling a torn tail from damage in the middle of the same file would
 mean deciding what the bytes after it were supposed to be, and stopping at the
 last record that reads is the answer that loses nothing either way.
 
-Note that `disable_wal` leaves an **empty log file** behind rather than no log
+Note that `Wal::Off` leaves an **empty log file** behind rather than no log
 file, so the question an opener asks is whether a log holds a record, not
 whether one exists — Oxia's own configuration has a log file in the directory,
 holding nothing but the eleven-byte EOF trailer. A store writes into that log
@@ -1737,8 +1742,8 @@ let mut batch = db.indexed_batch();    // readable through itself
 batch.put(b"/users/alice", b"...")?;
 batch.delete_range(b"/sessions/", b"/sessions0")?;
 let seen = batch.get(b"/users/alice", Comparison::Equal).await?;
-batch.commit(Durability::NoSync).await?;   // appended to the WAL, not synced
-db.put(b"/users/bob", b"...", Durability::Sync).await?;   // one write, no index, synced
+batch.commit().await?;                 // as durable as the store's Wal setting
+db.put(b"/users/bob", b"...").await?;  // one write, no index
 db.flush().await?;                     // a table; the logs it covers can go
 
 let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
@@ -1774,7 +1779,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | `Flush`, `Close`, `Delete`, `DiskSpaceUsage` | `flush`, `close`, `destroy`, `disk_usage` |
 | `pebble.Open` of a shard's path, new or returning | `open_with` with `create_if_missing` (§6) |
 | `vfs.FS`, `CacheSizeMB` | `Fs` (§10), `Caches` (§8) |
-| `SyncData`, `UseWAL` | `Durability` on every write and commit, and `disable_wal` in `Options` (§4) |
+| `SyncData`, `UseWAL` | `Options::wal`: `Wal::Synced`, `Wal::Buffered` or `Wal::Off` (§4) |
 | Pebble metrics, write-stall events | OpenTelemetry via nanometer, as encina ([METRICS.md](METRICS.md)) |
 
 ## 12. Testing
@@ -1873,7 +1878,7 @@ in both directions.
   scenario runs once to count its operations, then once per operation with an
   error injected there, once with a crash, and once with buffers withheld. After
   a crash, reopening must yield the state as of the last synced write — or as of
-  the last `flush()` with `disable_wal`, which is Oxia's configuration and so
+  the last `flush()` with `Wal::Off`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or
   a half-rotated marker must leave the database openable.
 - **Overlap paths**, by the same method. Nothing the simulated filesystem does

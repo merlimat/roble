@@ -543,7 +543,7 @@ async fn the_debt_is_what_the_levels_hold_above_their_allowances() {
 async fn a_failed_write_is_counted_by_what_went_wrong() {
     let (options, tag) = metered("errors");
     let (env, dir) = load("db-twin-a").await;
-    let db = roble::open_with(&env, &dir, options.disable_wal(true))
+    let db = roble::open_with(&env, &dir, options.wal(roble::Wal::Off))
         .await
         .expect("open");
 

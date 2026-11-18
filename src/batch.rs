@@ -52,7 +52,7 @@ use roble_format::key::{self, InternalKey, Kind};
 use crate::env::Fs;
 use crate::error::Result;
 use crate::memtable::Memtable;
-use crate::open::{Db, Durability};
+use crate::open::Db;
 use crate::read::{Comparison, Found, successor};
 use crate::scan::Scan;
 
@@ -272,15 +272,15 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
         )
     }
 
-    /// Applies the batch to the store, durable when this returns if
-    /// `durability` says so ([`Durability`]).
+    /// Applies the batch to the store, as durable when this returns as the
+    /// store's [`Wal`](crate::Wal) setting makes every write.
     ///
     /// Takes the batch, because the stand-in numbers in its index are only
     /// meaningful before a commit: afterwards its entries are the store's,
     /// with sequence numbers of their own, and reading them through this
     /// index again would find every one of them twice.
-    pub async fn commit(mut self, durability: Durability) -> Result<()> {
-        self.db.write_raw(&mut self.repr, durability.syncs()).await
+    pub async fn commit(mut self) -> Result<()> {
+        self.db.write(&mut self.repr).await
     }
 }
 

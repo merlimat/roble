@@ -75,19 +75,15 @@ async fn run_async(dir: &Path, command: DbCommand) -> Result<ExitCode> {
         // staying up.
         DbCommand::Put { key, value } => {
             let db = open(dir, true).await?;
-            db.put(&key, &value, roble::Durability::Sync)
-                .await
-                .at(dir)?;
+            db.put(&key, &value).await.at(dir)?;
         }
         DbCommand::Delete { key } => {
             let db = open(dir, false).await?;
-            db.delete(&key, roble::Durability::Sync).await.at(dir)?;
+            db.delete(&key).await.at(dir)?;
         }
         DbCommand::DeleteRange { start, end } => {
             let db = open(dir, false).await?;
-            db.delete_range(&start, &end, roble::Durability::Sync)
-                .await
-                .at(dir)?;
+            db.delete_range(&start, &end).await.at(dir)?;
         }
         DbCommand::Get { key, hexdump } => {
             let found = reading(dir, async |db| {

@@ -174,6 +174,9 @@ pub(crate) struct Store<F: Fs> {
     /// Whether this store was opened with the WAL off, so that `flush` is
     /// the only durability point (§4).
     disable_wal: bool,
+    /// Whether every write syncs the log before it returns
+    /// ([`crate::Wal::Synced`]).
+    sync_writes: bool,
     /// Whether a flush leaves the picker's compaction for the caller (§9).
     disable_automatic_compactions: bool,
     /// The next sequence number to hand out.
@@ -482,7 +485,7 @@ async fn open_dir<E: Env>(
     //
     // A reader opens it only to read, so that it says which log is current;
     // nothing it does appends to it.
-    let log = match replayed.tail.filter(|_| !options.disable_wal) {
+    let log = match replayed.tail.filter(|_| options.wal != crate::Wal::Off) {
         Some((log_num, at)) => {
             let path = dir.join(roble_format::files::log_filename(log_num));
             let access = if read_only {
@@ -544,7 +547,8 @@ async fn open_dir<E: Env>(
             fs,
             store_id,
             caches: options.caches,
-            disable_wal: options.disable_wal,
+            disable_wal: options.wal == crate::Wal::Off,
+            sync_writes: options.wal == crate::Wal::Synced,
             disable_automatic_compactions: options.disable_automatic_compactions,
             memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
             frozen: std::cell::RefCell::new(None),
@@ -869,68 +873,41 @@ impl<F: Fs> std::fmt::Debug for Db<F> {
     }
 }
 
-/// Whether a write is durable when it returns, or only written.
-///
-/// Pebble's `pebble.Sync` and `pebble.NoSync`. A write is appended to the
-/// log either way; [`Durability::Sync`] also syncs the log before the write
-/// returns, so it survives the machine going away and not just the store.
-///
-/// With the WAL off ([`crate::Options::disable_wal`]) there is no log to
-/// sync, and [`Durability::Sync`] is refused with [`Error::Unsupported`]
-/// rather than ignored: nothing but [`Db::flush`] makes a write durable
-/// then, and saying otherwise would be the silent half of a data loss (§4).
-///
-/// Every write names one. The [`Default`] is [`Durability::Sync`], the
-/// choice that loses nothing, for a caller that keeps one in a struct of
-/// its own.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Durability {
-    /// Synced to disk before the write returns.
-    #[default]
-    Sync,
-    /// Written to the log, and synced later or not at all.
-    NoSync,
-}
-
-impl Durability {
-    /// Whether the log is to be synced.
-    pub(crate) fn syncs(self) -> bool {
-        self == Durability::Sync
-    }
-}
-
 impl<F: Fs> Db<F> {
     /// Sets `key` to `value`.
     ///
     /// A batch of that one write, appended to the log and then applied to
-    /// the memtable, and durable when this returns if `durability` says so.
+    /// the memtable, as durable when this returns as the store's
+    /// [`Wal`](crate::Wal) setting makes every write.
     ///
     /// Several writes that have to land together, or that are read back
     /// before they do, go in an [`Db::indexed_batch`] instead. This one
     /// builds no index, which is about 90 ns a write cheaper.
-    pub async fn put(&self, key: &[u8], value: &[u8], durability: Durability) -> Result<()> {
+    pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.put(key, value)?;
-        self.write_raw(&mut batch, durability.syncs()).await
+        self.write(&mut batch).await
     }
 
     /// Deletes `key`, as [`Db::put`] writes.
-    pub async fn delete(&self, key: &[u8], durability: Durability) -> Result<()> {
+    pub async fn delete(&self, key: &[u8]) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.delete(key)?;
-        self.write_raw(&mut batch, durability.syncs()).await
+        self.write(&mut batch).await
     }
 
     /// Deletes every key in `start..end`, as [`Db::put`] writes.
-    pub async fn delete_range(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        durability: Durability,
-    ) -> Result<()> {
+    pub async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
         let mut batch = roble_format::batch::Batch::new();
         batch.delete_range(start, end)?;
-        self.write_raw(&mut batch, durability.syncs()).await
+        self.write(&mut batch).await
+    }
+
+    /// Writes a batch as the store's [`Wal`](crate::Wal) setting says every
+    /// write is made: synced for [`Wal::Synced`](crate::Wal::Synced), and
+    /// not otherwise.
+    pub(crate) async fn write(&self, batch: &mut roble_format::batch::Batch) -> Result<()> {
+        self.write_raw(batch, self.store.sync_writes).await
     }
 
     /// Appends a batch to the log, syncs it if asked, and then applies it to
@@ -946,8 +923,10 @@ impl<F: Fs> Db<F> {
     /// saying otherwise would be the silent half of a data loss.
     ///
     /// What [`IndexedBatch::commit`](crate::IndexedBatch::commit) and
-    /// [`Db::put`] go through, with `sync` for [`Durability::Sync`]. It takes the format's own batch, which roble's
-    /// tests build directly; a caller builds an [`Db::indexed_batch`].
+    /// [`Db::put`] go through, with `sync` from the store's
+    /// [`Wal`](crate::Wal) setting. It takes the format's own batch, which
+    /// roble's tests build directly, and a `sync` of its own, which they
+    /// choose per write; a caller builds an [`Db::indexed_batch`].
     #[doc(hidden)]
     pub async fn write_raw(
         &self,
@@ -1517,7 +1496,7 @@ impl<F: Fs> Db<F> {
     /// started. Once this returns, the directory can be opened again at once,
     /// which dropping the store promises only when nothing was in flight.
     ///
-    /// It does not flush. With the WAL off ([`crate::Options::disable_wal`]),
+    /// It does not flush. With the WAL off ([`crate::Wal::Off`]),
     /// what the memtable holds is gone with the store unless
     /// [`Db::flush`] wrote it out first.
     pub async fn close(self) -> Result<()> {

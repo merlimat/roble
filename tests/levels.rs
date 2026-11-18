@@ -15,10 +15,7 @@ async fn flushed(db: &roble::Db<roble::sim::SimFs>, keys: &[&[u8]]) {
     for key in keys {
         batch.put(key, b"value").expect("put");
     }
-    batch
-        .commit(roble::Durability::NoSync)
-        .await
-        .expect("commit");
+    batch.commit().await.expect("commit");
     db.flush().await.expect("flush");
 }
 

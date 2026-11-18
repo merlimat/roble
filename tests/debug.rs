@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Caches, Comparison, Durability, Options};
+use roble::{Caches, Comparison, Options};
 
 async fn open(env: &SimEnv) -> roble::Db<SimFs> {
     roble::open_with(
@@ -41,13 +41,13 @@ async fn options_print_every_setting() {
     let printed = format!(
         "{:?}",
         Options::<SimFs>::new()
-            .disable_wal(true)
+            .wal(roble::Wal::Off)
             .memtable_size(4096)
     );
     for want in [
         "Options",
         "caches: Caches",
-        "disable_wal: true",
+        "wal: Off",
         "memtable_size: 4096",
         "target_file_size",
     ] {
@@ -80,7 +80,7 @@ async fn caches_print_what_they_hold_against_their_budgets() {
 async fn a_scan_prints_its_bounds_and_where_it_is() {
     let env = SimEnv::new();
     let db = open(&env).await;
-    db.put(b"b", b"1", Durability::NoSync).await.expect("put");
+    db.put(b"b", b"1").await.expect("put");
 
     let mut scan = db.range(&b"a"[..]..&b"c"[..]).expect("range");
     let before = format!("{scan:?}");
@@ -98,7 +98,7 @@ async fn a_scan_prints_its_bounds_and_where_it_is() {
 async fn a_snapshot_and_a_batch_print_how_much_they_hold() {
     let env = SimEnv::new();
     let db = open(&env).await;
-    db.put(b"a", b"1", Durability::NoSync).await.expect("put");
+    db.put(b"a", b"1").await.expect("put");
 
     let snap = db.snapshot().expect("snapshot");
     let printed = format!("{snap:?}");

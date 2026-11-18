@@ -66,8 +66,8 @@ pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, FormatError, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
 pub use levels::{LevelInfo, TableInfo};
-pub use open::{Db, Durability, open, open_read_only, open_with};
-pub use options::Options;
+pub use open::{Db, open, open_read_only, open_with};
+pub use options::{Options, Wal};
 pub use pick::Pick;
 pub use read::{Comparison, Found, GetBuf};
 /// What [`Options::compression`] takes.

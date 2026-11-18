@@ -445,7 +445,7 @@ async fn a_write_that_would_number_past_the_trailer_is_refused() {
     .build()
     .await;
     let db = roble::open(&env, &dir).await.expect("open");
-    match db.put(b"a", b"1", roble::Durability::NoSync).await {
+    match db.put(b"a", b"1").await {
         Err(Error::Corrupt(m)) => assert!(m.contains("largest one a key holds"), "got: {m}"),
         other => panic!("expected Corrupt, got {other:?}"),
     }
@@ -1140,7 +1140,7 @@ async fn a_task_of_its_own_can_be_the_one_that_flushes() {
             &roble::DefaultEnv,
             &dir,
             roble::Options::new()
-                .disable_wal(true)
+                .wal(roble::Wal::Off)
                 .disable_automatic_compactions(true)
                 .memtable_size(16 << 10)
                 // This test is the task, run by hand so that it can count

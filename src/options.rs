@@ -16,7 +16,7 @@
 //!
 //! Most of these are budgets, and say only what a store spends. Two are
 //! policies, which is to say they change what a call means rather than what
-//! it costs: `disable_wal` changes where durability comes from, and so
+//! it costs: [`Options::wal`] changes where durability comes from, and so
 //! changes what `write` promises, and `create_if_missing` decides whether an
 //! `open` of a directory with no database in it is an error or a database
 //! (§6, `crate::create`).
@@ -30,13 +30,38 @@ use crate::cache::Caches;
 use crate::env::Fs;
 use roble_format::block::Codec;
 
+/// How a store's writes reach its write-ahead log, and so how durable a
+/// write is when it returns ([`Options::wal`]).
+///
+/// The store's, not each write's: every [`put`](crate::Db::put),
+/// [`delete`](crate::Db::delete), [`delete_range`](crate::Db::delete_range)
+/// and [`commit`](crate::IndexedBatch::commit) is made the same way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Wal {
+    /// No log. A write reaches the memtable and nothing else, and is durable
+    /// only once a [`flush`](crate::Db::flush) has written it to a table:
+    /// Oxia's configuration, since its own replication log is the source of
+    /// truth.
+    Off,
+    /// Every write is appended to the log before it is applied, and the log
+    /// is left to the OS to sync. A write survives the process going away,
+    /// not the machine. Pebble's `pebble.NoSync`, RocksDB's default.
+    Buffered,
+    /// Every write is appended to the log and the log synced before the
+    /// write returns, so it survives the machine going away too. Pebble's
+    /// `pebble.Sync`; the default, as the choice that loses nothing.
+    #[default]
+    Synced,
+}
+
 /// How a store is opened.
 pub struct Options<F: Fs = crate::FileFs> {
     /// The caches it draws on, shared with every other store on the thread
     /// that was given the same handle (§8).
     pub(crate) caches: Caches<F>,
-    /// Whether to skip the log entirely.
-    pub(crate) disable_wal: bool,
+    /// How writes reach the log ([`Options::wal`]).
+    pub(crate) wal: Wal,
     /// Whether an open with no database to find writes one.
     pub(crate) create_if_missing: bool,
     /// Whether a flush leaves the compaction the picker chose for the
@@ -74,7 +99,7 @@ impl<F: Fs> Default for Options<F> {
     fn default() -> Self {
         Options {
             caches: Caches::default(),
-            disable_wal: false,
+            wal: Wal::Synced,
             create_if_missing: false,
             disable_automatic_compactions: false,
             background_tasks: true,
@@ -108,12 +133,18 @@ impl<F: Fs> Options<F> {
         self
     }
 
-    /// Turns the WAL off, making `flush` the only durability point.
+    /// How writes reach the write-ahead log, and so how durable a write is
+    /// when it returns: [`Wal::Synced`] by default.
     ///
-    /// This is Oxia's configuration (§1): its replication log is the source
-    /// of truth, so the store need only be durable at `flush`, and Oxia
-    /// replays everything after that. A write then reaches the memtable and
-    /// nothing else, and a crash takes the database back to its last flush.
+    /// One setting for the store rather than a flag on every write, as Oxia
+    /// configures Pebble: its `UseWAL` and `SyncData` are the store's, and
+    /// every commit is made with them.
+    ///
+    /// [`Wal::Off`] is Oxia's configuration (§1): its replication log is the
+    /// source of truth, so the store need only be durable at
+    /// [`Db::flush`](crate::Db::flush), and Oxia replays everything after
+    /// that. A write then reaches the memtable and nothing else, and a crash
+    /// takes the database back to its last flush.
     ///
     /// It does not stop a log being *read*. A database written with a WAL and
     /// reopened without one still has its unflushed logs replayed, because
@@ -127,8 +158,8 @@ impl<F: Fs> Options<F> {
     /// put those records in a table. Re-applying them costs time and nothing
     /// else — every entry arrives with the sequence number it was written
     /// with, so a newer value or tombstone still wins.
-    pub fn disable_wal(mut self, disable: bool) -> Self {
-        self.disable_wal = disable;
+    pub fn wal(mut self, wal: Wal) -> Self {
+        self.wal = wal;
         self
     }
 
@@ -334,7 +365,7 @@ impl<F: Fs> std::fmt::Debug for Options<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("Options");
         d.field("caches", &self.caches)
-            .field("disable_wal", &self.disable_wal)
+            .field("wal", &self.wal)
             .field("create_if_missing", &self.create_if_missing)
             .field(
                 "disable_automatic_compactions",

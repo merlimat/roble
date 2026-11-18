@@ -55,7 +55,7 @@ async fn load(name: &str) -> (SimEnv, PathBuf) {
 }
 
 fn no_wal() -> Options<SimFs> {
-    Options::new().disable_wal(true)
+    Options::new().wal(roble::Wal::Off)
 }
 
 async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {

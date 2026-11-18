@@ -58,8 +58,9 @@ They always run in this order, whatever order `--phases` names them in.
 
 - **load** — writes `--batches` batches to each shard, each batch `--records`
   consecutive records, through an *indexed* batch because that is what Oxia
-  uses: its `PebbleBatch` reads back through itself before committing. With the
-  WAL on, each commit syncs.
+  uses: its `PebbleBatch` reads back through itself before committing. Each
+  commit is as durable as `--wal` says: synced with `--wal synced`, appended
+  with the default `buffered`.
 - **settle** — leaves the database in a shape the read phases can be compared
   over. roble compacts cooperatively on the thread that owns the store (§9),
   in a task this driver spawns beside each shard, so this drives the picker to
@@ -506,10 +507,20 @@ exactly the trap anyone setting a roble number beside a Go Pebble number
 obtained elsewhere will walk into, and because on Linux — which is what Oxia
 runs — they are all `fsync` anyway.
 
+**`--wal` sets one durability for every engine**: `off` (no log, Oxia's
+configuration), `buffered` (appended and left to the OS to sync; the
+default) or `synced` (synced before every write returns). roble takes it as
+its `Wal` setting and RocksDB as `disable_wal` and `sync` on every write.
+Until this setting existed RocksDB's two were tied to one per-write sync
+flag, so its WAL was off for every unsynced write — every YCSB write — while
+roble's was on: a default YCSB row compared roble writing a log against
+RocksDB writing none. RocksDB's YCSB write rows from before then are
+`--wal off` rows, whatever the run was given.
+
 **encina's load row is not quite in the same units.** Its `write` is durable
-by itself and takes no sync flag, so `--no-wal` asks roble and RocksDB for
-less than it asks encina for. That counts against encina on the load row
-and nowhere else.
+by itself and takes no sync flag, so `--wal off` and `--wal buffered` ask
+roble and RocksDB for less than they ask encina for. That counts against
+encina on the write rows and nowhere else.
 
 **The phases share a block cache and run in order**, so whichever of the two
 scans goes second reads a cache the first one warmed. Reverse runs first
@@ -567,9 +578,9 @@ nine) — so a lookup searched one table instead of three. Setting it to 2 MiB g
 changes its point reads by under 1% on the same machine, because its filters
 absorb them. Worth aligning anyway, and worth recording that the layout did
 not explain the gap it looked certain to explain. `--no-wal` is another: it takes
-`disable_wal` on roble and `disable_WAL` on RocksDB's write options, and setting only the sync flag on the last of those left it
-writing a journal the others were not — worth 5 MiB of directory and half its
-load rate. `--cache-mb` is the third, divided per store for encina, whose
+the WAL off roble and RocksDB alike, and setting only the sync flag on RocksDB's
+write options left it writing a journal the others were not — worth 5 MiB of
+directory and half its load rate. `--cache-mb` is the third, divided per store for encina, whose
 cache is its own.
 
 **`--value-chunk` dials how compressible a value is**, since the default
@@ -653,10 +664,11 @@ belongs anyway.
 
 **The batch-size pass, gone from `run.sh` with the others, was read *within*
 an engine, not across engines**: how
-much of its throughput depends on the caller batching. With `--no-wal` the
-LSMs sync nothing per commit while encina commits durably whatever it is
-asked, so the per-commit cost it shows is a different cost from theirs. Run
-without `--no-wal` for the comparison where every engine commits durably.
+much of its throughput depends on the caller batching. With `--wal off` or
+`buffered` the LSMs sync nothing per commit while encina commits durably
+whatever it is asked, so the per-commit cost it shows is a different cost
+from theirs. Run with `--wal synced` for the comparison where every engine
+commits durably.
 
 **Both sides of it batch, and that is a change.** It used to write the small
 side one record per commit, which separated the two costs as cleanly as
