@@ -1746,7 +1746,7 @@ batch.commit().await?;                 // as durable as the store's Wal setting
 db.put(b"/users/bob", b"...").await?;  // one write, no index
 db.flush().await?;                     // a table; the logs it covers can go
 
-let last = db.get(b"/users/zzzz", Comparison::Floor, |k, _v| k.to_vec()).await?;
+let last = db.get(b"/users/zzzz", Comparison::Floor).await?;   // Option<Found>, key and value
 
 let snap = db.snapshot()?;             // one instant, every table held open
 let mut scan = snap.range(&b"/users/"[..]..&b"/users0"[..])?;
@@ -1773,7 +1773,7 @@ The Oxia mapping, so the surface is complete rather than approximately right:
 | batch `Get`, `FindLower`, `KeyRangeScan`, `RangeScan` | indexed batch iterators (§6) |
 | batch `Count`, `Size`, `Checksum` | `count`, `len`, `as_bytes` — the Pebble repr, so a checksum over it matches Go |
 | `Get` with `ComparisonType` | `get` with `Comparison` |
-| `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, `keys`, `range_rev` |
+| `KeyRangeScan`, `RangeScan`, `KeyRangeScanReverse` | `range`, stepped with `first`/`next`, or `last`/`prev` for reverse |
 | `KeyPrefixIterator` with `Lookup` | `snapshot()`, then `range` and `get` on it (§6) |
 | `Snapshot`, `SnapshotLoader` | `checkpoint`, and opening a directory of received files |
 | `Flush`, `Close`, `Delete`, `DiskSpaceUsage` | `flush`, `close`, `destroy`, `disk_usage` |
