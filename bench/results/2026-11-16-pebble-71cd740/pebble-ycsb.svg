@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 758 452" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" rx="10" fill="#ffffff"/>
+<text x="16" y="26" font-size="16" font-weight="600" fill="#1f2328">YCSB beside Go Pebble</text>
+<text x="16" y="45" font-size="11.5" fill="#57606a">operations a second, median of three rounds; each row scaled to its fastest</text>
+<rect x="118" y="55" width="10" height="10" rx="2" fill="#41704A"/><text x="132" y="64" font-size="11.5" fill="#1f2328">roble</text>
+<rect x="190" y="55" width="10" height="10" rx="2" fill="#6B7C93"/><text x="204" y="64" font-size="11.5" fill="#1f2328">RocksDB</text>
+<rect x="278" y="55" width="10" height="10" rx="2" fill="#8A6BB0"/><text x="292" y="64" font-size="11.5" fill="#1f2328">Pebble</text>
+<text x="108" y="94.5" font-size="12" text-anchor="end" fill="#1f2328">In cache · A</text>
+<rect x="118" y="74" width="528.2" height="9" rx="2" fill="#41704A"/>
+<text x="651.2" y="82" font-size="9.5" fill="#57606a">546.9k</text>
+<rect x="118" y="85" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="93" font-size="9.5" fill="#57606a">579.8k</text>
+<rect x="118" y="96" width="190.3" height="9" rx="2" fill="#8A6BB0"/>
+<text x="313.3" y="104" font-size="9.5" fill="#57606a">197.1k</text>
+<text x="108" y="139.5" font-size="12" text-anchor="end" fill="#1f2328">In cache · B</text>
+<rect x="118" y="119" width="560.0" height="9" rx="2" fill="#41704A"/>
+<text x="683.0" y="127" font-size="9.5" fill="#57606a">771.1k</text>
+<rect x="118" y="130" width="528.5" height="9" rx="2" fill="#6B7C93"/>
+<text x="651.5" y="138" font-size="9.5" fill="#57606a">727.8k</text>
+<rect x="118" y="141" width="308.6" height="9" rx="2" fill="#8A6BB0"/>
+<text x="431.6" y="149" font-size="9.5" fill="#57606a">424.9k</text>
+<text x="108" y="184.5" font-size="12" text-anchor="end" fill="#1f2328">In cache · C</text>
+<rect x="118" y="164" width="560.0" height="9" rx="2" fill="#41704A"/>
+<text x="683.0" y="172" font-size="9.5" fill="#57606a">857.9k</text>
+<rect x="118" y="175" width="535.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="658.0" y="183" font-size="9.5" fill="#57606a">819.6k</text>
+<rect x="118" y="186" width="211.8" height="9" rx="2" fill="#8A6BB0"/>
+<text x="334.8" y="194" font-size="9.5" fill="#57606a">324.5k</text>
+<text x="108" y="229.5" font-size="12" text-anchor="end" fill="#1f2328">In cache · E</text>
+<rect x="118" y="209" width="543.7" height="9" rx="2" fill="#41704A"/>
+<text x="666.7" y="217" font-size="9.5" fill="#57606a">74.3k</text>
+<rect x="118" y="220" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="228" font-size="9.5" fill="#57606a">76.5k</text>
+<rect x="118" y="231" width="237.5" height="9" rx="2" fill="#8A6BB0"/>
+<text x="360.5" y="239" font-size="9.5" fill="#57606a">32.4k</text>
+<text x="108" y="274.5" font-size="12" text-anchor="end" fill="#1f2328">Past memory · A</text>
+<rect x="118" y="254" width="560.0" height="9" rx="2" fill="#41704A"/>
+<text x="683.0" y="262" font-size="9.5" fill="#57606a">88.2k</text>
+<rect x="118" y="265" width="541.1" height="9" rx="2" fill="#6B7C93"/>
+<text x="664.1" y="273" font-size="9.5" fill="#57606a">85.2k</text>
+<rect x="118" y="276" width="484.1" height="9" rx="2" fill="#8A6BB0"/>
+<text x="607.1" y="284" font-size="9.5" fill="#57606a">76.2k</text>
+<text x="108" y="319.5" font-size="12" text-anchor="end" fill="#1f2328">Past memory · B</text>
+<rect x="118" y="299" width="487.9" height="9" rx="2" fill="#41704A"/>
+<text x="610.9" y="307" font-size="9.5" fill="#57606a">53.5k</text>
+<rect x="118" y="310" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="318" font-size="9.5" fill="#57606a">61.4k</text>
+<rect x="118" y="321" width="350.5" height="9" rx="2" fill="#8A6BB0"/>
+<text x="473.5" y="329" font-size="9.5" fill="#57606a">38.4k</text>
+<text x="108" y="364.5" font-size="12" text-anchor="end" fill="#1f2328">Past memory · C</text>
+<rect x="118" y="344" width="513.2" height="9" rx="2" fill="#41704A"/>
+<text x="636.2" y="352" font-size="9.5" fill="#57606a">50.9k</text>
+<rect x="118" y="355" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="363" font-size="9.5" fill="#57606a">55.5k</text>
+<rect x="118" y="366" width="329.3" height="9" rx="2" fill="#8A6BB0"/>
+<text x="452.3" y="374" font-size="9.5" fill="#57606a">32.6k</text>
+<text x="108" y="409.5" font-size="12" text-anchor="end" fill="#1f2328">Past memory · E</text>
+<rect x="118" y="389" width="486.7" height="9" rx="2" fill="#41704A"/>
+<text x="609.7" y="397" font-size="9.5" fill="#57606a">10.5k</text>
+<rect x="118" y="400" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="408" font-size="9.5" fill="#57606a">12.1k</text>
+<rect x="118" y="411" width="428.4" height="9" rx="2" fill="#8A6BB0"/>
+<text x="551.4" y="419" font-size="9.5" fill="#57606a">9.3k</text>
+</svg>

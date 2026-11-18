@@ -1,0 +1,8 @@
+stage,direction,rate,cpu_s
+before,forward,1936410,0.153
+no per-source copy,forward,2934673,0.100
+no value allocation,forward,3350414,0.090
+one source per level,forward,4360066,0.070
+before,reverse,1609103,0.185
+no value allocation,reverse,2271889,0.130
+one source per level,reverse,2694331,0.110

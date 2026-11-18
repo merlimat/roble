@@ -90,6 +90,16 @@ A comparer other than Pebble's bytewise one, range keys, blob files and WAL
 failover are refused with an error naming what was found. The cross-language
 tests in `compat/` hold both directions to Go Pebble itself.
 
+## Performance
+
+![YCSB A to F in cache: roble, RocksDB and encina](bench/results/2026-11-18-standard-1369bad/in-cache-ycsb.svg)
+
+roble, RocksDB and encina on one Linux VM, each held to one CPU and 512 MiB,
+with the WAL off as Oxia runs it; medians of three runs. Every phase, the
+store past memory, Go Pebble beside them, and every number behind the charts
+are in [bench/results](bench/results/README.md); how the runs are made is in
+[bench/README.md](bench/README.md).
+
 ## Crates
 
 | Crate | |

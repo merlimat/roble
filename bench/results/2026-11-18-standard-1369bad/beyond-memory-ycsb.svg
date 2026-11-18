@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 758 362" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="100%" height="100%" rx="10" fill="#ffffff"/>
+<text x="16" y="26" font-size="16" font-weight="600" fill="#1f2328">Past memory: YCSB A to F</text>
+<text x="16" y="45" font-size="11.5" fill="#57606a">YCSB operations a second; each row scaled to its fastest engine</text>
+<rect x="118" y="55" width="10" height="10" rx="2" fill="#41704A"/><text x="132" y="64" font-size="11.5" fill="#1f2328">roble</text>
+<rect x="190" y="55" width="10" height="10" rx="2" fill="#6B7C93"/><text x="204" y="64" font-size="11.5" fill="#1f2328">RocksDB</text>
+<rect x="278" y="55" width="10" height="10" rx="2" fill="#C98A2E"/><text x="292" y="64" font-size="11.5" fill="#1f2328">encina</text>
+<text x="108" y="94.5" font-size="12" text-anchor="end" fill="#1f2328">ycsb-A</text>
+<rect x="118" y="74" width="544.6" height="9" rx="2" fill="#41704A"/>
+<text x="667.6" y="82" font-size="9.5" fill="#57606a">109.9k</text>
+<rect x="118" y="85" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="93" font-size="9.5" fill="#57606a">113.0k</text>
+<rect x="118" y="96" width="19.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="142.0" y="104" font-size="9.5" fill="#57606a">3.8k</text>
+<text x="108" y="139.5" font-size="12" text-anchor="end" fill="#1f2328">ycsb-B</text>
+<rect x="118" y="119" width="509.5" height="9" rx="2" fill="#41704A"/>
+<text x="632.5" y="127" font-size="9.5" fill="#57606a">51.4k</text>
+<rect x="118" y="130" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="138" font-size="9.5" fill="#57606a">56.5k</text>
+<rect x="118" y="141" width="251.1" height="9" rx="2" fill="#C98A2E"/>
+<text x="374.1" y="149" font-size="9.5" fill="#57606a">25.4k</text>
+<text x="108" y="184.5" font-size="12" text-anchor="end" fill="#1f2328">ycsb-C</text>
+<rect x="118" y="164" width="457.4" height="9" rx="2" fill="#41704A"/>
+<text x="580.4" y="172" font-size="9.5" fill="#57606a">47.4k</text>
+<rect x="118" y="175" width="505.5" height="9" rx="2" fill="#6B7C93"/>
+<text x="628.5" y="183" font-size="9.5" fill="#57606a">52.4k</text>
+<rect x="118" y="186" width="560.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="683.0" y="194" font-size="9.5" fill="#57606a">58.1k</text>
+<text x="108" y="229.5" font-size="12" text-anchor="end" fill="#1f2328">ycsb-D</text>
+<rect x="118" y="209" width="523.3" height="9" rx="2" fill="#41704A"/>
+<text x="646.3" y="217" font-size="9.5" fill="#57606a">131.9k</text>
+<rect x="118" y="220" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="228" font-size="9.5" fill="#57606a">141.2k</text>
+<rect x="118" y="231" width="205.7" height="9" rx="2" fill="#C98A2E"/>
+<text x="328.7" y="239" font-size="9.5" fill="#57606a">51.9k</text>
+<text x="108" y="274.5" font-size="12" text-anchor="end" fill="#1f2328">ycsb-E</text>
+<rect x="118" y="254" width="501.8" height="9" rx="2" fill="#41704A"/>
+<text x="624.8" y="262" font-size="9.5" fill="#57606a">10.2k</text>
+<rect x="118" y="265" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="273" font-size="9.5" fill="#57606a">11.3k</text>
+<rect x="118" y="276" width="545.0" height="9" rx="2" fill="#C98A2E"/>
+<text x="668.0" y="284" font-size="9.5" fill="#57606a">11.0k</text>
+<text x="108" y="319.5" font-size="12" text-anchor="end" fill="#1f2328">ycsb-F</text>
+<rect x="118" y="299" width="522.7" height="9" rx="2" fill="#41704A"/>
+<text x="645.7" y="307" font-size="9.5" fill="#57606a">53.4k</text>
+<rect x="118" y="310" width="560.0" height="9" rx="2" fill="#6B7C93"/>
+<text x="683.0" y="318" font-size="9.5" fill="#57606a">57.2k</text>
+<rect x="118" y="321" width="34.5" height="9" rx="2" fill="#C98A2E"/>
+<text x="157.5" y="329" font-size="9.5" fill="#57606a">3.5k</text>
+</svg>
