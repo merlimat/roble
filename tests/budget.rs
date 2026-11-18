@@ -126,7 +126,7 @@ fn opened(wal: bool, budget: u64) -> Options<SimFs> {
     let o = Options::new()
         .memtable_size(budget)
         .disable_automatic_compactions(true);
-    if wal { o } else { o.disable_wal(true) }
+    if wal { o } else { o.wal(roble::Wal::Off) }
 }
 
 /// The keys of `written` that `found` holds, as a count, or `None` when what
@@ -446,7 +446,7 @@ async fn the_default_budget_is_not_something_ordinary_writes_reach() {
     for wal in [true, false] {
         let (env, dir) = load("db-twin-a").await;
         let o = Options::new();
-        let db = roble::open_with(&env, &dir, if wal { o } else { o.disable_wal(true) })
+        let db = roble::open_with(&env, &dir, if wal { o } else { o.wal(roble::Wal::Off) })
             .await
             .expect("open");
         let tables_before = db.versions().version.table_count();

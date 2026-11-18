@@ -21,27 +21,31 @@ one Go Pebble opens, and the other way round.
   tasks of its own on that thread, and hands the thread back every so often
   while it does, so reads and writes beside it wait a slice rather than a
   merge. Many stores can share one thread and one cache budget.
+- **Durability is the store's setting**, as Oxia configures Pebble: every
+  write is synced to the log before it returns (`Wal::Synced`, the default),
+  appended and left to the OS to sync (`Wal::Buffered`), or not logged at all
+  and durable at `flush()` (`Wal::Off`, Oxia's configuration).
 - **Built to be tested**: all I/O goes through an `Fs` trait, and the `sim`
   feature's in-memory filesystem can fail or crash at any single operation.
 
 ## Example
 
 ```rust
-use roble::{Comparison, DefaultEnv, Durability, Options};
+use roble::{Comparison, DefaultEnv, Options};
 
 #[compio::main]
 async fn main() -> roble::Result<()> {
     let options = Options::new().create_if_missing(true);
     let db = roble::open_with(&DefaultEnv, "data/shard-0", options).await?;
 
-    // One write, synced to the log before it returns.
-    db.put(b"/users/alice", b"1", Durability::Sync).await?;
+    // One write, synced to the log before it returns: the store's default.
+    db.put(b"/users/alice", b"1").await?;
 
     // Several that land together, readable through the batch before they do.
     let mut batch = db.indexed_batch();
     batch.put(b"/users/bob", b"2")?;
     batch.delete(b"/users/carol")?;
-    batch.commit(Durability::NoSync).await?;
+    batch.commit().await?;
 
     let alice = db.get(b"/users/alice", Comparison::Equal).await?;
     assert_eq!(alice.map(|f| f.value), Some(b"1".to_vec()));

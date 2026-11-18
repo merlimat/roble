@@ -103,7 +103,7 @@ async fn a_memtable_filling_up_holds_its_budget_and_not_twice_it() {
         roble::Options::new()
             .create_if_missing(true)
             .disable_automatic_compactions(true)
-            .disable_wal(true)
+            .wal(roble::Wal::Off)
             .memtable_size(BUDGET),
     )
     .await

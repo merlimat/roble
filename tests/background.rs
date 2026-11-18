@@ -41,7 +41,7 @@ fn options() -> Options<SimFs> {
     // the tables counted are the ones it wrote.
     Options::new()
         .create_if_missing(true)
-        .disable_wal(true)
+        .wal(roble::Wal::Off)
         .disable_automatic_compactions(true)
         .memtable_size(BUDGET)
 }

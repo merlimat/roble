@@ -98,7 +98,7 @@ const WRITTEN: &[&[u8]] = &[b"injected-1", b"injected-2", b"injected-tail"];
 /// nothing.
 fn options(wal: bool) -> Options<SimFs> {
     let o = Options::new().l0_compaction_threshold(1);
-    if wal { o } else { o.disable_wal(true) }
+    if wal { o } else { o.wal(roble::Wal::Off) }
 }
 
 /// Open; twice over, write a batch, flush it and compact; then one last write

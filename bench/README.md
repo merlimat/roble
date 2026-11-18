@@ -58,8 +58,9 @@ They always run in this order, whatever order `--phases` names them in.
 
 - **load** — writes `--batches` batches to each shard, each batch `--records`
   consecutive records, through an *indexed* batch because that is what Oxia
-  uses: its `PebbleBatch` reads back through itself before committing. With the
-  WAL on, each commit syncs.
+  uses: its `PebbleBatch` reads back through itself before committing. Each
+  commit is as durable as `--wal` says: synced with `--wal synced`, appended
+  with the default `buffered`.
 - **settle** — leaves the database in a shape the read phases can be compared
   over. roble compacts cooperatively on the thread that owns the store (§9),
   in a task this driver spawns beside each shard, so this drives the picker to
@@ -382,6 +383,43 @@ the first time anything here has measured one. E is `scan-short`'s number,
 which it should be: 95% of E is that scan. A leaves `L0=2` where the `settle`
 before it left `L0=1`.
 
+### The three WAL modes
+
+What `--wal` costs a mix, roble alone, in the standard environment ("One core,
+512 MiB": one pinned CPU, 512 MiB with the page cache, a 256 MiB block cache)
+over the in-cache scenario's 1,400,000 records, each mix over a store loaded
+and settled for it. Medians of three rounds, the modes interleaved within each
+cell, with the slowest and fastest round beside them:
+
+| mix | `off` | `buffered` | `synced` | buffered/off | synced/off |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A (50% update) | 685,967 (553k–795k) | 342,588 (310k–439k) | 4,748 (4.0k–4.8k) | 0.50 | 0.007 |
+| B (5% update) | 745,603 (572k–934k) | 731,139 (663k–736k) | 45,438 (42.9k–46.2k) | 0.98 | 0.061 |
+| C (reads only) | 972,671 (958k–1,047k) | 985,433 (954k–1,002k) | 957,732 (933k–1,019k) | 1.01 | 0.98 |
+| D (5% insert) | 1,119,048 (1,038k–1,124k) | 982,075 (950k–988k) | 44,605 (44.3k–46.5k) | 0.88 | 0.040 |
+| E (5% insert, scans) | 77,637 (76.6k–78.1k) | 75,985 (74.0k–76.9k) | 29,666 (29.0k–30.0k) | 0.98 | 0.38 |
+| F (50% read-modify-write) | 550,275 (541k–573k) | 275,701 (276k–276k) | 4,988 (4.9k–5.0k) | 0.50 | 0.009 |
+
+Operations a second. Measured on the Linux VM, 2026-11-18, with `roble-bench`
+built with mimalloc.
+
+- **`synced` is an fsync per write**, about 330 µs each on this VM: A's and F's
+  p50 is 330 µs where `off`'s is 1 µs, and the process spends a tenth of the
+  CPU the other two do (1 s against 9 s of a 10 s run) because it is waiting.
+  YCSB writes one record per commit, so nothing amortises it; a caller that
+  batches pays it per batch. The number is the VM's virtual disk, whose cache
+  is the host's (UTM's `writeback`), and not a statement about any device.
+- **`buffered` is a log append per write**, a `write` into the page cache on
+  every commit, and halves the two mixes that are half writes. Where writes
+  are 5% it is within 2% of `off` on B and E, and 12% below it on D.
+- **C is the control**: no writes, so no mode has anything to do, and the
+  three agree within the rounds' spread.
+- `off` is Oxia's configuration and the one `run.sh` measures. Its rounds
+  spread widest on A and B (553k–795k and 572k–934k): at those rates a
+  memtable fills every few seconds, so how many flushes land inside a
+  ten-second run varies from round to round, which is the likely reason
+  rather than a measured one.
+
 ### Cross-checking against Pebble's own tool
 
 There is no Pebble column here any more, but `cmd/pebble` can still say
@@ -506,10 +544,20 @@ exactly the trap anyone setting a roble number beside a Go Pebble number
 obtained elsewhere will walk into, and because on Linux — which is what Oxia
 runs — they are all `fsync` anyway.
 
+**`--wal` sets one durability for every engine**: `off` (no log, Oxia's
+configuration), `buffered` (appended and left to the OS to sync; the
+default) or `synced` (synced before every write returns). roble takes it as
+its `Wal` setting and RocksDB as `disable_wal` and `sync` on every write.
+Until this setting existed RocksDB's two were tied to one per-write sync
+flag, so its WAL was off for every unsynced write — every YCSB write — while
+roble's was on: a default YCSB row compared roble writing a log against
+RocksDB writing none. RocksDB's YCSB write rows from before then are
+`--wal off` rows, whatever the run was given.
+
 **encina's load row is not quite in the same units.** Its `write` is durable
-by itself and takes no sync flag, so `--no-wal` asks roble and RocksDB for
-less than it asks encina for. That counts against encina on the load row
-and nowhere else.
+by itself and takes no sync flag, so `--wal off` and `--wal buffered` ask
+roble and RocksDB for less than they ask encina for. That counts against
+encina on the write rows and nowhere else.
 
 **The phases share a block cache and run in order**, so whichever of the two
 scans goes second reads a cache the first one warmed. Reverse runs first
@@ -567,9 +615,9 @@ nine) — so a lookup searched one table instead of three. Setting it to 2 MiB g
 changes its point reads by under 1% on the same machine, because its filters
 absorb them. Worth aligning anyway, and worth recording that the layout did
 not explain the gap it looked certain to explain. `--no-wal` is another: it takes
-`disable_wal` on roble and `disable_WAL` on RocksDB's write options, and setting only the sync flag on the last of those left it
-writing a journal the others were not — worth 5 MiB of directory and half its
-load rate. `--cache-mb` is the third, divided per store for encina, whose
+the WAL off roble and RocksDB alike, and setting only the sync flag on RocksDB's
+write options left it writing a journal the others were not — worth 5 MiB of
+directory and half its load rate. `--cache-mb` is the third, divided per store for encina, whose
 cache is its own.
 
 **`--value-chunk` dials how compressible a value is**, since the default
@@ -653,10 +701,11 @@ belongs anyway.
 
 **The batch-size pass, gone from `run.sh` with the others, was read *within*
 an engine, not across engines**: how
-much of its throughput depends on the caller batching. With `--no-wal` the
-LSMs sync nothing per commit while encina commits durably whatever it is
-asked, so the per-commit cost it shows is a different cost from theirs. Run
-without `--no-wal` for the comparison where every engine commits durably.
+much of its throughput depends on the caller batching. With `--wal off` or
+`buffered` the LSMs sync nothing per commit while encina commits durably
+whatever it is asked, so the per-commit cost it shows is a different cost
+from theirs. Run with `--wal synced` for the comparison where every engine
+commits durably.
 
 **Both sides of it batch, and that is a change.** It used to write the small
 side one record per commit, which separated the two costs as cleanly as

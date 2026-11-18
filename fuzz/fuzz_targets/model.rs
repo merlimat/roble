@@ -167,7 +167,11 @@ impl How {
 fn options(c: &Config) -> Options<roble::sim::SimFs> {
     let mut o = Options::new()
         .create_if_missing(true)
-        .disable_wal(!c.wal)
+        .wal(if c.wal {
+            roble::Wal::Synced
+        } else {
+            roble::Wal::Off
+        })
         .disable_automatic_compactions(!c.automatic_compactions)
         .l0_compaction_threshold(1 + u64::from(c.l0_compaction_threshold % 4))
         .target_file_size(256 + u64::from(c.target_file_size % 8192))

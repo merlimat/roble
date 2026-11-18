@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use roble_format::files as roble_files;
 
 use crate::report::Report;
-use crate::{Compression, Config, fail, key_for, value_for};
+use crate::{Compression, Config, WalMode, fail, key_for, value_for};
 
 /// One table of one level, as an engine describes its own.
 ///
@@ -63,12 +63,12 @@ pub trait Store: Sized {
     async fn open(cfg: &Config, dir: &Path) -> Vec<Self>;
 
     /// Writes records `from..from + count` of shard `shard` as one batch, and
-    /// commits it, durably if `sync`.
-    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize, sync: bool);
+    /// commits it as `cfg.wal` says every write is made.
+    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize);
 
     /// Deletes every key in `start..end` as one range deletion, and commits
-    /// it, durably if `sync`.
-    async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool);
+    /// it as `cfg.wal` says.
+    async fn delete_range(&self, cfg: &Config, start: &[u8], end: &[u8]);
 
     /// Leaves the store in a shape the read phases can be compared over, and
     /// says how many pieces of work it did.
@@ -250,7 +250,11 @@ impl Store for Roble {
                     })
                     // Oxia's configuration: its replication log is the source
                     // of truth, so the store need only be durable at a flush.
-                    .disable_wal(!cfg.wal)
+                    .wal(match cfg.wal {
+                        WalMode::Off => roble::Wal::Off,
+                        WalMode::Buffered => roble::Wal::Buffered,
+                        WalMode::Synced => roble::Wal::Synced,
+                    })
                     // Stops the merge a flush would run where it stands, and
                     // the stall a write would wait out for one; the store
                     // does not spawn the task that would run it either.
@@ -280,7 +284,7 @@ impl Store for Roble {
         Self::open(cfg, dir).await
     }
 
-    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize, sync: bool) {
+    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize) {
         // An *indexed* batch, which is the one Oxia uses: its `PebbleBatch`
         // reads back through itself before committing, so the repr measured
         // here is the one built under an index.
@@ -291,26 +295,18 @@ impl Store for Roble {
                 .unwrap_or_else(|e| fail(&format!("put: {e}")));
         }
         batch
-            .commit(if sync {
-                roble::Durability::Sync
-            } else {
-                roble::Durability::NoSync
-            })
+            .commit()
             .await
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
     }
 
-    async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) {
+    async fn delete_range(&self, _cfg: &Config, start: &[u8], end: &[u8]) {
         let mut batch = self.db.indexed_batch();
         batch
             .delete_range(start, end)
             .unwrap_or_else(|e| fail(&format!("delete range: {e}")));
         batch
-            .commit(if sync {
-                roble::Durability::Sync
-            } else {
-                roble::Durability::NoSync
-            })
+            .commit()
             .await
             .unwrap_or_else(|e| fail(&format!("commit: {e}")));
     }
@@ -493,14 +489,7 @@ impl Store for Encina {
         shards
     }
 
-    async fn write_batch(
-        &self,
-        cfg: &Config,
-        shard: usize,
-        from: usize,
-        count: usize,
-        _sync: bool,
-    ) {
+    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize) {
         // encina's write is durable by itself: there is no sync flag to pass,
         // so a `--no-wal` run asks it for less than it gives. That is in its
         // favour on the load row and against it nowhere, which the README
@@ -515,7 +504,7 @@ impl Store for Encina {
             .unwrap_or_else(|e| fail(&format!("write: {e}")));
     }
 
-    async fn delete_range(&self, start: &[u8], end: &[u8], _sync: bool) {
+    async fn delete_range(&self, _cfg: &Config, start: &[u8], end: &[u8]) {
         let mut batch = encina::WriteBatch::new();
         batch.delete_range(start, end);
         self.db
@@ -622,6 +611,22 @@ pub struct Rocks {
 }
 
 #[cfg(feature = "rocksdb")]
+/// RocksDB's write options for every write of a run, from `--wal`.
+///
+/// Both of them, because each mode means the same thing for every engine:
+/// `off` turns its WAL off as roble's `Wal::Off` does, and `buffered` keeps
+/// it on and unsynced. This used to tie the two to one `sync` flag, which
+/// turned RocksDB's WAL off for every unsynced write — every YCSB write —
+/// while roble's stayed on, so a default YCSB row compared roble writing a
+/// log against RocksDB writing none.
+fn write_options(cfg: &Config) -> rocksdb::WriteOptions {
+    let mut write = rocksdb::WriteOptions::default();
+    write.set_sync(cfg.wal == WalMode::Synced);
+    write.disable_wal(cfg.wal == WalMode::Off);
+    write
+}
+
+#[cfg(feature = "rocksdb")]
 impl Store for Rocks {
     const NAME: &'static str = "rocksdb";
 
@@ -694,32 +699,21 @@ impl Store for Rocks {
         shards
     }
 
-    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize, sync: bool) {
+    async fn write_batch(&self, cfg: &Config, shard: usize, from: usize, count: usize) {
         let mut batch = rocksdb::WriteBatch::default();
         for i in from..from + count {
             batch.put(key_for(shard, i), value_for(cfg, shard, i));
         }
-        let mut write = rocksdb::WriteOptions::default();
-        // Both, because `--no-wal` means what it says for the other two:
-        // roble takes `disable_wal` and Pebble `DisableWAL`, so setting only
-        // the sync flag here left RocksDB writing a journal the others were
-        // not — which showed up as its directory being 5 MiB larger than
-        // theirs during the load, and as a `journal off` rate measured with a
-        // journal still being written.
-        write.set_sync(sync);
-        write.disable_wal(!sync);
+        let write = write_options(cfg);
         self.db
             .write_opt(batch, &write)
             .unwrap_or_else(|e| fail(&format!("write: {e}")));
     }
 
-    async fn delete_range(&self, start: &[u8], end: &[u8], sync: bool) {
+    async fn delete_range(&self, cfg: &Config, start: &[u8], end: &[u8]) {
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(start, end);
-        // As `write_batch` sets them, and for its reason.
-        let mut write = rocksdb::WriteOptions::default();
-        write.set_sync(sync);
-        write.disable_wal(!sync);
+        let write = write_options(cfg);
         self.db
             .write_opt(batch, &write)
             .unwrap_or_else(|e| fail(&format!("delete range: {e}")));

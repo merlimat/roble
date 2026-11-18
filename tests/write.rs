@@ -616,35 +616,24 @@ async fn a_delete_after_a_reopen_buries_what_replay_brought_back() {
 }
 
 /// `put`, `delete` and `delete_range` on the store write what a batch of one
-/// would, and refuse `sync` on a store with the WAL off as a batch does.
+/// would. How durable each is when it returns is the store's `Wal` setting,
+/// which `tests/wal.rs` holds to what it promises.
 #[compio::test]
 async fn single_writes_on_the_store_read_back_as_a_model_would() {
     let (env, dir) = load("db-simple").await;
     let db = roble::open(&env, &dir).await.expect("open");
     let mut model = contents(&db).await;
 
-    db.put(b"/a", b"1", roble::Durability::NoSync)
-        .await
-        .expect("put");
-    db.put(b"/b", b"2", roble::Durability::Sync)
-        .await
-        .expect("put");
-    db.put(b"/c", b"3", roble::Durability::NoSync)
-        .await
-        .expect("put");
-    db.put(b"/d", b"4", roble::Durability::NoSync)
-        .await
-        .expect("put");
+    db.put(b"/a", b"1").await.expect("put");
+    db.put(b"/b", b"2").await.expect("put");
+    db.put(b"/c", b"3").await.expect("put");
+    db.put(b"/d", b"4").await.expect("put");
     for (k, v) in [(b"/a", b"1"), (b"/b", b"2"), (b"/c", b"3"), (b"/d", b"4")] {
         model.insert(k.to_vec(), v.to_vec());
     }
-    db.delete(b"/a", roble::Durability::NoSync)
-        .await
-        .expect("delete");
+    db.delete(b"/a").await.expect("delete");
     model.remove(&b"/a"[..]);
-    db.delete_range(b"/b", b"/d", roble::Durability::Sync)
-        .await
-        .expect("delete_range");
+    db.delete_range(b"/b", b"/d").await.expect("delete_range");
     model.retain(|k, _| !(k.as_slice() >= &b"/b"[..] && k.as_slice() < &b"/d"[..]));
 
     assert_eq!(contents(&db).await, model);
@@ -655,24 +644,6 @@ async fn single_writes_on_the_store_read_back_as_a_model_would() {
             .map(|f| f.value),
         Some(b"4".to_vec())
     );
-    drop(db);
-
-    let no_wal = roble::open_with(&env, &dir, roble::Options::new().disable_wal(true))
-        .await
-        .expect("open without the WAL");
-    for refused in [
-        no_wal.put(b"/e", b"5", roble::Durability::Sync).await,
-        no_wal.delete(b"/d", roble::Durability::Sync).await,
-        no_wal
-            .delete_range(b"/a", b"/z", roble::Durability::Sync)
-            .await,
-    ] {
-        assert!(
-            matches!(refused, Err(roble::Error::Unsupported(_))),
-            "a synced write with the WAL off should be refused: {refused:?}"
-        );
-    }
-    assert_eq!(contents(&no_wal).await, model, "and should change nothing");
 }
 
 #[compio::test]
@@ -684,7 +655,7 @@ async fn an_empty_or_inverted_range_is_the_callers_mistake() {
     let before = contents(&db).await;
 
     let err = db
-        .delete_range(b"/z", b"/a", roble::Durability::NoSync)
+        .delete_range(b"/z", b"/a")
         .await
         .expect_err("an inverted range");
     assert!(matches!(err, roble::Error::InvalidArgument(_)), "{err:?}");

@@ -222,7 +222,7 @@ async fn a_warm_write_allocates_nothing() {
         // Compactions left on, which is what makes a write look at L0's
         // depth at all; nothing here spawns one, and L0 is far from the line.
         roble::Options::new()
-            .disable_wal(true)
+            .wal(roble::Wal::Off)
             .memtable_size(4 << 20),
     )
     .await

@@ -130,7 +130,7 @@ fn opened(wal: bool, budget: u64) -> Options<SimFs> {
     let o = Options::new()
         .memtable_size(budget)
         .disable_automatic_compactions(true);
-    if wal { o } else { o.disable_wal(true) }
+    if wal { o } else { o.wal(roble::Wal::Off) }
 }
 
 async fn put<F: Fs>(db: &roble::Db<F>, i: usize, wal: bool) -> roble::Result<()> {

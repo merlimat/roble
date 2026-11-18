@@ -22,31 +22,33 @@
 //! # Where to start
 //!
 //! - [`open_with`] opens a database directory, creating one if
-//!   [`Options::create_if_missing`] says so, and returns a [`Db`].
+//!   [`Options::create_if_missing`] says so, and returns a [`Db`]. How
+//!   durable a write is when it returns is the store's [`Wal`] setting:
+//!   synced to the log by default, buffered, or no log at all.
 //! - [`Db::put`], [`Db::delete`] and [`Db::delete_range`] write one change;
 //!   [`Db::indexed_batch`] builds an [`IndexedBatch`] of several, readable
-//!   through before it commits. Each write says its [`Durability`].
+//!   through before it commits.
 //! - [`Db::get`] finds a key, or the nearest one on either side of it
 //!   ([`Comparison`]); [`Db::range`] makes a [`Scan`] that steps forwards or
 //!   backwards; [`Db::snapshot`] holds one instant for reads that must agree.
 //! - [`Db::flush`] writes the memtable out, which is what makes a write
-//!   durable with the WAL off ([`Options::disable_wal`]);
+//!   durable with the WAL off ([`Wal::Off`]);
 //!   [`Db::checkpoint`] copies the database to a directory Go Pebble opens;
 //!   [`Db::close`] stops the store and lets go of the directory.
 //!
 //! ```no_run
-//! use roble::{Comparison, DefaultEnv, Durability, Options};
+//! use roble::{Comparison, DefaultEnv, Options};
 //!
 //! # async fn example() -> roble::Result<()> {
 //! let options = Options::new().create_if_missing(true);
 //! let db = roble::open_with(&DefaultEnv, "data/shard-0", options).await?;
 //!
-//! db.put(b"/users/alice", b"1", Durability::Sync).await?;
+//! db.put(b"/users/alice", b"1").await?;
 //!
 //! let mut batch = db.indexed_batch();
 //! batch.put(b"/users/bob", b"2")?;
 //! batch.delete(b"/users/carol")?;
-//! batch.commit(Durability::NoSync).await?;
+//! batch.commit().await?;
 //!
 //! // The greatest key at or below `/users/b`, which is alice.
 //! let floor = db.get(b"/users/b", Comparison::Floor).await?;
@@ -127,8 +129,8 @@ pub use env::{Access, DirEntry, Disk, DiskUsage, Env, Fs};
 pub use error::{Error, FormatError, Result};
 pub use file::{DefaultEnv, FileDisk, FileFs, FileLock};
 pub use levels::{LevelInfo, TableInfo};
-pub use open::{Db, Durability, open, open_read_only, open_with};
-pub use options::Options;
+pub use open::{Db, open, open_read_only, open_with};
+pub use options::{Options, Wal};
 pub use pick::Pick;
 pub use read::{Comparison, Found, GetBuf};
 /// What [`Options::compression`] takes.
