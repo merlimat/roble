@@ -10,6 +10,11 @@ description = "Embedded ordered key-value store whose on-disk files are Pebble's
 readme = "README.md"
 keywords = ["pebble", "lsm", "key-value", "embedded", "database"]
 categories = ["database-implementations", "asynchronous"]
+# What the crate is: its source, README and licence. Not the tests, which
+# need the `sim` feature through a path-only dev-dependency that publishing
+# drops, so they do not build from the package; nor the harness, CI, the
+# design notes or the logo, which live in the repository.
+include = ["/src", "/README.md", "/LICENSE"]
 
 # Every feature documented, each gated item marked with the one it needs.
 [package.metadata.docs.rs]
