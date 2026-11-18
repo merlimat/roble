@@ -30,7 +30,7 @@
 
 use std::future::Future;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
@@ -140,10 +140,9 @@ impl Fs for FileFs {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            out.extend(unless_gone(entry.metadata())?.map(|meta| DirEntry {
-                name: PathBuf::from(entry.file_name()),
-                size: if meta.is_dir() { 0 } else { meta.len() },
-                is_dir: meta.is_dir(),
+            out.extend(unless_gone(entry.metadata())?.map(|meta| {
+                let size = if meta.is_dir() { 0 } else { meta.len() };
+                DirEntry::new(entry.file_name(), size, meta.is_dir())
             }));
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -173,7 +172,7 @@ impl Fs for FileFs {
                 }
             }
         }
-        Ok(DiskUsage { used_bytes })
+        Ok(DiskUsage::new(used_bytes))
     }
 
     async fn lock(&self, path: &Path) -> Result<FileLock> {
