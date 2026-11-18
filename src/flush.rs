@@ -420,6 +420,10 @@ async fn build_table<D: Disk>(
     // reading of them back only to drop them.
     let mut written = Vec::new();
     let mut written_any = false;
+    // A key whose kind the flush changed, re-encoded for the bounds. Only a
+    // Set or a SingleDelete over an older version of its key needs it
+    // (`crate::table::written_over`).
+    let mut renamed = Vec::new();
 
     let mut cursor = {
         let held = memtable.borrow();
@@ -435,8 +439,33 @@ async fn build_table<D: Disk>(
                 let encoded = cursor.key(&held);
                 let key = InternalKey::decode(encoded)?;
                 if !written_any || key.user_key != written.as_slice() {
+                    // The versions this one supersedes follow it, newest
+                    // first, and a copy of the cursor reads them where they
+                    // are, so looking costs nothing but the steps.
+                    let mut key = key;
+                    let as_written = key.kind;
+                    if matches!(key.kind, Kind::Set | Kind::SingleDelete) {
+                        let mut older = cursor;
+                        older.next(&held);
+                        while older.is_valid() {
+                            let o = InternalKey::decode(older.key(&held))?;
+                            if o.user_key != key.user_key {
+                                break;
+                            }
+                            key.kind = crate::table::written_over(key.kind, o.kind);
+                            if key.kind != as_written {
+                                break;
+                            }
+                            older.next(&held);
+                        }
+                    }
                     writer.add(key, cursor.value(&held))?;
-                    bounds.saw_key(encoded)?;
+                    if key.kind != as_written {
+                        key::encode_into(key.user_key, key.seq_num, key.kind, &mut renamed);
+                        bounds.saw_key(&renamed)?;
+                    } else {
+                        bounds.saw_key(encoded)?;
+                    }
                     bounds.saw_seq(key.seq_num);
                     written.clear();
                     written.extend_from_slice(key.user_key);

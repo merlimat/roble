@@ -66,49 +66,28 @@ fn spell(found: &Option<Found>) -> String {
     }
 }
 
-#[compio::test]
-async fn roble_reads_what_go_pebble_reads() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
-    let path = dir.join("db-reads.probes");
+/// Pebble's answers to the probes, and the probe keys they were asked of.
+fn pebble_probes() -> (String, Vec<Vec<u8>>) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-reads.probes");
     let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "{}: {e}; regenerate with 'cd harness && go run ./read-probes ../tests/golden'",
             path.display()
         )
     });
-
-    let (_tmp, db_dir) = fixture("db-reads");
-    let db = roble::open(&roble::DefaultEnv, &db_dir)
-        .await
-        .expect("open the database Go wrote");
-
-    // The shape the harness asserted when it built this: if a later change
-    // flattens it, the comparison below would still pass while testing much
-    // less, so it is checked here too.
-    assert!(
-        db.versions().version.level(0).len() >= 2,
-        "L0 should hold overlapping tables, holds {}",
-        db.versions().version.level(0).len()
-    );
-    assert!(
-        db.versions()
-            .version
-            .levels()
-            .filter(|(_, t)| !t.is_empty())
-            .count()
-            >= 2,
-        "the database should span more than one level"
-    );
-
     let probes: Vec<Vec<u8>> = expected
         .lines()
         .filter_map(|l| l.strip_prefix("probe "))
         .map(unhex)
         .collect();
     assert!(!probes.is_empty(), "no probes in {}", path.display());
+    (expected, probes)
+}
 
+/// roble's answers to the probes, spelled as the harness spells Pebble's.
+async fn answers<F: roble::Fs>(db: &roble::Db<F>, probes: &[Vec<u8>]) -> String {
     let mut out = String::new();
-    for probe in &probes {
+    for probe in probes {
         out.push_str(&format!("probe {}\n", hex(probe)));
 
         let equal = db.get(probe, Comparison::Equal).await.expect("equal");
@@ -134,7 +113,11 @@ async fn roble_reads_what_go_pebble_reads() {
             out.push_str(&format!("  {name} {}\n", spell(&found)));
         }
     }
+    out
+}
 
+/// Fails with the first line where roble's answers leave Pebble's.
+fn assert_answers_match(out: &str, expected: &str, when: &str) {
     if out != expected {
         let (a, b) = (
             out.lines().collect::<Vec<_>>(),
@@ -147,13 +130,211 @@ async fn roble_reads_what_go_pebble_reads() {
             .unwrap_or(a.len().min(b.len()));
         let from = at.saturating_sub(6);
         panic!(
-            "reads differ at line {}:\n  roble:  {:?}\n  pebble: {:?}\ncontext:\n{}",
+            "{when}: reads differ at line {}:\n  roble:  {:?}\n  pebble: {:?}\ncontext:\n{}",
             at + 1,
             a.get(at),
             b.get(at),
             b[from..(at + 2).min(b.len())].join("\n")
         );
     }
+}
+
+#[compio::test]
+async fn roble_reads_what_go_pebble_reads() {
+    let (expected, probes) = pebble_probes();
+
+    let (_tmp, db_dir) = fixture("db-reads");
+    let db = roble::open(&roble::DefaultEnv, &db_dir)
+        .await
+        .expect("open the database Go wrote");
+
+    // The shape the harness asserted when it built this: if a later change
+    // flattens it, the comparison below would still pass while testing much
+    // less, so it is checked here too.
+    assert!(
+        db.versions().version.level(0).len() >= 2,
+        "L0 should hold overlapping tables, holds {}",
+        db.versions().version.level(0).len()
+    );
+    assert!(
+        db.versions()
+            .version
+            .levels()
+            .filter(|(_, t)| !t.is_empty())
+            .count()
+            >= 2,
+        "the database should span more than one level"
+    );
+
+    let out = answers(&db, &probes).await;
+    assert_answers_match(&out, &expected, "the database as Go wrote it");
+}
+
+/// The tables of `level` whose user keys run from `smallest` to `largest`,
+/// oldest first.
+fn tables_spanning<F: roble::Fs>(
+    db: &roble::Db<F>,
+    level: u32,
+    smallest: &[u8],
+    largest: &[u8],
+) -> Vec<u64> {
+    let mut found: Vec<u64> = db
+        .versions()
+        .version
+        .level(level)
+        .iter()
+        .filter(|t| {
+            t.smallest_user_key().expect("smallest") == smallest
+                && t.largest_user_key().expect("largest") == largest
+        })
+        .map(|t| t.file_num)
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+/// Every entry of the tables, as the format crate's dump prints them.
+fn dumps(dir: &Path, tables: &[u64]) -> String {
+    tables
+        .iter()
+        .map(|n| {
+            let bytes = std::fs::read(dir.join(format!("{n:06}.sst"))).expect("read a table");
+            roble::roble_format::dump_table(&bytes).expect("dump a table")
+        })
+        .collect()
+}
+
+/// A compaction of what Pebble wrote changes none of Pebble's answers, at any
+/// step, including the step where roble writes the kinds it only reads.
+///
+/// `SINGLEDEL` and `DELSIZED` are §3's "read, never written", and roble's
+/// own writes never produce them. A compaction does copy them, though: it
+/// keeps each key's newest entry, and a deletion that still has something
+/// below it to hide stays (`crate::compact`). Every other compaction test
+/// starts from a fixture with neither kind in it, and compacting `db-reads`
+/// all at once would not reach the case either, because each kind's Set
+/// would be in the same merge and both would go. So the Sets go down first:
+/// the oldest table, holding `s0`'s Set, into L2 together with the `u` keys'
+/// table, so that one L2 table spans `t0` as well. Then the tables holding
+/// `SINGLEDEL s0`, `DELSIZED t0` and `SETWITHDEL t1` go to L1 over it, and
+/// each deletion has something below it to hide.
+///
+/// Then everything settles into L6, where the deletions have nothing left to
+/// hide and go. Pebble's answers are checked after every step. The
+/// directory at the step that writes the kinds is the one
+/// `compat/wal-replay --kinds` hands Pebble to read and compact.
+#[compio::test]
+async fn compacting_what_go_pebble_wrote_changes_none_of_its_answers() {
+    let (expected, probes) = pebble_probes();
+    let (_tmp, dir) = fixture("db-reads");
+    let db = roble::open_with(
+        &roble::DefaultEnv,
+        &dir,
+        roble::Options::new()
+            .disable_automatic_compactions(true)
+            .background_tasks(false),
+    )
+    .await
+    .expect("open the database Go wrote");
+
+    // The scripted tables, found by what they span rather than by number.
+    let s = tables_spanning(&db, 0, b"s0", b"s1");
+    let t = tables_spanning(&db, 0, b"s1", b"t1");
+    let u = tables_spanning(&db, 0, b"u0", b"u2");
+    let ([sets, singledels], [kinds], [u_sets, _u_cut]) = (&s[..], &t[..], &u[..]) else {
+        panic!("the fixture no longer has the tables this test is built around: {s:?} {t:?} {u:?}");
+    };
+    assert!(
+        dumps(&dir, &[*singledels]).contains("singledel 7330")
+            && dumps(&dir, &[*kinds]).contains("delsized 7430"),
+        "the fixture's scripted tables should hold SINGLEDEL s0 and DELSIZED t0"
+    );
+
+    let low = [
+        db.compact(0, &[*sets]).await.expect("compact the Sets"),
+        db.compact(0, &[*u_sets]).await.expect("compact the u keys"),
+    ]
+    .concat();
+    assert_answers_match(
+        &answers(&db, &probes).await,
+        &expected,
+        "the oldest tables moved to L1",
+    );
+    let below = db.compact(1, &low).await.expect("compact into L2");
+    assert_eq!(below.len(), 1, "one L2 table should span s0 to u2");
+    assert_answers_match(
+        &answers(&db, &probes).await,
+        &expected,
+        "the Sets settled into L2",
+    );
+
+    let out = db
+        .compact(0, &[*singledels, *kinds])
+        .await
+        .expect("compact the deletions");
+    let written = dumps(&dir, &out);
+    for (entry, kind) in [
+        ("singledel 7330", "SINGLEDEL"),
+        ("delsized 7430", "DELSIZED"),
+        ("setwithdel 7431", "SETWITHDEL"),
+        // s1's Set buried its SINGLEDEL, with the first Set still in L2.
+        ("setwithdel 7331", "SETWITHDEL over a buried SINGLEDEL"),
+    ] {
+        assert!(
+            written.contains(entry),
+            "roble's output should carry {kind} over what lies below it:\n{written}"
+        );
+    }
+    assert_answers_match(
+        &answers(&db, &probes).await,
+        &expected,
+        "SINGLEDEL and DELSIZED written by roble",
+    );
+
+    // Everything down a level at a time, until it all sits in L6.
+    for level in 0..6 {
+        let tables: Vec<u64> = db
+            .versions()
+            .version
+            .level(level)
+            .iter()
+            .map(|t| t.file_num)
+            .collect();
+        if tables.is_empty() {
+            continue;
+        }
+        db.compact(level, &tables).await.expect("compact a level");
+        assert_answers_match(
+            &answers(&db, &probes).await,
+            &expected,
+            &format!("L{level} compacted into L{}", level + 1),
+        );
+    }
+    let deepest: Vec<u32> = db
+        .versions()
+        .version
+        .levels()
+        .filter(|(_, t)| !t.is_empty())
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(deepest, [6], "everything should have settled into L6");
+    let settled: Vec<u64> = db
+        .versions()
+        .version
+        .level(6)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    let settled = dumps(&dir, &settled);
+    assert!(
+        !settled.contains("singledel") && !settled.contains("delsized"),
+        "a deletion with nothing below it should be gone from L6:\n{settled}"
+    );
+
+    // And a reopen reads what the MANIFEST roble appended to says.
+    drop(db);
+    let db = roble::open(&roble::DefaultEnv, &dir).await.expect("reopen");
+    assert_answers_match(&answers(&db, &probes).await, &expected, "after a reopen");
 }
 
 /// `get_into` answers what `get` answers, through one `GetBuf` reused for

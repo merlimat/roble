@@ -545,6 +545,18 @@ async fn merge<D: Disk>(
     // everything pays it most.
     let mut seen = Vec::new();
     let mut seen_any = false;
+    // The surviving entry of the user key being merged, held back until the
+    // versions it supersedes have gone past: what they are decides what it
+    // is written as — a Set over a deletion as a SETWITHDEL, a SingleDelete
+    // over anything as a Delete (`crate::table::written_over`) — and the
+    // merge cannot look ahead. Its value is in `value`, which the next
+    // survivor's would overwrite, so it is added to the output before that
+    // one is read. `held` is reused as `value` is.
+    let mut held = Vec::new();
+    let mut holding = false;
+    // Its kind, kept beside it so that a superseded entry is weighed against
+    // it without decoding the key again.
+    let mut held_kind = key::Kind::Set;
 
     let mut heap = Heap::new(&iters)?;
     while let Some(w) = heap.top() {
@@ -553,8 +565,9 @@ async fn merge<D: Disk>(
         // (`block::restart::Cursor::key`), so it stays put until something
         // advances the iterator — which nothing here does until the entry
         // has been written, `value_into` reading it through a shared borrow
-        // as `key` does. The one copy left is `Output::add`'s, which the
-        // table being built has to have.
+        // as `key` does. What is left is a survivor's copy into `held`,
+        // reused and only of the key, and `Output::add`'s, which the table
+        // being built has to have.
         let encoded = iters[w].key();
         let k = InternalKey::decode(encoded)?;
         let user = k.user_key;
@@ -566,6 +579,22 @@ async fn merge<D: Disk>(
             seen.clear();
             seen.extend_from_slice(user);
             seen_any = true;
+            // The last key's versions are all behind it, so what it is
+            // written as is settled, and it goes before anything of this key
+            // — or before the table it belongs to is finished below.
+            if holding {
+                open.add(InternalKey::decode(&held)?, &held, &value)?;
+                holding = false;
+            }
+        } else if holding {
+            let kind = crate::table::written_over(held_kind, k.kind);
+            if kind != held_kind {
+                // The trailer's low byte is the kind, with the obsolete bit
+                // beside it, which stays as it was.
+                let at = held.len() - key::TRAILER_LEN;
+                held[at] = kind.to_byte() | (held[at] & key::OBSOLETE_BIT);
+                held_kind = kind;
+            }
         }
 
         if newest && keep(user, k.seq_num, k.kind, &tombstones, below) {
@@ -587,7 +616,10 @@ async fn merge<D: Disk>(
                 }
             }
             iters[w].value_into(&mut value).await?;
-            open.add(k, encoded, &value)?;
+            held.clear();
+            held.extend_from_slice(encoded);
+            held_kind = k.kind;
+            holding = true;
         }
         iters[w].next().await?;
         heap.advanced(&iters)?;
@@ -601,6 +633,9 @@ async fn merge<D: Disk>(
         pacer.did(1).await;
     }
 
+    if holding {
+        open.add(InternalKey::decode(&held)?, &held, &value)?;
+    }
     if let Some((bytes, bounds, entries)) = open.finish(&tombstones, None)? {
         // Nothing left to hand the buffer on to: this was the last output.
         let _ = write(Chunk::Last(bytes, bounds, entries)).await?;

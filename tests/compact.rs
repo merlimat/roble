@@ -1672,3 +1672,179 @@ async fn a_compressed_output_is_split_at_its_stored_size() {
         );
     }
 }
+
+/// What kind each user key's entry in a table has, from the format crate's
+/// dump: `entry <seq> <kind> <key> [value]`, keyed by the key as text.
+fn kinds_in(dump: &str) -> BTreeMap<String, String> {
+    dump.lines()
+        .filter_map(|l| l.strip_prefix("entry "))
+        .map(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            let key = (0..fields[2].len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&fields[2][i..i + 2], 16).expect("hex") as char)
+                .collect();
+            (key, fields[1].to_string())
+        })
+        .collect()
+}
+
+#[compio::test]
+async fn a_set_that_buries_a_deletion_in_a_compaction_is_written_as_setwithdel() {
+    // Pebble's `setNext`: a SET that meets an older DEL, SINGLEDEL or
+    // DELSIZED of its key in one compaction is written as SETWITHDEL. That
+    // is what tells a later SingleDelete there may be more below the Set it
+    // meets, so it acts as a Delete rather than cancelling one Set. Written
+    // as a plain SET with an older value still in a deeper level, a
+    // SingleDelete Pebble is allowed to issue cancels the Set and brings the
+    // older value back (`tests/read.rs` reaches that shape from a database
+    // Pebble wrote). Each version is in a table of its own, so the meeting
+    // happens in the merge and not in a flush.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("create");
+
+    let mut oldest = Batch::new();
+    oldest.put(b"d", b"old").expect("put");
+    oldest.put(b"s", b"old").expect("put");
+    oldest.put(b"z", b"old").expect("put");
+    oldest.delete(b"m").expect("delete");
+    oldest.put(b"p", b"old").expect("put");
+    let mut middle = Batch::new();
+    middle.delete(b"d").expect("delete");
+    middle.single_delete(b"s").expect("single_delete");
+    middle.delete_sized(b"z", 3).expect("delete_sized");
+    // A Set between the newest and the deletion does not stop it: Pebble
+    // walks every older entry of the key until it meets one.
+    middle.put(b"m", b"mid").expect("put");
+    let mut newest = Batch::new();
+    for key in [&b"d"[..], b"s", b"z", b"m", b"p", b"n"] {
+        newest.put(key, b"new").expect("put");
+    }
+    let tables = vec![
+        flush_batch(&db, &mut oldest).await,
+        flush_batch(&db, &mut middle).await,
+        flush_batch(&db, &mut newest).await,
+    ];
+    let out = one_output(db.compact(0, &tables).await.expect("compact"));
+
+    let bytes = env
+        .sim()
+        .durable(&dir.join(format!("{out:06}.sst")))
+        .expect("the table is on disk");
+    let dump = roble_format::dump_table(&bytes).expect("dump");
+    let want: BTreeMap<String, String> = [
+        ("d", "setwithdel"),
+        ("m", "setwithdel"),
+        // Neither met a deletion, so both stay what they were written.
+        ("n", "set"),
+        ("p", "set"),
+        ("s", "setwithdel"),
+        ("z", "setwithdel"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert_eq!(kinds_in(&dump), want, "the compacted table:\n{dump}");
+
+    // And the store answers what it did, a SETWITHDEL reading as its Set.
+    for key in [&b"d"[..], b"m", b"n", b"p", b"s", b"z"] {
+        assert_eq!(
+            db.get(key, Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"new".to_vec()),
+        );
+    }
+}
+
+/// Flushes one batch and compacts its table down to `level`, a level at a
+/// time, so that what it holds lies below anything flushed after it.
+async fn settle<F: Fs>(db: &roble::Db<F>, batch: &mut Batch, level: u32) {
+    let mut tables = vec![flush_batch(db, batch).await];
+    for from in 0..level {
+        tables = db.compact(from, &tables).await.expect("compact");
+    }
+}
+
+#[compio::test]
+async fn a_single_delete_that_buries_an_older_version_in_a_compaction_is_written_as_del() {
+    // The history Pebble allows a SingleDelete on: `k` Set, overwritten, then
+    // deleted, then Set once more, then SingleDeleted. The first two values
+    // sit in L3 and L2. Pebble's `singleDeleteNext` turns a SINGLEDEL that
+    // meets the DEL — or the SETWITHDEL the DEL left behind it — into a DEL.
+    // Kept a SINGLEDEL over it, the next Pebble compaction lets it cancel
+    // `b` and nothing else, and `a` comes back. Twice: once with the Set and
+    // the DEL compacted together first, which leaves a SETWITHDEL for the
+    // SINGLEDEL to meet, and once with all three in one merge.
+    for staged in [true, false] {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        let db = roble::open_with(
+            &env,
+            &dir,
+            Options::new()
+                .create_if_missing(true)
+                .disable_automatic_compactions(true),
+        )
+        .await
+        .expect("create");
+
+        let mut first = Batch::new();
+        first.put(b"k", b"a").expect("put");
+        // Beside it, so that the L1 output below has a SINGLEDEL with
+        // nothing older in the merge, which stays one.
+        first.put(b"r", b"a").expect("put");
+        settle(&db, &mut first, 3).await;
+        let mut second = Batch::new();
+        second.put(b"k", b"b").expect("put");
+        settle(&db, &mut second, 2).await;
+
+        let mut deleted = Batch::new();
+        deleted.delete(b"k").expect("delete");
+        let mut again = Batch::new();
+        again.put(b"k", b"d").expect("put");
+        let mut l0 = vec![
+            flush_batch(&db, &mut deleted).await,
+            flush_batch(&db, &mut again).await,
+        ];
+        if staged {
+            db.compact(0, &l0)
+                .await
+                .expect("compact the DEL and the Set");
+            l0.clear();
+        }
+        let mut single = Batch::new();
+        single.single_delete(b"k").expect("single_delete");
+        single.single_delete(b"r").expect("single_delete");
+        l0.push(flush_batch(&db, &mut single).await);
+        let out = one_output(db.compact(0, &l0).await.expect("compact"));
+
+        let bytes = env
+            .sim()
+            .durable(&dir.join(format!("{out:06}.sst")))
+            .expect("the table is on disk");
+        let dump = roble_format::dump_table(&bytes).expect("dump");
+        let want: BTreeMap<String, String> = [("k", "del"), ("r", "singledel")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(
+            kinds_in(&dump),
+            want,
+            "staged {staged}, the compacted table:\n{dump}"
+        );
+        for key in [&b"k"[..], b"r"] {
+            assert_eq!(db.get(key, Comparison::Equal).await.expect("get"), None);
+        }
+    }
+}

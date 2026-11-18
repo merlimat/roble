@@ -267,7 +267,7 @@ shard, which is the case for `SINGLEDEL` and `DELSIZED`.
 | Bloom filter blocks (full key, bytewise `Split`) | yes | yes |
 | The Pebblev4 obsolete bit | yes, honoured | **never set** |
 | Block properties | yes, unknown collectors skipped | the minimum Go accepts (M1) |
-| `SINGLEDEL`, `DELSIZED` | yes | never written |
+| `SINGLEDEL`, `DELSIZED` | yes | never created; a compaction carries one Pebble wrote, a `SINGLEDEL` over an older version as `DELETE` |
 | MANIFEST version edits | yes | yes |
 | `marker.manifest.*`, `marker.format-version.*` | yes | yes |
 | `OPTIONS-*`, `LOCK`, file naming, obsolete-file deletion | yes | yes |
@@ -402,9 +402,25 @@ The anchors that matter most:
 Key kinds roble handles: `DELETE` 0, `SET` 1, `SINGLEDEL` 7, `RANGEDEL` 15,
 `SETWITHDEL` 18, `DELSIZED` 23, and the Pebblev4 obsolete bit, 64. Refused:
 `MERGE` 2, and the range-key kinds `RANGEKEYDEL` 19, `RANGEKEYUNSET` 20 and
-`RANGEKEYSET` 21. `SINGLEDEL` and `DELSIZED` are read but never written: Oxia
+`RANGEKEYSET` 21. `SINGLEDEL` and `DELSIZED` are read but never created: Oxia
 creates neither, and reading them costs two match arms where refusing them would
-cost a dead shard if Pebble ever produced one on its own.
+cost a dead shard if Pebble ever produced one on its own. A compaction does
+write one it read, when the key has something below the output level for the
+deletion to hide, as it would any other deletion; `tests/read.rs` and
+`compat/wal-replay --kinds` check that Pebble's answers over those tables, and
+after Pebble compacts them, are the ones it gave over its own. And a `SET`
+that a flush or a compaction writes over an older `DELETE`, `SINGLEDEL` or
+`DELSIZED` of its key, which it drops, is written as `SETWITHDEL`, as
+Pebble's `setNext` does. No read can tell the two apart; a later
+`SingleDelete` can, when Pebble compacts it next. One that meets a
+`SETWITHDEL` acts as a Delete. One that meets a plain `SET` cancels only that
+Set, and an older value still in a deeper level comes back (`read-probes
+single-delete`). For the same reason a `SINGLEDEL` written over any older
+version of its key that the flush or compaction drops is written as a
+`DELETE`. Left a `SINGLEDEL`, Pebble would let it cancel the next Set below
+and uncover the one under that; Pebble's own `singleDeleteNext` turns one
+that meets a deletion or a `SETWITHDEL` into a `DELETE` as well (`read-probes
+stays-deleted`). A `SINGLEDEL` with nothing older beside it stays one.
 
 ## 4. Decisions
 
@@ -1814,7 +1830,7 @@ in both directions.
   Two details that are load-bearing rather than incidental: the generator
   **refuses to write a fixture that collapsed into a single level**, because
   such a fixture tests the merge not at all and nothing else would notice; and
-  `SINGLEDEL` and `DELSIZED`, which roble reads and never writes, are written
+  `SINGLEDEL` and `DELSIZED`, which roble reads and never creates, are written
   by hand on keys the random rounds cannot touch, since both kinds have
   invariants a random mix would break and a kind that is never any key's newest
   entry never has its visibility tested.
@@ -1846,7 +1862,7 @@ in both directions.
   opens it, scans it, verifies it with the `pebble` tool, checkpoints it; roble opens
   that checkpoint and compares. Then the reverse. **This is the gate: a change
   that breaks it is a broken change**, including a performance change.
-  `compat/wal-replay` runs it in nine modes, and the strongest is `--created`:
+  `compat/wal-replay` runs it in ten modes, and the strongest is `--created`:
   it is handed a path and nothing else, so when Pebble opens the result every
   byte in the directory — MANIFEST, both markers, the log, the tables — was
   written by roble. Every other mode starts from a database Pebble built, which

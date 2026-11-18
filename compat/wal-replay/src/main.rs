@@ -36,6 +36,17 @@
 //! the MANIFEST, both markers, the log, the tables — was written by roble and
 //! none of it by Pebble. The other modes all begin from a fixture Pebble
 //! built.
+//!
+//! `--kinds` is handed `db-reads` and writes no keys at all. It compacts the
+//! fixture's scripted tables so that roble's output carries `SINGLEDEL`,
+//! `DELSIZED` and `SETWITHDEL`, kinds roble reads but never writes itself.
+//! Pebble then has to give its original probe answers over that directory,
+//! and again after compacting it (`harness/read-probes check`).
+//!
+//! `--single-delete` creates a database where roble compacts a SingleDelete
+//! over the DEL it buries, with two older values below, and Pebble has to
+//! compact it and still find the key deleted
+//! (`harness/read-probes stays-deleted`).
 
 use std::path::PathBuf;
 
@@ -45,7 +56,7 @@ async fn main() {
     let Some(dir) = args.next().map(PathBuf::from) else {
         eprintln!(
             "usage: wal-replay <database-dir> \
-             [--flush|--rotate|--compact|--settle|--no-wal|--swept|--checkpoint]"
+             [--flush|--rotate|--compact|--settle|--no-wal|--swept|--checkpoint|--created|--kinds|--single-delete]"
         );
         std::process::exit(2);
     };
@@ -54,6 +65,16 @@ async fn main() {
     // other half of the round trip. With `--swept` roble writes nothing and
     // the only change to the directory is what its open deleted.
     let mode = args.next();
+    // Its own path: it writes nothing, and what Pebble is asked afterwards is
+    // the fixture's probes rather than a list of keys written here.
+    if mode.as_deref() == Some("--kinds") {
+        kinds_run(&dir).await;
+        return;
+    }
+    if mode.as_deref() == Some("--single-delete") {
+        single_delete_run(&dir).await;
+        return;
+    }
     // Its own flag rather than a seventh place in the tuple below: a
     // checkpoint is not another way of writing to this database, it is a
     // second directory written out of it.
@@ -445,6 +466,173 @@ async fn swept_run<F: roble::Fs>(db: &roble::Db<F>, dir: &PathBuf, before: &[Str
     println!(
         "roble opened {} and collected {gone:?}, leaving {keys} keys",
         dir.display()
+    );
+}
+
+/// Compacts `db-reads` until roble's own output holds the kinds it never
+/// writes itself.
+///
+/// The steps are `tests/read.rs`'s
+/// (`compacting_what_go_pebble_wrote_changes_none_of_its_answers`), which
+/// says why each is needed. In short: the Sets go to L2 first, in one table
+/// spanning `s0` to `u2`, so that the tables holding `SINGLEDEL s0`,
+/// `DELSIZED t0` and `SETWITHDEL t1` compact into L1 with something below
+/// each to hide. A compaction keeps such a deletion, so roble writes it.
+async fn kinds_run(dir: &PathBuf) {
+    let options = roble::Options::new()
+        .disable_automatic_compactions(true)
+        .background_tasks(false);
+    let db = roble::open_with(&roble::DefaultEnv, dir, options)
+        .await
+        .unwrap_or_else(|e| fail(&format!("open {}: {e}", dir.display())));
+
+    let spanning = |smallest: &[u8], largest: &[u8]| -> Vec<u64> {
+        let mut found: Vec<u64> = db
+            .versions()
+            .version
+            .level(0)
+            .iter()
+            .filter(|t| {
+                t.smallest_user_key().ok() == Some(smallest)
+                    && t.largest_user_key().ok() == Some(largest)
+            })
+            .map(|t| t.file_num)
+            .collect();
+        found.sort_unstable();
+        found
+    };
+    let (s, t, u) = (
+        spanning(b"s0", b"s1"),
+        spanning(b"s1", b"t1"),
+        spanning(b"u0", b"u2"),
+    );
+    let ([sets, singledels], [kinds], [u_sets, _]) = (&s[..], &t[..], &u[..]) else {
+        fail(&format!(
+            "{} is not db-reads as this mode knows it: {s:?} {t:?} {u:?}",
+            dir.display()
+        ));
+    };
+
+    let compact = async |level: u32, tables: &[u64]| -> Vec<u64> {
+        db.compact(level, tables)
+            .await
+            .unwrap_or_else(|e| fail(&format!("compact L{level} {tables:?}: {e}")))
+    };
+    let low = [compact(0, &[*sets]).await, compact(0, &[*u_sets]).await].concat();
+    let below = compact(1, &low).await;
+    if below.len() != 1 {
+        fail(&format!("one L2 table should span s0 to u2, got {below:?}"));
+    }
+    let out = compact(0, &[*singledels, *kinds]).await;
+
+    let mut written = String::new();
+    for n in &out {
+        let bytes = std::fs::read(dir.join(format!("{n:06}.sst")))
+            .unwrap_or_else(|e| fail(&format!("read table {n:06}: {e}")));
+        written.push_str(
+            &roble::roble_format::dump_table(&bytes)
+                .unwrap_or_else(|e| fail(&format!("dump table {n:06}: {e}"))),
+        );
+    }
+    for (entry, kind) in [
+        ("singledel 7330", "SINGLEDEL"),
+        ("delsized 7430", "DELSIZED"),
+        ("setwithdel 7431", "SETWITHDEL"),
+        // s1's Set buried its SINGLEDEL, with the first Set still in L2.
+        ("setwithdel 7331", "SETWITHDEL over a buried SINGLEDEL"),
+    ] {
+        if !written.contains(entry) {
+            fail(&format!(
+                "roble's output does not carry {kind}, so this proves nothing"
+            ));
+        }
+    }
+    println!(
+        "roble compacted db-reads so that its tables {out:?} carry SINGLEDEL, DELSIZED and \
+         SETWITHDEL over the Sets it moved to L2 ({below:?})"
+    );
+}
+
+/// Creates a database in which roble compacts a SingleDelete over the DEL it
+/// buries, with two older values of the key in deeper levels.
+///
+/// `k` is Set to `a` (settled to L3), Set to `b` (L2), deleted, Set to `d`,
+/// and SingleDeleted — a history Pebble allows a SingleDelete on, since `k`
+/// was Set once since its last Delete. roble compacts the last three into
+/// one L1 table, and must write `k` there as a DEL: left a SINGLEDEL, Pebble's
+/// next compaction would let it cancel `b` alone and bring `a` back.
+/// `tests/compact.rs` pins the kind; this hands Pebble the directory
+/// (`harness/read-probes stays-deleted`).
+async fn single_delete_run(dir: &PathBuf) {
+    use roble::roble_format::batch::Batch;
+
+    let options = roble::Options::new()
+        .create_if_missing(true)
+        .disable_automatic_compactions(true)
+        .background_tasks(false);
+    let db = roble::open_with(&roble::DefaultEnv, dir, options)
+        .await
+        .unwrap_or_else(|e| fail(&format!("create {}: {e}", dir.display())));
+
+    let flush = async |batch: &mut Batch| -> u64 {
+        db.write_raw(batch, true)
+            .await
+            .unwrap_or_else(|e| fail(&format!("write: {e}")));
+        db.flush()
+            .await
+            .unwrap_or_else(|e| fail(&format!("flush: {e}")))
+            .unwrap_or_else(|| fail("flush wrote nothing"))
+    };
+    let compact = async |level: u32, tables: &[u64]| -> Vec<u64> {
+        db.compact(level, tables)
+            .await
+            .unwrap_or_else(|e| fail(&format!("compact L{level} {tables:?}: {e}")))
+    };
+    let put = |key: &[u8], value: &[u8]| -> Batch {
+        let mut batch = Batch::new();
+        batch
+            .put(key, value)
+            .unwrap_or_else(|e| fail(&format!("put: {e}")));
+        batch
+    };
+
+    for (value, level) in [(&b"a"[..], 3), (b"b", 2)] {
+        let mut tables = vec![flush(&mut put(b"k", value)).await];
+        for from in 0..level {
+            tables = compact(from, &tables).await;
+        }
+    }
+    let mut deleted = Batch::new();
+    deleted
+        .delete(b"k")
+        .unwrap_or_else(|e| fail(&format!("delete: {e}")));
+    let mut single = Batch::new();
+    single
+        .single_delete(b"k")
+        .unwrap_or_else(|e| fail(&format!("single_delete: {e}")));
+    let l0 = vec![
+        flush(&mut deleted).await,
+        flush(&mut put(b"k", b"d")).await,
+        flush(&mut single).await,
+    ];
+    let out = compact(0, &l0).await;
+
+    let [table] = &out[..] else {
+        fail(&format!("one L1 table was expected, got {out:?}"));
+    };
+    let bytes = std::fs::read(dir.join(format!("{table:06}.sst")))
+        .unwrap_or_else(|e| fail(&format!("read table {table:06}: {e}")));
+    let dump = roble::roble_format::dump_table(&bytes)
+        .unwrap_or_else(|e| fail(&format!("dump table {table:06}: {e}")));
+    let entries: Vec<&str> = dump.lines().filter(|l| l.starts_with("entry ")).collect();
+    if entries.len() != 1 || !entries[0].contains(" del 6b") {
+        fail(&format!(
+            "roble should have written k as a DEL over what it buried, wrote {entries:?}"
+        ));
+    }
+    println!(
+        "roble compacted a SingleDelete of k over the DEL it buried into table {table:06} as a \
+         DEL, with k's first two values below it in L2 and L3"
     );
 }
 
