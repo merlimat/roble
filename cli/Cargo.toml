@@ -12,6 +12,9 @@ rust-version.workspace = true
 description = "Puts, gets, scans and deletes the entries of a roble database, and inspects Pebble's files"
 keywords = ["pebble", "roble", "lsm", "sstable", "cli"]
 categories = ["command-line-utilities", "database"]
+# Its source, README and licence. Not the tests, which read roble-format's
+# golden files from beside this crate in the repository.
+include = ["/src", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "roble"
