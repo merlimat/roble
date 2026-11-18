@@ -72,6 +72,9 @@ missing_debug_implementations = "warn"
 
 [workspace]
 members = ["bench", "cli", "format", "compat/minlz", "compat/sst-roundtrip", "compat/wal-replay"]
+# What a bare `cargo build` at the root builds: the published crates, so the
+# `roble` command is built too. bench and compat need `-p` or `--workspace`.
+default-members = [".", "cli", "format"]
 resolver = "3"
 
 [workspace.package]
