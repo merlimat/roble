@@ -233,7 +233,19 @@ fn batch(seq: u64, ops: Vec<BatchOp>) {
     let seq = seq & SEQ_NUM_MAX;
     b.set_seq_num(seq);
     assert_eq!(b.count() as usize, want.len());
-    assert_eq!(batch::seq_num_of(b.as_bytes()).expect("seq num"), seq);
+    // A header whose entries would be numbered past the largest number a key
+    // holds is refused, and any other reads back as it was set.
+    let last = seq + (want.len() as u64).saturating_sub(1);
+    match batch::seq_num_of(b.as_bytes()) {
+        Ok(read) => {
+            assert!(last <= SEQ_NUM_MAX, "a range past the end read back");
+            assert_eq!(read, seq);
+        }
+        Err(e) => {
+            assert!(last > SEQ_NUM_MAX, "a range that fits was refused: {e}");
+            return;
+        }
+    }
 
     let mut r = Batch::read(b.as_bytes()).expect("a batch reads");
     for (kind, k, v) in want {
