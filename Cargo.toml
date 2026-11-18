@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "Embedded ordered key-value store whose on-disk files are Pebble's"
+readme = "README.md"
+keywords = ["pebble", "lsm", "key-value", "embedded", "database"]
+categories = ["database-implementations", "asynchronous"]
 
 # Every feature documented, each gated item marked with the one it needs.
 [package.metadata.docs.rs]
@@ -76,6 +81,11 @@ version = "0.0.0-dev"
 edition = "2024"
 authors = ["Matteo Merli <matteo.merli@gmail.com>"]
 license = "Apache-2.0"
+repository = "https://github.com/merlimat/roble"
+# What nanometer, behind the default opentelemetry feature, declares; without
+# it roble builds on 1.95 (compio's executor) and roble-format on 1.89
+# (crc-fast), both found by building with each toolchain in turn.
+rust-version = "1.99"
 # bench and compat are never published; roble, roble-format and roble-cli
 # opt out of this.
 publish = false
