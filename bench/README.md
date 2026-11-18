@@ -383,6 +383,43 @@ the first time anything here has measured one. E is `scan-short`'s number,
 which it should be: 95% of E is that scan. A leaves `L0=2` where the `settle`
 before it left `L0=1`.
 
+### The three WAL modes
+
+What `--wal` costs a mix, roble alone, in the standard environment ("One core,
+512 MiB": one pinned CPU, 512 MiB with the page cache, a 256 MiB block cache)
+over the in-cache scenario's 1,400,000 records, each mix over a store loaded
+and settled for it. Medians of three rounds, the modes interleaved within each
+cell, with the slowest and fastest round beside them:
+
+| mix | `off` | `buffered` | `synced` | buffered/off | synced/off |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A (50% update) | 685,967 (553k–795k) | 342,588 (310k–439k) | 4,748 (4.0k–4.8k) | 0.50 | 0.007 |
+| B (5% update) | 745,603 (572k–934k) | 731,139 (663k–736k) | 45,438 (42.9k–46.2k) | 0.98 | 0.061 |
+| C (reads only) | 972,671 (958k–1,047k) | 985,433 (954k–1,002k) | 957,732 (933k–1,019k) | 1.01 | 0.98 |
+| D (5% insert) | 1,119,048 (1,038k–1,124k) | 982,075 (950k–988k) | 44,605 (44.3k–46.5k) | 0.88 | 0.040 |
+| E (5% insert, scans) | 77,637 (76.6k–78.1k) | 75,985 (74.0k–76.9k) | 29,666 (29.0k–30.0k) | 0.98 | 0.38 |
+| F (50% read-modify-write) | 550,275 (541k–573k) | 275,701 (276k–276k) | 4,988 (4.9k–5.0k) | 0.50 | 0.009 |
+
+Operations a second. Measured on the Linux VM, 2026-11-18, with `roble-bench`
+built with mimalloc.
+
+- **`synced` is an fsync per write**, about 330 µs each on this VM: A's and F's
+  p50 is 330 µs where `off`'s is 1 µs, and the process spends a tenth of the
+  CPU the other two do (1 s against 9 s of a 10 s run) because it is waiting.
+  YCSB writes one record per commit, so nothing amortises it; a caller that
+  batches pays it per batch. The number is the VM's virtual disk, whose cache
+  is the host's (UTM's `writeback`), and not a statement about any device.
+- **`buffered` is a log append per write**, a `write` into the page cache on
+  every commit, and halves the two mixes that are half writes. Where writes
+  are 5% it is within 2% of `off` on B and E, and 12% below it on D.
+- **C is the control**: no writes, so no mode has anything to do, and the
+  three agree within the rounds' spread.
+- `off` is Oxia's configuration and the one `run.sh` measures. Its rounds
+  spread widest on A and B (553k–795k and 572k–934k): at those rates a
+  memtable fills every few seconds, so how many flushes land inside a
+  ten-second run varies from round to round, which is the likely reason
+  rather than a measured one.
+
 ### Cross-checking against Pebble's own tool
 
 There is no Pebble column here any more, but `cmd/pebble` can still say
