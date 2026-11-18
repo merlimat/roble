@@ -7,7 +7,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "Puts, gets, scans and deletes the entries of a roble database, and inspects Pebble's files"
+keywords = ["pebble", "roble", "lsm", "sstable", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "roble"
