@@ -9,3 +9,13 @@ which is in `LICENSE` beside it.
 roble's `Version::l0_sublevels` to give the count Pebble prints. The other
 commands test Pebble's compaction picking, which roble does not share (§9),
 and are skipped. CI checks that the copy is still the file at the pin.
+
+`range_del` is Pebble's `testdata/range_del`, copied unchanged the same way.
+`tests/range_del.rs` builds each `define`'s LSM — memtables as a log it
+replays, tables written at their levels — and asks `get` and `iter` what Pebble
+answered. Every read there is at a sequence number, so each is asked of the
+LSM less its entries numbered at or above it, which is the same answer read at
+the newest one. Skipped: defines holding a MERGE, which roble refuses; two
+whose layers hold older sequence numbers than the layers below them, which no
+store writes and Pebble's own comment calls unnatural; and the reads after a
+`compact`, which are of Pebble's compaction.
