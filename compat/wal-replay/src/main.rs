@@ -47,6 +47,13 @@
 //! over the DEL it buries, with two older values below, and Pebble has to
 //! compact it and still find the key deleted
 //! (`harness/read-probes stays-deleted`).
+//!
+//! `--large-keys` creates a database of Pebble's `testdata/large_keys` keys,
+//! which share a megabyte of prefix: a block holds one or two of them, every
+//! index separator and table bound is a megabyte, and the edit naming the
+//! tables spans dozens of the MANIFEST's blocks. roble flushes, deletes,
+//! compacts with splits between them and rotates the MANIFEST, and Pebble
+//! reads the result (`harness/verify-wal`).
 
 use std::path::PathBuf;
 
@@ -56,7 +63,7 @@ async fn main() {
     let Some(dir) = args.next().map(PathBuf::from) else {
         eprintln!(
             "usage: wal-replay <database-dir> \
-             [--flush|--rotate|--compact|--settle|--no-wal|--swept|--checkpoint|--created|--kinds|--single-delete]"
+             [--flush|--rotate|--compact|--settle|--no-wal|--swept|--checkpoint|--created|--kinds|--single-delete|--large-keys]"
         );
         std::process::exit(2);
     };
@@ -73,6 +80,10 @@ async fn main() {
     }
     if mode.as_deref() == Some("--single-delete") {
         single_delete_run(&dir).await;
+        return;
+    }
+    if mode.as_deref() == Some("--large-keys") {
+        large_keys_run(&dir).await;
         return;
     }
     // Its own flag rather than a seventh place in the tuple below: a
@@ -633,6 +644,140 @@ async fn single_delete_run(dir: &PathBuf) {
     println!(
         "roble compacted a SingleDelete of k over the DEL it buried into table {table:06} as a \
          DEL, with k's first two values below it in L2 and L3"
+    );
+}
+
+/// Writes Pebble's large keys through every structure they stretch, and says
+/// what Pebble should find (`tests/large_keys.rs` holds the same keys to a
+/// `BTreeMap`).
+async fn large_keys_run(dir: &PathBuf) {
+    use roble::roble_format::batch::Batch;
+
+    let mut prefix = vec![b'a'];
+    prefix.resize(1_000_001, b'p');
+    let large = |word: &str| [prefix.clone(), word.as_bytes().to_vec()].concat();
+    let words = [
+        "arition",
+        "alling",
+        "eal",
+        "ellate",
+        "endectomy",
+        "etizers",
+        "etizing",
+        "laude",
+        "lauding",
+        "le",
+        "les",
+        "letini",
+        "letinis",
+        "lebottomjeans",
+        "lication",
+        "ly",
+        "lying",
+        "ollo",
+        "raisal",
+        "raisals",
+        "raiser",
+        "raisers",
+        "raising",
+        "rentice",
+        "rentices",
+        "renticing",
+        "roval",
+        "rovals",
+        "rove",
+    ];
+
+    let options = roble::Options::new()
+        .create_if_missing(true)
+        .disable_automatic_compactions(true)
+        .background_tasks(false)
+        .target_file_size(4_000_000);
+    let db = roble::open_with(&roble::DefaultEnv, dir, options)
+        .await
+        .unwrap_or_else(|e| fail(&format!("create {}: {e}", dir.display())));
+    let commit = async |batch: &mut Batch| {
+        db.write_raw(batch, true)
+            .await
+            .unwrap_or_else(|e| fail(&format!("write: {e}")));
+        db.flush()
+            .await
+            .unwrap_or_else(|e| fail(&format!("flush: {e}")))
+            .unwrap_or_else(|| fail("flush wrote nothing"));
+    };
+
+    let mut model = std::collections::BTreeMap::new();
+    let mut batch = Batch::new();
+    for word in words {
+        batch
+            .put(&large(word), b"value")
+            .unwrap_or_else(|e| fail(&format!("put: {e}")));
+        model.insert(large(word), b"value".to_vec());
+    }
+    commit(&mut batch).await;
+
+    let mut deleted = Vec::new();
+    let mut batch = Batch::new();
+    batch
+        .put(&large("eal"), b"again")
+        .unwrap_or_else(|e| fail(&format!("put: {e}")));
+    model.insert(large("eal"), b"again".to_vec());
+    for word in ["le", "rove", "arition"] {
+        batch
+            .delete(&large(word))
+            .unwrap_or_else(|e| fail(&format!("delete: {e}")));
+        model.remove(&large(word));
+        deleted.push(large(word));
+    }
+    batch
+        .delete_range(&large("lication"), &large("raisal"))
+        .unwrap_or_else(|e| fail(&format!("delete_range: {e}")));
+    let (lo, hi) = (large("lication"), large("raisal"));
+    deleted.extend(model.keys().filter(|k| lo <= **k && **k < hi).cloned());
+    model.retain(|k, _| !(lo <= *k && *k < hi));
+    commit(&mut batch).await;
+
+    let l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    let l1 = db
+        .compact(0, &l0)
+        .await
+        .unwrap_or_else(|e| fail(&format!("compact into L1: {e}")));
+    if l1.len() < 2 {
+        fail(&format!(
+            "the merge did not split between megabyte keys: {l1:?}"
+        ));
+    }
+    let l2 = db
+        .compact(1, &l1)
+        .await
+        .unwrap_or_else(|e| fail(&format!("compact into L2: {e}")));
+    let manifest = db
+        .rotate_manifest()
+        .await
+        .unwrap_or_else(|e| fail(&format!("rotate: {e}")));
+    db.remove_obsolete_files()
+        .await
+        .unwrap_or_else(|e| fail(&format!("sweep: {e}")));
+
+    let mut out = String::new();
+    for (k, v) in &model {
+        out.push_str(&format!("{} {}\n", hex(k), hex(v)));
+    }
+    for k in &deleted {
+        out.push_str(&format!("deleted {}\n", hex(k)));
+    }
+    std::fs::write(dir.join("roble-wrote.txt"), out)
+        .unwrap_or_else(|e| fail(&format!("write the expectation: {e}")));
+    println!(
+        "roble wrote {} megabyte keys and deleted {} into tables {l2:?} at L2, named by {manifest}",
+        model.len(),
+        deleted.len()
     );
 }
 

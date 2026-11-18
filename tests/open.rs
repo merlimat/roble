@@ -911,6 +911,10 @@ async fn a_manifest_record_that_does_not_frame_is_refused_with_its_number() {
     // A record whose checksum does not match its bytes. The number says which
     // one, and that the records before it were read — a MANIFEST is a
     // sequence, and where it stops being readable is the useful fact.
+    //
+    // A record after it, because damage to the last one is indistinguishable
+    // from a crash tearing it, and that opens to the edits before it
+    // (`a_manifest_torn_in_its_last_edit_opens_and_stays_openable`).
     let edit = VersionEdit {
         comparer_name: Some(BYTEWISE.to_string()),
         next_file_num: Some(10),
@@ -920,9 +924,11 @@ async fn a_manifest_record_that_does_not_frame_is_refused_with_its_number() {
     let mut writer = RecordWriter::legacy();
     writer.write_record(&edit.encode()).expect("frame");
     writer.write_record(&edit.encode()).expect("frame");
+    let second_ends = writer.as_bytes().len();
+    writer.write_record(&edit.encode()).expect("frame");
     let mut bytes = writer.finish();
     // Corrupt the payload of the second record, leaving its checksum stale.
-    let at = bytes.len() - 1;
+    let at = second_ends - 1;
     bytes[at] ^= 0xff;
 
     let (env, dir) = Synth {
@@ -1227,4 +1233,118 @@ async fn a_task_of_its_own_can_be_the_one_that_flushes() {
         1,
         "a store that said it was finished should have been let go of"
     );
+}
+
+/// The store's one MANIFEST and its durable bytes.
+async fn manifest_of(env: &SimEnv, dir: &Path) -> (PathBuf, Vec<u8>) {
+    let names: Vec<PathBuf> = env
+        .sim()
+        .list(dir)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|e| dir.join(e.name))
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("MANIFEST-")
+        })
+        .collect();
+    let [path] = &names[..] else {
+        panic!("one MANIFEST was expected, found {names:?}");
+    };
+    let bytes = env.sim().durable(path).expect("the MANIFEST");
+    (path.clone(), bytes)
+}
+
+/// A store with `a` flushed and `b` only in the log, and, with `flush`, a
+/// second flush whose edit is the one torn below.
+async fn flushed_once(env: &SimEnv, dir: &Path, flush: bool) {
+    let db = roble::open_with(
+        env,
+        dir,
+        roble::Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("create");
+    db.put(b"a", b"1").await.expect("put");
+    db.flush().await.expect("flush");
+    db.put(b"b", b"2").await.expect("put");
+    if flush {
+        db.flush().await.expect("flush");
+    }
+}
+
+#[compio::test]
+async fn a_manifest_torn_in_its_last_edit_opens_and_stays_openable() {
+    // A crash between appending an edit and syncing it can leave the
+    // MANIFEST ending partway through the edit: cut short, or as long as it
+    // should be with the unwritten part read back as zeros. Either way the
+    // edit was never acknowledged, and the store opens to the one before it
+    // with what the edit would have flushed still in the log — as Pebble
+    // opens it. Then it has to stay openable: the next edit must not be
+    // appended after the torn bytes, where a replay would read it as part of
+    // them. `tests/large_keys.rs` tears an edit dozens of blocks long; this
+    // tears a short one at every byte.
+    let dir = PathBuf::from("/db");
+    let finished = SimEnv::new();
+    flushed_once(&finished, &dir, true).await;
+    let (_, full) = manifest_of(&finished, &dir).await;
+
+    let before = SimEnv::new();
+    flushed_once(&before, &dir, false).await;
+    before.sim().crash();
+    let (path, start) = manifest_of(&before, &dir).await;
+    assert!(full.len() > start.len() && full.starts_with(&start));
+
+    for cut in start.len() + 1..full.len() {
+        for zeroed in [false, true] {
+            let when = format!(
+                "cut at {cut} of {}{}",
+                full.len(),
+                if zeroed { ", zero-filled" } else { "" }
+            );
+            let mut torn = full[..cut].to_vec();
+            if zeroed {
+                torn.resize(full.len(), 0);
+            }
+            let env = SimEnv::new();
+            for e in before.sim().list(&dir).await.expect("list") {
+                let p = dir.join(&e.name);
+                let bytes = if p == path {
+                    torn.clone()
+                } else {
+                    before.sim().durable(&p).expect("a file")
+                };
+                write(env.sim(), &p, &bytes).await;
+            }
+            env.sim().sync_dir(&dir).await.expect("sync dir");
+
+            let db = roble::open(&env, &dir)
+                .await
+                .unwrap_or_else(|e| panic!("{when}: the store did not open: {e}"));
+            assert_eq!(
+                db.versions().version.level(0).len(),
+                1,
+                "{when}: the torn edit was applied"
+            );
+            for (k, v) in [(&b"a"[..], &b"1"[..]), (b"b", b"2")] {
+                let found = db.get(k, roble::Comparison::Equal).await.expect("get");
+                assert_eq!(found.map(|f| f.value).as_deref(), Some(v), "{when}: {k:?}");
+            }
+            db.flush().await.expect("flush");
+            drop(db);
+            let db = roble::open(&env, &dir)
+                .await
+                .unwrap_or_else(|e| panic!("{when}: the store did not open a second time: {e}"));
+            assert_eq!(
+                db.versions().version.level(0).len(),
+                2,
+                "{when}: the flush after it was lost"
+            );
+        }
+    }
 }

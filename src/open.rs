@@ -388,7 +388,7 @@ async fn open_dir<E: Env>(
     }
 
     // 6. Replay it.
-    let edits = read_version_edits(
+    let ManifestEdits { edits, torn } = read_version_edits(
         &fs,
         &dir.join(&manifest_filename),
         parsed.file_num,
@@ -587,6 +587,14 @@ async fn open_dir<E: Env>(
         }),
         owner: true,
     };
+    // A MANIFEST that ended in a torn edit is not appended to again: the
+    // next edit would land after the torn bytes, and a replay stops there.
+    // So the store moves to a fresh one now, before anything can append,
+    // as Pebble starts a fresh MANIFEST on every open. The old one is
+    // collected with the next sweep.
+    if torn {
+        db.rotate_manifest().await?;
+    }
     if !read_only && options.background_tasks {
         db.spawn_background(env);
     }
@@ -679,17 +687,43 @@ pub(crate) fn retired(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Err
     }
 }
 
+/// Every version edit in a MANIFEST, and whether it ended in a torn one.
+struct ManifestEdits {
+    edits: Vec<VersionEdit>,
+    /// A last edit that was cut short, and so was never applied. Nothing may
+    /// be appended after it: the store moves to a fresh MANIFEST instead.
+    torn: bool,
+}
+
 /// Reads every version edit in a MANIFEST.
+///
+/// **A torn last edit ends it**, as a torn last record ends the last log. A
+/// crash between appending an edit and syncing it can leave the file ending
+/// partway through that edit: cut short, or with its tail zero-filled. The
+/// edit was never acknowledged, so the version is the one before it, and
+/// Pebble opens such a MANIFEST the same way (`versionSet.load` stops at the
+/// first record that does not read). The edit is easily dozens of the log's
+/// 32 KiB blocks long when its tables' bounds are long keys, which is what
+/// `tests/large_keys.rs` tears it across.
+///
+/// **Damage before the end is still refused**, where Pebble would stop at it
+/// too. An edit that fails to read with records after it was not torn by a
+/// crash, since nothing is appended after a failed append; and stopping there
+/// would drop the edits after it, whose tables the sweep would then delete
+/// as obsolete with the logs they replaced already gone. So the edit counts
+/// as torn only when the chunk that failed runs to the end of the file, or
+/// the record does, or everything from that chunk on is zero.
 ///
 /// A reader may find the writer halfway through appending to it, so for a
 /// reader a record that does not read is stale rather than corrupt: opening
-/// again reads it whole, or, if it is damage, keeps failing on it.
+/// again reads it whole, or, if it is damage, keeps failing on it. That
+/// holds for a torn tail too, which to a reader is an edit still arriving.
 async fn read_version_edits<F: Fs>(
     fs: &F,
     path: &Path,
     file_num: u64,
     read_only: bool,
-) -> Result<Vec<VersionEdit>> {
+) -> Result<ManifestEdits> {
     let disk = fs
         .open(path, Access::ReadOnly)
         .await
@@ -699,17 +733,34 @@ async fn read_version_edits<F: Fs>(
     // The file number is passed even though a MANIFEST's chunks are legacy and
     // carry none, so that one which turns out to be recyclable is checked
     // rather than waved through.
-    let reader = RecordReader::new(&bytes, file_num as u32);
+    let mut reader = RecordReader::new(&bytes, file_num as u32);
     let mut edits = Vec::new();
-    for record in reader {
-        let record = record.map_err(|e| {
-            let m = format!("{}: record {}: {e}", path.display(), edits.len());
-            if read_only {
-                Error::Stale(m)
-            } else {
-                Error::Corrupt(m)
+    let mut torn = false;
+    // Where the last edit that read ends. Bytes after it at a clean end are a
+    // tear too: a header cut off within its first seven bytes reads as block
+    // padding and ends the stream, and the next edit appended after it would
+    // be framed against those bytes and read as garbage. At worst they are
+    // padding a writer closed with, and a fresh MANIFEST costs one snapshot.
+    let mut good = 0;
+    while let Some(record) = reader.next() {
+        let record = match record {
+            Ok(record) => {
+                good = reader.offset();
+                record
             }
-        })?;
+            Err(_) if !read_only && torn_tail(&bytes, reader.offset()) => {
+                torn = true;
+                break;
+            }
+            Err(e) => {
+                let m = format!("{}: record {}: {e}", path.display(), edits.len());
+                return Err(if read_only {
+                    Error::Stale(m)
+                } else {
+                    Error::Corrupt(m)
+                });
+            }
+        };
         edits.push(VersionEdit::decode(&record)?);
     }
     if edits.is_empty() {
@@ -718,7 +769,35 @@ async fn read_version_edits<F: Fs>(
             path.display()
         )));
     }
-    Ok(edits)
+    let torn = torn || (!read_only && good < bytes.len());
+    Ok(ManifestEdits { edits, torn })
+}
+
+/// Whether a record that failed to read, at the chunk starting at `at`, is
+/// the torn end of the file rather than damage with something after it.
+///
+/// `at` is where the reader stopped: the chunk it could not read, or the end
+/// of the file when the record ran into it. A torn chunk is the last thing
+/// in the file that was written. What follows it either is not there at all
+/// or is a tail that never received its bytes and reads as zeros, so the
+/// written bytes from `at` on — the file less its trailing zeros — fit
+/// inside that one chunk: less than its header, or no more than its header
+/// and the length the header claims. Bytes written past the chunk are
+/// something else, appended after it, and that is damage.
+fn torn_tail(bytes: &[u8], at: usize) -> bool {
+    use roble_format::record::LEGACY_HEADER_LEN;
+    let Some(rest) = bytes.get(at..) else {
+        return true;
+    };
+    let written = &rest[..rest.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)];
+    if written.len() < LEGACY_HEADER_LEN {
+        return true;
+    }
+    // A MANIFEST's chunks are legacy: seven bytes of header, the length at
+    // four. One whose header was itself damaged claims an arbitrary length,
+    // which is no worse: it is torn only if that length covers what is left.
+    let size = u16::from_le_bytes([written[4], written[5]]) as usize;
+    LEGACY_HEADER_LEN + size >= written.len()
 }
 
 /// The MANIFEST a store appends to, and the marker that names it.

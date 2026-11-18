@@ -1039,6 +1039,22 @@ than opening without it**: ignoring one silently discards writes that were
 already acknowledged. With `Wal::Off` there is nothing to replay and the
 database opens as of the last flush.
 
+The MANIFEST ends the same way. A crash between appending an edit and syncing
+it can leave the file ending partway through that edit, cut short or with its
+unwritten tail read back as zeros, and the edit was never acknowledged: the
+version is the one before it, and whatever it would have flushed is still in
+the logs. Pebble opens such a MANIFEST too (`versionSet.load` stops at the
+first record that does not read). roble then moves to a fresh MANIFEST before
+anything can append, as Pebble does on every open, because an edit appended
+after the torn bytes is one the next replay would stop short of. Damage
+*before* the end is still refused, where Pebble would stop there as well: an
+edit that fails to read with written bytes after it was not torn by a crash,
+and stopping at it would drop the edits after it — whose tables the sweep
+would then delete, with the logs they replaced already gone. The test is that
+the written bytes from the failed chunk on, less trailing zeros, fit inside
+that chunk. Edits naming long keys run to dozens of the MANIFEST's 32 KiB
+blocks, and `tests/large_keys.rs` tears one at every block boundary.
+
 ### Reading beside a writer
 
 `open_read_only(env, dir, options)` opens a database to read while another
@@ -1871,7 +1887,7 @@ in both directions.
   opens it, scans it, verifies it with the `pebble` tool, checkpoints it; roble opens
   that checkpoint and compares. Then the reverse. **This is the gate: a change
   that breaks it is a broken change**, including a performance change.
-  `compat/wal-replay` runs it in ten modes, and the strongest is `--created`:
+  `compat/wal-replay` runs it in twelve modes, and the strongest is `--created`:
   it is handed a path and nothing else, so when Pebble opens the result every
   byte in the directory — MANIFEST, both markers, the log, the tables — was
   written by roble. Every other mode starts from a database Pebble built, which
@@ -1896,6 +1912,14 @@ in both directions.
   every `get`, both scans and a compaction must each give the undamaged
   store's answer or that mismatch, something must notice every block, and a
   compaction that fails must leave the version as it was.
+- **Keys far larger than a block.** Every other test writes short keys, so a
+  block holds many, a separator is short and a MANIFEST edit is one chunk.
+  `tests/large_keys.rs` writes Pebble's own `testdata/large_keys` keys, which
+  share a megabyte of prefix, and holds them to a `BTreeMap` through flushes,
+  compactions that split between them, a MANIFEST rotation, reopens and a
+  crash; then tears the two-megabyte edit naming such a table at every block
+  boundary, which must open to the edit before. `compat/wal-replay
+  --large-keys` hands the same store to Go Pebble.
 - **Model-based property tests**, as encina's: random sequences of writes,
   deletes, range deletes, gets under every comparison, scans forward and
   reverse, flushes, compactions and reopens, checked against a `BTreeMap`, with
