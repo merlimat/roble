@@ -1950,6 +1950,16 @@ in both directions.
   the last `flush()` with `Wal::Off`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or
   a half-rotated marker must leave the database openable.
+- **A real process, killed.** `SimFs` is not what a store runs on, so
+  `tests/crash_loop.rs` runs the store on `FileFs` in a child process — with
+  its own background flushes and compactions on, small memtables and tables,
+  and a MANIFEST rotated every few edits — and kills it with SIGKILL at a
+  random moment, sometimes mid-recovery. The parent reopens and requires every
+  acknowledged batch, and at most the one in flight, in every round so far.
+  A kill keeps the page cache, so this is not a durability test; it is that no
+  moment a process can die at leaves a directory that will not open, or one
+  that lost or invented a write. CI runs 20 kills; `ROBLE_CRASH_LOOP_ROUNDS`
+  runs more, as on the Linux VM, where the I/O goes through io_uring.
 - **Overlap paths**, by the same method. Nothing the simulated filesystem does
   blocks — every operation finishes in the call that starts it, which is what
   makes a replay a replay — so two of a store's operations can never interleave
