@@ -414,6 +414,61 @@ fn reads_back(codec: roble_format::block::Codec) {
     assert_eq!(read_back, tombstones);
 }
 
+/// roble writes a single-level index however long it grows (DESIGN.md §3),
+/// where Pebble would partition one past `IndexBlockSize`, the block size.
+#[test]
+fn an_index_longer_than_a_block_is_still_one_block() {
+    use roble_format::sst::{TableWriter, WriterOptions};
+    use roble_format::{InternalKey, Kind};
+
+    const BLOCK_SIZE: usize = 512;
+    let mut w = TableWriter::new(WriterOptions::default().block_size(BLOCK_SIZE)).expect("writer");
+    let mut keys = Vec::new();
+    for i in 0..4000u64 {
+        let user_key = format!("/shard-0000/bucket-{:02}/key-{i:010}", i / 1000).into_bytes();
+        let key = InternalKey {
+            user_key: &user_key,
+            seq_num: 1 + i,
+            kind: Kind::Set,
+            obsolete: false,
+        };
+        w.add(key, &[0x5a; 64]).expect("add");
+        keys.push(user_key);
+    }
+    let bytes = w.finish().expect("finish");
+    let table = Table::open(&bytes).expect("open");
+
+    let index = table.decode_block(table.footer().index).expect("index");
+    assert!(
+        index.as_slice().len() > 16 * BLOCK_SIZE,
+        "the index is meant to be many blocks long, not {} bytes",
+        index.as_slice().len()
+    );
+    assert!(!table.has_two_level_index());
+    assert_eq!(
+        table
+            .properties()
+            .get("rocksdb.block.based.table.index.type"),
+        Some(&0u32.to_le_bytes()[..]),
+        "0 is Pebble's binarySearchIndex"
+    );
+    let entries = table.index_entries().expect("index entries");
+    assert_eq!(
+        Some(entries.len() as u64),
+        table.properties().num_data_blocks().expect("property"),
+        "the one index block points at every data block"
+    );
+
+    let mut got = Vec::new();
+    table
+        .for_each_entry(|key, _| {
+            got.push(key.user_key.to_vec());
+            Ok(())
+        })
+        .expect("walk");
+    assert_eq!(got, keys);
+}
+
 #[test]
 fn the_writer_refuses_what_roble_does_not_write() {
     use roble_format::sst::{TableWriter, WriterOptions};

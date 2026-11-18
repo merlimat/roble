@@ -260,7 +260,7 @@ shard, which is the case for `SINGLEDEL` and `DELSIZED`.
 |---|---|---|
 | sstable, Pebblev4 down to Pebblev1 | yes | Pebblev4 only |
 | In-place value prefix byte on `SET` (Pebblev3+) | yes | yes |
-| Two-level index blocks | yes | yes, when the index outgrows a block |
+| Two-level index blocks | yes | **no**; one index block, however long |
 | Value blocks and value handles | yes | **no** |
 | Range-deletion blocks, v2 (`rocksdb.range_del2`) | yes | yes |
 | Range-deletion blocks, v1 (`rocksdb.range_del`) | **error** | never written |
@@ -311,9 +311,19 @@ or corrupting a Go reader; reading one means getting it right or failing loudly.
   skip a key; set it wrongly and Go Pebble skips a live one — wrong results, in
   the other implementation, with no corruption error anywhere. Always-zero is
   correct and legal.
-- **Two-level indexes are written**, which is not a choice. Oxia leaves
-  `TargetFileSizes` at Pebble's default — 2 MiB at L0, doubling per level — so a
-  deep file runs to ~128 MiB and its index is many blocks long.
+- **No two-level index.** Every table gets a single-level index, one block
+  however long, which is valid Pebble at any size. Pebble partitions its index
+  once it outgrows `IndexBlockSize`, which defaults to the block size, 16 KiB,
+  and Oxia sets neither. A deep table does outgrow it: Oxia leaves
+  `TargetFileSizes` at Pebble's default, 2 MiB at L0 and doubling per level, so
+  an L6 table runs to 128 MiB, and with the bench's keys its index is 0.46 MiB
+  uncompressed and 1.3 to 3.8 MiB under Snappy, where Pebble would write 29 to
+  238 partitions. Partitions would buy roble nothing, because its table reader
+  fetches every one when it opens a table and flattens them into the one index
+  the table cache holds (§8). A two-level file would cost it a read per
+  partition at open and save none. Partitions pay only for a reader that loads
+  them as it needs them: Go Pebble after a rollback, or a roble reader built
+  the same way, which is the change to make before writing them.
 - **The value prefix byte is block decoding, not a value-block detail.** In a
   Pebblev3+ table every `SET` value is one prefix byte followed by the value,
   value block or not. A Pebblev2 table has no such byte, so the reader branches
