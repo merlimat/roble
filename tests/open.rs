@@ -428,6 +428,30 @@ async fn a_comparer_other_than_bytewise_is_refused() {
 }
 
 #[compio::test]
+async fn a_write_that_would_number_past_the_trailer_is_refused() {
+    // A MANIFEST at the last sequence number a key holds leaves none for the
+    // next write. No store gets there by writing; a damaged one can claim
+    // to, and its next write is refused rather than numbered past the end,
+    // where the bits the trailer has no room for would be lost.
+    let (env, dir) = Synth {
+        edits: vec![VersionEdit {
+            comparer_name: Some(BYTEWISE.to_string()),
+            next_file_num: Some(10),
+            last_seq_num: Some(roble_format::key::SEQ_NUM_MAX),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .build()
+    .await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    match db.put(b"a", b"1", roble::Durability::NoSync).await {
+        Err(Error::Corrupt(m)) => assert!(m.contains("largest one a key holds"), "got: {m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[compio::test]
 async fn a_table_in_the_manifest_but_not_on_disk_is_refused() {
     // The shape of a checkpoint that was streamed short.
     let (env, dir) = Synth {

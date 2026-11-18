@@ -31,8 +31,7 @@ use roble_format::manifest::{NUM_LEVELS, NewTable, VersionEdit};
 
 use crate::error::{Error, Result};
 
-/// The comparer roble supports, and the only one Oxia leaves behind (§3).
-pub const BYTEWISE_COMPARER: &str = "leveldb.BytewiseComparator";
+pub(crate) use roble_format::sst::BYTEWISE_COMPARER;
 
 /// One table in a version, as the MANIFEST describes it.
 ///

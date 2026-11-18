@@ -1008,6 +1008,15 @@ impl<F: Fs> Db<F> {
         let _writing = self.store.writers.begin().await;
 
         let base = self.store.next_seq.get();
+        // Every number the batch takes has to fit a key's trailer. Only a
+        // database whose files claim some 2^56 writes gets anywhere near
+        // this, so it is refused as theirs rather than numbered past the end.
+        if base.saturating_add(u64::from(batch.count())) > roble_format::key::SEQ_NUM_MAX + 1 {
+            return Err(Error::Corrupt(format!(
+                "a batch of {} at sequence number {base} would run past the largest one a key holds",
+                batch.count()
+            )));
+        }
         batch.set_seq_num(base);
 
         if !self.store.disable_wal {

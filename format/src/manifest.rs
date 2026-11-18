@@ -145,7 +145,18 @@ impl VersionEdit {
                 TAG_LOG_NUMBER => edit.min_unflushed_log_num = Some(take_uvarint(&mut src)?),
                 TAG_PREV_LOG_NUMBER => edit.obsolete_prev_log_num = Some(take_uvarint(&mut src)?),
                 TAG_NEXT_FILE_NUMBER => edit.next_file_num = Some(take_uvarint(&mut src)?),
-                TAG_LAST_SEQUENCE => edit.last_seq_num = Some(take_uvarint(&mut src)?),
+                TAG_LAST_SEQUENCE => {
+                    let n = take_uvarint(&mut src)?;
+                    // No writer hands out a number the trailer cannot hold,
+                    // and a store resuming from one would number its next
+                    // write past it.
+                    if n > crate::key::SEQ_NUM_MAX {
+                        return Error::corrupt(format!(
+                            "version edit's last sequence number {n} is past the largest one a key holds"
+                        ));
+                    }
+                    edit.last_seq_num = Some(n);
+                }
                 TAG_COMPACT_POINTER => {
                     // RocksDB stopped using these; Pebble reads and drops them.
                     let _level = take_level(&mut src)?;
@@ -386,6 +397,26 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A last sequence number the trailer cannot hold was written by
+    /// nothing, and a store resuming from it would number its next write
+    /// past the end, so it is refused where it is read.
+    #[test]
+    fn a_last_sequence_number_past_the_trailer_is_refused() {
+        let at = |n| {
+            let edit = VersionEdit {
+                last_seq_num: Some(n),
+                ..Default::default()
+            };
+            VersionEdit::decode(&edit.encode())
+        };
+        let max = crate::key::SEQ_NUM_MAX;
+        assert_eq!(
+            at(max).expect("the largest is fine").last_seq_num,
+            Some(max)
+        );
+        assert!(matches!(at(max + 1), Err(Error::Corrupt(_))));
+    }
 
     fn sample() -> VersionEdit {
         VersionEdit {

@@ -34,7 +34,7 @@
 //!   before the current entry and scans forward to the entry that ends where
 //!   the current one begins. It keeps every entry that scan decodes, so the
 //!   rescan happens once per restart interval rather than once per step
-//!   ([`Behind`]), and a reverse scan decodes each entry about twice where a
+//!   (`Behind`), and a reverse scan decodes each entry about twice where a
 //!   forward one decodes it once.
 //! - **The search is for the *last* restart at or before the target**, not the
 //!   first one after it. Landing one interval late skips entries that belong to
