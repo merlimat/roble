@@ -1917,8 +1917,12 @@ in both directions.
   — to be where the map says after each move. A snapshot is read both ways
   against the map as it stood when it was taken, after the writes, flushes and
   compactions since. A read through an open batch sees the map with the batch's
-  writes laid over it, and a commit applies them. CI runs ten seeds; `SEEDS`,
-  `SEED`, `SEGMENTS` and `OPS` run more or replay one.
+  writes laid over it, and a commit applies them. One turn in three kills itself
+  at a random point instead of closing, and the next, the other engine's, opens
+  what it left: the script is cut where the killed turn stopped, and a write it
+  had under way is decided by reading a key the two outcomes disagree on, so
+  every acknowledged write must be there and nothing else. CI runs ten seeds;
+  `SEEDS`, `SEED`, `SEGMENTS` and `OPS` run more or replay one.
 - **A number Pebble will not export is pinned by a fixture instead.** The first
   sequence number a key may be given is `base.SeqNumStart`, in one of Pebble's
   internal packages, so it cannot be asserted against the symbol the way
