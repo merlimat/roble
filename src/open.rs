@@ -273,8 +273,8 @@ pub(crate) struct Store<F: Fs> {
 
 /// Opens the database in `dir` with the defaults.
 ///
-/// A store that shares a thread with others, or that wants Oxia's
-/// configuration, is opened with [`open_with`] instead (§8, §11).
+/// A store that shares a thread with others, or that wants any other
+/// setting, is opened with [`open_with`] instead (§8, §11).
 pub async fn open<E: Env>(env: &E, dir: impl AsRef<Path>) -> Result<Db<E::Fs>> {
     open_with(env, dir, crate::options::Options::default()).await
 }
@@ -1441,7 +1441,7 @@ impl<F: Fs> Db<F> {
     /// How many bytes of writes no table holds yet.
     ///
     /// What a caller watches to decide when to flush: §8 sizes a memtable at
-    /// 4 MiB, to match Oxia.
+    /// 4 MiB, Pebble's `MemTableSize`.
     pub fn unflushed_bytes(&self) -> usize {
         self.memtables_each().map(|m| m.borrow().bytes()).sum()
     }
@@ -1925,8 +1925,7 @@ impl<F: Fs> Db<F> {
         let _ = self.disk_usage().await;
     }
 
-    /// Bytes of every file in this store's directory, which is Oxia's
-    /// `DiskSpaceUsage`.
+    /// Bytes of every file in this store's directory.
     ///
     /// Measured from the directory rather than summed from the version, so it
     /// takes in the MANIFEST, the logs, the markers and anything obsolete the
@@ -1936,8 +1935,7 @@ impl<F: Fs> Db<F> {
     /// which is a sum of what it believes rather than of what is there.
     ///
     /// It walks the directory, so it is a call to make when something asks
-    /// and not one to make on a timer. Oxia memoizes Pebble's for five
-    /// seconds for that reason ([METRICS.md](../METRICS.md)).
+    /// and not one to make on a timer.
     pub async fn disk_usage(&self) -> Result<u64> {
         let usage = self.store.fs.disk_usage(&self.store.dir).await?;
         self.store.metrics.disk_size.set(usage.used_bytes as i64);

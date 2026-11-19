@@ -21,13 +21,13 @@
 //!                carry one — each length-prefixed with a uvarint
 //! ```
 //!
-//! **These bytes are a replication contract, not an internal encoding.** Oxia
-//! checksums the whole repr, header included, and compares that checksum
-//! across replicas (`oxiad/dataserver/database/db.go`). A Go batch and a roble
-//! batch of the same operations that differ by one byte produce different
-//! checksums, and the disagreement surfaces as a replica mismatch rather than
-//! as a format error — so roble uses Pebble's encoding rather than one of its
-//! own (DESIGN.md §6).
+//! **These bytes are a contract, not an internal encoding.** A caller may
+//! checksum the whole repr, header included, and compare it with a checksum
+//! taken somewhere else — on another replica, say, which may be running Go
+//! Pebble. A Go batch and a roble batch of the same operations that differ by
+//! one byte produce different checksums, and the disagreement surfaces as a
+//! mismatch between the two rather than as a format error — so roble uses
+//! Pebble's encoding rather than one of its own (DESIGN.md §6).
 //!
 //! The checksum is taken *before* commit, so what it covers is an uncommitted
 //! repr whose sequence-number field is still zero. That is measured, not
@@ -84,14 +84,15 @@ impl Batch {
         }
     }
 
-    /// Empties the batch without releasing its buffer, as `clear()` does in
-    /// Oxia's write path (DESIGN.md §6).
+    /// Empties the batch without releasing its buffer, so the next batch
+    /// built in it starts with the room this one had.
     pub fn clear(&mut self) {
         self.repr.truncate(HEADER_LEN);
         self.repr[..HEADER_LEN].fill(0);
     }
 
-    /// The whole representation, header included: the bytes Oxia checksums.
+    /// The whole representation, header included: byte-identical to Go
+    /// Pebble's for the same operations, and so the bytes to checksum.
     pub fn as_bytes(&self) -> &[u8] {
         &self.repr
     }
@@ -161,9 +162,8 @@ impl Batch {
 
     /// Reserves room for a value and lets the caller write it in place.
     ///
-    /// This is what Oxia's `PutMarshalable` needs: marshal the protobuf once,
-    /// into the batch, instead of into a temporary that is then copied
-    /// (DESIGN.md §11).
+    /// So a value — a protobuf, say — is serialized once, into the batch,
+    /// instead of into a temporary that is then copied (DESIGN.md §11).
     pub fn put_with<F>(&mut self, key: &[u8], value_len: usize, fill: F) -> Result<()>
     where
         F: FnOnce(&mut [u8]),

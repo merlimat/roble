@@ -54,10 +54,10 @@ use crate::key::{InternalKey, Kind, TRAILER_LEN};
 use crate::rangedel;
 use crate::sst::reader::BYTEWISE_COMPARER;
 
-/// The merger name Pebble records by default, which Oxia leaves alone.
+/// The merger name Pebble records by default, and the one roble records.
 pub const CONCATENATE_MERGER: &str = "pebble.concatenate";
 
-/// Oxia's block size, and so roble's default (DESIGN.md §1).
+/// roble's default target size of a data block.
 pub const DEFAULT_BLOCK_SIZE: usize = 16 * 1024;
 
 /// The one table format roble writes.
@@ -100,8 +100,8 @@ impl WriterOptions {
     /// Bits per key for the bloom filter, or `None` to write no filter block.
     ///
     /// A table without one is format-legal and Go Pebble reads it, but it
-    /// throws away the point-lookup filtering Oxia configures, so the default
-    /// matches Oxia's `bloom.FilterPolicy(10)` (DESIGN.md §1).
+    /// throws away point-lookup filtering, so the default is
+    /// [`filter::DEFAULT_BITS_PER_KEY`].
     pub fn filter_bits_per_key(mut self, bits: Option<usize>) -> Self {
         self.filter_bits_per_key = bits;
         self

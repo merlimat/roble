@@ -141,9 +141,9 @@ impl DiskUsage {
 
 /// The filesystem a database lives in: Pebble's `vfs.FS` in Rust terms.
 ///
-/// Every path a store touches goes through here, which is what lets Oxia
-/// inject its own — and what lets roble's tests fail or crash any single
-/// operation (§12).
+/// Every path a store touches goes through here, which is what lets an
+/// application supply its own — and what lets roble's tests fail or crash
+/// any single operation (§12).
 ///
 /// **A handle, not a thing.** `Clone` is part of the trait because a store
 /// keeps the filesystem it was opened in rather than borrowing it, and that
@@ -199,7 +199,8 @@ pub trait Fs: Clone + 'static {
     /// disk, which is how an LSM loses a table it believes it wrote.
     fn sync_dir(&self, dir: &Path) -> impl Future<Output = Result<()>>;
 
-    /// How much space the directory's files take, for Oxia's `DiskSpaceUsage`.
+    /// How much space the directory's files take, for
+    /// [`Db::disk_usage`](crate::Db::disk_usage).
     fn disk_usage(&self, dir: &Path) -> impl Future<Output = Result<DiskUsage>>;
 
     /// Takes the database directory's lock, keeping out a second owner.

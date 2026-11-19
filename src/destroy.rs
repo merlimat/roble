@@ -67,7 +67,7 @@ impl<F: Fs> Db<F> {
     /// Waits for the store's background work to stop first, as
     /// [`Db::close`] does.
     ///
-    /// Oxia's `KV.Delete`. Returns the names of the files it removed.
+    /// Returns the names of the files it removed.
     ///
     /// The database's directory is left behind, empty: see the module's
     /// documentation for that and for the order of what follows. A

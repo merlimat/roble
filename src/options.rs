@@ -40,8 +40,8 @@ use roble_format::block::Codec;
 #[non_exhaustive]
 pub enum Wal {
     /// No log. A write reaches the memtable and nothing else, and is durable
-    /// only once a [`flush`](crate::Db::flush) has written it to a table:
-    /// Oxia's configuration, since its own replication log is the source of
+    /// only once a [`flush`](crate::Db::flush) has written it to a table: for
+    /// a caller whose own log, such as a replication log, is the source of
     /// truth.
     Off,
     /// Every write is appended to the log before it is applied, and the log
@@ -136,15 +136,14 @@ impl<F: Fs> Options<F> {
     /// How writes reach the write-ahead log, and so how durable a write is
     /// when it returns: [`Wal::Synced`] by default.
     ///
-    /// One setting for the store rather than a flag on every write, as Oxia
-    /// configures Pebble: its `UseWAL` and `SyncData` are the store's, and
-    /// every commit is made with them.
+    /// One setting for the store rather than a flag on every write: every
+    /// commit is made with it.
     ///
-    /// [`Wal::Off`] is Oxia's configuration (§1): its replication log is the
-    /// source of truth, so the store need only be durable at
-    /// [`Db::flush`](crate::Db::flush), and Oxia replays everything after
-    /// that. A write then reaches the memtable and nothing else, and a crash
-    /// takes the database back to its last flush.
+    /// [`Wal::Off`] is for a caller with a log of its own, such as a
+    /// replication log, that is the source of truth: the store need only be
+    /// durable at [`Db::flush`](crate::Db::flush), and the caller replays
+    /// everything after that. A write then reaches the memtable and nothing
+    /// else, and a crash takes the database back to its last flush.
     ///
     /// It does not stop a log being *read*. A database written with a WAL and
     /// reopened without one still has its unflushed logs replayed, because
@@ -170,9 +169,9 @@ impl<F: Fs> Options<F> {
     /// of quietly handing back an empty store. On, an open makes the
     /// directory if it is not there, writes the least a database can consist
     /// of, and then opens that — one call, under one lock, which is why this
-    /// is a setting rather than a `create` of its own: Oxia's own call site
-    /// cannot tell a shard arriving from a shard already here, since
-    /// `newKVPebble` builds a path and opens it either way.
+    /// is a setting rather than a `create` of its own: a caller that opens a
+    /// path whether or not a database is there yet should not have to tell
+    /// the two apart.
     ///
     /// It does not make an open forgiving of anything else. A directory
     /// holding a `marker.` file is refused rather than written into,
@@ -316,8 +315,8 @@ impl<F: Fs> Options<F> {
     /// What the tables a compaction writes — L1 and below — compress their
     /// data and index blocks with. Snappy by default.
     ///
-    /// A flush always writes L0 uncompressed. Both halves are Oxia's
-    /// configuration (DESIGN.md §1): L0 tables are the ones written most
+    /// A flush always writes L0 uncompressed. Both halves are settled in
+    /// DESIGN.md §14: L0 tables are the ones written most
     /// often and read for the shortest time, so not worth the CPU, while the
     /// levels below hold nearly all the data. Snappy is the cheapest codec Go
     /// Pebble reads — a quarter to a third of Zstd's CPU to compress a block

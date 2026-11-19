@@ -33,11 +33,11 @@ pub enum ChecksumType {
     Crc32c,
     /// `ChecksumTypeXXHash64`.
     ///
-    /// Not reachable in an Oxia table today — Pebble defaults to crc32c
-    /// (`sstable/options.go`: `ensureDefaults`) and Oxia never sets `Checksum`
-    /// — but unlike MinLZ, which the table format forbids outright, this is
-    /// one option away. The cost of reading it is a few lines; the cost of
-    /// being wrong is a shard that will not open.
+    /// Not written unless asked for — Pebble defaults to crc32c
+    /// (`sstable/options.go`: `ensureDefaults`) — but unlike MinLZ, which the
+    /// table format forbids outright, this is one option away. The cost of
+    /// reading it is a few lines; the cost of being wrong is a database that
+    /// will not open.
     XxHash64,
 }
 
