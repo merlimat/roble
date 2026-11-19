@@ -174,13 +174,70 @@ async fn a_log_holding_no_records_does_not_stop_an_open() {
 
 // ------------------------------------------- against a directory built on purpose
 
+/// Pebble's open flushes what it replayed, which moves the MANIFEST's minimum
+/// unflushed log past every log in the directory, and only then creates the
+/// log it will write to. Killed in between, it leaves a database with no log
+/// a writer can carry on in, and its next open creates one. So must roble's.
+#[compio::test]
+async fn an_open_with_no_log_left_to_resume_creates_one() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let options = || {
+        roble::Options::new()
+            .create_if_missing(true)
+            .background_tasks(false)
+    };
+    let db = roble::open_with(&env, &dir, options())
+        .await
+        .expect("create");
+    db.put(b"a", b"written").await.expect("put a");
+    db.flush().await.expect("flush a");
+    let log = db
+        .current_log()
+        .expect("a store with a WAL writes to a log");
+    drop(db);
+
+    // The log the flush moved the store to holds nothing, so losing it is
+    // the state Pebble's interrupted open leaves.
+    let fs = env.sim();
+    fs.remove(&dir.join(roble_format::files::log_filename(log)))
+        .await
+        .expect("remove the log");
+    fs.sync_dir(&dir).await.expect("sync dir");
+
+    let db = roble::open_with(&env, &dir, options())
+        .await
+        .expect("an open with no log to resume");
+    let fresh = db
+        .current_log()
+        .expect("a writable open with a WAL has a log to write to");
+    assert!(fresh > log, "log {fresh} reuses a number at or below {log}");
+    db.put(b"b", b"written").await.expect("put b");
+    drop(db);
+    env.sim().crash();
+
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    for key in [b"a".as_slice(), b"b"] {
+        assert_eq!(
+            db.get(key, roble::Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"written".to_vec()),
+            "{}",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
 /// Builds a database directory in the simulated filesystem.
 ///
 /// Everything is explicit, because what these tests vary is exactly the thing
 /// Pebble would never write.
 struct Synth {
     /// Whether to write a format-version marker at all. A database with a
-    /// MANIFEST and no marker predates markers entirely.
+    /// MANIFEST and no marker is a creation that stopped short, or with a
+    /// `CURRENT` file one that predates markers.
     format_marker: bool,
     format_version: String,
     format_marker_iter: u64,
@@ -814,13 +871,13 @@ async fn the_lock_is_held_for_as_long_as_the_database_is_open() {
 // opened at all.
 
 #[compio::test]
-async fn a_database_with_no_format_marker_predates_markers_and_is_refused() {
-    // Pebble reads a missing marker as FormatDefault, which only happens for a
-    // directory it is about to create. One with a MANIFEST and no marker was
-    // written before Pebble recorded the version at all, and roble cannot tell
-    // which version that was.
+async fn a_database_with_no_format_marker_and_a_current_file_is_refused() {
+    // A database written before Pebble recorded its format version names its
+    // MANIFEST with a `CURRENT` file, and roble cannot tell which version
+    // that was. Pebble refuses it too (`checkForLegacyFormatVersion1`).
     let (env, dir) = Synth {
         format_marker: false,
+        extra: vec![("CURRENT".to_string(), b"MANIFEST-000001\n".to_vec())],
         ..Default::default()
     }
     .build()
@@ -830,6 +887,129 @@ async fn a_database_with_no_format_marker_predates_markers_and_is_refused() {
             assert!(m.contains("no marker.format-version.* file"), "got: {m}")
         }
         other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// A database roble created, with what `prepare` does to it, and then its
+/// format marker taken away: what Pebble leaves when it is killed between
+/// the manifest marker and the format marker of its own creation.
+async fn without_format_marker(prepare: impl AsyncFnOnce(&roble::Db<SimFs>)) -> (SimEnv, PathBuf) {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        roble::Options::new()
+            .create_if_missing(true)
+            .background_tasks(false),
+    )
+    .await
+    .expect("create");
+    prepare(&db).await;
+    drop(db);
+    let fs = env.sim();
+    for name in listing(fs, &dir).await {
+        if name.starts_with("marker.format-version.") {
+            fs.remove(&dir.join(name)).await.expect("remove the marker");
+        }
+    }
+    fs.sync_dir(&dir).await.expect("sync dir");
+    (env, dir)
+}
+
+async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs
+        .list(dir)
+        .await
+        .expect("list")
+        .iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[compio::test]
+async fn a_creation_stopped_before_its_format_marker_is_finished() {
+    // Pebble writes the format marker last of its creation, after the
+    // manifest marker and the log, and its next open reads a directory with
+    // no marker and nothing in it as a creation to finish. roble's must too.
+    // Both with the log and without it: Pebble may be killed before either.
+    for keep_log in [true, false] {
+        let (env, dir) = without_format_marker(async |_| {}).await;
+        if !keep_log {
+            for name in listing(env.sim(), &dir).await {
+                if name.ends_with(".log") {
+                    env.sim().remove(&dir.join(name)).await.expect("remove");
+                }
+            }
+            env.sim().sync_dir(&dir).await.expect("sync dir");
+        }
+
+        // A reader opens it and writes nothing.
+        let before = listing(env.sim(), &dir).await;
+        let reader = roble::open_read_only(&env, &dir, roble::Options::new())
+            .await
+            .unwrap_or_else(|e| panic!("keep_log {keep_log}: the reader: {e}"));
+        assert_eq!(
+            reader.format_version(),
+            roble_format::files::FORMAT_VERSION_PIN
+        );
+        drop(reader);
+        assert_eq!(before, listing(env.sim(), &dir).await, "a reader wrote");
+
+        // A writer finishes it: the pin, at iteration one, as a creation
+        // writes it — and a log to write to.
+        let db = roble::open(&env, &dir)
+            .await
+            .unwrap_or_else(|e| panic!("keep_log {keep_log}: the open: {e}"));
+        assert!(
+            db.markers().contains(&marker_filename(
+                MARKER_FORMAT_VERSION,
+                1,
+                &roble_format::files::format_version_value(roble_format::files::FORMAT_VERSION_PIN),
+            )),
+            "keep_log {keep_log}: {:?}",
+            db.markers()
+        );
+        db.put(b"k", b"v").await.expect("put");
+        drop(db);
+        env.sim().crash();
+
+        let db = roble::open(&env, &dir).await.expect("reopen after a crash");
+        assert_eq!(
+            db.get(b"k", roble::Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"v".to_vec()),
+            "keep_log {keep_log}"
+        );
+    }
+}
+
+#[compio::test]
+async fn a_database_with_no_format_marker_and_data_is_refused() {
+    // Something was written, so this is not a creation that stopped short,
+    // and the format it was written in cannot be known. Refused before the
+    // open has changed anything: no sweep, no log cut, no marker.
+    let in_log = without_format_marker(async |db| db.put(b"k", b"v").await.expect("put")).await;
+    let in_table = without_format_marker(async |db| {
+        db.put(b"k", b"v").await.expect("put");
+        db.flush().await.expect("flush");
+    })
+    .await;
+    for (what, (env, dir)) in [("a log record", in_log), ("a table", in_table)] {
+        let before = listing(env.sim(), &dir).await;
+        match roble::open(&env, &dir).await {
+            Err(Error::Unsupported(m)) => assert!(m.contains("holds data"), "{what}: got: {m}"),
+            other => panic!("{what}: expected Unsupported, got {other:?}"),
+        }
+        assert_eq!(
+            before,
+            listing(env.sim(), &dir).await,
+            "{what}: the refused open changed the directory"
+        );
     }
 }
 
@@ -972,24 +1152,28 @@ async fn an_opened_database_describes_itself() {
 }
 
 #[compio::test]
-async fn a_write_to_a_database_with_no_log_is_refused() {
+async fn a_write_to_a_database_with_no_log_goes_to_one_the_open_created() {
     // A directory built by hand has markers, a MANIFEST and nothing else. A
-    // database opened from one can be read — everything a read needs is in the
-    // MANIFEST and the tables — but a write has nowhere to record itself, and
-    // a write that is not recoverable is one a crash loses silently (§4).
-    // Refusing is the only answer that does not lie about durability.
+    // write still needs a log to record itself in, or a crash loses it
+    // silently (§4), so a writable open creates one, as Pebble's does.
     let (env, dir) = Synth::default().build().await;
     let db = roble::open(&env, &dir).await.expect("open");
 
     let mut batch = roble_format::batch::Batch::new();
     batch.put(b"k", b"v").expect("put");
-    match db.write_raw(&mut batch, true).await {
-        Err(Error::Unsupported(m)) => assert!(
-            m.contains("holds no log file") && m.contains("could not be recovered"),
-            "got: {m}"
-        ),
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
+    db.write_raw(&mut batch, true).await.expect("write");
+    drop(db);
+
+    // Replayed from that log: nothing flushed it.
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        db.get(b"k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"v".to_vec()),
+        "the write must come back from the log"
+    );
 }
 
 /// A store can be owned by a task of its own.

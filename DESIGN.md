@@ -625,7 +625,11 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   (`makeRoomForWrite` under `commit.mu`), and its `rotateWAL` closes the old
   log, which syncs it and writes the EOF trailer, before creating the next.
   roble writes no trailer: a synced log that ends on a record boundary reads
-  as cleanly finished to both readers.
+  as cleanly finished to both readers. A flush that fails after that sync and
+  before the swap may still have left the next log's name durable — on a
+  real filesystem a create alone can — so until a swap moves the store off
+  the old log, every write to it is synced whatever the `Wal` setting. Pebble
+  panics there instead; roble's failed flush is one the next flush retries.
 
   That permit is also what keeps two writes off each other, and that is the
   same fact rather than a second one. A write reads the sequence number it
@@ -1051,7 +1055,18 @@ reason.
 
 `open()` reads `marker.format-version.*` and `marker.manifest.*`, replays the
 MANIFEST into a version, and then replays, in order, every log the version edits
-leave unflushed, applying each record to a fresh memtable. The next sequence
+leave unflushed, applying each record to a fresh memtable.
+
+A directory with a manifest marker and no format marker is what Pebble leaves
+when it is killed in its own creation, which writes the format marker last. Its
+next open reads such a directory as a creation to finish, provided it holds
+nothing (`ErrorIfNotPristine`), and roble's does the same: read at the pin, and
+refused if the version names a table or a log holds a record — refused before
+the open has swept, cut or created anything. A writable open then writes the
+marker at the pin, iteration one, as roble's own creation does. A `CURRENT`
+file is still refused outright: it is how a database written before markers
+names its MANIFEST, and the format that database was written in cannot be
+known. The next sequence
 number is the highest the replay saw, or the MANIFEST's last sequence number when
 there was nothing to replay — it never goes backwards, or a write Oxia replays
 could lose to a tombstone that outlives it.
@@ -1158,24 +1173,21 @@ at `FormatMinSupported` and upgrading, which is why its own directories carry
 several is current, and `compat/wal-replay --checkpoint` has been making that
 claim about a roble-written iteration one since M4.
 
-**The log is there because a store with no log refuses writes.** With the WAL on,
-a `write` that could not be recovered is not acknowledged (§4), and nothing but
-a flush ever opens a log — so a database created without one could not be
-written to until it had been flushed, and could not be flushed until it had
-been written to. Pebble solves this on the other side, creating a log in every
-open that is not read-only; doing it at creation instead leaves the open's log
-handling to the one thing it does today, which is resuming the log a replay
-found, and means the directory is complete when the creation returns rather
-than when something first opens it.
+**The log is there so the directory is complete when the creation returns.**
+With the WAL on, a `write` that could not be recovered is not acknowledged (§4).
+An open that finds no log to resume creates one, as Pebble's open does, because
+a Pebble killed in its own open can leave such a directory ("Opening and
+recovery"); but a created database does not lean on that, and reads as whole
+before anything has opened it.
 
 **The manifest marker goes last**, after the format version, because it is the
 marker that makes a directory read as a database: until everything it names is
 in place it must not be written. `checkpoint` does the same, for the same
 reason — written the other way round, a checkpoint interrupted between the two
 left a directory an open read as a database whose format version had never been
-recorded, which is the one case that message is for. Both orders leave an
-unfinished directory that an open refuses; only one of them describes what is
-there.
+recorded. Pebble's own creation does write them that way round, and an open
+finishes what it leaves only when it holds nothing ("Opening and recovery"), so
+a checkpoint interrupted that way round is refused as soon as it holds data.
 
 **A directory holding a `marker.` file is refused rather than written into,
 unless it is a creation that did not finish.** A marker means either a database
@@ -1226,6 +1238,12 @@ it replays every log but the newest strictly (`strictWALTail`). Pebble never
 meets this, because it never appends to a log it replayed: its open flushes
 what it replayed and starts a fresh log. `compat/differential` found it by
 killing roble in such a flush.
+
+And when there is no last log to carry on in, a writable open creates one, as
+Pebble's does. Pebble's open moves the MANIFEST past every log it replayed
+before it creates the next, so killed in between it leaves a directory with
+no log at or past the minimum; `compat/differential` found that too, by
+killing Pebble in its open.
 
 That rule is looser than §6 states in one way, and the looseness is
 deliberate: it tolerates a torn record anywhere in the last log, not only at

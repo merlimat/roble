@@ -30,7 +30,9 @@
 //!    listing is taken again afterwards: the creation changed what the
 //!    directory holds, and every step below still answers from one listing.
 //! 4. Read `marker.format-version.*`, and refuse a version above the pin
-//!    **before** trusting any structure inside the files.
+//!    **before** trusting any structure inside the files. No marker at all is
+//!    a creation that stopped short, read at the pin and refused after step 7
+//!    if anything was ever written into it.
 //! 5. Read `marker.manifest.*`, which names the MANIFEST to replay. No marker
 //!    means no database.
 //! 6. Replay that MANIFEST into a version, then check the comparer, and move
@@ -178,6 +180,13 @@ pub(crate) struct Store<F: Fs> {
     /// Whether every write syncs the log before it returns
     /// ([`crate::Wal::Synced`]).
     sync_writes: bool,
+    /// Whether a flush has started moving the store off its log and not
+    /// finished, so that a later log may already be durable behind it.
+    ///
+    /// Every write to the log syncs while this is set, whatever the store's
+    /// [`crate::Wal`] setting: the log is no longer certain to be the last,
+    /// and only the last may end in a torn record (`Db::sync_log`).
+    log_followed: std::cell::Cell<bool>,
     /// Whether a flush leaves the picker's compaction for the caller (§9).
     disable_automatic_compactions: bool,
     /// The next sequence number to hand out.
@@ -363,8 +372,13 @@ async fn open_dir<E: Env>(
             .collect();
     }
 
-    // 4. The format version, before anything inside a file is trusted.
-    let format_version = read_format_version(&names)?;
+    // 4. The format version, before anything inside a file is trusted. None
+    //    when the creation that made the directory stopped before writing
+    //    it, which only the replay below can confirm: that directory is
+    //    read at the pin, and refused if it turns out to hold anything.
+    let marked = read_format_version(&names)?;
+    let unmarked = marked.is_none();
+    let format_version = marked.unwrap_or(FORMAT_VERSION_PIN);
 
     // 5. Which MANIFEST.
     let manifest_marker = files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?
@@ -458,6 +472,38 @@ async fn open_dir<E: Env>(
     )
     .await?;
 
+    // A directory with no format marker is the remains of a creation only if
+    // nothing was ever written into it: Pebble writes the marker last of its
+    // creation (`writeFormatVersionMarker`, after the log), and its own open
+    // reads a directory without one as a creation to finish, under
+    // `ErrorIfNotPristine`. So no table and no record, or this is a database
+    // whose format roble cannot know — refused here, before the sweep, the
+    // log cut or the log created below have touched anything.
+    if unmarked {
+        let has_tables = versions.version.levels().any(|(_, t)| !t.is_empty());
+        if has_tables || !memtable.is_empty() || !memtable.tombstones().is_empty() {
+            return Err(Error::Unsupported(format!(
+                "{} has no marker.{MARKER_FORMAT_VERSION}.* file and holds data, so it is not a \
+                 creation that stopped short of writing one; roble cannot tell which format it \
+                 was written in",
+                dir.display()
+            )));
+        }
+        // Finished as roble's own creation would have written it: the pin,
+        // at iteration one (`crate::create`). A reader writes nothing.
+        if !read_only {
+            let marker = crate::rotate::move_marker(
+                &fs,
+                dir,
+                MARKER_FORMAT_VERSION,
+                1,
+                &files::format_version_value(FORMAT_VERSION_PIN),
+            )
+            .await?;
+            names.push(marker);
+        }
+    }
+
     // 8. What the replayed MANIFEST no longer refers to: the logs it has
     //    moved past, and any table a flush wrote whose edit never landed.
     //    This is where an interrupted flush is collected — the table was
@@ -539,6 +585,25 @@ async fn open_dir<E: Env>(
                 at,
             })
         }
+        // No log at or past the MANIFEST's minimum, which is what Pebble
+        // leaves when it is killed between flushing what its open replayed
+        // and creating the log it writes to next: its next open creates one,
+        // and so does this. Created and its name made durable before anything
+        // is appended, as a flush creates one (`crate::flush`), under a number
+        // the ratchet above has put past every file in the directory.
+        None if !read_only && options.wal != crate::Wal::Off => {
+            let log_num = versions.next_file_num;
+            let path = dir.join(roble_format::files::log_filename(log_num));
+            let disk = fs.create(&path).await?;
+            disk.sync(Default::default()).await?;
+            fs.sync_dir(dir).await?;
+            versions.next_file_num = log_num + 1;
+            Some(Log {
+                disk: std::rc::Rc::new(disk),
+                log_num,
+                at: 0,
+            })
+        }
         None => None,
     };
 
@@ -585,6 +650,7 @@ async fn open_dir<E: Env>(
             caches: options.caches,
             disable_wal: options.wal == crate::Wal::Off,
             sync_writes: options.wal == crate::Wal::Synced,
+            log_followed: std::cell::Cell::new(false),
             disable_automatic_compactions: options.disable_automatic_compactions,
             memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
             frozen: std::cell::RefCell::new(None),
@@ -666,18 +732,28 @@ fn refuse_unreadable_files(names: &[String]) -> Result<()> {
 }
 
 /// Reads the format-version marker and checks it against the pin.
-fn read_format_version(names: &[String]) -> Result<u64> {
-    let marker = files::current_marker(names.iter().map(String::as_str), MARKER_FORMAT_VERSION)?
-        .ok_or_else(|| {
-            // Pebble reads a missing marker as FormatDefault, which only
-            // happens for a directory it is about to create. A database with a
-            // MANIFEST and no format marker predates markers entirely.
-            Error::Unsupported(
-                "the database has no marker.format-version.* file, so it was written before \
-                 Pebble recorded the format version"
-                    .to_string(),
-            )
-        })?;
+fn read_format_version(names: &[String]) -> Result<Option<u64>> {
+    let Some(marker) =
+        files::current_marker(names.iter().map(String::as_str), MARKER_FORMAT_VERSION)?
+    else {
+        // Pebble reads a missing marker as FormatDefault: a directory it is
+        // creating, or one whose creation stopped after the manifest marker
+        // and before this one, which the open then confirms holds nothing.
+        // Only the second is this open's to finish; with no manifest marker
+        // either there is no database here at all. Nor with a `CURRENT`
+        // file, which is how a database written before markers names its
+        // MANIFEST (`checkForLegacyFormatVersion1`).
+        let manifest_marker =
+            files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?.is_some();
+        if manifest_marker && !names.iter().any(|n| n == "CURRENT") {
+            return Ok(None);
+        }
+        return Err(Error::Unsupported(
+            "the database has no marker.format-version.* file, so it was written before \
+             Pebble recorded the format version"
+                .to_string(),
+        ));
+    };
 
     let version: u64 = marker.value.parse().map_err(|_| {
         Error::Corrupt(format!(
@@ -704,7 +780,7 @@ fn read_format_version(names: &[String]) -> Result<u64> {
              not know"
         )));
     }
-    Ok(version)
+    Ok(Some(version))
 }
 
 /// Turns a file that has gone into [`Error::Stale`], for a reader.
@@ -1146,7 +1222,10 @@ impl<F: Fs> Db<F> {
                 .await;
             result?;
             self.store.metrics.written.add(written);
-            if sync {
+            // A flush that failed while moving the store to its next log
+            // may have left that log durable, which makes this one an earlier
+            // log: whatever goes into it has to be complete (`Db::sync_log`).
+            if sync || self.store.log_followed.get() {
                 let _timer = self.store.metrics.sync_duration.start();
                 disk.sync(Default::default()).await?;
             }
@@ -2021,6 +2100,7 @@ impl<F: Fs> Db<F> {
             // number outlives the operation that asked for it.
             self.versions_mut().next_file_num = log.log_num + 1;
             *self.store.log.borrow_mut() = Some(log);
+            self.store.log_followed.set(false);
         }
         Ok(())
     }
@@ -2066,7 +2146,10 @@ impl<F: Fs> Db<F> {
     /// syncs it, before it creates the next one, for the same reason.
     ///
     /// Takes the writer permit as proof that nothing lands on the log between
-    /// this sync and the swap that moves the store off it.
+    /// this sync and the swap that moves the store off it. A flush that fails
+    /// in between has still perhaps made the next log's name durable — on a
+    /// real filesystem even its create can — so from here until a swap moves
+    /// the store off this log, every write to it is synced as well.
     pub(crate) async fn sync_log(&self, _writing: &crate::change::Writing<'_>) -> Result<()> {
         let disk = self
             .store
@@ -2078,6 +2161,7 @@ impl<F: Fs> Db<F> {
             let _timer = self.store.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
         }
+        self.store.log_followed.set(true);
         Ok(())
     }
 

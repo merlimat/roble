@@ -48,18 +48,12 @@
 //! `compat/wal-replay --checkpoint` has been making that claim about a
 //! roble-written iteration one since M4.
 //!
-//! **Why an empty log.** With the WAL on, a store whose log is `None`
-//! refuses writes outright (`crate::open`): a write it could not recover is
-//! a write it will not acknowledge. Nothing else in roble creates the first
-//! log — a flush's new log is opened by the flush that needs it — so a
-//! database created without one would be a database that cannot be written
-//! to until it is flushed, which is to say never.
-//!
-//! Pebble solves this on the other side, creating a log in every open that
-//! is not read-only. Doing it here instead keeps the open's log handling to
-//! the one thing it does today, which is resuming the log a replay found,
-//! and it means the created directory is complete the moment this returns
-//! rather than complete once something has opened it.
+//! **Why an empty log.** With the WAL on, a write has to go to a log or it
+//! is not acknowledged (`crate::open`). An open that finds no log to resume
+//! creates one, as Pebble's does — a Pebble killed in its own open can leave
+//! such a directory — but writing it here as well means the created
+//! directory is complete the moment this returns rather than once something
+//! has opened it.
 //!
 //! So the edit says the minimum unflushed log is 2, and log 2 is there and
 //! holds nothing. Those agree: a log that holds nothing has nothing to
