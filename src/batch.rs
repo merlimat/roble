@@ -101,7 +101,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
 
     /// Adds a key, letting `fill` write the value straight into the batch.
     ///
-    /// What Oxia's `PutMarshalable` needs, so a protobuf is marshalled once
+    /// So a value — a protobuf, say — is serialized once, into the batch,
     /// rather than into a buffer that is then copied.
     pub fn put_with<G>(&mut self, key: &[u8], value_len: usize, fill: G) -> Result<()>
     where
@@ -153,16 +153,16 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
 
     /// Its representation: the bytes a commit appends to the log.
     ///
-    /// These are the bytes Oxia checksums and compares across replicas, so
-    /// they are byte-identical to the ones Go Pebble builds for the same
-    /// operations — a claim the golden fixture of `format/tests/batch_repr.rs`
+    /// They are byte-identical to the ones Go Pebble builds for the same
+    /// operations, so a checksum of them agrees with one taken over a Go
+    /// batch — a claim the golden fixture of `format/tests/batch_repr.rs`
     /// holds the format crate to, and which this batch inherits by encoding
     /// through it and nothing else.
     ///
     /// The eight header bytes that hold the sequence number are still zero.
-    /// That is what a checksum here covers, and it is what Oxia relies on,
-    /// taking the checksum before committing; since [`commit`](Self::commit)
-    /// takes the batch, these are the only bytes it can ever hand out. The
+    /// That is what a checksum taken before committing covers; since
+    /// [`commit`](Self::commit) takes the batch, these are the only bytes it
+    /// can ever hand out. The
     /// stand-in numbers its index orders itself by never reach them.
     pub fn as_bytes(&self) -> &[u8] {
         self.repr.as_bytes()
@@ -184,8 +184,8 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     /// filter answers without reading a block at all, and on a settled store
     /// of fourteen tables an absent key costs about 318 ns through the point
     /// path against 4,192 ns through the merge — which is the case that
-    /// matters, since Oxia reads a record's version metadata before every
-    /// put and an insert is a key that is not there yet.
+    /// matters to a caller that reads a key before writing it, since an
+    /// insert is a key that is not there yet.
     pub async fn get(&self, key: &[u8], how: Comparison) -> Result<Option<Found>> {
         if how == Comparison::Equal {
             return self.equal(key).await;

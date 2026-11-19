@@ -210,7 +210,7 @@ impl<F: Fs> Db<F> {
 
     /// How many bytes the levels hold above what their allowances let them.
     ///
-    /// Pebble's compaction debt, which Oxia graphs: the number that says a
+    /// Pebble's compaction debt: the number that says a
     /// store is falling behind before anything stalls. L0 is counted in
     /// tables rather than bytes, so its excess is charged at what its tables
     /// weigh.

@@ -269,8 +269,8 @@ impl<'a> Table<'a> {
     /// Whether this table's index is two-level.
     ///
     /// Pebble writes one once the index outgrows a block, which a deep level
-    /// reaches easily: Oxia leaves `TargetFileSizes` at Pebble's doubling
-    /// default, so an L6 file runs to ~128 MiB (DESIGN.md §3).
+    /// reaches easily: at Pebble's default `TargetFileSizes`, doubling per
+    /// level, an L6 file runs to ~128 MiB (DESIGN.md §3).
     pub fn has_two_level_index(&self) -> bool {
         self.two_level_index
     }
@@ -342,7 +342,7 @@ impl<'a> Table<'a> {
     /// Calls `f` with the last entry before `target`, and returns whether
     /// there was one.
     ///
-    /// This is the floor lookup of §6, the one Oxia leans hardest on.
+    /// This is the floor lookup of §6.
     pub fn seek_lt<F>(&self, target: &[u8], mut f: F) -> Result<bool>
     where
         F: FnMut(crate::InternalKey<'_>, crate::block::Value<'_>) -> Result<()>,

@@ -130,13 +130,10 @@ impl<F: Fs> Snapshot<F> {
     /// sorts, or `None` if there is none.
     ///
     /// [`Db::get`] at the snapshot's instant. With [`Comparison::Equal`] it is
-    /// Oxia's `Lookup`, which returns `ErrKeyNotFound` where this returns
-    /// `None`. That one is a point lookup rather than a scan positioned once,
-    /// so that it costs what a point lookup costs: the bloom filters rule out
-    /// the tables that cannot hold the key, and a scan consults no filter
-    /// because a scan asks about a range (§6). Oxia reaches the same place
-    /// from the other side, seeking a cloned iterator with `SeekPrefixGE` so
-    /// that the filters are consulted after all.
+    /// a point lookup rather than a scan positioned once, so that it costs
+    /// what a point lookup costs: the bloom filters rule out the tables that
+    /// cannot hold the key, and a scan consults no filter because a scan asks
+    /// about a range (§6).
     ///
     /// The other four make a scan bounded on the side the comparison decides
     /// and take the first or last key in it, as the store's do. The store

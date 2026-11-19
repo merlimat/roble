@@ -39,8 +39,8 @@ pub enum Compression {
     /// 0, stored as-is: every block of L0, and any block compression did
     /// not shrink enough to keep.
     None,
-    /// 1, Snappy: what Oxia configures for L1 and below, and what Pebble
-    /// falls back to below Pebblev6 (see [`Compression::MinLz`]).
+    /// 1, Snappy: roble's default for L1 and below, and what Pebble falls
+    /// back to below Pebblev6 (see [`Compression::MinLz`]).
     Snappy,
     /// 2, zlib. In the format, never written by Pebble.
     Zlib,
@@ -52,8 +52,8 @@ pub enum Compression {
     Lz4hc,
     /// 6, xpress. In the format, never written by Pebble.
     Xpress,
-    /// 7, Zstd. Written by Oxia's conversion profile for data and value
-    /// blocks, so roble has to read it (DESIGN.md §1).
+    /// 7, Zstd. Written by Pebble's `ZstdCompression` profile, and by
+    /// `GoodCompression` for data blocks on arm64 (DESIGN.md §3).
     Zstd,
     /// 8, MinLZ. Unreachable at roble's pin: Pebble replaces a whole
     /// compression profile with Snappy when the profile uses MinLZ and the
@@ -126,7 +126,7 @@ pub enum Codec {
     /// that came off the disk (DESIGN.md §8).
     #[default]
     None,
-    /// Snappy, Pebble's default and what Oxia configures for L1 and below.
+    /// Snappy, Pebble's default, and roble's for L1 and below.
     Snappy,
     /// Zstd at the given level.
     Zstd(i32),

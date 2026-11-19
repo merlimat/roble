@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `rocksdb.BuiltinBloomFilter` block (`bloom/bloom.go`), which Oxia
-//! configures at 10 bits per key.
+//! The `rocksdb.BuiltinBloomFilter` block (`bloom/bloom.go`), at 10 bits per
+//! key by default.
 //!
 //! RocksDB's full-file filter: cache-line-sized blocks of bits, then a
 //! five-byte tail of one probe count and a four-byte little-endian line count.
@@ -30,14 +30,14 @@
 //! 1. **The hash sign-extends its trailing bytes.** The last one to three
 //!    bytes are folded in as `uint32(int8(b))`, not `uint32(b)`, to match
 //!    RocksDB. Every key whose tail byte is `0x80` or above hashes differently
-//!    if you use the unsigned value — and Oxia's keys are arbitrary bytes.
+//!    if you use the unsigned value — and keys are arbitrary bytes.
 //! 2. **The bytes hashed are `key[:Comparer.Split(key)]`**, not the whole
 //!    internal key and not necessarily the whole user key
 //!    (`rowblk_writer.go`: `maybeAddToFilter`). Under the bytewise comparer
 //!    `Split` is the full user key, which is one more reason roble refuses any
-//!    other comparer (DESIGN.md §3): `oxia-slash-spans` sets `Split` to return
-//!    0, and a filter built over empty prefixes excludes nothing while a
-//!    filter built over whole keys would exclude almost everything.
+//!    other comparer (DESIGN.md §3): one whose `Split` returns 0 builds its
+//!    filter over empty prefixes, which excludes nothing, while a filter
+//!    built over whole keys would exclude almost everything.
 
 use crate::error::{Error, Result};
 
@@ -47,7 +47,7 @@ pub const POLICY_NAME: &str = "rocksdb.BuiltinBloomFilter";
 /// The metaindex entry the filter block is stored under.
 pub const META_NAME: &str = "fullfilter.rocksdb.BuiltinBloomFilter";
 
-/// Oxia's `bloom.FilterPolicy(10)`, and so roble's default (DESIGN.md §1).
+/// roble's default bits per key: Pebble's `bloom.FilterPolicy(10)`.
 pub const DEFAULT_BITS_PER_KEY: usize = 10;
 
 const CACHE_LINE_SIZE: usize = 64;

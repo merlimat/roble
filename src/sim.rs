@@ -17,8 +17,9 @@
 //! §12 tests the failure paths by running a scenario once to count its
 //! operations, then once per operation with an error injected there, once with
 //! a crash, and once with buffers withheld. All of that needs a filesystem
-//! that counts, fails and forgets on command — this is it. Oxia relies on the
-//! same seam, passing Pebble a `vfs.NewCrashableMem` in its own tests.
+//! that counts, fails and forgets on command — this is it, as Pebble's
+//! `vfs.NewCrashableMem` is for Go, and an application's own crash tests can
+//! use it the same way.
 //!
 //! **Crashing is the interesting part.** [`SimFs::crash`] drops everything
 //! that was written but not synced, and forgets directory entries that no

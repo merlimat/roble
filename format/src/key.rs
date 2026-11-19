@@ -59,7 +59,7 @@ pub enum Kind {
     Delete,
     /// `SET`, 1.
     Set,
-    /// `MERGE`, 2. Refused by the table reader: Oxia configures no merger.
+    /// `MERGE`, 2. Refused by the table reader: roble has no merge operator.
     Merge,
     /// `SINGLEDEL`, 7. Read, never created; a compaction carries one it read,
     /// or writes a `DEL` for it over an older version of its key it drops.
@@ -71,17 +71,17 @@ pub enum Kind {
     /// `SETWITHDEL`, 18. Written for a Set that a flush or compaction lays
     /// over a deletion of its key it drops, as Pebble's `setNext` does.
     SetWithDelete,
-    /// `RANGEKEYDEL`, 19. Refused: Oxia creates no range keys.
+    /// `RANGEKEYDEL`, 19. Refused: roble does not serve range keys.
     RangeKeyDelete,
     /// `RANGEKEYUNSET`, 20. Refused.
     RangeKeyUnset,
     /// `RANGEKEYSET`, 21. Refused.
     RangeKeySet,
-    /// `INGESTSST`, 22. Refused: Oxia does not ingest.
+    /// `INGESTSST`, 22. Refused: roble does not ingest tables.
     IngestSst,
     /// `DELSIZED`, 23. Read, never created; a compaction carries one it read.
     DeleteSized,
-    /// `EXCISE`, 24. Refused: Oxia does not excise.
+    /// `EXCISE`, 24. Refused: roble does not excise.
     Excise,
 }
 

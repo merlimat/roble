@@ -57,7 +57,7 @@ impl<F: Fs> Db<F> {
     ///
     /// **It flushes first.** A checkpoint of a store with writes still in
     /// its memtable would be a checkpoint missing them, and with the WAL off
-    /// — which is Oxia's configuration (§4) — there would be no log in the
+    /// ([`Wal::Off`](crate::Wal::Off)) there would be no log in the
     /// directory to carry them either. So the memtable becomes a table
     /// first, and what the checkpoint holds is everything written before it
     /// was asked for.
