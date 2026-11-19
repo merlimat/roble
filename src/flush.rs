@@ -17,8 +17,12 @@
 //! The order is what makes a crash during a flush harmless, and it is the
 //! order Pebble uses:
 //!
-//! 1. Create the log the store will write to next and sync the directory,
-//!    then freeze the memtable and point the store at both in one step. From
+//! 1. With writes held off, sync the log the store is moving past, create
+//!    the log it will write to next and sync the directory, then freeze the
+//!    memtable and point the store at both in one step. The sync comes
+//!    first because a log a later one follows is replayed strictly, and
+//!    without a sync on every write only this makes it complete before the
+//!    later one's name is durable (`crate::open::Db::sync_log`). From
 //!    here a write goes to a memtable this flush is not writing out and a
 //!    log its edit does not retire, which is what makes a write arriving in
 //!    the middle of a flush safe (§5, `crate::open::Db::freeze_memtable`).
@@ -172,12 +176,19 @@ impl<F: Fs> Db<F> {
                     return Ok(None);
                 }
 
+                // No write from here to the swap: the log being moved past is
+                // synced below, and a write that landed on it after the sync
+                // would be a record no sync covered in a log that is no
+                // longer the last (`crate::open::Db::sync_log`).
+                let writing = self.hold_writes().await;
+
                 // The log the store writes to next, created before anything
                 // points at it. With the WAL off there is none, and so
                 // nothing to create and nothing for the edit to retire.
                 let log_num = if self.wal_disabled() {
                     None
                 } else {
+                    self.sync_log(&writing).await?;
                     let log_num = self.version_set().next_file_num;
                     let log_path = self
                         .store
@@ -189,7 +200,7 @@ impl<F: Fs> Db<F> {
                     self.fs().sync_dir(&self.store.dir).await?;
                     Some(log_num)
                 };
-                self.freeze_memtable(log_num).await?;
+                self.freeze_memtable(log_num, &writing).await?;
                 current
             }
         };

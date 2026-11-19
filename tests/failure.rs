@@ -717,3 +717,103 @@ async fn a_flush_interrupted_after_a_reopen_over_a_stale_log_tail_leaves_a_datab
         "no failure left the resumed log behind a newer one, so nothing here tested it"
     );
 }
+
+/// A store that writes without syncing, and flushes only when asked.
+fn buffered_options() -> Options<SimFs> {
+    flush_options().wal(roble::Wal::Buffered)
+}
+
+/// Writes `a` and flushes it, writes `b` without a sync, then flushes again
+/// with operation `fail` of that flush made to fail, and crashes.
+///
+/// Returns the log `b` went to.
+async fn buffered_flush_fails(env: &SimEnv, dir: &Path, fail: u64) -> u64 {
+    let db = roble::open_with(env, dir, buffered_options())
+        .await
+        .expect("create");
+    db.put(b"a", b"written").await.expect("put a");
+    db.flush().await.expect("flush a");
+    db.put(b"b", b"written").await.expect("put b");
+    let log = db
+        .current_log()
+        .expect("a store with a WAL writes to a log");
+
+    env.sim().fail_at(fail);
+    let _ = db.flush().await;
+    env.sim().stop_failing();
+    drop(db);
+    env.sim().crash();
+    log
+}
+
+/// The logs in `dir`, by number.
+async fn logs(env: &SimEnv, dir: &Path) -> Vec<u64> {
+    env.sim()
+        .list(dir)
+        .await
+        .expect("list")
+        .iter()
+        .filter_map(|e| roble_format::files::parse_filename(e.name.to_str()?))
+        .filter(|p| p.file_type == roble_format::files::FileType::Log)
+        .map(|p| p.file_num)
+        .collect()
+}
+
+/// A log that a later one follows is replayed strictly, by roble and by
+/// Pebble alike: a bad record in it is corruption, because a log is only
+/// ever left behind once it is complete. A flush is what leaves one behind,
+/// by creating the next log, so the one it retires has to be durable before
+/// the new one's name is.
+///
+/// Without a sync of every write, that is the flush's to do. Skipped, a
+/// machine crash after the new log's directory sync keeps the new log and
+/// only the part of the old one the disk happened to write — which a real
+/// disk may cut in the middle of a record, and which the strict replay then
+/// refuses. The simulated filesystem drops unsynced bytes whole rather than
+/// tearing them, so the open goes through; what shows here is the write the
+/// old log lost although a later log survived it.
+#[compio::test]
+async fn a_flush_makes_the_log_it_moves_past_durable_before_the_next_one_is() {
+    let total = {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        let db = roble::open_with(&env, &dir, buffered_options())
+            .await
+            .expect("create");
+        db.put(b"a", b"written").await.expect("put a");
+        db.flush().await.expect("flush a");
+        db.put(b"b", b"written").await.expect("put b");
+        let before = env.sim().ops();
+        db.flush().await.expect("flush b");
+        env.sim().ops() - before
+    };
+
+    let mut moved_past = 0u64;
+    for fail in 1..=total {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        let log = buffered_flush_fails(&env, &dir, fail).await;
+        let later = logs(&env, &dir).await.into_iter().any(|n| n > log);
+
+        let db = roble::open(&env, &dir)
+            .await
+            .unwrap_or_else(|e| panic!("the flush failed at operation {fail}: the reopen: {e}"));
+        let found = contents(&db).await;
+        assert!(found.contains_key(b"a".as_slice()), "a was flushed");
+        if later {
+            moved_past += 1;
+            assert!(
+                found.contains_key(b"b".as_slice()),
+                "the flush failed at operation {fail} of {total}, after a log later than \
+                 {log} was durable, and {log} had lost the write it held"
+            );
+        }
+    }
+
+    // The guard against passing for the wrong reason: some failure has to
+    // come after the new log's name was durable, or nothing was tested.
+    assert!(
+        moved_past > 0,
+        "no failure of the flush left a later log behind"
+    );
+}

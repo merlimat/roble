@@ -613,6 +613,20 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   `crate::change::Writers`, and a freeze does not swap until no write holds
   it.
 
+  With a WAL, a flush holds that permit itself, and for longer: from a sync
+  of the log it is moving past, through creating the next log and syncing the
+  directory, to the swap. A log that a later one follows is replayed strictly,
+  by roble and by Pebble's `strictWALTail` alike, because it was complete when
+  the next one was made. Without a sync on every write (`Wal::Buffered`) that
+  is so only once the flush has synced it — skipped, a machine crash after
+  the new log's name is durable can keep part of the old log's last record,
+  and neither engine opens the directory — and a write landing between that
+  sync and the swap would undo it. Pebble holds commits off for the same span
+  (`makeRoomForWrite` under `commit.mu`), and its `rotateWAL` closes the old
+  log, which syncs it and writes the EOF trailer, before creating the next.
+  roble writes no trailer: a synced log that ends on a record boundary reads
+  as cleanly finished to both readers.
+
   That permit is also what keeps two writes off each other, and that is the
   same fact rather than a second one. A write reads the sequence number it
   will stamp and the offset it will append its record at, waits for the disk,
