@@ -16,7 +16,8 @@
 name: Release
 
 # Pushing a tag like v0.1.0 publishes roble-format, roble and roble-cli at
-# version 0.1.0. The tag sets the version: the manifests keep 0.0.0-dev.
+# version 0.1.0, then creates the GitHub release for the tag. The tag sets the
+# version: the manifests keep 0.0.0-dev.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
@@ -51,3 +52,28 @@ jobs:
       - run: cargo publish --workspace --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # After the crates are out, so a release never names a version crates.io
+  # does not have. Its notes link the crates and their docs at this version,
+  # above the changes GitHub lists since the previous tag.
+  release:
+    name: Create the GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      # To create the release. The job that holds the cargo token keeps
+      # read-only access.
+      contents: write
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cat > notes.md <<EOF
+          - roble: [crates.io](https://crates.io/crates/roble/$version), [API docs](https://docs.rs/roble/$version)
+          - roble-format: [crates.io](https://crates.io/crates/roble-format/$version), [API docs](https://docs.rs/roble-format/$version)
+          - roble-cli: [crates.io](https://crates.io/crates/roble-cli/$version)
+          EOF
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --notes "$(cat notes.md)"
