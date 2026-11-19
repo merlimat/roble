@@ -35,7 +35,11 @@
 //! `snap` takes a snapshot, up to three at once until `unsnap` lets one go,
 //! and `snapcheck` and `snapwalk` read one as `check` and `walk` read the
 //! store, against the map as it was when the snapshot was taken, while the
-//! writes, flushes and compactions after it go on underneath. So a
+//! writes, flushes and compactions after it go on underneath. `batch` opens
+//! an indexed batch; `bput`, `bdel` and `bdelrange` write into it while the
+//! store's own writes go on beside it, `bcheck` and `bwalk` read through it
+//! against the map with the batch laid over it, and `commit` or `abort` ends
+//! it. So a
 //! disagreement names the engine that read wrongly, the segment, and what the
 //! other had written before it.
 //!
@@ -85,15 +89,33 @@ enum Op {
     DelRange(String, String),
     Flush,
     Compact,
-    /// A check of the store, or of the live snapshot at this index.
-    Check(Option<usize>),
+    /// A check of what `At` names.
+    Check(At),
     /// A scan over `[lower, upper)`, either side open when `None`, and the
-    /// moves to make with it: of the store, or of a live snapshot.
-    Walk(Option<usize>, Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
+    /// moves to make with it, over what `At` names.
+    Walk(At, Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
     /// A snapshot, appended to the live ones.
     Snap,
     /// The live snapshot at this index, let go.
     Unsnap(usize),
+    /// An indexed batch, opened. One at a time.
+    Batch,
+    /// A `Put`, `Del` or `DelRange` written into the open batch.
+    Batched(Box<Op>),
+    /// The open batch, committed.
+    Commit,
+    /// The open batch, dropped.
+    Abort,
+}
+
+/// What a check or a walk reads.
+#[derive(Clone, Copy)]
+enum At {
+    Store,
+    /// The live snapshot at this index.
+    Snap(usize),
+    /// The store through the open batch.
+    Batch,
 }
 
 /// One move of a walk.
@@ -142,22 +164,37 @@ fn parse(line: &str) -> Op {
         ["delrange", a, b] => Op::DelRange(a.to_string(), b.to_string()),
         ["flush"] => Op::Flush,
         ["compact"] => Op::Compact,
-        ["check"] => Op::Check(None),
-        ["snapcheck", i] => Op::Check(Some(i.parse().expect("snapshot"))),
+        ["check"] => Op::Check(At::Store),
+        ["snapcheck", i] => Op::Check(At::Snap(i.parse().expect("snapshot"))),
+        ["bcheck"] => Op::Check(At::Batch),
         ["snap"] => Op::Snap,
         ["unsnap", i] => Op::Unsnap(i.parse().expect("snapshot")),
-        ["walk", lower, upper, moves @ ..] => walk_op(None, lower, upper, moves),
+        ["walk", lower, upper, moves @ ..] => walk_op(At::Store, lower, upper, moves),
         ["snapwalk", i, lower, upper, moves @ ..] => {
-            walk_op(Some(i.parse().expect("snapshot")), lower, upper, moves)
+            walk_op(At::Snap(i.parse().expect("snapshot")), lower, upper, moves)
+        }
+        ["bwalk", lower, upper, moves @ ..] => walk_op(At::Batch, lower, upper, moves),
+        ["batch"] => Op::Batch,
+        ["commit"] => Op::Commit,
+        ["abort"] => Op::Abort,
+        [w, rest @ ..] if w.starts_with('b') && ["bput", "bdel", "bdelrange"].contains(w) => {
+            Op::Batched(Box::new(parse(
+                &[&w[1..]]
+                    .iter()
+                    .chain(rest)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )))
         }
         _ => fail(&format!("cannot read {line:?}")),
     }
 }
 
-fn walk_op(snap: Option<usize>, lower: &str, upper: &str, moves: &[&str]) -> Op {
+fn walk_op(at: At, lower: &str, upper: &str, moves: &[&str]) -> Op {
     let bound = |w: &str| (w != "-").then(|| script_key(w));
     Op::Walk(
-        snap,
+        at,
         bound(lower),
         bound(upper),
         moves.iter().map(|w| parse_move(w)).collect(),
@@ -179,6 +216,42 @@ fn segments(script: &str) -> Vec<Vec<Op>> {
     out
 }
 
+/// The history up to some point: the map of what is committed, and the
+/// writes of a batch that is open.
+#[derive(Default)]
+struct History<'s> {
+    model: Model,
+    batch: Option<Vec<&'s Op>>,
+}
+
+impl<'s> History<'s> {
+    fn apply(&mut self, op: &'s Op) {
+        match op {
+            Op::Batch => self.batch = Some(Vec::new()),
+            Op::Batched(write) => self.batch.as_mut().expect("no batch is open").push(write),
+            Op::Commit => {
+                for write in self.batch.take().expect("no batch is open") {
+                    apply(&mut self.model, write);
+                }
+            }
+            Op::Abort => self.batch = None,
+            _ => apply(&mut self.model, op),
+        }
+    }
+
+    /// The map as a read through the open batch sees it: the batch's writes
+    /// over what is committed, since on a commit they will be numbered above
+    /// everything before.
+    fn through_batch(&self) -> Model {
+        let mut model = self.model.clone();
+        for write in self.batch.iter().flatten() {
+            apply(&mut model, write);
+        }
+        model
+    }
+}
+
+/// One store write, applied to a map.
 fn apply(model: &mut Model, op: &Op) {
     match op {
         Op::Put(k, step, len) => {
@@ -191,6 +264,9 @@ fn apply(model: &mut Model, op: &Op) {
             model.retain(|k, _| !(a.as_bytes() <= k.as_slice() && k.as_slice() < b.as_bytes()))
         }
         Op::Flush | Op::Compact | Op::Check(_) | Op::Walk(..) | Op::Snap | Op::Unsnap(_) => {}
+        Op::Batch | Op::Batched(_) | Op::Commit | Op::Abort => {
+            unreachable!("a batch's lines go through History")
+        }
     }
 }
 
@@ -215,10 +291,12 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         out.push_str("segment\ncheck\n");
         // Snapshots live in one engine's turn: it closes the store at the end.
         let mut snaps = 0;
+        // So does an open batch, ended before the turn is.
+        let mut batch = false;
         for _ in 0..ops {
             step += 1;
             let line = match rng.below(100) {
-                0..=57 => {
+                0..=55 => {
                     // Mostly short, now and then past a 4 KiB block, and
                     // rarely past a 32 KiB log block.
                     let len = match rng.below(100) {
@@ -226,27 +304,32 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                         90..=98 => 4_000 + rng.below(4_000),
                         _ => 33_000 + rng.below(8_000),
                     };
-                    format!("put {} {step} {len}", key(rng.below(KEYS)))
+                    let line = format!("put {} {step} {len}", key(rng.below(KEYS)));
+                    into_batch(&mut rng, batch, line)
                 }
-                58..=77 => format!("del {}", key(rng.below(KEYS))),
-                78..=82 => {
+                56..=75 => {
+                    let line = format!("del {}", key(rng.below(KEYS)));
+                    into_batch(&mut rng, batch, line)
+                }
+                76..=80 => {
                     let a = rng.below(KEYS);
                     let b = a + 1 + rng.below(30);
-                    format!("delrange {} {}", key(a), key(b))
+                    let line = format!("delrange {} {}", key(a), key(b));
+                    into_batch(&mut rng, batch, line)
                 }
-                83..=90 => "flush".to_string(),
+                81..=88 => "flush".to_string(),
                 // Rare, since it flattens the store into its last level, and
                 // the layouts worth reading are the ones before that.
-                91 if rng.below(4) == 0 => "compact".to_string(),
-                91 => "flush".to_string(),
-                92..=95 => gen_walk(&mut rng),
+                89 if rng.below(4) == 0 => "compact".to_string(),
+                89 => "flush".to_string(),
+                90..=93 => gen_walk(&mut rng),
                 // Taken now and then and read a while later, so that writes,
                 // flushes and compactions land between.
-                96..=97 if snaps == 0 || (snaps < 3 && rng.below(3) == 0) => {
+                94..=95 if snaps == 0 || (snaps < 3 && rng.below(3) == 0) => {
                     snaps += 1;
                     "snap".to_string()
                 }
-                96..=97 => {
+                94..=95 => {
                     let i = rng.below(snaps);
                     match rng.below(3) {
                         0 => format!("snapcheck {i}"),
@@ -260,10 +343,36 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                         }
                     }
                 }
+                // A batch lives for a couple of hundred operations, most of
+                // the writes in its time going into it, and is read through
+                // along the way.
+                96..=97 if !batch => {
+                    batch = true;
+                    "batch".to_string()
+                }
+                96..=97 => match rng.below(20) {
+                    0..=3 => {
+                        batch = false;
+                        "commit".to_string()
+                    }
+                    4 => {
+                        batch = false;
+                        "abort".to_string()
+                    }
+                    5..=11 => "bcheck".to_string(),
+                    _ => format!("b{}", gen_walk(&mut rng)),
+                },
                 _ => "check".to_string(),
             };
             out.push_str(&line);
             out.push('\n');
+        }
+        if batch {
+            out.push_str(if rng.below(4) == 0 {
+                "abort\n"
+            } else {
+                "commit\n"
+            });
         }
         // Half the segments end flushed, and half leave their last writes
         // in the log for the other engine to replay.
@@ -273,6 +382,15 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         out.push_str("check\n");
     }
     print!("{out}");
+}
+
+/// A write, into the open batch seven times in ten while one is open.
+fn into_batch(rng: &mut Rng, batch: bool, write: String) -> String {
+    if batch && rng.below(10) < 7 {
+        format!("b{write}")
+    } else {
+        write
+    }
 }
 
 /// A walk: a range, a quarter of the time the whole alphabet and otherwise
@@ -339,6 +457,7 @@ fn show(found: &Option<(Vec<u8>, Vec<u8>)>) -> String {
 enum Src<'a, F: roble::Fs> {
     Db(&'a roble::Db<F>),
     Snap(&'a roble::Snapshot<F>),
+    Batch(&'a roble::IndexedBatch<'a, F>),
 }
 
 impl<F: roble::Fs> Src<'_, F> {
@@ -349,6 +468,7 @@ impl<F: roble::Fs> Src<'_, F> {
         match self {
             Src::Db(db) => db.range(range),
             Src::Snap(snap) => snap.range(range),
+            Src::Batch(batch) => batch.range(range),
         }
     }
 
@@ -356,6 +476,7 @@ impl<F: roble::Fs> Src<'_, F> {
         match self {
             Src::Db(db) => db.get(key, how).await,
             Src::Snap(snap) => snap.get(key, how).await,
+            Src::Batch(batch) => batch.get(key, how).await,
         }
     }
 }
@@ -599,9 +720,9 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
     let text = std::fs::read_to_string(script)
         .unwrap_or_else(|e| fail(&format!("{}: {e}", script.display())));
     let all = segments(&text);
-    let mut model = Model::new();
+    let mut history = History::default();
     for op in all[..segment].iter().flatten() {
-        apply(&mut model, op);
+        history.apply(op);
     }
 
     // Small, so flushes and compactions keep happening, and inline, so they
@@ -626,8 +747,10 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
 
     // The live snapshots, each with the map as it was when it was taken.
     let mut snaps: Vec<(roble::Snapshot<_>, Model)> = Vec::new();
+    let mut batch: Option<roble::IndexedBatch<_>> = None;
     for (i, op) in all[segment].iter().enumerate() {
         let at = format!("segment {segment} (roble), operation {i}");
+        let model = &history.model;
         match op {
             Op::Put(k, step, len) => db.put(k.as_bytes(), &value(*step, *len)).await,
             Op::Del(k) => db.delete(k.as_bytes()).await,
@@ -637,23 +760,31 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
                 compact_all(&db, &at).await;
                 Ok(())
             }
-            Op::Check(None) => {
-                check(&Src::Db(&db), &model, &at).await;
-                Ok(())
-            }
-            Op::Check(Some(i)) => {
-                let (snap, then) = &snaps[*i];
-                check(&Src::Snap(snap), then, &format!("{at}, snapshot {i}")).await;
-                Ok(())
-            }
-            Op::Walk(None, lower, upper, moves) => {
-                walk(&Src::Db(&db), &model, lower, upper, moves, &at).await;
-                Ok(())
-            }
-            Op::Walk(Some(i), lower, upper, moves) => {
-                let (snap, then) = &snaps[*i];
-                let at = format!("{at}, snapshot {i}");
-                walk(&Src::Snap(snap), then, lower, upper, moves, &at).await;
+            Op::Check(on) | Op::Walk(on, ..) => {
+                let through;
+                let (src, model, at) = match on {
+                    At::Store => (Src::Db(&db), model, at.clone()),
+                    At::Snap(i) => (
+                        Src::Snap(&snaps[*i].0),
+                        &snaps[*i].1,
+                        format!("{at}, snapshot {i}"),
+                    ),
+                    At::Batch => {
+                        through = history.through_batch();
+                        let batch = batch.as_ref().expect("no batch is open");
+                        (
+                            Src::Batch(batch),
+                            &through,
+                            format!("{at}, through the batch"),
+                        )
+                    }
+                };
+                match op {
+                    Op::Walk(_, lower, upper, moves) => {
+                        walk(&src, model, lower, upper, moves, &at).await
+                    }
+                    _ => check(&src, model, &at).await,
+                }
                 Ok(())
             }
             Op::Snap => db.snapshot().map(|snap| snaps.push((snap, model.clone()))),
@@ -661,10 +792,29 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
                 snaps.remove(*i);
                 Ok(())
             }
+            Op::Batch => {
+                batch = Some(db.indexed_batch());
+                Ok(())
+            }
+            Op::Batched(write) => {
+                let b = batch.as_mut().expect("no batch is open");
+                match &**write {
+                    Op::Put(k, step, len) => b.put(k.as_bytes(), &value(*step, *len)),
+                    Op::Del(k) => b.delete(k.as_bytes()),
+                    Op::DelRange(a, z) => b.delete_range(a.as_bytes(), z.as_bytes()),
+                    _ => unreachable!("only writes go into a batch"),
+                }
+            }
+            Op::Commit => batch.take().expect("no batch is open").commit().await,
+            Op::Abort => {
+                batch = None;
+                Ok(())
+            }
         }
         .unwrap_or_else(|e| fail(&format!("{at}: {e}")));
-        apply(&mut model, op);
+        history.apply(op);
     }
+    drop(batch);
     drop(snaps);
     db.close()
         .await
