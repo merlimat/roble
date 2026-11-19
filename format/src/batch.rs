@@ -353,6 +353,28 @@ mod tests {
         assert_eq!(Batch::new().as_bytes(), &[0u8; 12]);
         assert_eq!(Batch::new().count(), 0);
         assert_eq!(Batch::new().seq_num(), 0);
+        assert_eq!(Batch::default().as_bytes(), Batch::new().as_bytes());
+    }
+
+    /// The header counts entries in four bytes, so a batch holding as many as
+    /// they count refuses one more rather than wrapping to zero, which would
+    /// have the reader stop before every entry it holds.
+    #[test]
+    fn a_batch_its_header_cannot_count_further_refuses_another_entry() {
+        let mut b = Batch::new();
+        b.repr[COUNT_OFFSET..HEADER_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = b
+            .put(b"/a", b"1")
+            .expect_err("one past what the header counts");
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        assert_eq!(b.count(), u32::MAX, "the count is left as it was");
+        assert_eq!(b.as_bytes().len(), HEADER_LEN, "and nothing was added");
+    }
+
+    #[test]
+    fn a_representation_shorter_than_its_header_has_no_sequence_number() {
+        let err = seq_num_of(&[0; HEADER_LEN - 1]).expect_err("no header");
+        assert!(matches!(err, Error::Truncated { .. }), "got {err:?}");
     }
 
     #[test]

@@ -1119,6 +1119,11 @@ mod tests {
         assert!(!c.is_valid(), "first");
         c.last(&block).expect("last");
         assert!(!c.is_valid(), "last");
+        let target = key::search_key(b"a");
+        c.seek_ge(&block, &target).expect("seek_ge");
+        assert!(!c.is_valid(), "seek_ge");
+        c.seek_lt(&block, &target).expect("seek_lt");
+        assert!(!c.is_valid(), "seek_lt");
     }
 
     #[test]

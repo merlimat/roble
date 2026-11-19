@@ -303,6 +303,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_key_shorter_than_a_trailer_does_not_split() {
+        for len in 0..TRAILER_LEN {
+            let err = split_encoded(&vec![0; len]).expect_err("no room for a trailer");
+            assert!(matches!(err, Error::Truncated { .. }), "{len}: {err:?}");
+        }
+    }
+
+    #[test]
     fn encode_into_writes_what_encode_returns_over_what_was_there() {
         let mut out = b"left over from the last key, and longer".to_vec();
         for (user, seq, kind) in [

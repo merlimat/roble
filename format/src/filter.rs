@@ -323,6 +323,8 @@ mod tests {
         let block = b.finish();
         let f = Filter::new(&block).expect("valid filter");
         assert_eq!(f.probes(), 6);
+        // Each line is a 64-byte cache line, and the bits are nothing else.
+        assert_eq!(f.lines() as usize * 64, block.len() - 5);
         for k in &keys {
             assert!(
                 f.may_contain(k),
@@ -383,6 +385,15 @@ mod tests {
         // Bits present but a zero line count.
         let mut block = vec![0u8; 64 + 5];
         block[64] = 6;
+        assert!(Filter::new(&block).is_err());
+        // More lines than bytes of bits, so not one bit to a line.
+        let mut block = vec![0u8; 4 + 5];
+        block[4] = 6;
+        block[5..].copy_from_slice(&8u32.to_le_bytes());
+        assert!(Filter::new(&block).is_err());
+        // A line of bits, and no probes into it.
+        let mut block = vec![0u8; 64 + 5];
+        block[65..].copy_from_slice(&1u32.to_le_bytes());
         assert!(Filter::new(&block).is_err());
     }
 }

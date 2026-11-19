@@ -317,6 +317,37 @@ async fn a_flush_rotates_a_manifest_that_outgrows_its_limit() {
 }
 
 #[compio::test]
+async fn a_compaction_rotates_a_manifest_that_outgrows_its_limit() {
+    // A compaction's edit is a MANIFEST append as much as a flush's is, and a
+    // store that only compacts for a while — catching up after a burst of
+    // flushes — must not grow its MANIFEST past the limit meanwhile either.
+    // Any edit outgrows a limit of one byte, so the first compaction rotates.
+    let (env, dir) = load("db-reads").await;
+    let options = roble::Options::new()
+        .max_manifest_bytes(1)
+        .disable_automatic_compactions(true);
+    let db = roble::open_with(&env, &dir, options).await.expect("open");
+    let first = db.manifest_filename();
+    assert!(
+        db.pick().is_some(),
+        "the fixture should arrive wanting a compaction"
+    );
+
+    db.compact_once().await.expect("compact");
+    assert_ne!(
+        db.manifest_filename(),
+        first,
+        "the compaction should have rotated the MANIFEST"
+    );
+    let replayed = replay(env.sim(), &dir, &db.manifest_filename()).await;
+    assert_eq!(
+        shape(&replayed),
+        shape(&db.versions()),
+        "the rotated MANIFEST replays to a different database"
+    );
+}
+
+#[compio::test]
 async fn a_rotation_cut_at_any_point_leaves_the_database_openable() {
     // §12: a half-rotated marker must leave the database openable. The
     // dangerous moment is between creating the new marker and removing the

@@ -106,6 +106,23 @@ async fn tables_touching_at_an_inclusive_bound_are_refused() {
 }
 
 #[compio::test]
+async fn an_edit_a_running_store_applies_is_refused_as_a_replayed_one_is() {
+    // `apply` is how a store takes the edits it makes as it runs. A comparer
+    // other than the set's is refused there as on replay, and before any of
+    // the edit is applied: the set is left as it was.
+    let mut set = replay(vec![table(1, 1, b"a", b"m", 20, Kind::Set)]).expect("replay");
+    let err = set
+        .apply(&VersionEdit {
+            comparer_name: Some("another.Comparator".to_string()),
+            new_tables: vec![table(1, 2, b"n", b"z", 20, Kind::Set)],
+            ..VersionEdit::default()
+        })
+        .expect_err("a second comparer");
+    assert!(format!("{err}").contains("comparer changes"), "got: {err}");
+    assert_eq!(set.version.level(1).len(), 1, "none of the edit applied");
+}
+
+#[compio::test]
 async fn a_bound_is_exclusive_only_at_the_largest_sequence_number() {
     // A range deletion that ends at an ordinary sequence number is not a
     // sentinel: it is a key the table holds.

@@ -376,10 +376,9 @@ fn properties_of(path: &Path) -> Result<TableProperties> {
     let footer = Footer::decode(&tail, size).at(path)?;
     let meta = block(footer.metaindex, footer.checksum)?;
     let metaindex = Metaindex::parse(&Block::new(&meta).at(path)?).at(path)?;
-    // Untested, with a reason (§12): every writer that exists emits a
-    // properties block, so a metaindex without one is a table built by hand.
-    // The engine refuses such a table when it opens one too, and is untested
-    // there for the same reason.
+    // Every writer that exists emits a properties block, so a metaindex
+    // without one is a table built by hand. The engine refuses such a table
+    // when it opens one too.
     let Some(handle) = metaindex.properties else {
         return Err(Error::Message(format!(
             "{}: the table has no properties block",
@@ -636,6 +635,72 @@ mod tests {
         assert!(
             matches!(&refused, Err(Error::Message(m)) if m.contains("table")),
             "the refusal names the table"
+        );
+    }
+
+    /// The properties are what this reads a table for, so a table whose
+    /// metaindex names none is refused, by name. No writer leaves the block
+    /// out, so the metaindex is rebuilt here without it, with a checksum that
+    /// holds and a footer naming it.
+    #[test]
+    fn a_table_with_no_properties_block_is_refused() {
+        use roble_format::block::{Block, BlockBuilder};
+        use roble_format::sst::{TableWriter, WriterOptions};
+        use roble_format::{FOOTER_LEN, Footer, InternalKey, Kind};
+
+        let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+        let key = InternalKey {
+            user_key: b"/oxia/a",
+            seq_num: 1,
+            kind: Kind::Set,
+            obsolete: false,
+        };
+        w.add(key, b"value").expect("add");
+        let bytes = w.finish().expect("finish");
+        let at = bytes.len() - FOOTER_LEN;
+        let footer = Footer::decode(&bytes[at..], bytes.len() as u64).expect("footer");
+
+        let h = footer.metaindex;
+        let old = Block::new(&bytes[h.offset as usize..(h.offset + h.length) as usize])
+            .expect("the metaindex roble wrote");
+        let mut metaindex = BlockBuilder::new(1);
+        let mut it = old.iter();
+        while let Some(entry) = it.next() {
+            let entry = entry.expect("entry");
+            if entry.key != b"rocksdb.properties" {
+                metaindex.add(entry.key, entry.value, 0, None, false);
+            }
+        }
+        let metaindex = metaindex.finish().to_vec();
+        let mut table = bytes[..at].to_vec();
+        table.extend_from_slice(&metaindex);
+        table.push(0); // no compression
+        table.extend_from_slice(&footer.checksum.compute(&metaindex, 0).to_le_bytes());
+        let mut tail = bytes[at..].to_vec();
+        let mut handles = Vec::new();
+        for mut v in [
+            at as u64,
+            metaindex.len() as u64,
+            footer.index.offset,
+            footer.index.length,
+        ] {
+            while v >= 0x80 {
+                handles.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            handles.push(v as u8);
+        }
+        tail[1..FOOTER_LEN - 12].fill(0);
+        tail[1..1 + handles.len()].copy_from_slice(&handles);
+        table.extend_from_slice(&tail);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("000001.sst");
+        std::fs::write(&path, table).expect("write");
+        let refused = properties_of(&path);
+        assert!(
+            matches!(&refused, Err(Error::Message(m)) if m.contains("no properties block")),
+            "the refusal says what the table lacks"
         );
     }
 

@@ -77,12 +77,11 @@ impl Metaindex {
         }
         // Pebble refuses a v1 range-deletion block too: it is unfragmented,
         // and every format roble can open is past the point where one could
-        // legitimately exist (`sstable/reader.go`).
-        // Untested, with a reason rather than a test (§12), and the same
-        // reason either side of the flag: no Pebble that could have written a
-        // table roble opens still writes `rocksdb.range_del`. It is refused
-        // because a reader that ignored the name would miss every deletion in
-        // it, which is worse than refusing a table nobody has.
+        // legitimately exist (`sstable/reader.go`). No Pebble that could have
+        // written a table roble opens still writes `rocksdb.range_del`, so
+        // only a table built by hand has one. It is refused because a reader
+        // that ignored the name would miss every deletion in it, which is
+        // worse than refusing a table nobody has.
         if parsed.range_del_v1_present {
             return Error::unsupported(
                 "table has an unfragmented v1 range-deletion block (rocksdb.range_del)",
@@ -131,8 +130,7 @@ impl<'a> Table<'a> {
                 let block = decode_block_at(bytes, h, footer.checksum)?;
                 Properties::decode(&Block::new(block.as_slice())?)?
             }
-            // Untested, with a reason (§12), as its twin in the engine is:
-            // every writer that exists emits a properties block, so a
+            // Every writer that exists emits a properties block, so a
             // metaindex without one is a table built by hand. Checked anyway
             // because the comparer below is read from it, and a missing block
             // would otherwise be a silent "no comparer named".
@@ -679,6 +677,109 @@ mod tests {
             !text.contains("is not served by roble"),
             "the general refusal should not be the one that fires, got {text:?}"
         );
+    }
+
+    /// A table roble wrote, its metaindex rebuilt from what `edit` makes of
+    /// the entries. The new block goes after the table's own blocks with a
+    /// checksum that holds, and the footer is the old one with only its
+    /// metaindex handle changed, so every check before the metaindex's own
+    /// passes. No writer produces any of the metaindexes the tests below
+    /// give it.
+    fn with_metaindex(edit: impl FnOnce(&mut Vec<(Vec<u8>, Vec<u8>)>)) -> Vec<u8> {
+        use crate::block::BlockBuilder;
+        use crate::sst::{TableWriter, WriterOptions};
+
+        let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+        w.add(key_of(Kind::Set), b"value").expect("add");
+        let bytes = w.finish().expect("finish");
+        let at = bytes.len() - FOOTER_LEN;
+        let footer = Footer::decode(&bytes[at..], bytes.len() as u64).expect("footer");
+
+        let h = footer.metaindex;
+        let old = Block::new(&bytes[h.offset as usize..(h.offset + h.length) as usize])
+            .expect("the metaindex roble wrote");
+        let mut entries = Vec::new();
+        let mut it = old.iter();
+        while let Some(entry) = it.next() {
+            let entry = entry.expect("entry");
+            entries.push((entry.key.to_vec(), entry.value.to_vec()));
+        }
+        edit(&mut entries);
+        entries.sort();
+        let mut metaindex = BlockBuilder::new(1);
+        for (name, value) in &entries {
+            metaindex.add(name, value, 0, None, false);
+        }
+        let metaindex = metaindex.finish().to_vec();
+
+        let mut table = bytes[..at].to_vec();
+        table.extend_from_slice(&metaindex);
+        table.push(0); // no compression
+        table.extend_from_slice(&footer.checksum.compute(&metaindex, 0).to_le_bytes());
+        let mut tail = bytes[at..].to_vec();
+        let mut handles = Vec::new();
+        for mut v in [
+            at as u64,
+            metaindex.len() as u64,
+            footer.index.offset,
+            footer.index.length,
+        ] {
+            while v >= 0x80 {
+                handles.push(v as u8 | 0x80);
+                v >>= 7;
+            }
+            handles.push(v as u8);
+        }
+        tail[1..FOOTER_LEN - 12].fill(0);
+        tail[1..1 + handles.len()].copy_from_slice(&handles);
+        table.extend_from_slice(&tail);
+        table
+    }
+
+    /// The encoded handle of the table's properties block, to name in an
+    /// entry whose block is never read.
+    fn properties_handle(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let (_, handle) = entries
+            .iter()
+            .find(|(name, _)| name == META_PROPERTIES)
+            .expect("a properties entry");
+        handle.clone()
+    }
+
+    #[test]
+    fn a_table_with_no_properties_block_is_refused() {
+        // The comparer is read from the properties, so a table without them
+        // would otherwise open with no comparer named, as if any were fine.
+        let bytes = with_metaindex(|e| e.retain(|(name, _)| name != META_PROPERTIES));
+        let err = Table::open(&bytes).expect_err("no properties block");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert!(format!("{err}").contains("no properties block"), "{err}");
+    }
+
+    #[test]
+    fn a_table_with_a_v1_range_deletion_block_is_refused() {
+        // A reader that skipped the name would miss every deletion in it.
+        let bytes = with_metaindex(|e| {
+            let handle = properties_handle(e);
+            e.push((META_RANGE_DEL_V1.to_vec(), handle));
+        });
+        let err = Table::open(&bytes).expect_err("a v1 range-deletion block");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert!(format!("{err}").contains("rocksdb.range_del"), "{err}");
+    }
+
+    #[test]
+    fn a_value_index_with_a_column_no_bytes_wide_is_refused_at_open() {
+        // The widths after the handle size every row of the index, and the
+        // metaindex is where they are first read.
+        let bytes = with_metaindex(|e| {
+            let mut value = properties_handle(e);
+            value.extend_from_slice(&[0, 2, 1]);
+            e.push((META_VALUE_INDEX.to_vec(), value));
+        });
+        let err = Table::open(&bytes).expect_err("an empty column");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert!(format!("{err}").contains("0 bytes wide"), "{err}");
     }
 
     fn separator(user: &[u8], seq: u64) -> IndexEntry {

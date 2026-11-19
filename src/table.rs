@@ -175,11 +175,10 @@ impl<D: Disk> OpenTable<D> {
         .await?;
         let metaindex = Metaindex::parse(&Block::new(&meta_bytes)?)?;
 
-        // Untested, with a reason (§12): every writer that exists emits a
-        // properties block, so a metaindex without one is a table built by
-        // hand. It is checked anyway because the comparer below is read from
-        // it, and a missing block there would otherwise be a silent "no
-        // comparer named" rather than a refusal.
+        // Every writer that exists emits a properties block, so a metaindex
+        // without one is a table built by hand. It is checked anyway because
+        // the comparer below is read from it, and a missing block there would
+        // otherwise be a silent "no comparer named" rather than a refusal.
         let Some(props_handle) = metaindex.properties else {
             return Err(Error::from(roble_format::Error::Corrupt(
                 "table has no properties block".to_string(),

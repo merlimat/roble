@@ -28,6 +28,17 @@ coverage is below PERCENT. The percentage compared is the one this script
 prints, floored to a tenth, so the rule is exactly "the number CI posted last
 time must not go down" — no epsilon to reason about, and a run that rounds to
 the same tenth passes.
+
+Line coverage is counted here, by the same walk that finds the lines to list,
+rather than taken from llvm-cov's own summary. That summary adds up its lines
+function by function, and a function compiled more than once — into the unit
+tests and into the library the integration tests link, and a generic one again
+for each type each test crate uses it with — is credited with whichever single
+copy ran the most of it. A line that only another copy ran then counts as
+missed, yet appears nowhere in the listing, which merges every copy, so
+nobody could find it to cover it; and moving a test from one file to another
+could move the number. Counted from the listing, every line the percentage
+misses is a line the listing shows.
 """
 
 import json
@@ -47,6 +58,7 @@ def main():
         del args[at : at + 2]
     with open(args[0]) as f:
         report = json.load(f)["data"][0]
+    count_lines(report)
     if floor is not None:
         sys.exit(verdict(report, floor))
     text = "\n".join(summary(report)) + "\n"
@@ -82,6 +94,25 @@ def verdict(report, floor):
     return 0
 
 
+def count_lines(report):
+    """Replaces llvm-cov's line counts, each file's and the total, with the
+    lines `misses` finds: every line that maps to code, and of those, every
+    line some test ran."""
+    total = {"count": 0, "covered": 0}
+    for file in report["files"]:
+        mapped, unrun, _ = misses(file["segments"])
+        lines = {"count": len(mapped), "covered": len(mapped) - len(unrun)}
+        file["summary"]["lines"] = with_percent(lines)
+        total["count"] += lines["count"]
+        total["covered"] += lines["covered"]
+    report["totals"]["lines"] = with_percent(total)
+
+
+def with_percent(summary):
+    summary["percent"] = 100 * summary["covered"] / summary["count"]
+    return summary
+
+
 def tenth(summary):
     """The percentage as this script prints it: floored to a tenth, so that
     only full coverage shows as 100%."""
@@ -107,7 +138,7 @@ def summary(report):
         "that doesn't."
     )
     for file in files:
-        unrun, gaps = misses(file["segments"])
+        _, unrun, gaps = misses(file["segments"])
         if not unrun and not gaps:
             continue
         with open(file["filename"], encoding="utf-8") as f:
@@ -141,12 +172,13 @@ def coverage(summary):
 
 
 def misses(segments):
-    """Returns the lines that never ran, and for each line that did, the columns
-    where regions that never ran start. Lines count as llvm-cov counts them.
+    """Returns the lines that map to code, those of them that never ran, and for
+    each line that did, the columns where regions that never ran start. Lines
+    count as llvm-cov counts them line by line, every copy of the code merged.
 
     A segment is [line, column, count, has count, starts a region, is a gap].
     """
-    unrun, gaps = set(), {}
+    mapped_lines, unrun, gaps = set(), set(), {}
     wrapped = None  # The last segment before the line.
     at = 0
     for line in range(1, segments[-1][0] + 1 if segments else 1):
@@ -158,6 +190,7 @@ def misses(segments):
         skipped = here and not here[0][3] and here[0][4]
         mapped = not skipped and (wrapped and wrapped[3] or starts)
         if mapped or any(s[3] and s[4] for s in here):
+            mapped_lines.add(line)
             count = max([wrapped[2] if wrapped else 0] + [s[2] for s in starts])
             if count == 0:
                 unrun.add(line)
@@ -165,7 +198,7 @@ def misses(segments):
                 gaps[line] = cols
         if here:
             wrapped = here[-1]
-    return unrun, gaps
+    return mapped_lines, unrun, gaps
 
 
 def markers(text, cols):

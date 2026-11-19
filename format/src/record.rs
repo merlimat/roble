@@ -481,7 +481,12 @@ mod tests {
 
     fn sizes() -> Vec<Vec<u8>> {
         // Around the block boundary in both directions, plus multi-block.
+        // The first two each leave a recyclable writer a block tail to pad:
+        // five bytes, too few for even a legacy header, and then nine, enough
+        // for one but too few for a recyclable one.
         let interesting = [
+            BLOCK_SIZE - RECYCLABLE_HEADER_LEN - 5,
+            BLOCK_SIZE - RECYCLABLE_HEADER_LEN - 9,
             0usize,
             1,
             100,
@@ -798,6 +803,16 @@ mod tests {
             format!("{err}").contains("zeroed chunk header followed by data"),
             "got {err:?}"
         );
+
+        // The same fifteen bytes all zero, after a whole record, are padding,
+        // and where the stream ends with them it ends cleanly.
+        let payload = vec![b'a'; fill];
+        let mut bytes = chunk(FULL, None, &payload);
+        bytes.resize(BLOCK_SIZE, 0);
+        let got: Vec<Vec<u8>> = RecordReader::new(&bytes, 0)
+            .collect::<Result<_>>()
+            .expect("a clean end");
+        assert_eq!(got, [payload]);
     }
 
     #[test]
@@ -920,5 +935,20 @@ mod resume_tests {
         joined.extend_from_slice(second.as_bytes());
 
         assert_eq!(joined, whole);
+    }
+
+    /// A resumed writer can be handed an offset no writer stops at, one that
+    /// leaves its block too little room for a header. The trailer then goes
+    /// where a reader looks for the next header, at the start of the next
+    /// block, behind zeros.
+    #[test]
+    fn an_eof_trailer_with_no_room_in_its_block_starts_the_next() {
+        let short = RECYCLABLE_HEADER_LEN - 1;
+        let mut w = RecordWriter::resuming(3, BLOCK_SIZE - short);
+        w.write_eof_trailer().expect("trailer");
+        assert_eq!(w.position(), BLOCK_SIZE + RECYCLABLE_HEADER_LEN);
+        let bytes = w.as_bytes();
+        assert!(bytes[..short].iter().all(|&b| b == 0), "padded");
+        assert_eq!(bytes[short + 6], RECYCLABLE_FULL, "then the trailer");
     }
 }

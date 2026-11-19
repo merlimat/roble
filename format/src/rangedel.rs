@@ -443,4 +443,34 @@ mod tests {
         let block = Block::new(&bytes).expect("parse");
         assert!(decode(&block).is_err());
     }
+
+    /// What `Builder` refuses as the caller's mistake is, read back from a
+    /// table, damage: the sentinel trailer, a range that ends where it starts
+    /// or before, and two ranges that start together but end apart. Such a
+    /// block is built a key at a time here, since the builder would not
+    /// write it.
+    #[test]
+    fn a_block_no_builder_would_write_is_refused() {
+        type Raw<'a> = (&'a [u8], &'a [u8], u64);
+        let cases: [(&str, &[Raw<'_>]); 4] = [
+            ("the sentinel", &[(b"/a", b"/b", SEQ_NUM_MAX)]),
+            ("an empty range", &[(b"/a", b"/a", 5)]),
+            ("an inverted range", &[(b"/b", b"/a", 5)]),
+            (
+                "one start, two ends",
+                &[(b"/a", b"/b", 5), (b"/a", b"/c", 4)],
+            ),
+        ];
+        for (what, raw) in cases {
+            let mut b = BlockBuilder::new(1);
+            for (start, end, seq_num) in raw {
+                let key = crate::key::encode(start, *seq_num, Kind::RangeDelete);
+                b.add(&key, end, 0, None, false);
+            }
+            let bytes = b.finish().to_vec();
+            let block = Block::new(&bytes).expect("parse");
+            let err = decode(&block).expect_err(what);
+            assert!(matches!(err, Error::Corrupt(_)), "{what}: {err:?}");
+        }
+    }
 }
