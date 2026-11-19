@@ -18,7 +18,8 @@
 // The other half of `differential run`, and the same rules: replay the
 // segments before this one into a model, apply this one to the store and the
 // model together, and at every check read the store every way and require
-// the model's answers. Pebble runs as Oxia configures it — the format major
+// the model's answers, and at every walk move a bounded iterator as the
+// script says and require the model's answer after every move. Pebble runs as Oxia configures it — the format major
 // version of the pin, a bloom filter at ten bits a key, L0 uncompressed and
 // Snappy below — with memtables and tables small enough that flushes and
 // compactions keep happening, and its own automatic compactions on, so that
@@ -92,6 +93,123 @@ func atoi(s string) int {
 		fail(fmt.Errorf("not a number: %q", s))
 	}
 	return n
+}
+
+// scriptKey is a key of a script line: a key of the alphabet, or, ending
+// in "+", the key with a zero byte appended.
+func scriptKey(w string) []byte {
+	if k, ok := strings.CutSuffix(w, "+"); ok {
+		return append([]byte(k), 0)
+	}
+	return []byte(w)
+}
+
+// walkWant is where a walk's iterator should be after a move, by the
+// model: want holds the model's keys in [lower, upper), sorted, and at is
+// the key the iterator is on before the move.
+func walkWant(want []string, mv, at string) (string, bool) {
+	// The first index at or after k, and the last before it.
+	ge := func(k string) (string, bool) {
+		i := sort.SearchStrings(want, k)
+		if i < len(want) {
+			return want[i], true
+		}
+		return "", false
+	}
+	lt := func(k string) (string, bool) {
+		i := sort.SearchStrings(want, k)
+		if i > 0 {
+			return want[i-1], true
+		}
+		return "", false
+	}
+	switch {
+	case mv == "f":
+		return ge("")
+	case mv == "l":
+		if len(want) == 0 {
+			return "", false
+		}
+		return want[len(want)-1], true
+	case mv == "n":
+		return ge(at + "\x00")
+	case mv == "p":
+		return lt(at)
+	case strings.HasPrefix(mv, "g:"):
+		return ge(string(scriptKey(mv[2:])))
+	case strings.HasPrefix(mv, "t:"):
+		return lt(string(scriptKey(mv[2:])))
+	}
+	fail(fmt.Errorf("cannot read the move %q", mv))
+	return "", false
+}
+
+// walk moves an iterator over [lower, upper) as the script says and
+// requires the model's answer after every move. A step from nothing is
+// skipped: Pebble turns round onto the range's end and roble stays on
+// nothing, and which is right is not what the walk asks.
+func walk(db *pebble.DB, model map[string][]byte, args []string, at string) {
+	var opts pebble.IterOptions
+	lower, upper := "-", "-"
+	if args[0] != "-" {
+		opts.LowerBound = scriptKey(args[0])
+		lower = args[0]
+	}
+	if args[1] != "-" {
+		opts.UpperBound = scriptKey(args[1])
+		upper = args[1]
+	}
+	var want []string
+	for _, k := range sorted(model) {
+		if (opts.LowerBound == nil || k >= string(opts.LowerBound)) &&
+			(opts.UpperBound == nil || k < string(opts.UpperBound)) {
+			want = append(want, k)
+		}
+	}
+	iter, err := db.NewIter(&opts)
+	if err != nil {
+		fail(fmt.Errorf("%s: walk: %w", at, err))
+	}
+	defer iter.Close()
+	valid := false
+	var done []string
+	for _, mv := range args[2:] {
+		if !valid && (mv == "n" || mv == "p") {
+			continue
+		}
+		before := ""
+		if valid {
+			before = string(iter.Key())
+		}
+		wantKey, wantOK := walkWant(want, mv, before)
+		switch {
+		case mv == "f":
+			valid = iter.First()
+		case mv == "l":
+			valid = iter.Last()
+		case mv == "n":
+			valid = iter.Next()
+		case mv == "p":
+			valid = iter.Prev()
+		case strings.HasPrefix(mv, "g:"):
+			valid = iter.SeekGE(scriptKey(mv[2:]))
+		case strings.HasPrefix(mv, "t:"):
+			valid = iter.SeekLT(scriptKey(mv[2:]))
+		}
+		done = append(done, mv)
+		if err := iter.Error(); err != nil {
+			fail(fmt.Errorf("%s: walk %s: %w", at, strings.Join(done, " "), err))
+		}
+		got, gotV := "", []byte(nil)
+		if valid {
+			got, gotV = string(iter.Key()), iter.Value()
+		}
+		if valid != wantOK || got != wantKey || (valid && !bytes.Equal(gotV, model[got])) {
+			fail(fmt.Errorf("%s: walk over [%s, %s) after %s: Pebble is on %s, the history %s",
+				at, lower, upper, strings.Join(done, " "),
+				show(got, gotV, valid), show(wantKey, model[wantKey], wantOK)))
+		}
+	}
 }
 
 func apply(model map[string][]byte, o op) {
@@ -281,6 +399,8 @@ func main() {
 			err = db.Compact(context.Background(), []byte("a"), []byte("z"), false)
 		case "check":
 			check(db, model, at)
+		case "walk":
+			walk(db, model, o.args, at)
 		default:
 			err = fmt.Errorf("cannot read %q", o.name)
 		}
