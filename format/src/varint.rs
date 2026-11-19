@@ -119,6 +119,13 @@ mod tests {
     }
 
     #[test]
+    fn a_uvarint_wider_than_64_bits_is_refused() {
+        // Ten bytes carry every u64; an eleventh after a tenth that still
+        // continues would carry bits no u64 has.
+        assert!(matches!(uvarint(&[0xff; 11]), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
     fn a_truncated_or_empty_uvarint_is_refused() {
         for bytes in [&[][..], &[0x80], &[0xff, 0xff]] {
             assert!(uvarint(bytes).is_err(), "{bytes:?}");

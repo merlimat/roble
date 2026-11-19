@@ -718,6 +718,27 @@ mod tests {
     }
 
     #[test]
+    fn the_oldest_new_file_tag_ends_at_the_bounds() {
+        // TAG_NEW_FILE predates the sequence numbers TAG_NEW_FILE2 added.
+        // Reading them anyway would take the next tag and its value for them.
+        let edit = Edit::default()
+            .tag(TAG_NEW_FILE)
+            .num(1)
+            .num(8)
+            .num(300)
+            .bytes(&bound(b"a", 1))
+            .bytes(&bound(b"z", 2))
+            .tag(TAG_NEXT_FILE_NUMBER)
+            .num(42)
+            .decode()
+            .expect("the oldest tag is read");
+        let t = &edit.new_tables[0];
+        assert_eq!((t.level, t.file_num, t.size), (1, 8, 300));
+        assert_eq!((t.smallest_seq_num, t.largest_seq_num), (0, 0));
+        assert_eq!(edit.next_file_num, Some(42), "the tag after it is read");
+    }
+
+    #[test]
     fn a_creation_time_that_is_not_one_number_is_refused() {
         let err = Edit::default()
             .tag(TAG_NEW_FILE4)

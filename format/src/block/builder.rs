@@ -200,6 +200,7 @@ mod tests {
             b.add(k, format!("v{i}").as_bytes(), max_shared, None, false);
             prev = k.to_vec();
         }
+        assert_eq!(b.len(), keys.len());
         let bytes = b.finish().to_vec();
         let block = Block::new(&bytes).expect("parse the block just built");
         let mut got = Vec::new();

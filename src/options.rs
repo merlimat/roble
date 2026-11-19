@@ -246,8 +246,8 @@ impl<F: Fs> Options<F> {
         self
     }
 
-    /// How large the MANIFEST may grow before a flush replaces it
-    /// (`crate::rotate`).
+    /// How large the MANIFEST may grow before a flush or a compaction replaces
+    /// it (`crate::rotate`).
     pub fn max_manifest_bytes(mut self, bytes: u64) -> Self {
         self.max_manifest_bytes = bytes;
         self

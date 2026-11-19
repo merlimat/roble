@@ -219,6 +219,16 @@ mod tests {
 
         // Missing widths must not read as a bare block handle.
         assert!(ValueIndex::decode_metaindex_value(&bytes[..bytes.len() - 1]).is_err());
+
+        // A column of no bytes, or of more than a u64 holds, is refused.
+        let widths = bytes.len() - 3;
+        for bad in [[0, 2, 1], [1, 9, 1], [1, 2, 0]] {
+            bytes[widths..].copy_from_slice(&bad);
+            assert!(
+                ValueIndex::decode_metaindex_value(&bytes).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

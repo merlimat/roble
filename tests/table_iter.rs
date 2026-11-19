@@ -194,6 +194,64 @@ async fn an_index_naming_a_block_past_the_end_is_refused_at_open() {
     );
 }
 
+/// The comparer is read from the properties, so a table whose metaindex names
+/// none is refused when it is opened rather than read with no comparer named.
+/// No writer leaves the block out, so the metaindex is rebuilt here without
+/// it, checksummed and named by a new footer, as the index is above.
+#[compio::test]
+async fn a_table_with_no_properties_block_is_refused_at_open() {
+    use roble_format::block::{Block, BlockBuilder};
+    use roble_format::{FOOTER_LEN, InternalKey, Kind};
+
+    let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+    let key = InternalKey {
+        user_key: b"/oxia/a",
+        seq_num: 1,
+        kind: Kind::Set,
+        obsolete: false,
+    };
+    w.add(key, b"value").expect("add");
+    let bytes = w.finish().expect("finish");
+    let footer = *Table::open(&bytes).expect("a table roble wrote").footer();
+
+    let h = footer.metaindex;
+    let old = Block::new(&bytes[h.offset as usize..(h.offset + h.length) as usize])
+        .expect("the metaindex roble wrote");
+    let mut metaindex = BlockBuilder::new(1);
+    let mut it = old.iter();
+    while let Some(entry) = it.next() {
+        let entry = entry.expect("entry");
+        if entry.key != b"rocksdb.properties" {
+            metaindex.add(entry.key, entry.value, 0, None, false);
+        }
+    }
+    let metaindex = metaindex.finish().to_vec();
+
+    let at = bytes.len() - FOOTER_LEN;
+    let mut patched = bytes[..at].to_vec();
+    patched.extend_from_slice(&metaindex);
+    patched.push(0); // no compression
+    let sum = footer.checksum.compute(&metaindex, 0);
+    patched.extend_from_slice(&sum.to_le_bytes());
+    let mut tail = bytes[at..].to_vec();
+    let mut handles = Vec::new();
+    put_uvarint(&mut handles, at as u64);
+    put_uvarint(&mut handles, metaindex.len() as u64);
+    put_uvarint(&mut handles, footer.index.offset);
+    put_uvarint(&mut handles, footer.index.length);
+    tail[1..FOOTER_LEN - 12].fill(0);
+    tail[1..1 + handles.len()].copy_from_slice(&handles);
+    patched.extend_from_slice(&tail);
+
+    let (_env, opened) = try_open_bytes(patched).await;
+    let err = match opened {
+        Ok(_) => panic!("a table with no properties block opened"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, roble::Error::Format(_)), "got {err:?}");
+    assert!(format!("{err}").contains("no properties block"), "{err}");
+}
+
 fn put_uvarint(dst: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         dst.push(v as u8 | 0x80);

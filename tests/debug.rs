@@ -140,3 +140,22 @@ async fn a_memtable_prints_its_size_and_not_its_entries() {
     assert!(printed.contains("len: 1"), "{printed}");
     assert!(printed.contains("range_deletions: 0"), "{printed}");
 }
+
+#[compio::test]
+async fn a_get_buffer_says_whether_it_holds_a_parked_scan() {
+    let env = SimEnv::new();
+    let db = open(&env).await;
+    db.put(b"a", b"1").await.expect("put");
+
+    let mut buf = roble::GetBuf::new();
+    assert!(format!("{buf:?}").contains("KeptScan(none)"), "{buf:?}");
+    // An ordered comparison is answered through a scan, which the buffer
+    // keeps, parked, for the next one.
+    assert!(
+        db.get_into(b"b", Comparison::Floor, &mut buf)
+            .await
+            .expect("floor")
+    );
+    assert!(format!("{buf:?}").contains("KeptScan(parked)"), "{buf:?}");
+    db.close().await.expect("close");
+}

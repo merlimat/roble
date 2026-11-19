@@ -422,6 +422,13 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&[0x80, 0x80, 0x40]); // uvarint, ~1 MiB
         assert!(decode(Compression::Zstd, &data).is_err());
+
+        // And a frame that decodes cleanly to less than the prefix claims
+        // must not hand back the zeros it left in the buffer as the block's.
+        let mut data = vec![10]; // uvarint 10, twice what the frame holds
+        data.extend_from_slice(&zstd::bulk::compress(b"hello", 1).expect("compress"));
+        let err = decode(Compression::Zstd, &data).expect_err("a short frame");
+        assert!(format!("{err}").contains("produced 5"), "got {err:?}");
     }
 
     /// Every algorithm's name, which nothing had asked for.

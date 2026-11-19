@@ -121,4 +121,22 @@ mod tests {
         assert_ne!(crc32c(data), crc);
         assert_eq!(crc32c(b""), cook(0));
     }
+
+    /// None and the 32-bit xxhash are refused as what they are, rather than
+    /// read as one of the two types roble checks.
+    #[test]
+    fn a_checksum_type_no_pebble_roble_opens_writes_is_refused() {
+        assert_eq!(
+            ChecksumType::from_byte(1).expect("crc32c"),
+            ChecksumType::Crc32c
+        );
+        assert_eq!(
+            ChecksumType::from_byte(3).expect("xxhash64"),
+            ChecksumType::XxHash64
+        );
+        for b in [0, 2, 4, u8::MAX] {
+            let err = ChecksumType::from_byte(b).expect_err("refused");
+            assert!(matches!(err, Error::Unsupported(_)), "{b}: {err:?}");
+        }
+    }
 }

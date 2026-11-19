@@ -561,6 +561,30 @@ mod tests {
         assert!(seen.len() > 600, "only {} of 1024 buckets", seen.len());
     }
 
+    #[test]
+    fn a_usize_hashes_as_the_word_it_widens_to() {
+        // One word, as a `u64` is, rather than the eight byte-at-a-time
+        // rounds `Hasher`'s own `write_usize` would make of it.
+        let (mut a, mut b) = (WordHasher::default(), WordHasher::default());
+        a.write_usize(0x1234_5678);
+        b.write_u64(0x1234_5678);
+        assert_eq!(a.finish(), b.finish());
+    }
+
+    /// A store's view of the block cache counts the one cache every store on
+    /// the thread shares, as `Caches::blocks_held` does, and not the blocks
+    /// that store put there.
+    #[test]
+    fn every_stores_view_counts_the_whole_block_cache() {
+        let caches: Caches = Caches::new(DEFAULT_OPEN_TABLES, 1 << 20);
+        let (one, other) = (caches.blocks(0), caches.blocks(1));
+        assert!(one.is_empty() && other.is_empty());
+        one.hold(7, 0, Rc::new(vec![0; 100]));
+        assert_eq!((one.len(), other.len()), (1, 1));
+        assert!(!other.is_empty());
+        assert_eq!(other.bytes_held(), 100);
+    }
+
     /// The default table cache keeps everything, which is what makes it a
     /// bound nobody trips over rather than a cliff somebody falls off.
     ///
@@ -570,6 +594,7 @@ mod tests {
     #[test]
     fn an_unlimited_cache_evicts_nothing() {
         let mut c: Clock<u32, u32> = Clock::new(DEFAULT_OPEN_TABLES);
+        assert!(c.is_empty());
         // More than the old default of 128, so this would have swept.
         for k in 0..1_000 {
             c.insert(k, k, 1);
@@ -642,6 +667,22 @@ mod tests {
         c.insert(99, 99, 1);
         assert_eq!(c.len(), 4, "still within budget: {}", c.len());
         assert_eq!(c.get(&99), Some(99));
+    }
+
+    #[test]
+    fn the_sweep_steps_over_a_slot_a_removal_emptied() {
+        // A removal leaves its slot empty until an insert reuses it. A sweep
+        // that reaches it first has nothing there to evict, and goes on to
+        // the next slot.
+        let mut c: Clock<u32, u32> = Clock::new(3);
+        for k in 0..3 {
+            c.insert(k, k, 1);
+        }
+        c.remove(&0);
+        c.insert(3, 3, 2);
+        assert_eq!(c.get(&1), None, "the entry past the empty slot went");
+        assert_eq!((c.get(&2), c.get(&3)), (Some(2), Some(3)));
+        assert_eq!(c.used(), 3);
     }
 
     #[test]

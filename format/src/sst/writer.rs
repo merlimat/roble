@@ -536,3 +536,34 @@ fn put_uvarint(buf: &mut Vec<u8>, mut x: u64) {
     }
     buf.push(x as u8);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(user_key: &[u8], seq_num: u64) -> InternalKey<'_> {
+        InternalKey {
+            user_key,
+            seq_num,
+            kind: Kind::Set,
+            obsolete: false,
+        }
+    }
+
+    /// A user key may be in a table more than once, as an older version a
+    /// snapshot still sees, but only newest first: that is the order a table
+    /// sorts one user key's entries in.
+    #[test]
+    fn versions_of_one_key_are_taken_newest_first_only() {
+        let mut w = TableWriter::new(WriterOptions::default()).expect("writer");
+        w.add(set(b"/k", 9), b"new").expect("a version");
+        w.add(set(b"/k", 4), b"old").expect("then an older one");
+        for seq_num in [4, 7] {
+            let err = w.add(set(b"/k", seq_num), b"x").expect_err("not older");
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "#{seq_num}: {err:?}"
+            );
+        }
+    }
+}
