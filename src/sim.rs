@@ -78,6 +78,8 @@ pub(crate) enum Op {
     Write,
     /// Syncing a file.
     Sync,
+    /// Cutting or growing a file.
+    SetLen,
 }
 
 /// One file's bytes: what is durable, and what has only been written.
@@ -571,6 +573,31 @@ impl Disk for SimDisk {
         match state.files.get_mut(&path) {
             Some(file) => {
                 file.durable = file.live.clone();
+                Ok(())
+            }
+            None => Err(Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{}", path.display()),
+            ))),
+        }
+    }
+
+    async fn set_len(&self, len: u64) -> Result<()> {
+        self.fs.pause_if_next().await;
+        let mut state = self.fs.state.borrow_mut();
+        state.step(Op::SetLen)?;
+        if !self.writable {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is open read-only", self.path.display()),
+            )));
+        }
+        let path = self.path.clone();
+        match state.files.get_mut(&path) {
+            // Only what a reader sees: until a sync, a crash leaves the
+            // durable bytes as they were, as it leaves an unsynced write.
+            Some(file) => {
+                file.live.resize(len as usize, 0);
                 Ok(())
             }
             None => Err(Error::Io(io::Error::new(

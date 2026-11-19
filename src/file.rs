@@ -240,6 +240,10 @@ impl Disk for FileDisk {
         Ok(self.file.sync_all().await?)
     }
 
+    async fn set_len(&self, len: u64) -> Result<()> {
+        Ok(self.file.set_len(len).await?)
+    }
+
     async fn close(self) -> Result<()> {
         Ok(self.file.close().await?)
     }

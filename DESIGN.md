@@ -47,8 +47,8 @@
 > And the **WAL**: `write(batch, sync)` frames the batch into the log, syncs
 > it when asked and only then applies it to the memtable, so nothing is
 > readable that is not recoverable. `open` replays the logs the version edits
-> leave unflushed, taking each batch's own sequence number, and carries on
-> writing where the replay stopped.
+> leave unflushed, taking each batch's own sequence number, cuts the last log
+> where the replay stopped, and carries on writing there.
 >
 > And **flush**: the memtable written out as a table, the table and the log
 > that follows it made durable, and then a version edit appended to the
@@ -1197,16 +1197,37 @@ again from the replication log — and closing it means syncing a directory robl
 was never handed.
 
 As built, the replay stops at the first record of the **last** log that does
-not read, and the store carries on writing from there — overwriting what was
-half-written, which was never acknowledged. A record that does not read in an
-*earlier* log is corruption and refused, because a later log exists only if
-that one was finished.
+not read, and the store carries on writing from there — first cutting the file
+to that point, which drops what was half-written and was never acknowledged. A
+record that does not read in an *earlier* log is corruption and refused,
+because a later log exists only if that one was finished.
+
+The cut is what makes that last rule safe to apply to a log the store carried
+on in. Written over rather than cut, a torn record longer than what replaces
+it, or the bytes of a file's earlier life when the log is one Pebble recycled,
+stays past the store's last record; the next flush creates a newer log before
+its edit retires this one, and a crash between left a log that was finished,
+by this rule, and does not read to its end — which Pebble refuses too, since
+it replays every log but the newest strictly (`strictWALTail`). Pebble never
+meets this, because it never appends to a log it replayed: its open flushes
+what it replayed and starts a fresh log. `compat/differential` found it by
+killing roble in such a flush.
 
 That rule is looser than §6 states in one way, and the looseness is
 deliberate: it tolerates a torn record anywhere in the last log, not only at
 its tail. Telling a torn tail from damage in the middle of the same file would
 mean deciding what the bytes after it were supposed to be, and stopping at the
-last record that reads is the answer that loses nothing either way.
+last record that reads is the answer that keeps every record the replay could
+read.
+
+What it does not keep, since the cut, is the bytes after the damage: records
+that might have read past a record damaged in the middle of the last log are
+cut away by a writable open, where before they lay on disk until the store's
+own writes covered them. Nothing reads them either way — the replay has
+stopped before them, and the store's next record goes where they begin — so
+the cut loses nothing a reader could have had; it does remove what someone
+examining the file by hand afterwards might have wanted. A read-only open cuts
+nothing.
 
 Note that `Wal::Off` leaves an **empty log file** behind rather than no log
 file, so the question an opener asks is whether a log holds a record, not
@@ -1917,8 +1938,12 @@ in both directions.
   — to be where the map says after each move. A snapshot is read both ways
   against the map as it stood when it was taken, after the writes, flushes and
   compactions since. A read through an open batch sees the map with the batch's
-  writes laid over it, and a commit applies them. CI runs ten seeds; `SEEDS`,
-  `SEED`, `SEGMENTS` and `OPS` run more or replay one.
+  writes laid over it, and a commit applies them. One turn in three kills itself
+  at a random point instead of closing, and the next, the other engine's, opens
+  what it left: the script is cut where the killed turn stopped, and a write it
+  had under way is decided by reading a key the two outcomes disagree on, so
+  every acknowledged write must be there and nothing else. CI runs ten seeds;
+  `SEEDS`, `SEED`, `SEGMENTS` and `OPS` run more or replay one.
 - **A number Pebble will not export is pinned by a fixture instead.** The first
   sequence number a key may be given is `base.SeqNumStart`, in one of Pebble's
   internal packages, so it cannot be asserted against the symbol the way

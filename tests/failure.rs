@@ -623,3 +623,97 @@ async fn a_reopen_after_an_interrupted_flush_never_writes_over_a_log_it_replayed
          tested the reopen that writes to it"
     );
 }
+
+/// A store that wrote `a` and closed, with bytes of an earlier life left past
+/// the log's last record — what a log Pebble recycled holds after its
+/// records, or a record torn by a kill. Returns the log's number.
+async fn with_a_stale_tail(env: &SimEnv, dir: &Path) -> u64 {
+    let db = roble::open_with(env, dir, flush_options())
+        .await
+        .expect("create");
+    db.put(b"a", b"written").await.expect("put a");
+    let log = db
+        .current_log()
+        .expect("a store with a WAL writes to a log");
+    db.close().await.expect("close");
+
+    let path = dir.join(roble_format::files::log_filename(log));
+    let disk = env
+        .sim()
+        .open(&path, roble::Access::ReadWrite)
+        .await
+        .expect("open the log");
+    let end = disk.len().await.expect("len");
+    // Letters, as the middle of an old value is: no header a reader could
+    // mistake for a record, only bytes a reader has to stop at.
+    let stale: Vec<u8> = (0..300u32).map(|i| b'a' + (i * 7 % 26) as u8).collect();
+    let (result, _) = disk.write(WriteBuf::new(stale), end, ()).await;
+    result.expect("write the stale tail");
+    disk.sync(()).await.expect("sync");
+    disk.close().await.expect("close");
+    log
+}
+
+/// A log the store carries on writing to after a reopen ends where its
+/// records do, so that a flush interrupted at any operation leaves a
+/// directory that opens.
+///
+/// The reopen resumes the log where the replay stopped, before the stale
+/// tail. A flush then creates a newer log before its edit retires this one,
+/// and a crash in between leaves this one behind a newer log, where Pebble
+/// and roble both read it strictly: the stale bytes past `b` were taken for
+/// a record that went wrong, and neither would open the directory. Found by
+/// compat/differential killing roble in a flush after it resumed a log
+/// Pebble had recycled.
+#[compio::test]
+async fn a_flush_interrupted_after_a_reopen_over_a_stale_log_tail_leaves_a_database_that_opens() {
+    let total = {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        with_a_stale_tail(&env, &dir).await;
+        let db = roble::open_with(&env, &dir, flush_options())
+            .await
+            .expect("reopen");
+        db.put(b"b", b"written").await.expect("put b");
+        let before = env.sim().ops();
+        db.flush().await.expect("flush");
+        env.sim().ops() - before
+    };
+
+    let mut behind = 0u64;
+    for n in 1..=total {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        let stale = with_a_stale_tail(&env, &dir).await;
+        let db = roble::open_with(&env, &dir, flush_options())
+            .await
+            .expect("the reopen over the stale tail");
+        db.put(b"b", b"written").await.expect("put b");
+        env.sim().fail_at(n);
+        let _ = db.flush().await;
+        env.sim().stop_failing();
+        // The state the trap needs: the resumed log, no longer the newest.
+        if db.current_log().is_some_and(|current| current > stale)
+            && db.versions().min_unflushed_log_num <= stale
+        {
+            behind += 1;
+        }
+        drop(db);
+        env.sim().crash();
+
+        let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+            panic!("the flush failed at operation {n} of {total}: the reopen: {e}")
+        });
+        let found = contents(&db).await;
+        let keys: Vec<&[u8]> = found.keys().map(Vec::as_slice).collect();
+        assert_eq!(
+            keys,
+            [b"a".as_slice(), b"b"],
+            "the flush failed at operation {n} of {total}"
+        );
+    }
+    assert!(
+        behind > 0,
+        "no failure left the resumed log behind a newer one, so nothing here tested it"
+    );
+}

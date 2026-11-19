@@ -39,13 +39,25 @@
 //! an indexed batch; `bput`, `bdel` and `bdelrange` write into it while the
 //! store's own writes go on beside it, `bcheck` and `bwalk` read through it
 //! against the map with the batch laid over it, and `commit` or `abort` ends
-//! it. So a
-//! disagreement names the engine that read wrongly, the segment, and what the
-//! other had written before it.
+//! it. So a disagreement names the engine that read wrongly, the segment,
+//! and what the other had written before it.
+//!
+//! Some turns are killed. `run.sh` names an operation, or the open, and a
+//! delay in microseconds; the turn starts a timer as it begins that one and
+//! aborts the process when it fires, wherever it has got to. `run.sh` reads
+//! how far the turn got from the `done` lines it printed after each
+//! operation, and `truncate` cuts the script's segment there: the operations
+//! done stay, an open batch is aborted, and a write that was under way when
+//! the kill came becomes `maybe`, since it may or may not have landed. The
+//! next turn, the other engine's, opens what the killed one left, decides the
+//! `maybe` by reading a key the two outcomes disagree on, prints which, and
+//! `resolve` writes that into the script before anything else reads it.
 //!
 //! ```text
 //! differential gen <seed> <segments> <ops-per-segment>   script on stdout
-//! differential run <dir> <script> <segment>              roble runs one segment
+//! differential run <dir> <script> <segment> [kill <op|open> <micros>]
+//! differential truncate <script> <segment> <done>        cut a killed segment
+//! differential resolve <script> <segment> applied|dropped
 //! ```
 
 use std::collections::BTreeMap;
@@ -106,6 +118,9 @@ enum Op {
     Commit,
     /// The open batch, dropped.
     Abort,
+    /// A write that was under way when the turn was killed, which may or may
+    /// not have landed: the next turn decides which and `resolve` says so.
+    Maybe(Box<Op>),
 }
 
 /// What a check or a walk reads.
@@ -177,6 +192,7 @@ fn parse(line: &str) -> Op {
         ["batch"] => Op::Batch,
         ["commit"] => Op::Commit,
         ["abort"] => Op::Abort,
+        ["maybe", rest @ ..] => Op::Maybe(Box::new(parse(&rest.join(" ")))),
         [w, rest @ ..] if w.starts_with('b') && ["bput", "bdel", "bdelrange"].contains(w) => {
             Op::Batched(Box::new(parse(
                 &[&w[1..]]
@@ -222,6 +238,9 @@ fn segments(script: &str) -> Vec<Vec<Op>> {
 struct History<'s> {
     model: Model,
     batch: Option<Vec<&'s Op>>,
+    /// A `maybe` not yet decided, with the batch that was open at it, which
+    /// the `abort` after it closes before the next turn decides.
+    maybe: Option<(&'s Op, Option<Vec<&'s Op>>)>,
 }
 
 impl<'s> History<'s> {
@@ -235,8 +254,21 @@ impl<'s> History<'s> {
                 }
             }
             Op::Abort => self.batch = None,
+            Op::Maybe(write) => self.maybe = Some((write, self.batch.clone())),
             _ => apply(&mut self.model, op),
         }
+    }
+
+    /// The map if the undecided `maybe` landed, or `None` if there is none.
+    fn with_maybe(&self) -> Option<Model> {
+        let (write, batch) = self.maybe.as_ref()?;
+        let mut landed = History {
+            model: self.model.clone(),
+            batch: batch.clone(),
+            maybe: None,
+        };
+        landed.apply(write);
+        Some(landed.model)
     }
 
     /// The map as a read through the open batch sees it: the batch's writes
@@ -264,7 +296,7 @@ fn apply(model: &mut Model, op: &Op) {
             model.retain(|k, _| !(a.as_bytes() <= k.as_slice() && k.as_slice() < b.as_bytes()))
         }
         Op::Flush | Op::Compact | Op::Check(_) | Op::Walk(..) | Op::Snap | Op::Unsnap(_) => {}
-        Op::Batch | Op::Batched(_) | Op::Commit | Op::Abort => {
+        Op::Batch | Op::Batched(_) | Op::Commit | Op::Abort | Op::Maybe(_) => {
             unreachable!("a batch's lines go through History")
         }
     }
@@ -716,7 +748,125 @@ async fn compact_all<F: roble::Fs>(db: &roble::Db<F>, at: &str) {
     }
 }
 
-async fn run(dir: &Path, script: &Path, segment: usize) {
+/// Decides a `maybe` the killed turn before this one left: finds a key the
+/// two outcomes disagree on, reads it, takes the outcome the store holds,
+/// and prints which for `run.sh` to `resolve` into the script.
+async fn decide<F: roble::Fs>(db: &roble::Db<F>, history: &mut History<'_>, segment: usize) {
+    let Some(landed) = history.with_maybe() else {
+        return;
+    };
+    history.maybe = None;
+    let differ = landed
+        .keys()
+        .chain(history.model.keys())
+        .find(|k| landed.get(*k) != history.model.get(*k))
+        .cloned();
+    let Some(k) = differ else {
+        // The write changed nothing, so either answer is the same map.
+        println!("resolved dropped");
+        return;
+    };
+    let found = db
+        .get(&k, Comparison::Equal)
+        .await
+        .unwrap_or_else(|e| fail(&format!("segment {segment}: deciding the maybe: {e}")))
+        .map(|f| f.value);
+    if found.as_ref() == landed.get(&k) {
+        history.model = landed;
+        println!("resolved applied");
+    } else if found.as_ref() == history.model.get(&k) {
+        println!("resolved dropped");
+    } else {
+        fail(&format!(
+            "segment {segment}: the write the killed turn left under way neither landed nor did \
+             not: {} holds {}",
+            String::from_utf8_lossy(&k),
+            show(&found.map(|v| (k.clone(), v)))
+        ));
+    }
+}
+
+/// The script's lines, split into the lines before segment `segment`, its
+/// own, and the lines after.
+fn split_segment(script: &str, segment: usize) -> (Vec<&str>, Vec<&str>, Vec<&str>) {
+    let lines: Vec<&str> = script.lines().collect();
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i] == "segment")
+        .collect();
+    let start = starts[segment] + 1;
+    let end = starts.get(segment + 1).copied().unwrap_or(lines.len());
+    (
+        lines[..start].to_vec(),
+        lines[start..end].to_vec(),
+        lines[end..].to_vec(),
+    )
+}
+
+fn rewrite(script: &Path, before: Vec<&str>, own: Vec<String>, after: Vec<&str>) {
+    let mut out = before.join("\n");
+    for line in own.iter().map(String::as_str).chain(after) {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out.push('\n');
+    std::fs::write(script, out).unwrap_or_else(|e| fail(&format!("{}: {e}", script.display())));
+}
+
+/// Cuts segment `segment`, killed after `done` operations: those stay, a
+/// write under way becomes `maybe`, and any open batch is aborted.
+fn truncate(script: &Path, segment: usize, done: usize) {
+    let text = std::fs::read_to_string(script).unwrap_or_else(|e| fail(&format!("{e}")));
+    let (before, own, after) = split_segment(&text, segment);
+    let mut kept: Vec<String> = own.iter().take(done).map(|l| l.to_string()).collect();
+    if let Some(next) = own.get(done) {
+        let word = next.split_whitespace().next().unwrap_or("");
+        if ["put", "del", "delrange", "commit"].contains(&word) {
+            kept.push(format!("maybe {next}"));
+        }
+    }
+    kept.push("abort".to_string());
+    rewrite(script, before, kept, after);
+}
+
+/// Writes the next turn's decision into segment `segment`: the `maybe`
+/// becomes its write, or goes.
+fn resolve(script: &Path, segment: usize, applied: bool) {
+    let text = std::fs::read_to_string(script).unwrap_or_else(|e| fail(&format!("{e}")));
+    let (before, own, after) = split_segment(&text, segment);
+    let own = own
+        .iter()
+        .filter_map(|l| match l.strip_prefix("maybe ") {
+            Some(write) => applied.then(|| write.to_string()),
+            None => Some(l.to_string()),
+        })
+        .collect();
+    rewrite(script, before, own, after);
+}
+
+/// Where a turn that is to be killed dies: as it begins this operation, or
+/// the open, plus this many microseconds.
+#[derive(Clone, Copy)]
+struct Kill {
+    at: Option<usize>,
+    micros: u64,
+}
+
+impl Kill {
+    /// Starts the timer if `at` is where it was asked for. The process ends
+    /// as a kill ends it: no destructor runs, nothing buffered is written,
+    /// and what the OS already holds stays.
+    fn arm(kill: Option<Kill>, at: Option<usize>) {
+        if let Some(k) = kill.filter(|k| k.at == at) {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_micros(k.micros));
+                std::process::abort();
+            });
+        }
+    }
+}
+
+async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
+    let sync = kill.is_some();
     let text = std::fs::read_to_string(script)
         .unwrap_or_else(|e| fail(&format!("{}: {e}", script.display())));
     let all = segments(&text);
@@ -728,15 +878,22 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
     // Small, so flushes and compactions keep happening, and inline, so they
     // happen inside the writes that need them and are done when this exits.
     // Writes are buffered, not synced: what the other engine opens next is
-    // what this one closed, through the page cache, and durability is not
-    // the subject (SimFs and tests/crash_loop.rs are).
+    // what this one left, through the page cache, which a kill does not
+    // lose either, and a machine crash is not the subject (SimFs is). A turn
+    // that may be killed syncs anyway, as Pebble's has to (its unsynced
+    // writes wait in its own buffers), so that both paths are run.
     let options = roble::Options::new()
         .create_if_missing(true)
-        .wal(roble::Wal::Buffered)
+        .wal(if sync {
+            roble::Wal::Synced
+        } else {
+            roble::Wal::Buffered
+        })
         .memtable_size(64 << 10)
         .target_file_size(16 << 10)
         .lbase_max_bytes(64 << 10)
         .background_tasks(false);
+    Kill::arm(kill, None);
     let db = roble::open_with(&roble::DefaultEnv, dir, options)
         .await
         .unwrap_or_else(|e| {
@@ -745,11 +902,16 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
             ))
         });
 
+    // A kill before this line was a kill inside the open.
+    println!("opened");
+    decide(&db, &mut history, segment).await;
+
     // The live snapshots, each with the map as it was when it was taken.
     let mut snaps: Vec<(roble::Snapshot<_>, Model)> = Vec::new();
     let mut batch: Option<roble::IndexedBatch<_>> = None;
     for (i, op) in all[segment].iter().enumerate() {
         let at = format!("segment {segment} (roble), operation {i}");
+        Kill::arm(kill, Some(i));
         let model = &history.model;
         match op {
             Op::Put(k, step, len) => db.put(k.as_bytes(), &value(*step, *len)).await,
@@ -810,9 +972,12 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
                 batch = None;
                 Ok(())
             }
+            Op::Maybe(_) => fail(&format!("{at}: a maybe in a turn's own segment")),
         }
         .unwrap_or_else(|e| fail(&format!("{at}: {e}")));
         history.apply(op);
+        // How far a killed turn got: `run.sh` reads the last of these.
+        println!("done {i}");
     }
     drop(batch);
     drop(snaps);
@@ -840,14 +1005,37 @@ async fn main() {
         .as_slice()
     {
         ["gen", seed, segments, ops] => generate(num(seed), num(segments), num(ops)),
-        ["run", dir, script, segment] => {
+        ["run", dir, script, segment, kill @ ..] => {
+            let kill = match kill {
+                [] => None,
+                ["kill", at, micros] => Some(Kill {
+                    at: (*at != "open").then(|| num(at) as usize),
+                    micros: num(micros),
+                }),
+                _ => fail("run takes kill <op|open> <micros> or nothing after the segment"),
+            };
             run(
                 &PathBuf::from(dir),
                 &PathBuf::from(script),
                 num(segment) as usize,
+                kill,
             )
             .await
         }
-        _ => fail("usage: differential gen <seed> <segments> <ops> | run <dir> <script> <segment>"),
+        ["truncate", script, segment, done] => truncate(
+            &PathBuf::from(script),
+            num(segment) as usize,
+            num(done) as usize,
+        ),
+        ["resolve", script, segment, how @ ("applied" | "dropped")] => resolve(
+            &PathBuf::from(script),
+            num(segment) as usize,
+            *how == "applied",
+        ),
+        _ => fail(
+            "usage: differential gen <seed> <segments> <ops> | run <dir> <script> <segment> \
+             [kill <op|open> <micros>] \
+             | truncate <script> <segment> <done> | resolve <script> <segment> applied|dropped",
+        ),
     }
 }

@@ -98,6 +98,20 @@ jobs:
 
       - name: roble and Go Pebble take turns at one random history
         run: compat/differential/run.sh
+        env:
+          DIFFERENTIAL_OUT: ${{ runner.temp }}/differential
+
+      # A killed turn's timing does not replay, so what a failure left — the
+      # directory and the script, cut as the turns that ran had it — is kept.
+      - name: Upload the differential's directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential
+          path: |
+            ${{ runner.temp }}/differential
+            !${{ runner.temp }}/differential/pebble-differential
+          if-no-files-found: ignore
 
       # The committed golden corpus has to be what the pinned harness still
       # produces, or the tables roble is judged against have drifted from the

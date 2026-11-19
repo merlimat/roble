@@ -22,13 +22,18 @@
 // script says and require the model's answer after every move, and do both
 // through the snapshots the script takes, against the model as it was when
 // each was taken, and through the indexed batch it opens, against the model
-// with the batch's writes laid over it. Pebble runs as Oxia configures it — the format major
+// with the batch's writes laid over it. A turn run.sh kills syncs its writes
+// and sends itself SIGKILL a given number of microseconds after it begins a
+// given operation, or the open; every turn prints a line after each
+// operation, and the turn after a killed
+// one decides the write it left under way (compat/differential says how).
+// Pebble runs as Oxia configures it — the format major
 // version of the pin, a bloom filter at ten bits a key, L0 uncompressed and
 // Snappy below — with memtables and tables small enough that flushes and
 // compactions keep happening, and its own automatic compactions on, so that
 // what roble opens next is laid out the way Pebble chose.
 //
-//	differential <dir> <script> <segment>
+//	differential <dir> <script> <segment> [kill <op|open> <micros>]
 package main
 
 import (
@@ -41,6 +46,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
@@ -236,6 +243,10 @@ func apply(model map[string][]byte, o op) {
 type history struct {
 	model map[string][]byte
 	batch []op
+	// maybe is a write the killed turn before this one left under way, not
+	// yet decided, and maybeBatch the batch that was open at it.
+	maybe      *op
+	maybeBatch []op
 }
 
 func (h *history) apply(o op) {
@@ -249,6 +260,9 @@ func (h *history) apply(o op) {
 			apply(h.model, w)
 		}
 		h.batch = nil
+	case "maybe":
+		w := op{o.args[0], o.args[1:]}
+		h.maybe, h.maybeBatch = &w, h.batch
 	default:
 		apply(h.model, o)
 	}
@@ -262,6 +276,63 @@ func (h *history) throughBatch() map[string][]byte {
 		apply(out, w)
 	}
 	return out
+}
+
+// decide settles a maybe the killed turn before this one left: it finds a
+// key the two outcomes disagree on, reads it, keeps the outcome Pebble
+// holds, and prints which for run.sh to resolve into the script.
+func decide(db *pebble.DB, h *history, segment int) {
+	if h.maybe == nil {
+		return
+	}
+	write := *h.maybe
+	h.maybe = nil
+	landed := history{model: maps.Clone(h.model), batch: h.maybeBatch}
+	landed.apply(write)
+	var differ string
+	found := false
+	for _, m := range []map[string][]byte{landed.model, h.model} {
+		for _, k := range sorted(m) {
+			a, inA := landed.model[k]
+			b, inB := h.model[k]
+			if inA != inB || !bytes.Equal(a, b) {
+				differ, found = k, true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		fmt.Println("resolved dropped")
+		return
+	}
+	got, closer, err := db.Get([]byte(differ))
+	held := err == nil
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		fail(fmt.Errorf("segment %d: deciding the maybe: %w", segment, err))
+	}
+	same := func(m map[string][]byte) bool {
+		v, in := m[differ]
+		return in == held && (!in || bytes.Equal(v, got))
+	}
+	switch {
+	case same(landed.model):
+		// In place, since the caller holds this map.
+		h.batch = h.maybeBatch
+		h.apply(write)
+		h.batch = nil
+		fmt.Println("resolved applied")
+	case same(h.model):
+		fmt.Println("resolved dropped")
+	default:
+		fail(fmt.Errorf("segment %d: the write the killed turn left under way neither landed nor did not: %s holds %s",
+			segment, differ, show(differ, got, held)))
+	}
+	if held {
+		closer.Close()
+	}
 }
 
 func sorted(model map[string][]byte) []string {
@@ -376,9 +447,26 @@ func check(db pebble.Reader, model map[string][]byte, at string) {
 }
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: differential <dir> <script> <segment>")
+	if len(os.Args) != 4 && (len(os.Args) != 7 || os.Args[4] != "kill") {
+		fmt.Fprintln(os.Stderr, "usage: differential <dir> <script> <segment> [kill <op|open> <micros>]")
 		os.Exit(2)
+	}
+	// A turn that is to be killed syncs: Pebble's unsynced writes wait in its
+	// own buffers, which a kill loses, where roble's are already the OS's.
+	wo := pebble.NoSync
+	killAt, killAfter := -2, time.Duration(0)
+	if len(os.Args) == 7 {
+		wo = pebble.Sync
+		killAt = -1
+		if os.Args[5] != "open" {
+			killAt = atoi(os.Args[5])
+		}
+		killAfter = time.Duration(atoi(os.Args[6])) * time.Microsecond
+	}
+	arm := func(at int) {
+		if at == killAt {
+			time.AfterFunc(killAfter, func() { syscall.Kill(os.Getpid(), syscall.SIGKILL) })
+		}
 	}
 	dir, segment := os.Args[1], atoi(os.Args[3])
 	text, err := os.ReadFile(os.Args[2])
@@ -415,13 +503,17 @@ func main() {
 		cs.Levels[0] = block.NoCompression
 		return cs
 	})
-	// Writes are not synced: what the other engine opens next is what this
-	// one closed, through the page cache, and durability is not the subject
-	// (SimFs and tests/crash_loop.rs are).
+	// Writes are not synced unless the turn may be killed: what the other
+	// engine opens next is what this one left, through the page cache, and a
+	// machine crash is not the subject (SimFs is).
+	arm(-1)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		fail(fmt.Errorf("segment %d: Pebble could not open what roble left: %w", segment, err))
 	}
+	// A kill before this line was a kill inside the open.
+	fmt.Println("opened")
+	decide(db, &hist, segment)
 
 	// The live snapshots, each with the model as it was when it was taken.
 	type held struct {
@@ -432,13 +524,14 @@ func main() {
 	var batch *pebble.Batch
 	for i, o := range all[segment] {
 		at := fmt.Sprintf("segment %d (pebble), operation %d", segment, i)
+		arm(i)
 		switch o.name {
 		case "put":
-			err = db.Set([]byte(o.args[0]), value(atoi(o.args[1]), atoi(o.args[2])), pebble.NoSync)
+			err = db.Set([]byte(o.args[0]), value(atoi(o.args[1]), atoi(o.args[2])), wo)
 		case "del":
-			err = db.Delete([]byte(o.args[0]), pebble.NoSync)
+			err = db.Delete([]byte(o.args[0]), wo)
 		case "delrange":
-			err = db.DeleteRange([]byte(o.args[0]), []byte(o.args[1]), pebble.NoSync)
+			err = db.DeleteRange([]byte(o.args[0]), []byte(o.args[1]), wo)
 		case "flush":
 			err = db.Flush()
 		case "compact":
@@ -472,12 +565,14 @@ func main() {
 		case "bwalk":
 			walk(batch, hist.throughBatch(), o.args, at+", through the batch")
 		case "commit":
-			if err = batch.Commit(pebble.NoSync); err == nil {
+			if err = batch.Commit(wo); err == nil {
 				err = batch.Close()
 			}
 			batch = nil
 		case "abort":
-			err = batch.Close()
+			if batch != nil {
+				err = batch.Close()
+			}
 			batch = nil
 		default:
 			err = fmt.Errorf("cannot read %q", o.name)
@@ -486,6 +581,8 @@ func main() {
 			fail(fmt.Errorf("%s: %w", at, err))
 		}
 		hist.apply(o)
+		// How far a killed turn got: run.sh reads the last of these.
+		fmt.Printf("done %d\n", i)
 	}
 	if batch != nil {
 		fail(fmt.Errorf("segment %d: a batch is still open at the end", segment))
