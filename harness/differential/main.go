@@ -19,7 +19,9 @@
 // segments before this one into a model, apply this one to the store and the
 // model together, and at every check read the store every way and require
 // the model's answers, and at every walk move a bounded iterator as the
-// script says and require the model's answer after every move. Pebble runs as Oxia configures it — the format major
+// script says and require the model's answer after every move, and do both
+// through the snapshots the script takes, against the model as it was when
+// each was taken. Pebble runs as Oxia configures it — the format major
 // version of the pin, a bloom filter at ten bits a key, L0 uncompressed and
 // Snappy below — with memtables and tables small enough that flushes and
 // compactions keep happening, and its own automatic compactions on, so that
@@ -33,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"sort"
 	"strconv"
@@ -148,7 +151,7 @@ func walkWant(want []string, mv, at string) (string, bool) {
 // requires the model's answer after every move. A step from nothing is
 // skipped: Pebble turns round onto the range's end and roble stays on
 // nothing, and which is right is not what the walk asks.
-func walk(db *pebble.DB, model map[string][]byte, args []string, at string) {
+func walk(db pebble.Reader, model map[string][]byte, args []string, at string) {
 	var opts pebble.IterOptions
 	lower, upper := "-", "-"
 	if args[0] != "-" {
@@ -247,7 +250,7 @@ func show(k string, v []byte, ok bool) string {
 	return fmt.Sprintf("%s = %d bytes starting %q", k, len(v), head)
 }
 
-func check(db *pebble.DB, model map[string][]byte, at string) {
+func check(db pebble.Reader, model map[string][]byte, at string) {
 	want := sorted(model)
 	iter, err := db.NewIter(nil)
 	if err != nil {
@@ -384,6 +387,12 @@ func main() {
 		fail(fmt.Errorf("segment %d: Pebble could not open what roble left: %w", segment, err))
 	}
 
+	// The live snapshots, each with the model as it was when it was taken.
+	type held struct {
+		snap  *pebble.Snapshot
+		model map[string][]byte
+	}
+	var snaps []held
 	for i, o := range all[segment] {
 		at := fmt.Sprintf("segment %d (pebble), operation %d", segment, i)
 		switch o.name {
@@ -401,6 +410,18 @@ func main() {
 			check(db, model, at)
 		case "walk":
 			walk(db, model, o.args, at)
+		case "snap":
+			snaps = append(snaps, held{db.NewSnapshot(), maps.Clone(model)})
+		case "snapcheck":
+			h := snaps[atoi(o.args[0])]
+			check(h.snap, h.model, fmt.Sprintf("%s, snapshot %s", at, o.args[0]))
+		case "snapwalk":
+			h := snaps[atoi(o.args[0])]
+			walk(h.snap, h.model, o.args[1:], fmt.Sprintf("%s, snapshot %s", at, o.args[0]))
+		case "unsnap":
+			n := atoi(o.args[0])
+			err = snaps[n].snap.Close()
+			snaps = append(snaps[:n], snaps[n+1:]...)
 		default:
 			err = fmt.Errorf("cannot read %q", o.name)
 		}
@@ -408,6 +429,11 @@ func main() {
 			fail(fmt.Errorf("%s: %w", at, err))
 		}
 		apply(model, o)
+	}
+	for _, h := range snaps {
+		if err := h.snap.Close(); err != nil {
+			fail(fmt.Errorf("segment %d: snapshot close: %w", segment, err))
+		}
 	}
 	if err := db.Close(); err != nil {
 		fail(fmt.Errorf("segment %d: close: %w", segment, err))

@@ -31,7 +31,11 @@
 //! scans end to end, and every [`Comparison`] at every key of the alphabet
 //! and either side of it — and requires the map's answers. A `walk` makes a
 //! scan over a range and moves it the way the script says, seeking, stepping
-//! and turning round, and requires the map's answer after every move. So a
+//! and turning round, and requires the map's answer after every move.
+//! `snap` takes a snapshot, up to three at once until `unsnap` lets one go,
+//! and `snapcheck` and `snapwalk` read one as `check` and `walk` read the
+//! store, against the map as it was when the snapshot was taken, while the
+//! writes, flushes and compactions after it go on underneath. So a
 //! disagreement names the engine that read wrongly, the segment, and what the
 //! other had written before it.
 //!
@@ -81,10 +85,15 @@ enum Op {
     DelRange(String, String),
     Flush,
     Compact,
-    Check,
+    /// A check of the store, or of the live snapshot at this index.
+    Check(Option<usize>),
     /// A scan over `[lower, upper)`, either side open when `None`, and the
-    /// moves to make with it.
-    Walk(Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
+    /// moves to make with it: of the store, or of a live snapshot.
+    Walk(Option<usize>, Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
+    /// A snapshot, appended to the live ones.
+    Snap,
+    /// The live snapshot at this index, let go.
+    Unsnap(usize),
 }
 
 /// One move of a walk.
@@ -133,17 +142,26 @@ fn parse(line: &str) -> Op {
         ["delrange", a, b] => Op::DelRange(a.to_string(), b.to_string()),
         ["flush"] => Op::Flush,
         ["compact"] => Op::Compact,
-        ["check"] => Op::Check,
-        ["walk", lower, upper, moves @ ..] => {
-            let bound = |w: &str| (w != "-").then(|| script_key(w));
-            Op::Walk(
-                bound(lower),
-                bound(upper),
-                moves.iter().map(|w| parse_move(w)).collect(),
-            )
+        ["check"] => Op::Check(None),
+        ["snapcheck", i] => Op::Check(Some(i.parse().expect("snapshot"))),
+        ["snap"] => Op::Snap,
+        ["unsnap", i] => Op::Unsnap(i.parse().expect("snapshot")),
+        ["walk", lower, upper, moves @ ..] => walk_op(None, lower, upper, moves),
+        ["snapwalk", i, lower, upper, moves @ ..] => {
+            walk_op(Some(i.parse().expect("snapshot")), lower, upper, moves)
         }
         _ => fail(&format!("cannot read {line:?}")),
     }
+}
+
+fn walk_op(snap: Option<usize>, lower: &str, upper: &str, moves: &[&str]) -> Op {
+    let bound = |w: &str| (w != "-").then(|| script_key(w));
+    Op::Walk(
+        snap,
+        bound(lower),
+        bound(upper),
+        moves.iter().map(|w| parse_move(w)).collect(),
+    )
 }
 
 /// The script's segments, each a list of operations.
@@ -172,7 +190,7 @@ fn apply(model: &mut Model, op: &Op) {
         Op::DelRange(a, b) => {
             model.retain(|k, _| !(a.as_bytes() <= k.as_slice() && k.as_slice() < b.as_bytes()))
         }
-        Op::Flush | Op::Compact | Op::Check | Op::Walk(..) => {}
+        Op::Flush | Op::Compact | Op::Check(_) | Op::Walk(..) | Op::Snap | Op::Unsnap(_) => {}
     }
 }
 
@@ -195,6 +213,8 @@ fn generate(seed: u64, segments: u64, ops: u64) {
     for _ in 0..segments {
         // A check first, of what the other engine left, and one last.
         out.push_str("segment\ncheck\n");
+        // Snapshots live in one engine's turn: it closes the store at the end.
+        let mut snaps = 0;
         for _ in 0..ops {
             step += 1;
             let line = match rng.below(100) {
@@ -220,6 +240,26 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                 91 if rng.below(4) == 0 => "compact".to_string(),
                 91 => "flush".to_string(),
                 92..=95 => gen_walk(&mut rng),
+                // Taken now and then and read a while later, so that writes,
+                // flushes and compactions land between.
+                96..=97 if snaps == 0 || (snaps < 3 && rng.below(3) == 0) => {
+                    snaps += 1;
+                    "snap".to_string()
+                }
+                96..=97 => {
+                    let i = rng.below(snaps);
+                    match rng.below(3) {
+                        0 => format!("snapcheck {i}"),
+                        1 => format!(
+                            "snap{}",
+                            gen_walk(&mut rng).replacen("walk", &format!("walk {i}"), 1)
+                        ),
+                        _ => {
+                            snaps -= 1;
+                            format!("unsnap {i}")
+                        }
+                    }
+                }
                 _ => "check".to_string(),
             };
             out.push_str(&line);
@@ -295,7 +335,32 @@ fn show(found: &Option<(Vec<u8>, Vec<u8>)>) -> String {
     }
 }
 
-async fn check<F: roble::Fs>(db: &roble::Db<F>, model: &Model, at: &str) {
+/// What a check or a walk reads: the store, or a snapshot of it.
+enum Src<'a, F: roble::Fs> {
+    Db(&'a roble::Db<F>),
+    Snap(&'a roble::Snapshot<F>),
+}
+
+impl<F: roble::Fs> Src<'_, F> {
+    fn range<'k>(
+        &self,
+        range: impl std::ops::RangeBounds<&'k [u8]>,
+    ) -> roble::Result<roble::Scan<F>> {
+        match self {
+            Src::Db(db) => db.range(range),
+            Src::Snap(snap) => snap.range(range),
+        }
+    }
+
+    async fn get(&self, key: &[u8], how: Comparison) -> roble::Result<Option<roble::Found>> {
+        match self {
+            Src::Db(db) => db.get(key, how).await,
+            Src::Snap(snap) => snap.get(key, how).await,
+        }
+    }
+}
+
+async fn check<F: roble::Fs>(db: &Src<'_, F>, model: &Model, at: &str) {
     let mut scan = db
         .range(..)
         .unwrap_or_else(|e| fail(&format!("{at}: scan: {e}")));
@@ -453,7 +518,7 @@ fn walk_want<'m>(
 /// roble leaves the scan on nothing and Pebble turns round onto the range's
 /// end, and which is right is not what the walk is asking.
 async fn walk<F: roble::Fs>(
-    db: &roble::Db<F>,
+    db: &Src<'_, F>,
     model: &Model,
     lower: &Option<Vec<u8>>,
     upper: &Option<Vec<u8>>,
@@ -559,6 +624,8 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
             ))
         });
 
+    // The live snapshots, each with the map as it was when it was taken.
+    let mut snaps: Vec<(roble::Snapshot<_>, Model)> = Vec::new();
     for (i, op) in all[segment].iter().enumerate() {
         let at = format!("segment {segment} (roble), operation {i}");
         match op {
@@ -570,18 +637,35 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
                 compact_all(&db, &at).await;
                 Ok(())
             }
-            Op::Check => {
-                check(&db, &model, &at).await;
+            Op::Check(None) => {
+                check(&Src::Db(&db), &model, &at).await;
                 Ok(())
             }
-            Op::Walk(lower, upper, moves) => {
-                walk(&db, &model, lower, upper, moves, &at).await;
+            Op::Check(Some(i)) => {
+                let (snap, then) = &snaps[*i];
+                check(&Src::Snap(snap), then, &format!("{at}, snapshot {i}")).await;
+                Ok(())
+            }
+            Op::Walk(None, lower, upper, moves) => {
+                walk(&Src::Db(&db), &model, lower, upper, moves, &at).await;
+                Ok(())
+            }
+            Op::Walk(Some(i), lower, upper, moves) => {
+                let (snap, then) = &snaps[*i];
+                let at = format!("{at}, snapshot {i}");
+                walk(&Src::Snap(snap), then, lower, upper, moves, &at).await;
+                Ok(())
+            }
+            Op::Snap => db.snapshot().map(|snap| snaps.push((snap, model.clone()))),
+            Op::Unsnap(i) => {
+                snaps.remove(*i);
                 Ok(())
             }
         }
         .unwrap_or_else(|e| fail(&format!("{at}: {e}")));
         apply(&mut model, op);
     }
+    drop(snaps);
     db.close()
         .await
         .unwrap_or_else(|e| fail(&format!("segment {segment}: close: {e}")));

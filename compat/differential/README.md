@@ -11,7 +11,7 @@ and closes.
 
 A segment is a few hundred operations: puts over a 1000-key alphabet with
 values from one byte to past a 32 KiB log block, deletes, range deletions,
-flushes, full compactions, walks and checks. Both engines run with memtables and
+flushes, full compactions, snapshots, walks and checks. Both engines run with memtables and
 tables small enough that flushes and compactions keep happening, and Pebble
 with its own automatic compactions on, as Oxia configures it otherwise: the
 format major version of the pin, a ten-bit bloom filter, L0 uncompressed and
@@ -30,8 +30,15 @@ keys with either side now and then open, and makes forty moves with it —
 outside the range — and after every move requires the key the map says, so
 it turns round in the middle of tables and at their edges, where a full scan
 never does. A step from nothing is skipped, since the engines differ there:
-Pebble turns round onto the end of the range and roble stays on nothing. A
-disagreement names the engine
+Pebble turns round onto the end of the range and roble stays on nothing.
+
+`snap` takes a snapshot, and a turn holds up to three until `unsnap` lets one
+go or the turn ends. `snapcheck` and `snapwalk` read one the way `check` and
+`walk` read the store, against the map as it was when the snapshot was taken,
+with the writes, flushes and compactions since then underneath: newer
+versions and range deletions in the same memtable, tables the snapshot's
+version does not hold, and, on Pebble, compactions that keep what it can see.
+A disagreement names the engine
 that read wrongly, the segment and the operation, and what the other engine
 wrote before it is the segments before.
 
@@ -48,6 +55,9 @@ reverted (`tests/range_del.rs` keeps the layout instead).
 
 Walks catch a scan that ignores its lower bound on a seek, or that turns from
 reverse to forward onto the key it is on, in the first walk of seed 3000.
+Snapshot reads catch, within the first three seeds from 3000, a memtable
+range deletion or a scan's point entry seen whatever its number, and a
+snapshot's `Equal` taking a version written after it.
 
 ## Running it
 

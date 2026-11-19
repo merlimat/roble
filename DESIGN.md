@@ -1903,18 +1903,20 @@ in both directions.
   byte in the directory — MANIFEST, both markers, the log, the tables — was
   written by roble. Every other mode starts from a database Pebble built, which
   leaves Pebble's own bytes in the parts roble did not touch.
-- **Both engines, in turn, on one random history.** Every mode above is a
-  fixed scenario. `compat/differential` generates a seeded script of segments
-  — puts over a small alphabet with values from a byte to past a log block,
-  deletes, range deletions, flushes, full compactions, walks and checks — and
-  hands each segment to roble or to Go Pebble in turn on one directory, so
-  each opens what the other wrote: its tables, the layouts its compactions
-  chose (Pebble's automatic ones included), its MANIFEST, and the log it left
+- **Both engines, in turn, on one random history.** Every mode above is a fixed
+  scenario. `compat/differential` generates a seeded script of segments — puts
+  over a small alphabet with values from a byte to past a log block, deletes,
+  range deletions, flushes, full compactions, snapshots, walks and checks — and
+  hands each segment to roble or to Go Pebble in turn on one directory, so each
+  opens what the other wrote: its tables, the layouts its compactions chose
+  (Pebble's automatic ones included), its MANIFEST, and the log it left
   unflushed. The oracle is the script: each runner replays the segments before
   its own into a `BTreeMap` and, at every check, requires both scans and every
-  comparison at every key to agree with it, and at every walk, an iterator
-  over a range moved forty times — seeking, stepping, turning round — to be
-  where the map says after each move. CI runs ten seeds; `SEEDS`, `SEED`, `SEGMENTS` and `OPS` run more or replay one.
+  comparison at every key to agree with it, and at every walk, an iterator over
+  a range moved forty times — seeking, stepping, turning round — to be where the
+  map says after each move. A snapshot is read both ways against the map as it
+  stood when it was taken, after the writes, flushes and compactions since. CI
+  runs ten seeds; `SEEDS`, `SEED`, `SEGMENTS` and `OPS` run more or replay one.
 - **A number Pebble will not export is pinned by a fixture instead.** The first
   sequence number a key may be given is `base.SeqNumStart`, in one of Pebble's
   internal packages, so it cannot be asserted against the symbol the way
