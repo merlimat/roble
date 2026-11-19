@@ -11,7 +11,7 @@ and closes.
 
 A segment is a few hundred operations: puts over a 1000-key alphabet with
 values from one byte to past a 32 KiB log block, deletes, range deletions,
-flushes, full compactions, snapshots, walks and checks. Both engines run with memtables and
+flushes, full compactions, snapshots, batches, walks and checks. Both engines run with memtables and
 tables small enough that flushes and compactions keep happening, and Pebble
 with its own automatic compactions on, as Oxia configures it otherwise: the
 format major version of the pin, a ten-bit bloom filter, L0 uncompressed and
@@ -38,6 +38,13 @@ go or the turn ends. `snapcheck` and `snapwalk` read one the way `check` and
 with the writes, flushes and compactions since then underneath: newer
 versions and range deletions in the same memtable, tables the snapshot's
 version does not hold, and, on Pebble, compactions that keep what it can see.
+
+`batch` opens an indexed batch, one at a time, which lives a couple of hundred
+operations. While it is open, seven writes in ten go into it (`bput`, `bdel`,
+`bdelrange`) and the rest go to the store beside it. `bcheck` and `bwalk` read
+through it against the map with the batch's writes laid over what is
+committed, since a commit numbers them above everything before; `commit`
+applies them to the map, and `abort` drops them.
 A disagreement names the engine
 that read wrongly, the segment and the operation, and what the other engine
 wrote before it is the segments before.
@@ -57,7 +64,10 @@ Walks catch a scan that ignores its lower bound on a seek, or that turns from
 reverse to forward onto the key it is on, in the first walk of seed 3000.
 Snapshot reads catch, within the first three seeds from 3000, a memtable
 range deletion or a scan's point entry seen whatever its number, and a
-snapshot's `Equal` taking a version written after it.
+snapshot's `Equal` taking a version written after it. Reads through a batch
+catch, within the same seeds, a batch's `Equal` that ignores its own range
+deletion or orders it against its own put the wrong way round, and a scan
+that does not see a batch's entries.
 
 ## Running it
 

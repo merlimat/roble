@@ -21,7 +21,8 @@
 // the model's answers, and at every walk move a bounded iterator as the
 // script says and require the model's answer after every move, and do both
 // through the snapshots the script takes, against the model as it was when
-// each was taken. Pebble runs as Oxia configures it — the format major
+// each was taken, and through the indexed batch it opens, against the model
+// with the batch's writes laid over it. Pebble runs as Oxia configures it — the format major
 // version of the pin, a bloom filter at ten bits a key, L0 uncompressed and
 // Snappy below — with memtables and tables small enough that flushes and
 // compactions keep happening, and its own automatic compactions on, so that
@@ -230,6 +231,39 @@ func apply(model map[string][]byte, o op) {
 	}
 }
 
+// history is the model of what is committed, and the writes of a batch
+// that is open.
+type history struct {
+	model map[string][]byte
+	batch []op
+}
+
+func (h *history) apply(o op) {
+	switch o.name {
+	case "batch", "abort":
+		h.batch = nil
+	case "bput", "bdel", "bdelrange":
+		h.batch = append(h.batch, op{o.name[1:], o.args})
+	case "commit":
+		for _, w := range h.batch {
+			apply(h.model, w)
+		}
+		h.batch = nil
+	default:
+		apply(h.model, o)
+	}
+}
+
+// throughBatch is the model as a read through the open batch sees it: the
+// batch's writes over what is committed.
+func (h *history) throughBatch() map[string][]byte {
+	out := maps.Clone(h.model)
+	for _, w := range h.batch {
+		apply(out, w)
+	}
+	return out
+}
+
 func sorted(model map[string][]byte) []string {
 	out := make([]string, 0, len(model))
 	for k := range model {
@@ -355,12 +389,14 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	model := map[string][]byte{}
+	hist := history{model: map[string][]byte{}}
 	for _, s := range all[:segment] {
 		for _, o := range s {
-			apply(model, o)
+			hist.apply(o)
 		}
 	}
+	// The same map throughout: a commit applies to it in place.
+	model := hist.model
 
 	opts := &pebble.Options{
 		FS:                 vfs.Default,
@@ -393,6 +429,7 @@ func main() {
 		model map[string][]byte
 	}
 	var snaps []held
+	var batch *pebble.Batch
 	for i, o := range all[segment] {
 		at := fmt.Sprintf("segment %d (pebble), operation %d", segment, i)
 		switch o.name {
@@ -422,13 +459,36 @@ func main() {
 			n := atoi(o.args[0])
 			err = snaps[n].snap.Close()
 			snaps = append(snaps[:n], snaps[n+1:]...)
+		case "batch":
+			batch = db.NewIndexedBatch()
+		case "bput":
+			err = batch.Set([]byte(o.args[0]), value(atoi(o.args[1]), atoi(o.args[2])), nil)
+		case "bdel":
+			err = batch.Delete([]byte(o.args[0]), nil)
+		case "bdelrange":
+			err = batch.DeleteRange([]byte(o.args[0]), []byte(o.args[1]), nil)
+		case "bcheck":
+			check(batch, hist.throughBatch(), at+", through the batch")
+		case "bwalk":
+			walk(batch, hist.throughBatch(), o.args, at+", through the batch")
+		case "commit":
+			if err = batch.Commit(pebble.NoSync); err == nil {
+				err = batch.Close()
+			}
+			batch = nil
+		case "abort":
+			err = batch.Close()
+			batch = nil
 		default:
 			err = fmt.Errorf("cannot read %q", o.name)
 		}
 		if err != nil {
 			fail(fmt.Errorf("%s: %w", at, err))
 		}
-		apply(model, o)
+		hist.apply(o)
+	}
+	if batch != nil {
+		fail(fmt.Errorf("segment %d: a batch is still open at the end", segment))
 	}
 	for _, h := range snaps {
 		if err := h.snap.Close(); err != nil {
