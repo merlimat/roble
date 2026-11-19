@@ -81,7 +81,7 @@ for ((s = first; s < first + seeds; s++)); do
     if [ "$engine" = roble ]; then cmd=("$roble" run "$db" "$script" "$i"); else cmd=("$pebble" "$db" "$script" "$i"); fi
     progress="$out/progress"
     failed="seed $s failed in segment $i ($engine)"
-    if (( crash > 0 && i < segments - 1 && killed != i - 1 && RANDOM % crash == 0 )); then
+    if (( crash > 0 )) && (( i < segments - 1 && killed != i - 1 && RANDOM % crash == 0 )); then
       # A quarter of the kills aim at the open, the rest at an operation
       # picked at random; the turn kills itself that many microseconds after
       # it begins it, wherever it has got to by then. Synced, so that what

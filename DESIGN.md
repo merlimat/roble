@@ -1963,7 +1963,9 @@ in both directions.
   and checks — and hands each segment to roble or to Go Pebble in turn on one
   directory, so each opens what the other wrote: its tables, the layouts its
   compactions chose (Pebble's automatic ones included), its MANIFEST, and the
-  log it left unflushed. The oracle is the script: each runner replays the
+  log it left unflushed. Half of roble's turns flush and compact in the
+  store's own tasks, beside the turn's reads, and half inline. The oracle is
+  the script: each runner replays the
   segments before its own into a `BTreeMap` and, at every check, requires both
   scans and every comparison at every key to agree with it, and at every walk,
   an iterator over a range moved forty times — seeking, stepping, turning round

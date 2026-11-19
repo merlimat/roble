@@ -731,8 +731,9 @@ async fn walk<F: roble::Fs>(
 
 /// Every table down to the last level, as `harness/differential`'s
 /// `compact` has Pebble do.
-async fn compact_all<F: roble::Fs>(db: &roble::Db<F>, at: &str) {
-    for level in 0..6 {
+async fn compact_all<F: roble::Fs>(db: &roble::Db<F>, background: bool, at: &str) {
+    let mut level = 0;
+    while level < 6 {
         let tables: Vec<u64> = db
             .versions()
             .version
@@ -740,10 +741,16 @@ async fn compact_all<F: roble::Fs>(db: &roble::Db<F>, at: &str) {
             .iter()
             .map(|t| t.file_num)
             .collect();
-        if !tables.is_empty() {
-            db.compact(level, &tables)
-                .await
-                .unwrap_or_else(|e| fail(&format!("{at}: compact L{level}: {e}")));
+        if tables.is_empty() {
+            level += 1;
+            continue;
+        }
+        match db.compact(level, &tables).await {
+            Ok(_) => level += 1,
+            // The store's own merge task has some of them: wait for it, and
+            // take the level again as it then stands.
+            Err(roble::Error::Unsupported(_)) if background => db.compaction_settled().await,
+            Err(e) => fail(&format!("{at}: compact L{level}: {e}")),
         }
     }
 }
@@ -875,13 +882,19 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
         history.apply(op);
     }
 
-    // Small, so flushes and compactions keep happening, and inline, so they
-    // happen inside the writes that need them and are done when this exits.
+    // Small, so flushes and compactions keep happening. Every other roble
+    // turn runs them inline, inside the writes that need them, and the rest
+    // in the store's own tasks, as a store is opened by default: there a
+    // flush or a merge runs beside the turn's writes and reads, and a kill
+    // may find one under way that no operation of the script asked for.
+    // Either way they are done when the turn closes, which waits for the
+    // tasks.
     // Writes are buffered, not synced: what the other engine opens next is
     // what this one left, through the page cache, which a kill does not
     // lose either, and a machine crash is not the subject (SimFs is). A turn
     // that may be killed syncs anyway, as Pebble's has to (its unsynced
     // writes wait in its own buffers), so that both paths are run.
+    let background = segment / 2 % 2 == 1;
     let options = roble::Options::new()
         .create_if_missing(true)
         .wal(if sync {
@@ -892,7 +905,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
         .memtable_size(64 << 10)
         .target_file_size(16 << 10)
         .lbase_max_bytes(64 << 10)
-        .background_tasks(false);
+        .background_tasks(background);
     Kill::arm(kill, None);
     let db = roble::open_with(&roble::DefaultEnv, dir, options)
         .await
@@ -919,7 +932,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
             Op::DelRange(a, b) => db.delete_range(a.as_bytes(), b.as_bytes()).await,
             Op::Flush => db.flush().await.map(|_| ()),
             Op::Compact => {
-                compact_all(&db, &at).await;
+                compact_all(&db, background, &at).await;
                 Ok(())
             }
             Op::Check(on) | Op::Walk(on, ..) => {
