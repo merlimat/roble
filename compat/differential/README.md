@@ -18,7 +18,7 @@ configures it otherwise: the format major version of the pin, a ten-bit bloom
 filter, L0 uncompressed and Snappy below. Every other roble turn flushes and
 compacts inline, inside the writes that need it, and the rest in the store's
 own tasks, as a store is opened by default, so that a flush or a merge runs
-beside the turn's reads and a kill can land in one no operation asked for.
+beside the turn's reads, and a kill in such a turn may find one under way.
 Some turns are killed rather than closed.
 
 ## The oracle
@@ -124,9 +124,11 @@ deletion or orders it against its own put the wrong way round, and a scan
 that does not see a batch's entries.
 
 Turns with the store's tasks on catch a read that skips the memtable a flush
-has frozen and is writing out, in the first seed from 4000 (segment 6: a scan
-finds 342 keys where the history says 347). Inline, no read runs while a
-flush is under way, and the same twelve seeds pass with every turn inline.
+has frozen and is writing out, in the first seed from 4000. Inline, no read
+runs while a flush is under way, and the same twelve seeds pass with every
+turn inline. Half of roble's kills land in turns with the tasks on (10 of 20
+over ten seeds with `CRASH=1`); whether a flush or a merge of theirs was
+under way at the moment is not something the turn can tell.
 
 ## Running it
 

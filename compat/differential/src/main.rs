@@ -886,9 +886,9 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     // turn runs them inline, inside the writes that need them, and the rest
     // in the store's own tasks, as a store is opened by default: there a
     // flush or a merge runs beside the turn's writes and reads, and a kill
-    // can land in the middle of one that no operation of the script asked
-    // for. Either way they are done when the turn closes, which waits for
-    // the tasks.
+    // may find one under way that no operation of the script asked for.
+    // Either way they are done when the turn closes, which waits for the
+    // tasks.
     // Writes are buffered, not synced: what the other engine opens next is
     // what this one left, through the page cache, which a kill does not
     // lose either, and a machine crash is not the subject (SimFs is). A turn
