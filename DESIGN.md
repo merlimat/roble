@@ -1231,6 +1231,12 @@ meets this, because it never appends to a log it replayed: its open flushes
 what it replayed and starts a fresh log. `compat/differential` found it by
 killing roble in such a flush.
 
+And when there is no last log to carry on in, a writable open creates one, as
+Pebble's does. Pebble's open moves the MANIFEST past every log it replayed
+before it creates the next, so killed in between it leaves a directory with
+no log at or past the minimum; `compat/differential` found that too, by
+killing Pebble in its open.
+
 That rule is looser than §6 states in one way, and the looseness is
 deliberate: it tolerates a torn record anywhere in the last log, not only at
 its tail. Telling a torn tail from damage in the middle of the same file would

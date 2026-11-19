@@ -546,6 +546,25 @@ async fn open_dir<E: Env>(
                 at,
             })
         }
+        // No log at or past the MANIFEST's minimum, which is what Pebble
+        // leaves when it is killed between flushing what its open replayed
+        // and creating the log it writes to next: its next open creates one,
+        // and so does this. Created and its name made durable before anything
+        // is appended, as a flush creates one (`crate::flush`), under a number
+        // the ratchet above has put past every file in the directory.
+        None if !read_only && options.wal != crate::Wal::Off => {
+            let log_num = versions.next_file_num;
+            let path = dir.join(roble_format::files::log_filename(log_num));
+            let disk = fs.create(&path).await?;
+            disk.sync(Default::default()).await?;
+            fs.sync_dir(dir).await?;
+            versions.next_file_num = log_num + 1;
+            Some(Log {
+                disk: std::rc::Rc::new(disk),
+                log_num,
+                at: 0,
+            })
+        }
         None => None,
     };
 

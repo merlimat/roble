@@ -174,6 +174,62 @@ async fn a_log_holding_no_records_does_not_stop_an_open() {
 
 // ------------------------------------------- against a directory built on purpose
 
+/// Pebble's open flushes what it replayed, which moves the MANIFEST's minimum
+/// unflushed log past every log in the directory, and only then creates the
+/// log it will write to. Killed in between, it leaves a database with no log
+/// a writer can carry on in, and its next open creates one. So must roble's.
+#[compio::test]
+async fn an_open_with_no_log_left_to_resume_creates_one() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let options = || {
+        roble::Options::new()
+            .create_if_missing(true)
+            .background_tasks(false)
+    };
+    let db = roble::open_with(&env, &dir, options())
+        .await
+        .expect("create");
+    db.put(b"a", b"written").await.expect("put a");
+    db.flush().await.expect("flush a");
+    let log = db
+        .current_log()
+        .expect("a store with a WAL writes to a log");
+    drop(db);
+
+    // The log the flush moved the store to holds nothing, so losing it is
+    // the state Pebble's interrupted open leaves.
+    let fs = env.sim();
+    fs.remove(&dir.join(roble_format::files::log_filename(log)))
+        .await
+        .expect("remove the log");
+    fs.sync_dir(&dir).await.expect("sync dir");
+
+    let db = roble::open_with(&env, &dir, options())
+        .await
+        .expect("an open with no log to resume");
+    let fresh = db
+        .current_log()
+        .expect("a writable open with a WAL has a log to write to");
+    assert!(fresh > log, "log {fresh} reuses a number at or below {log}");
+    db.put(b"b", b"written").await.expect("put b");
+    drop(db);
+    env.sim().crash();
+
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    for key in [b"a".as_slice(), b"b"] {
+        assert_eq!(
+            db.get(key, roble::Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"written".to_vec()),
+            "{}",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
 /// Builds a database directory in the simulated filesystem.
 ///
 /// Everything is explicit, because what these tests vary is exactly the thing
@@ -972,24 +1028,28 @@ async fn an_opened_database_describes_itself() {
 }
 
 #[compio::test]
-async fn a_write_to_a_database_with_no_log_is_refused() {
+async fn a_write_to_a_database_with_no_log_goes_to_one_the_open_created() {
     // A directory built by hand has markers, a MANIFEST and nothing else. A
-    // database opened from one can be read — everything a read needs is in the
-    // MANIFEST and the tables — but a write has nowhere to record itself, and
-    // a write that is not recoverable is one a crash loses silently (§4).
-    // Refusing is the only answer that does not lie about durability.
+    // write still needs a log to record itself in, or a crash loses it
+    // silently (§4), so a writable open creates one, as Pebble's does.
     let (env, dir) = Synth::default().build().await;
     let db = roble::open(&env, &dir).await.expect("open");
 
     let mut batch = roble_format::batch::Batch::new();
     batch.put(b"k", b"v").expect("put");
-    match db.write_raw(&mut batch, true).await {
-        Err(Error::Unsupported(m)) => assert!(
-            m.contains("holds no log file") && m.contains("could not be recovered"),
-            "got: {m}"
-        ),
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
+    db.write_raw(&mut batch, true).await.expect("write");
+    drop(db);
+
+    // Replayed from that log: nothing flushed it.
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(
+        db.get(b"k", roble::Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value),
+        Some(b"v".to_vec()),
+        "the write must come back from the log"
+    );
 }
 
 /// A store can be owned by a task of its own.
