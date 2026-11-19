@@ -40,8 +40,14 @@ wrote before it is the segments before.
 Its first runs found roble answering `Floor` and a scan's reverse seek with a
 range-deleted key, over a layout Pebble writes and roble does not: a
 compaction split inside a range deletion, leaving a table that holds only the
-deletion's fragment below its first point key (seed 509). And it catches the
-`get` that #206 fixed, put back, in 24 of 30 seeds.
+deletion's fragment below its first point key (seed 509). And it caught the
+`get` that #206 fixed, put back, in 24 of 30 seeds. Both counts are from
+before walks: adding them changed the mix of operations, so a seed no longer
+makes the history it made then, and seed 509 now passes with that fix
+reverted (`tests/range_del.rs` keeps the layout instead).
+
+Walks catch a scan that ignores its lower bound on a seek, or that turns from
+reverse to forward onto the key it is on, in the first walk of seed 3000.
 
 ## Running it
 
