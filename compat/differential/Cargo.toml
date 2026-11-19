@@ -1,0 +1,15 @@
+[package]
+name = "differential"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Runs one random history through roble and Go Pebble in turn, on one directory."
+
+[dependencies]
+roble = { path = "../.." }
+compio = { version = "0.19.2", features = ["fs", "macros"] }
+
+[lints]
+workspace = true

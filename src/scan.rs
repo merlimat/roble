@@ -1324,6 +1324,21 @@ impl<F: Fs> Scan<F> {
             if let Source::Level(level) = &mut self.iters[i]
                 && level.is_deferred()
             {
+                // Except a bound that is the exclusive sentinel at `user`,
+                // which only a table's largest is, and so only going
+                // backward: that table ends before `user` and holds nothing
+                // here. Opening it now would move the level onto it, out of
+                // reach of the tombstones of the table it left, which is the
+                // one whose bounds take in `user` and may cover it — a
+                // reverse seek that lands in a table holding only a range
+                // deletion below the target, as Pebble writes when it splits
+                // a compaction inside one, leaves the level just so. The
+                // version of `user` taken so far is decided first; the next
+                // turn's `top` opens the table.
+                let k = InternalKey::decode(level.key())?;
+                if k.seq_num == key::SEQ_NUM_MAX && k.kind == Kind::RangeDelete {
+                    break;
+                }
                 level.realize().await?;
                 self.heap.stepped(&self.iters)?;
                 continue;

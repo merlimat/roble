@@ -471,3 +471,99 @@ async fn roble_reads_pebbles_range_deletion_cases_as_pebble_does() {
     );
     assert_eq!(judged, 24, "the reads judged in {}", path.display());
 }
+
+/// A reverse seek that steps back out of a table holding only a range
+/// deletion below the target keeps that deletion in play.
+///
+/// The layout `compat/differential` met in a database Pebble wrote (seed
+/// 509). Pebble split a compaction's output inside a range deletion at
+/// `k0403`, so in L5 the first table ends at the exclusive sentinel there and
+/// the second starts there with nothing but the deletion's fragment: its
+/// first point key is `k0411`. Beneath, L6 still holds `k0403` from before
+/// the deletion.
+///
+/// A `Floor` of `k0403` seeks below `k0403\0`. In L5 that lands in the
+/// second table, finds no point key below the target and waits at the first
+/// table's bound — still holding the second, whose fragment covers `k0403`.
+/// L6's `k0403` was taken first, and then that bound, at the same user key,
+/// came up, and the merge opened the first table to see what it held: which
+/// put the level on it and out of reach of the fragment, and the deleted
+/// `k0403` came back. A table whose bound is the exclusive sentinel at a key
+/// holds nothing there, so it waits until the key is decided.
+#[compio::test]
+async fn a_reverse_seek_keeps_the_deletion_of_the_table_it_stepped_back_out_of() {
+    let entry = |user: &str, kind, seq, value: &str| Entry {
+        user: user.as_bytes().to_vec(),
+        kind,
+        seq,
+        value: value.as_bytes().to_vec(),
+    };
+    let groups = vec![
+        (
+            Place::Level(5),
+            vec![
+                entry("k0390", Kind::Set, 300, "new"),
+                entry("k0392", Kind::RangeDelete, 339, "k0403"),
+            ],
+        ),
+        (
+            Place::Level(5),
+            vec![
+                entry("k0403", Kind::RangeDelete, 339, "k0416"),
+                entry("k0411", Kind::Set, 340, "after"),
+            ],
+        ),
+        (
+            Place::Level(6),
+            vec![
+                entry("k0380", Kind::Set, 85, "deep"),
+                entry("k0403", Kind::Set, 85, "deleted"),
+                entry("k0420", Kind::Set, 85, "deep"),
+            ],
+        ),
+    ];
+    let (env, dir) = build(&groups, u64::MAX).await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .background_tasks(false),
+    )
+    .await
+    .expect("open");
+    let l5 = db.versions().version.level(5).to_vec();
+    assert!(
+        l5.len() == 2 && l5[0].largest_is_exclusive().expect("bound"),
+        "the layout should be two L5 tables meeting at an exclusive bound"
+    );
+
+    let answer = |f: Option<roble::Found>| f.map(|f| text(&f.key));
+    for (probe, how) in [
+        (&b"k0403"[..], Comparison::Floor),
+        (b"k0403\0", Comparison::Floor),
+        (b"k0404", Comparison::Lower),
+        (b"k0410", Comparison::Floor),
+    ] {
+        assert_eq!(
+            answer(db.get(probe, how).await.expect("get")),
+            Some("k0390".to_string()),
+            "{how:?} of {:?} should pass the deleted k0403",
+            text(probe)
+        );
+    }
+    assert_eq!(
+        answer(db.get(b"k0403", Comparison::Equal).await.expect("get")),
+        None
+    );
+
+    let mut scan = db.range(..).expect("scan");
+    scan.seek_lt(b"k0403\0").await.expect("seek");
+    assert_eq!(text(scan.key()), "k0390", "a scan's reverse seek, too");
+    scan.prev().await.expect("prev");
+    assert_eq!(text(scan.key()), "k0380");
+    scan.seek_lt(b"k0412").await.expect("seek");
+    assert_eq!(text(scan.key()), "k0411");
+    scan.prev().await.expect("prev");
+    assert_eq!(text(scan.key()), "k0390", "and a step back across it");
+}
