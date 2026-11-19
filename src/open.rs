@@ -496,8 +496,19 @@ async fn open_dir<E: Env>(
         .max(SEQ_NUM_START);
 
     // The log the store carries on writing to, opened where the replay
-    // stopped. Overwriting a torn tail is the point: those bytes were never
-    // acknowledged.
+    // stopped, and cut there before anything is appended. Losing a torn tail
+    // is the point: those bytes were never acknowledged.
+    //
+    // Cut, not only written over. What lies past the replay's end is a torn
+    // record, or the bytes of an earlier life when the file is a log Pebble
+    // recycled, and the records appended after this need not cover it. That
+    // is harmless while this is the newest log, whose end both engines read
+    // leniently; but the next flush creates a newer one before its edit
+    // retires this, and Pebble replays every log but the newest strictly
+    // (`strictWALTail`), as roble does: a kill in between left a directory
+    // neither would open (compat/differential). Pebble never appends to a log
+    // it replayed, so it never has to cut one; carrying on in it is roble's
+    // choice, and the cut is what that choice costs.
     //
     // With the WAL off there is none, which is not the same as having
     // skipped the replay above: the records already in a log were
@@ -518,6 +529,10 @@ async fn open_dir<E: Env>(
                 .open(&path, access)
                 .await
                 .map_err(retired(read_only, &path))?;
+            if !read_only && disk.len().await? > at as u64 {
+                disk.set_len(at as u64).await?;
+                disk.sync(Default::default()).await?;
+            }
             Some(Log {
                 disk: std::rc::Rc::new(disk),
                 log_num,

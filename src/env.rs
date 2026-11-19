@@ -259,6 +259,14 @@ pub trait Disk: Sized + 'static {
     /// Makes every finished write durable, and the file's length.
     fn sync(&self, class: Self::Class) -> impl Future<Output = Result<()>>;
 
+    /// Cuts the file to `len` bytes, or grows it with zeros to that length.
+    /// Like a write, durable once [`Disk::sync`] has returned.
+    ///
+    /// What an open uses on the log it carries on writing to: whatever lies
+    /// past the last whole record is cut away before anything is appended,
+    /// so that the log ends where its records do (`crate::open`).
+    fn set_len(&self, len: u64) -> impl Future<Output = Result<()>>;
+
     /// Closes the file.
     fn close(self) -> impl Future<Output = Result<()>> {
         async { Ok(()) }

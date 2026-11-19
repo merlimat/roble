@@ -92,6 +92,16 @@ failure keeps the directory and the script, cut as the turns that ran had it.
 
 ## What it has found
 
+Kills found a directory neither engine would open: roble, reopening a
+directory, carried on writing into the last log where its replay stopped, and
+when that file was one Pebble had recycled, the bytes of its earlier life lay
+past roble's records. A flush creates a newer log before its edit retires the
+old one, and a kill in between left the old log behind a newer one, where
+Pebble and roble both read it strictly and took the stale bytes for corruption
+(`pebble/record: unexpected EOF`). The open now cuts the log it carries on
+writing to where its records end; `tests/failure.rs` crashes such a flush at
+every operation.
+
 Its first runs found roble answering `Floor` and a scan's reverse seek with a
 range-deleted key, over a layout Pebble writes and roble does not: a
 compaction split inside a range deletion, leaving a table that holds only the
