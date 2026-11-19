@@ -282,9 +282,10 @@ impl Drop for Claim<'_> {
 /// The one write at a time a store takes.
 ///
 /// Held from the sequence number a write stamps to the memtable it applies
-/// to, which is the span two writes may not share. Read by a freeze too,
-/// which cannot take a memtable away from a write that is still adding to it
-/// (`crate::open::Db::freeze_memtable`).
+/// to, which is the span two writes may not share. Taken by a flush too,
+/// from the sync of the log it moves past to the freeze, which cannot take a
+/// memtable or a log away from a write that is still adding to it
+/// (`crate::open::Db::freeze_memtable`, `crate::open::Db::sync_log`).
 #[derive(Default)]
 pub(crate) struct Writers {
     underway: Cell<bool>,
@@ -310,22 +311,6 @@ impl Writers {
         })
         .await;
         Writing { writers: self }
-    }
-
-    /// Waits until no write is part-way through, without taking the permit.
-    ///
-    /// Asked again on every poll rather than trusted once: a write that
-    /// started between a wake-up and the poll it woke is as much under way
-    /// as one that was already there, and the caller is about to freeze.
-    pub(crate) async fn settled(&self) {
-        poll_fn(|cx| {
-            if self.underway.get() {
-                self.waiting.borrow_mut().push(cx.waker().clone());
-                return Poll::Pending;
-            }
-            Poll::Ready(())
-        })
-        .await
     }
 }
 
@@ -460,39 +445,8 @@ mod tests {
     /// stays part-way through only across an await, the simulated filesystem
     /// never blocks, and so a write that is polled twice is a write that has
     /// finished (§10, §12). What that leaves untested from outside is the
-    /// wake-up, and a freeze that waits and is never woken stalls every
-    /// flush after it.
-    #[test]
-    fn a_freeze_waits_for_a_write_under_way_and_is_woken_by_it() {
-        let writers = Writers::default();
-        let flag = Arc::new(Flag(AtomicBool::new(false)));
-        let waker = Waker::from(Arc::clone(&flag));
-        let mut cx = Context::from_waker(&waker);
-
-        let writing = ready(writers.begin());
-        let mut settled = pin!(writers.settled());
-        assert!(
-            matches!(settled.as_mut().poll(&mut cx), Poll::Pending),
-            "a freeze must wait while a write is still adding to the memtable"
-        );
-        assert!(
-            !flag.0.load(Ordering::SeqCst),
-            "and must not be woken for nothing"
-        );
-
-        drop(writing);
-        assert!(
-            flag.0.load(Ordering::SeqCst),
-            "the write that finished must wake the freeze waiting on it"
-        );
-        assert!(
-            matches!(settled.as_mut().poll(&mut cx), Poll::Ready(())),
-            "and the freeze must then go through"
-        );
-    }
-
-    /// The same wake-up, for the other thing that waits on the permit. Also
-    /// unreachable from outside, and for the same reason.
+    /// wake-up, and a write — or a freeze, which takes the same permit — that
+    /// waits and is never woken stalls every one after it.
     #[test]
     fn a_second_write_waits_for_the_first_and_is_woken_by_it() {
         let writers = Writers::default();

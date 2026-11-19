@@ -1991,7 +1991,14 @@ impl<F: Fs> Db<F> {
     ///
     /// Any open scan keeps reading the memtable it started with: a flush
     /// replaces the handle and never the contents (§4).
-    pub(crate) async fn freeze_memtable(&self, log_num: Option<u64>) -> Result<()> {
+    ///
+    /// Takes the writer permit as proof that no write is under way, and none
+    /// can start until the caller lets go of it (§5, `crate::change`).
+    pub(crate) async fn freeze_memtable(
+        &self,
+        log_num: Option<u64>,
+        _writing: &crate::change::Writing<'_>,
+    ) -> Result<()> {
         // Opened before anything moves, because this is the only part that
         // can fail. A store left pointing at a log it could not open is a
         // store that cannot write, and this is a flush, not a write.
@@ -1999,10 +2006,6 @@ impl<F: Fs> Db<F> {
             Some(log_num) => Some(self.open_log(log_num).await?),
             None => None,
         };
-        // The last await before the swap, and that is the whole point of
-        // where it is: a write that started after this one returned would be
-        // in flight on the memtable the next lines take away (§5).
-        self.store.writers.settled().await;
         let fresh = std::rc::Rc::new(std::cell::RefCell::new(
             crate::memtable::Memtable::with_budget(
                 self.last_seq_num().wrapping_add(1),
@@ -2036,6 +2039,46 @@ impl<F: Fs> Db<F> {
     /// Whether this store leaves compaction to its caller (§9).
     pub(crate) fn automatic_compactions_disabled(&self) -> bool {
         self.store.disable_automatic_compactions
+    }
+
+    /// Holds off every write, once the one under way has finished, until the
+    /// guard is dropped.
+    ///
+    /// What a flush takes around moving the store to its next log: from the
+    /// sync of the log it moves past to the swap in
+    /// [`Db::freeze_memtable`], a write would land somewhere this flush has
+    /// already decided about.
+    pub(crate) async fn hold_writes(&self) -> crate::change::Writing<'_> {
+        self.store.writers.begin().await
+    }
+
+    /// Syncs the log the store is writing to, which a flush is about to move
+    /// past.
+    ///
+    /// A log a later one follows is replayed strictly, by roble and by Pebble
+    /// alike: a bad record in it is corruption rather than a torn tail,
+    /// because it was complete when the next one was created. Without a sync
+    /// on every write ([`crate::Wal::Buffered`], or `write_raw` asked not to)
+    /// that is only so once this has run. Skipped, a machine crash after the
+    /// next log's name is durable keeps whatever part of this one's last
+    /// page the disk got to, and a record cut there leaves a directory
+    /// neither engine opens. Pebble's `rotateWAL` closes the old log, which
+    /// syncs it, before it creates the next one, for the same reason.
+    ///
+    /// Takes the writer permit as proof that nothing lands on the log between
+    /// this sync and the swap that moves the store off it.
+    pub(crate) async fn sync_log(&self, _writing: &crate::change::Writing<'_>) -> Result<()> {
+        let disk = self
+            .store
+            .log
+            .borrow()
+            .as_ref()
+            .map(|l| std::rc::Rc::clone(&l.disk));
+        if let Some(disk) = disk {
+            let _timer = self.store.metrics.sync_duration.start();
+            disk.sync(Default::default()).await?;
+        }
+        Ok(())
     }
 
     /// Opens an existing log for appending, without pointing the store at
