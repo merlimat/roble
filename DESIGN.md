@@ -625,7 +625,11 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   (`makeRoomForWrite` under `commit.mu`), and its `rotateWAL` closes the old
   log, which syncs it and writes the EOF trailer, before creating the next.
   roble writes no trailer: a synced log that ends on a record boundary reads
-  as cleanly finished to both readers.
+  as cleanly finished to both readers. A flush that fails after that sync and
+  before the swap may still have left the next log's name durable — on a
+  real filesystem a create alone can — so until a swap moves the store off
+  the old log, every write to it is synced whatever the `Wal` setting. Pebble
+  panics there instead; roble's failed flush is one the next flush retries.
 
   That permit is also what keeps two writes off each other, and that is the
   same fact rather than a second one. A write reads the sequence number it

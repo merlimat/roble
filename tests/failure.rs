@@ -724,26 +724,28 @@ fn buffered_options() -> Options<SimFs> {
 }
 
 /// Writes `a` and flushes it, writes `b` without a sync, then flushes again
-/// with operation `fail` of that flush made to fail, and crashes.
+/// with operation `fail` of that flush made to fail, writes `c` without a
+/// sync after it, and crashes.
 ///
-/// Returns the log `b` went to.
-async fn buffered_flush_fails(env: &SimEnv, dir: &Path, fail: u64) -> u64 {
+/// Returns each unflushed key with the log it went to.
+async fn buffered_flush_fails(env: &SimEnv, dir: &Path, fail: u64) -> Vec<(&'static [u8], u64)> {
     let db = roble::open_with(env, dir, buffered_options())
         .await
         .expect("create");
     db.put(b"a", b"written").await.expect("put a");
     db.flush().await.expect("flush a");
+    let mut written = Vec::new();
     db.put(b"b", b"written").await.expect("put b");
-    let log = db
-        .current_log()
-        .expect("a store with a WAL writes to a log");
+    written.push((b"b".as_slice(), db.current_log().expect("a log")));
 
     env.sim().fail_at(fail);
     let _ = db.flush().await;
     env.sim().stop_failing();
+    db.put(b"c", b"written").await.expect("put c");
+    written.push((b"c".as_slice(), db.current_log().expect("a log")));
     drop(db);
     env.sim().crash();
-    log
+    written
 }
 
 /// The logs in `dir`, by number.
@@ -772,6 +774,11 @@ async fn logs(env: &SimEnv, dir: &Path) -> Vec<u64> {
 /// refuses. The simulated filesystem drops unsynced bytes whole rather than
 /// tearing them, so the open goes through; what shows here is the write the
 /// old log lost although a later log survived it.
+///
+/// And a flush that fails after creating the new log, but before the store
+/// moved to it, leaves the store writing to a log that may already have a
+/// later one behind it. The write after the failed flush is there for that:
+/// it must be as durable as the one before.
 #[compio::test]
 async fn a_flush_makes_the_log_it_moves_past_durable_before_the_next_one_is() {
     let total = {
@@ -788,32 +795,39 @@ async fn a_flush_makes_the_log_it_moves_past_durable_before_the_next_one_is() {
         env.sim().ops() - before
     };
 
-    let mut moved_past = 0u64;
+    // Per key: how many failures left a later log durable behind the one it
+    // went to.
+    let mut moved_past = [0u64; 2];
     for fail in 1..=total {
         let env = SimEnv::new();
         let dir = PathBuf::from("/db");
-        let log = buffered_flush_fails(&env, &dir, fail).await;
-        let later = logs(&env, &dir).await.into_iter().any(|n| n > log);
+        let written = buffered_flush_fails(&env, &dir, fail).await;
+        let logs = logs(&env, &dir).await;
 
         let db = roble::open(&env, &dir)
             .await
             .unwrap_or_else(|e| panic!("the flush failed at operation {fail}: the reopen: {e}"));
         let found = contents(&db).await;
         assert!(found.contains_key(b"a".as_slice()), "a was flushed");
-        if later {
-            moved_past += 1;
-            assert!(
-                found.contains_key(b"b".as_slice()),
-                "the flush failed at operation {fail} of {total}, after a log later than \
-                 {log} was durable, and {log} had lost the write it held"
-            );
+        for (i, (key, log)) in written.iter().enumerate() {
+            if logs.iter().any(|n| n > log) {
+                moved_past[i] += 1;
+                assert!(
+                    found.contains_key(*key),
+                    "the flush failed at operation {fail} of {total}; a log later than {log} \
+                     was durable, and {log} had lost {}",
+                    String::from_utf8_lossy(key)
+                );
+            }
         }
     }
 
     // The guard against passing for the wrong reason: some failure has to
     // come after the new log's name was durable, or nothing was tested.
+    // `b` is written before the flush and `c` after it, into a log the flush
+    // failed to move the store off: both have to be reached.
     assert!(
-        moved_past > 0,
-        "no failure of the flush left a later log behind"
+        moved_past.iter().all(|n| *n > 0),
+        "no failure of the flush left a later log behind every write: {moved_past:?}"
     );
 }

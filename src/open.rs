@@ -178,6 +178,13 @@ pub(crate) struct Store<F: Fs> {
     /// Whether every write syncs the log before it returns
     /// ([`crate::Wal::Synced`]).
     sync_writes: bool,
+    /// Whether a flush has started moving the store off its log and not
+    /// finished, so that a later log may already be durable behind it.
+    ///
+    /// Every write to the log syncs while this is set, whatever the store's
+    /// [`crate::Wal`] setting: the log is no longer certain to be the last,
+    /// and only the last may end in a torn record (`Db::sync_log`).
+    log_followed: std::cell::Cell<bool>,
     /// Whether a flush leaves the picker's compaction for the caller (§9).
     disable_automatic_compactions: bool,
     /// The next sequence number to hand out.
@@ -585,6 +592,7 @@ async fn open_dir<E: Env>(
             caches: options.caches,
             disable_wal: options.wal == crate::Wal::Off,
             sync_writes: options.wal == crate::Wal::Synced,
+            log_followed: std::cell::Cell::new(false),
             disable_automatic_compactions: options.disable_automatic_compactions,
             memtable: std::cell::RefCell::new(std::rc::Rc::new(std::cell::RefCell::new(memtable))),
             frozen: std::cell::RefCell::new(None),
@@ -1146,7 +1154,10 @@ impl<F: Fs> Db<F> {
                 .await;
             result?;
             self.store.metrics.written.add(written);
-            if sync {
+            // A flush that failed while moving the store to its next log
+            // may have left that log durable, which makes this one an earlier
+            // log: whatever goes into it has to be complete (`Db::sync_log`).
+            if sync || self.store.log_followed.get() {
                 let _timer = self.store.metrics.sync_duration.start();
                 disk.sync(Default::default()).await?;
             }
@@ -2021,6 +2032,7 @@ impl<F: Fs> Db<F> {
             // number outlives the operation that asked for it.
             self.versions_mut().next_file_num = log.log_num + 1;
             *self.store.log.borrow_mut() = Some(log);
+            self.store.log_followed.set(false);
         }
         Ok(())
     }
@@ -2066,7 +2078,10 @@ impl<F: Fs> Db<F> {
     /// syncs it, before it creates the next one, for the same reason.
     ///
     /// Takes the writer permit as proof that nothing lands on the log between
-    /// this sync and the swap that moves the store off it.
+    /// this sync and the swap that moves the store off it. A flush that fails
+    /// in between has still perhaps made the next log's name durable — on a
+    /// real filesystem even its create can — so from here until a swap moves
+    /// the store off this log, every write to it is synced as well.
     pub(crate) async fn sync_log(&self, _writing: &crate::change::Writing<'_>) -> Result<()> {
         let disk = self
             .store
@@ -2078,6 +2093,7 @@ impl<F: Fs> Db<F> {
             let _timer = self.store.metrics.sync_duration.start();
             disk.sync(Default::default()).await?;
         }
+        self.store.log_followed.set(true);
         Ok(())
     }
 
