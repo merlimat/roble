@@ -236,7 +236,8 @@ async fn an_open_with_no_log_left_to_resume_creates_one() {
 /// Pebble would never write.
 struct Synth {
     /// Whether to write a format-version marker at all. A database with a
-    /// MANIFEST and no marker predates markers entirely.
+    /// MANIFEST and no marker is a creation that stopped short, or with a
+    /// `CURRENT` file one that predates markers.
     format_marker: bool,
     format_version: String,
     format_marker_iter: u64,
@@ -870,13 +871,13 @@ async fn the_lock_is_held_for_as_long_as_the_database_is_open() {
 // opened at all.
 
 #[compio::test]
-async fn a_database_with_no_format_marker_predates_markers_and_is_refused() {
-    // Pebble reads a missing marker as FormatDefault, which only happens for a
-    // directory it is about to create. One with a MANIFEST and no marker was
-    // written before Pebble recorded the version at all, and roble cannot tell
-    // which version that was.
+async fn a_database_with_no_format_marker_and_a_current_file_is_refused() {
+    // A database written before Pebble recorded its format version names its
+    // MANIFEST with a `CURRENT` file, and roble cannot tell which version
+    // that was. Pebble refuses it too (`checkForLegacyFormatVersion1`).
     let (env, dir) = Synth {
         format_marker: false,
+        extra: vec![("CURRENT".to_string(), b"MANIFEST-000001\n".to_vec())],
         ..Default::default()
     }
     .build()
@@ -886,6 +887,129 @@ async fn a_database_with_no_format_marker_predates_markers_and_is_refused() {
             assert!(m.contains("no marker.format-version.* file"), "got: {m}")
         }
         other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// A database roble created, with what `prepare` does to it, and then its
+/// format marker taken away: what Pebble leaves when it is killed between
+/// the manifest marker and the format marker of its own creation.
+async fn without_format_marker(prepare: impl AsyncFnOnce(&roble::Db<SimFs>)) -> (SimEnv, PathBuf) {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        roble::Options::new()
+            .create_if_missing(true)
+            .background_tasks(false),
+    )
+    .await
+    .expect("create");
+    prepare(&db).await;
+    drop(db);
+    let fs = env.sim();
+    for name in listing(fs, &dir).await {
+        if name.starts_with("marker.format-version.") {
+            fs.remove(&dir.join(name)).await.expect("remove the marker");
+        }
+    }
+    fs.sync_dir(&dir).await.expect("sync dir");
+    (env, dir)
+}
+
+async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs
+        .list(dir)
+        .await
+        .expect("list")
+        .iter()
+        .map(|e| e.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[compio::test]
+async fn a_creation_stopped_before_its_format_marker_is_finished() {
+    // Pebble writes the format marker last of its creation, after the
+    // manifest marker and the log, and its next open reads a directory with
+    // no marker and nothing in it as a creation to finish. roble's must too.
+    // Both with the log and without it: Pebble may be killed before either.
+    for keep_log in [true, false] {
+        let (env, dir) = without_format_marker(async |_| {}).await;
+        if !keep_log {
+            for name in listing(env.sim(), &dir).await {
+                if name.ends_with(".log") {
+                    env.sim().remove(&dir.join(name)).await.expect("remove");
+                }
+            }
+            env.sim().sync_dir(&dir).await.expect("sync dir");
+        }
+
+        // A reader opens it and writes nothing.
+        let before = listing(env.sim(), &dir).await;
+        let reader = roble::open_read_only(&env, &dir, roble::Options::new())
+            .await
+            .unwrap_or_else(|e| panic!("keep_log {keep_log}: the reader: {e}"));
+        assert_eq!(
+            reader.format_version(),
+            roble_format::files::FORMAT_VERSION_PIN
+        );
+        drop(reader);
+        assert_eq!(before, listing(env.sim(), &dir).await, "a reader wrote");
+
+        // A writer finishes it: the pin, at iteration one, as a creation
+        // writes it — and a log to write to.
+        let db = roble::open(&env, &dir)
+            .await
+            .unwrap_or_else(|e| panic!("keep_log {keep_log}: the open: {e}"));
+        assert!(
+            db.markers().contains(&marker_filename(
+                MARKER_FORMAT_VERSION,
+                1,
+                &roble_format::files::format_version_value(roble_format::files::FORMAT_VERSION_PIN),
+            )),
+            "keep_log {keep_log}: {:?}",
+            db.markers()
+        );
+        db.put(b"k", b"v").await.expect("put");
+        drop(db);
+        env.sim().crash();
+
+        let db = roble::open(&env, &dir).await.expect("reopen after a crash");
+        assert_eq!(
+            db.get(b"k", roble::Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"v".to_vec()),
+            "keep_log {keep_log}"
+        );
+    }
+}
+
+#[compio::test]
+async fn a_database_with_no_format_marker_and_data_is_refused() {
+    // Something was written, so this is not a creation that stopped short,
+    // and the format it was written in cannot be known. Refused before the
+    // open has changed anything: no sweep, no log cut, no marker.
+    let in_log = without_format_marker(async |db| db.put(b"k", b"v").await.expect("put")).await;
+    let in_table = without_format_marker(async |db| {
+        db.put(b"k", b"v").await.expect("put");
+        db.flush().await.expect("flush");
+    })
+    .await;
+    for (what, (env, dir)) in [("a log record", in_log), ("a table", in_table)] {
+        let before = listing(env.sim(), &dir).await;
+        match roble::open(&env, &dir).await {
+            Err(Error::Unsupported(m)) => assert!(m.contains("holds data"), "{what}: got: {m}"),
+            other => panic!("{what}: expected Unsupported, got {other:?}"),
+        }
+        assert_eq!(
+            before,
+            listing(env.sim(), &dir).await,
+            "{what}: the refused open changed the directory"
+        );
     }
 }
 
