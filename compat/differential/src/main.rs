@@ -337,8 +337,12 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
 
     // Small, so flushes and compactions keep happening, and inline, so they
     // happen inside the writes that need them and are done when this exits.
+    // Writes are buffered, not synced: what the other engine opens next is
+    // what this one closed, through the page cache, and durability is not
+    // the subject (SimFs and tests/crash_loop.rs are).
     let options = roble::Options::new()
         .create_if_missing(true)
+        .wal(roble::Wal::Buffered)
         .memtable_size(64 << 10)
         .target_file_size(16 << 10)
         .lbase_max_bytes(64 << 10)

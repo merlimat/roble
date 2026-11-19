@@ -26,6 +26,14 @@ The script itself. A runner replays every segment before its own into a
 that read wrongly, the segment and the operation, and what the other engine
 wrote before it is the segments before.
 
+## What it has found
+
+Its first runs found roble answering `Floor` and a scan's reverse seek with a
+range-deleted key, over a layout Pebble writes and roble does not: a
+compaction split inside a range deletion, leaving a table that holds only the
+deletion's fragment below its first point key (seed 509). And it catches the
+`get` that #206 fixed, put back, in 24 of 30 seeds.
+
 ## Running it
 
 ```sh

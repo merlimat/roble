@@ -258,6 +258,9 @@ func main() {
 		cs.Levels[0] = block.NoCompression
 		return cs
 	})
+	// Writes are not synced: what the other engine opens next is what this
+	// one closed, through the page cache, and durability is not the subject
+	// (SimFs and tests/crash_loop.rs are).
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		fail(fmt.Errorf("segment %d: Pebble could not open what roble left: %w", segment, err))
@@ -267,11 +270,11 @@ func main() {
 		at := fmt.Sprintf("segment %d (pebble), operation %d", segment, i)
 		switch o.name {
 		case "put":
-			err = db.Set([]byte(o.args[0]), value(atoi(o.args[1]), atoi(o.args[2])), pebble.Sync)
+			err = db.Set([]byte(o.args[0]), value(atoi(o.args[1]), atoi(o.args[2])), pebble.NoSync)
 		case "del":
-			err = db.Delete([]byte(o.args[0]), pebble.Sync)
+			err = db.Delete([]byte(o.args[0]), pebble.NoSync)
 		case "delrange":
-			err = db.DeleteRange([]byte(o.args[0]), []byte(o.args[1]), pebble.Sync)
+			err = db.DeleteRange([]byte(o.args[0]), []byte(o.args[1]), pebble.NoSync)
 		case "flush":
 			err = db.Flush()
 		case "compact":
