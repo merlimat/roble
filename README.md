@@ -7,6 +7,9 @@
 
 # roble
 
+[![crates.io](https://img.shields.io/crates/v/roble)](https://crates.io/crates/roble)
+[![docs.rs](https://img.shields.io/docsrs/roble)](https://docs.rs/roble)
+
 An embedded, ordered key-value store in Rust whose files are
 [Pebble](https://github.com/cockroachdb/pebble)'s: a database roble writes is
 one Go Pebble opens, and the other way round.
@@ -115,11 +118,11 @@ Every number behind them, and the CSVs, are in
 
 ## Crates
 
-| Crate | |
-|---|---|
-| [`roble`](https://docs.rs/roble) | The engine. |
-| [`roble-format`](https://docs.rs/roble-format) | Pebble's on-disk formats, encoded and decoded with no I/O. |
-| [`roble-cli`](https://crates.io/crates/roble-cli) | `roble`, a command line tool to put, get, scan and delete entries and to inspect Pebble's files. |
+| Crate | | |
+|---|---|---|
+| [`roble`](https://crates.io/crates/roble) | The engine. | [API docs](https://docs.rs/roble) |
+| [`roble-format`](https://crates.io/crates/roble-format) | Pebble's on-disk formats, encoded and decoded with no I/O. | [API docs](https://docs.rs/roble-format) |
+| [`roble-cli`](https://crates.io/crates/roble-cli) | `roble`, a command line tool to put, get, scan and delete entries and to inspect Pebble's files. | |
 
 roble's features:
 
