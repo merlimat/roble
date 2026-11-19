@@ -127,6 +127,20 @@ both!(a_write_at_an_offset_grows_the_file, |fs, dir| {
     assert_eq!(&read_file(fs, &path).await[8..], b"tail");
 });
 
+both!(set_len_cuts_a_file_and_grows_it_with_zeros, |fs, dir| {
+    // What an open does to the log it carries on writing to: cut it where
+    // the replay stopped, so nothing past the last record survives.
+    let path = dir.join("000003.log");
+    write_file(fs, &path, b"records, then stale bytes").await;
+    let disk = fs.open(&path, Access::ReadWrite).await.expect("open");
+    disk.set_len(7).await.expect("cut");
+    assert_eq!(disk.len().await.expect("len"), 7);
+    disk.set_len(10).await.expect("grow");
+    disk.sync(Default::default()).await.expect("sync");
+    disk.close().await.expect("close");
+    assert_eq!(read_file(fs, &path).await, b"records\0\0\0");
+});
+
 both!(any_byte_range_is_a_valid_request, |fs, dir| {
     // The contract direct I/O quietly broke: a footer is 53 bytes at the end of
     // the file, a metaindex a few dozen somewhere in the middle, and neither is
@@ -274,6 +288,10 @@ both!(a_read_only_open_cannot_be_written_through, |fs, dir| {
         .write(WriteBuf::new(b"clobber".to_vec()), 0, Default::default())
         .await;
     assert!(result.is_err(), "a read-only open should refuse a write");
+    assert!(
+        disk.set_len(0).await.is_err(),
+        "a read-only open should refuse a cut"
+    );
     drop(disk);
 
     // And the bytes are still the ones that were written.
@@ -327,7 +345,12 @@ async fn a_crash_loses_what_was_never_synced() {
     // Synced contents and a synced name: survives.
     let kept = dir.join("kept.sst");
     write_file(&fs, &kept, b"durable").await;
+    // Cut but never synced: the cut goes, as an unsynced write does.
+    let uncut = dir.join("uncut.log");
+    write_file(&fs, &uncut, b"whole").await;
     fs.sync_dir(&dir).await.expect("sync dir");
+    let disk3 = fs.open(&uncut, Access::ReadWrite).await.expect("open");
+    disk3.set_len(2).await.expect("cut");
 
     // Written but never synced: the bytes go.
     let partial = dir.join("partial.sst");
@@ -346,6 +369,12 @@ async fn a_crash_loses_what_was_never_synced() {
     disk2.sync(()).await.expect("sync");
 
     fs.crash();
+
+    assert_eq!(
+        fs.durable(&uncut).as_deref(),
+        Some(&b"whole"[..]),
+        "an unsynced cut should be undone by a crash"
+    );
 
     assert_eq!(fs.durable(&kept).as_deref(), Some(&b"durable"[..]));
     assert_eq!(
@@ -371,9 +400,11 @@ async fn any_single_operation_can_be_made_to_fail() {
         let (result, _) = disk.write(WriteBuf::new(b"bytes".to_vec()), 0, ()).await;
         result?;
         disk.sync(()).await?;
+        disk.set_len(4).await?;
+        disk.sync(()).await?;
         fs.sync_dir(&dir).await?;
         let reopened = fs.open(&path, Access::ReadOnly).await?;
-        let (result, _) = reopened.read(ReadBuf::with_len(5), 0, ()).await;
+        let (result, _) = reopened.read(ReadBuf::with_len(4), 0, ()).await;
         result?;
         fs.rename(&path, &dir.join("000002.sst")).await?;
         fs.sync_dir(&dir).await?;

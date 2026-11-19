@@ -79,10 +79,10 @@ With roble's flush changed to remove the log it replaces as soon as the new
 one is in place, rather than after the edit that retires it, ten seeds pass
 with `CRASH=0` and fail with `CRASH=1` (seed 7006: Pebble opens what a killed
 roble flush left and finds 233 keys where the history says 234). What a kill
-does not reach is a window of microseconds: putting back #204's fix, or
-#203's, is not caught, the first because it needs a second crash before the
-next flush and the second because a kill almost never tears an edit in half.
-`tests/failure.rs` fails I/O at every step for those.
+does not reach is a window of microseconds: taking out #204's fix, or
+#203's, is not caught, the first because the bug needs a second crash before
+the next flush and the second because a kill almost never tears an edit in
+half. `tests/failure.rs` fails I/O at every step for those.
 
 No two turns running are killed, so the turn after a kill always finishes and
 decides, and the last turn never is. A seed kills the same turns aimed at the

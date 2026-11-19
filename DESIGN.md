@@ -1217,7 +1217,17 @@ That rule is looser than §6 states in one way, and the looseness is
 deliberate: it tolerates a torn record anywhere in the last log, not only at
 its tail. Telling a torn tail from damage in the middle of the same file would
 mean deciding what the bytes after it were supposed to be, and stopping at the
-last record that reads is the answer that loses nothing either way.
+last record that reads is the answer that keeps every record the replay could
+read.
+
+What it does not keep, since the cut, is the bytes after the damage: records
+that might have read past a record damaged in the middle of the last log are
+cut away by a writable open, where before they lay on disk until the store's
+own writes covered them. Nothing reads them either way — the replay has
+stopped before them, and the store's next record goes where they begin — so
+the cut loses nothing a reader could have had; it does remove what someone
+examining the file by hand afterwards might have wanted. A read-only open cuts
+nothing.
 
 Note that `Wal::Off` leaves an **empty log file** behind rather than no log
 file, so the question an opener asks is whether a log holds a record, not
