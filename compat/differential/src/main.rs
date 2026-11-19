@@ -28,8 +28,10 @@
 //! The oracle is the script itself. Each runner replays the segments before
 //! its own into a `BTreeMap`, applies its own to the store and the map
 //! together, and at every `check` reads the store every way it can — both
-//! scans end to end, and `Equal`, `Ceiling` and `Floor` at every key of the
-//! alphabet and either side of it — and requires the map's answers. So a
+//! scans end to end, and every [`Comparison`] at every key of the alphabet
+//! and either side of it — and requires the map's answers. A `walk` makes a
+//! scan over a range and moves it the way the script says, seeking, stepping
+//! and turning round, and requires the map's answer after every move. So a
 //! disagreement names the engine that read wrongly, the segment, and what the
 //! other had written before it.
 //!
@@ -80,6 +82,43 @@ enum Op {
     Flush,
     Compact,
     Check,
+    /// A scan over `[lower, upper)`, either side open when `None`, and the
+    /// moves to make with it.
+    Walk(Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
+}
+
+/// One move of a walk.
+enum Move {
+    First,
+    Last,
+    Next,
+    Prev,
+    SeekGe(Vec<u8>),
+    SeekLt(Vec<u8>),
+}
+
+/// A key of a script line: a key of the alphabet, or, ending in `+`, the
+/// key just after it (the key with a zero byte appended), so that seeks land
+/// between keys as well as on them.
+fn script_key(word: &str) -> Vec<u8> {
+    match word.strip_suffix('+') {
+        Some(k) => [k.as_bytes(), &[0]].concat(),
+        None => word.as_bytes().to_vec(),
+    }
+}
+
+fn parse_move(word: &str) -> Move {
+    match word {
+        "f" => Move::First,
+        "l" => Move::Last,
+        "n" => Move::Next,
+        "p" => Move::Prev,
+        _ => match word.split_once(':') {
+            Some(("g", k)) => Move::SeekGe(script_key(k)),
+            Some(("t", k)) => Move::SeekLt(script_key(k)),
+            _ => fail(&format!("cannot read the move {word:?}")),
+        },
+    }
 }
 
 fn parse(line: &str) -> Op {
@@ -95,6 +134,14 @@ fn parse(line: &str) -> Op {
         ["flush"] => Op::Flush,
         ["compact"] => Op::Compact,
         ["check"] => Op::Check,
+        ["walk", lower, upper, moves @ ..] => {
+            let bound = |w: &str| (w != "-").then(|| script_key(w));
+            Op::Walk(
+                bound(lower),
+                bound(upper),
+                moves.iter().map(|w| parse_move(w)).collect(),
+            )
+        }
         _ => fail(&format!("cannot read {line:?}")),
     }
 }
@@ -125,7 +172,7 @@ fn apply(model: &mut Model, op: &Op) {
         Op::DelRange(a, b) => {
             model.retain(|k, _| !(a.as_bytes() <= k.as_slice() && k.as_slice() < b.as_bytes()))
         }
-        Op::Flush | Op::Compact | Op::Check => {}
+        Op::Flush | Op::Compact | Op::Check | Op::Walk(..) => {}
     }
 }
 
@@ -151,7 +198,7 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         for _ in 0..ops {
             step += 1;
             let line = match rng.below(100) {
-                0..=59 => {
+                0..=57 => {
                     // Mostly short, now and then past a 4 KiB block, and
                     // rarely past a 32 KiB log block.
                     let len = match rng.below(100) {
@@ -161,17 +208,18 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                     };
                     format!("put {} {step} {len}", key(rng.below(KEYS)))
                 }
-                60..=79 => format!("del {}", key(rng.below(KEYS))),
-                80..=84 => {
+                58..=77 => format!("del {}", key(rng.below(KEYS))),
+                78..=82 => {
                     let a = rng.below(KEYS);
                     let b = a + 1 + rng.below(30);
                     format!("delrange {} {}", key(a), key(b))
                 }
-                85..=92 => "flush".to_string(),
+                83..=90 => "flush".to_string(),
                 // Rare, since it flattens the store into its last level, and
                 // the layouts worth reading are the ones before that.
-                93 if rng.below(4) == 0 => "compact".to_string(),
-                93 => "flush".to_string(),
+                91 if rng.below(4) == 0 => "compact".to_string(),
+                91 => "flush".to_string(),
+                92..=95 => gen_walk(&mut rng),
                 _ => "check".to_string(),
             };
             out.push_str(&line);
@@ -185,6 +233,42 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         out.push_str("check\n");
     }
     print!("{out}");
+}
+
+/// A walk: a range, a quarter of the time the whole alphabet and otherwise
+/// up to a few hundred keys with either side now and then open, and forty
+/// moves over it. Seeks aim at keys and between keys, a few of them outside
+/// the range, where a scan clamps them to its bounds.
+fn gen_walk(rng: &mut Rng) -> String {
+    let (mut lower, mut upper) = ("-".to_string(), "-".to_string());
+    let (mut from, mut to) = (0, KEYS);
+    if rng.below(4) != 0 {
+        from = rng.below(KEYS);
+        to = from + 1 + rng.below(300);
+        if rng.below(5) != 0 {
+            lower = key(from);
+        }
+        if rng.below(5) != 0 {
+            upper = key(to);
+        }
+    }
+    let mut line = format!("walk {lower} {upper}");
+    for _ in 0..40 {
+        let mv = match rng.below(10) {
+            0..=2 => "n".to_string(),
+            3..=5 => "p".to_string(),
+            6 => ["f", "l"][rng.below(2) as usize].to_string(),
+            _ => {
+                let at = from.saturating_sub(3) + rng.below(to - from.saturating_sub(3) + 3);
+                let plus = ["", "+"][rng.below(2) as usize];
+                let how = ["g", "t"][rng.below(2) as usize];
+                format!("{how}:{}{plus}", key(at))
+            }
+        };
+        line.push(' ');
+        line.push_str(&mv);
+    }
+    line
 }
 
 /// Every probe a check reads at: each key, and the keys either side of it,
@@ -284,6 +368,17 @@ async fn check<F: roble::Fs>(db: &roble::Db<F>, model: &Model, at: &str) {
                     .next_back()
                     .map(pair),
             ),
+            (
+                Comparison::Higher,
+                model
+                    .range((Bound::Excluded(p.clone()), Bound::Unbounded))
+                    .next()
+                    .map(pair),
+            ),
+            (
+                Comparison::Lower,
+                model.range(..p.clone()).next_back().map(pair),
+            ),
         ] {
             let got = db
                 .get(&p, how)
@@ -303,6 +398,115 @@ async fn check<F: roble::Fs>(db: &roble::Db<F>, model: &Model, at: &str) {
                     show(&want)
                 ));
             }
+        }
+    }
+}
+
+/// Where a walk's scan should be after a move, by the map: the move's key
+/// among the map's keys in `[lower, upper)`, or nothing. `at` is where the
+/// scan is before the move; a step off the end of the range leaves it on
+/// nothing, and a step from nothing is not made (see [`walk`]).
+fn walk_want<'m>(
+    model: &'m Model,
+    lower: &Option<Vec<u8>>,
+    upper: &Option<Vec<u8>>,
+    at: Option<&[u8]>,
+    mv: &Move,
+) -> Option<(&'m Vec<u8>, &'m Vec<u8>)> {
+    let lo = |b: Bound<Vec<u8>>| match (lower, b) {
+        (Some(l), Bound::Included(k)) if k < *l => Bound::Included(l.clone()),
+        (Some(l), Bound::Unbounded) => Bound::Included(l.clone()),
+        (_, b) => b,
+    };
+    let hi = |b: Bound<Vec<u8>>| match (upper, b) {
+        (Some(u), Bound::Excluded(k)) if k > *u => Bound::Excluded(u.clone()),
+        (Some(u), Bound::Unbounded) => Bound::Excluded(u.clone()),
+        (_, b) => b,
+    };
+    let ge = |from: Bound<Vec<u8>>| {
+        let (from, to) = (lo(from), hi(Bound::Unbounded));
+        // A range whose start is past its end is empty, where BTreeMap panics.
+        match (&from, &to) {
+            (Bound::Included(a) | Bound::Excluded(a), Bound::Excluded(b)) if a >= b => None,
+            _ => model.range((from, to)).next(),
+        }
+    };
+    let lt = |to: Bound<Vec<u8>>| {
+        let (from, to) = (lo(Bound::Unbounded), hi(to));
+        match (&from, &to) {
+            (Bound::Included(a), Bound::Excluded(b)) if a >= b => None,
+            _ => model.range((from, to)).next_back(),
+        }
+    };
+    match mv {
+        Move::First => ge(Bound::Unbounded),
+        Move::Last => lt(Bound::Unbounded),
+        Move::SeekGe(k) => ge(Bound::Included(k.clone())),
+        Move::SeekLt(k) => lt(Bound::Excluded(k.clone())),
+        Move::Next => ge(Bound::Excluded(at?.to_vec())),
+        Move::Prev => lt(Bound::Excluded(at?.to_vec())),
+    }
+}
+
+/// A scan over the walk's range, moved as the script says, and required to
+/// be where the map says after every move. A step from nothing is skipped:
+/// roble leaves the scan on nothing and Pebble turns round onto the range's
+/// end, and which is right is not what the walk is asking.
+async fn walk<F: roble::Fs>(
+    db: &roble::Db<F>,
+    model: &Model,
+    lower: &Option<Vec<u8>>,
+    upper: &Option<Vec<u8>>,
+    moves: &[Move],
+    at: &str,
+) {
+    let start = match lower {
+        Some(k) => Bound::Included(k.as_slice()),
+        None => Bound::Unbounded,
+    };
+    let end = match upper {
+        Some(k) => Bound::Excluded(k.as_slice()),
+        None => Bound::Unbounded,
+    };
+    let mut scan = db
+        .range((start, end))
+        .unwrap_or_else(|e| fail(&format!("{at}: walk: {e}")));
+    let mut done = Vec::new();
+    for mv in moves {
+        let now = scan.is_valid().then(|| scan.key().to_vec());
+        if now.is_none() && matches!(mv, Move::Next | Move::Prev) {
+            continue;
+        }
+        let want =
+            walk_want(model, lower, upper, now.as_deref(), mv).map(|(k, v)| (k.clone(), v.clone()));
+        let (name, result) = match mv {
+            Move::First => ("f".to_string(), scan.first().await),
+            Move::Last => ("l".to_string(), scan.last().await),
+            Move::Next => ("n".to_string(), scan.next().await),
+            Move::Prev => ("p".to_string(), scan.prev().await),
+            Move::SeekGe(k) => (
+                format!("g:{}", String::from_utf8_lossy(k)),
+                scan.seek_ge(k).await,
+            ),
+            Move::SeekLt(k) => (
+                format!("t:{}", String::from_utf8_lossy(k)),
+                scan.seek_lt(k).await,
+            ),
+        };
+        done.push(name);
+        result.unwrap_or_else(|e| fail(&format!("{at}: walk {}: {e}", done.join(" "))));
+        let got = scan
+            .is_valid()
+            .then(|| (scan.key().to_vec(), scan.value().to_vec()));
+        if got != want {
+            fail(&format!(
+                "{at}: walk over [{}, {}) after {}: roble is on {}, the history {}",
+                lower.as_deref().map_or("-".into(), String::from_utf8_lossy),
+                upper.as_deref().map_or("-".into(), String::from_utf8_lossy),
+                done.join(" "),
+                show(&got),
+                show(&want)
+            ));
         }
     }
 }
@@ -368,6 +572,10 @@ async fn run(dir: &Path, script: &Path, segment: usize) {
             }
             Op::Check => {
                 check(&db, &model, &at).await;
+                Ok(())
+            }
+            Op::Walk(lower, upper, moves) => {
+                walk(&db, &model, lower, upper, moves, &at).await;
                 Ok(())
             }
         }
