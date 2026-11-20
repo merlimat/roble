@@ -46,6 +46,13 @@ fn uvarint_long(src: &[u8]) -> Result<(u64, usize)> {
         }
         value |= u64::from(byte & 0x7f) << shift;
         if byte < 0x80 {
+            // A tenth byte lands at bit 63, with room for that one bit. More
+            // than that is a value wider than 64 bits, which the shift above
+            // would have dropped without a word; Go's Uvarint refuses it as
+            // an overflow.
+            if shift == 63 && byte > 1 {
+                return Error::corrupt("uvarint wider than 64 bits");
+            }
             // Go's Uvarint rejects an overlong encoding of a value that fits.
             if i > 0 && byte == 0 {
                 return Error::corrupt("uvarint has a redundant continuation byte");
@@ -123,6 +130,23 @@ mod tests {
         // Ten bytes carry every u64; an eleventh after a tenth that still
         // continues would carry bits no u64 has.
         assert!(matches!(uvarint(&[0xff; 11]), Err(Error::Corrupt(_))));
+
+        // And the tenth has room for one bit, the 64th. More than that is a
+        // value no u64 holds, refused as Go's Uvarint refuses it rather than
+        // read with its top bits gone: after nine 0x80s, a final 0x02 would
+        // have read as zero.
+        for (first, value) in [(0xff, u64::MAX), (0x80, 1 << 63)] {
+            let mut bytes = vec![first; 9];
+            bytes.push(0x01);
+            assert_eq!(uvarint(&bytes).expect("the 64th bit"), (value, 10));
+            for last in [0x02, 0x7f] {
+                bytes[9] = last;
+                assert!(
+                    matches!(uvarint(&bytes), Err(Error::Corrupt(_))),
+                    "{first:#x}s then {last:#x}"
+                );
+            }
+        }
     }
 
     #[test]
