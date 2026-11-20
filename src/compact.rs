@@ -324,7 +324,7 @@ impl<F: Fs> Db<F> {
         self.store.metrics.compactions.add(1);
         self.saw_debt();
         for (file_num, entries) in written {
-            self.saw_table_entries(file_num, Some(entries));
+            self.saw_table_entries(file_num, entries);
         }
         self.recount_records();
 

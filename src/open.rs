@@ -1194,17 +1194,9 @@ impl<F: Fs> Db<F> {
             // The log, with the borrow released before any waiting: a
             // `RefCell` held across an await is a panic waiting for the
             // first reader that arrives in the middle of a write.
-            let Some((disk, log_num, at)) = self
-                .store
-                .log
-                .borrow()
-                .as_ref()
-                .map(|l| (std::rc::Rc::clone(&l.disk), l.log_num, l.at))
-            else {
-                return Err(Error::Unsupported(format!(
-                    "{} holds no log file, so a write could not be recovered",
-                    self.store.dir.display()
-                )));
+            let (disk, log_num, at) = {
+                let log = self.wal_log();
+                (std::rc::Rc::clone(&log.disk), log.log_num, log.at)
             };
 
             let mut writer = roble_format::record::RecordWriter::resuming(log_num as u32, at);
@@ -1229,9 +1221,7 @@ impl<F: Fs> Db<F> {
                 let _timer = self.store.metrics.sync_duration.start();
                 disk.sync(Default::default()).await?;
             }
-            if let Some(log) = self.store.log.borrow_mut().as_mut() {
-                log.at = end;
-            }
+            self.wal_log().at = end;
         }
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
@@ -1956,13 +1946,10 @@ impl<F: Fs> Db<F> {
     }
 
     /// Takes note of how many entries a table holds.
-    pub(crate) fn saw_table_entries(&self, file_num: u64, entries: Option<u64>) {
+    pub(crate) fn saw_table_entries(&self, file_num: u64, entries: u64) {
         if !self.store.metrics.recording() {
             return;
         }
-        let Some(entries) = entries else {
-            return;
-        };
         if self
             .store
             .tables
@@ -1995,10 +1982,10 @@ impl<F: Fs> Db<F> {
     }
 
     /// Restates the estimate from what the tables and the memtable hold.
+    ///
+    /// Only while something is recording, which both callers have checked:
+    /// a write before its other metrics, and `recount_records`.
     pub(crate) fn saw_records(&self) {
-        if !self.store.metrics.recording() {
-            return;
-        }
         let in_memory: usize = self.memtables().iter().map(|m| m.borrow().len()).sum();
         self.store
             .metrics
@@ -2151,18 +2138,21 @@ impl<F: Fs> Db<F> {
     /// real filesystem even its create can — so from here until a swap moves
     /// the store off this log, every write to it is synced as well.
     pub(crate) async fn sync_log(&self, _writing: &crate::change::Writing<'_>) -> Result<()> {
-        let disk = self
-            .store
-            .log
-            .borrow()
-            .as_ref()
-            .map(|l| std::rc::Rc::clone(&l.disk));
-        if let Some(disk) = disk {
-            let _timer = self.store.metrics.sync_duration.start();
-            disk.sync(Default::default()).await?;
-        }
+        let disk = std::rc::Rc::clone(&self.wal_log().disk);
+        let _timer = self.store.metrics.sync_duration.start();
+        disk.sync(Default::default()).await?;
         self.store.log_followed.set(true);
         Ok(())
+    }
+
+    /// The log a write appends to and a flush syncs, for a store that writes
+    /// with the WAL on, which always has one: the open carries on in the log
+    /// it replayed or creates one, and a flush only ever swaps it for the next.
+    fn wal_log(&self) -> std::cell::RefMut<'_, Log<F::Disk>> {
+        std::cell::RefMut::map(self.store.log.borrow_mut(), |log| {
+            log.as_mut()
+                .expect("a store that writes with the WAL on has a log")
+        })
     }
 
     /// Opens an existing log for appending, without pointing the store at
