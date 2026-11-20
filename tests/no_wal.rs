@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Error, Fs, Options, WriteBuf};
+use roble::{Access, Comparison, Disk, Error, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 use roble_format::files::{self, FileType};
 
@@ -168,7 +168,8 @@ async fn a_write_is_refused_the_sync_it_cannot_keep() {
 async fn nothing_reaches_the_log() {
     // The fixture arrives with an empty log, as a database Pebble wrote with
     // the WAL off does — eleven bytes of EOF trailer and nothing else. It
-    // should still be those eleven bytes afterwards.
+    // should still be those eleven bytes once the writes are in, and the
+    // flush should then retire it rather than write to it.
     let (env, dir) = load("db-twin-a").await;
     let logs = of_type(&listing(env.sim(), &dir).await, FileType::Log);
     assert_eq!(logs.len(), 1, "the fixture should hold one log: {logs:?}");
@@ -186,22 +187,46 @@ async fn nothing_reaches_the_log() {
             .expect("put");
         db.write_raw(&mut batch, false).await.expect("write");
     }
-    db.flush().await.expect("flush").expect("a table");
 
+    // What the file holds, synced or not: a write that reached the log is
+    // there whether or not anything has synced it yet.
+    let log = env
+        .sim()
+        .open(&log_path, Access::ReadOnly)
+        .await
+        .expect("open the log");
+    let now = roble::__private::read_all(&log, ())
+        .await
+        .expect("read the log");
+    log.close().await.expect("close the log");
     assert_eq!(
-        env.sim().durable(&log_path).as_deref(),
-        Some(before.as_slice()),
+        now, before,
         "something was written to the log of a store that has none"
+    );
+
+    db.flush().await.expect("flush").expect("a table");
+    assert_eq!(
+        env.sim().durable(&log_path),
+        None,
+        "the flush should have retired the log"
     );
 }
 
 #[compio::test]
-async fn a_flush_with_the_wal_off_makes_no_log_and_retires_none() {
+async fn a_flush_with_the_wal_off_makes_no_log_and_retires_every_one() {
+    // With the WAL off a write goes to no log, so once a flush has landed
+    // no log holds anything a table does not, and its edit moves the minimum
+    // unflushed log number past every log there is: here the empty one the
+    // fixture's Pebble left behind.
     let (env, dir) = load("db-twin-a").await;
     let db = roble::open_with(&env, &dir, no_wal()).await.expect("open");
 
     let before = listing(env.sim(), &dir).await;
-    let min_unflushed = db.versions().min_unflushed_log_num;
+    assert_eq!(
+        of_type(&before, FileType::Log).len(),
+        1,
+        "the fixture should hold one log: {before:?}"
+    );
     let next_file_num = db.versions().next_file_num;
 
     let mut batch = Batch::new();
@@ -212,13 +237,14 @@ async fn a_flush_with_the_wal_off_makes_no_log_and_retires_none() {
     let after = listing(env.sim(), &dir).await;
     assert_eq!(
         of_type(&after, FileType::Log),
-        of_type(&before, FileType::Log),
-        "a flush with the WAL off should neither make a log nor retire one"
+        Vec::<u64>::new(),
+        "a flush with the WAL off should make no log, and retire the one there was"
     );
     assert_eq!(
         db.versions().min_unflushed_log_num,
-        min_unflushed,
-        "and should not move the minimum unflushed log number"
+        table,
+        "and should move the minimum unflushed log number to its table's, \
+         which is past every log the open found"
     );
     assert_eq!(
         db.versions().next_file_num,
@@ -273,21 +299,27 @@ async fn a_log_written_with_a_wal_is_still_replayed_without_one() {
         "a record in the log should be replayed whatever this store was asked to do"
     );
 
-    // And a flush here must not claim the logs are all accounted for. The
-    // MANIFEST's minimum unflushed log number stays where the WAL left it,
-    // rather than being written back to the zero a database that never had
-    // a WAL carries — which would make every retired log live again, and
-    // replayed.
+    // The open keeps the MANIFEST's minimum unflushed log number where the
+    // WAL left it, rather than writing back the zero a database that never
+    // had a WAL carries — which would make every retired log live again, and
+    // replayed. And a flush here retires the log it has just written out:
+    // left behind the bound, it would be replayed at every open beneath the
+    // table that holds its records.
     assert_eq!(
         db.versions().min_unflushed_log_num,
         with_wal,
         "the reopen should have kept the bound the WAL left"
     );
     db.flush().await.expect("flush").expect("a table");
+    assert!(
+        db.versions().min_unflushed_log_num > with_wal,
+        "a flush with the WAL off should move the log bound past the log it wrote out, \
+         not leave it at {with_wal}"
+    );
     assert_eq!(
-        db.versions().min_unflushed_log_num,
-        with_wal,
-        "a flush with the WAL off should leave the log bound alone"
+        env.sim().durable(&dir.join(files::log_filename(with_wal))),
+        None,
+        "and that log should be gone"
     );
 
     env.sim().crash();
@@ -300,6 +332,77 @@ async fn a_log_written_with_a_wal_is_still_replayed_without_one() {
             .expect("get")
             .map(|f| f.value),
         Some(b"with the wal on".to_vec()),
-        "and it should still be there once a table holds it too"
+        "and it should still be there, now that only a table holds it"
+    );
+}
+
+#[compio::test]
+async fn a_flushed_delete_stays_deleted_after_the_wal_is_turned_off() {
+    // A put logged with the WAL on, then deleted, flushed and compacted with
+    // it off. The compaction drops the tombstone, because nothing below it
+    // holds the key, so from there only the log still names the key. A log
+    // the flush left unretired would be replayed at the next open and bring
+    // the put back, though the delete was flushed and is durable by
+    // everything `Wal::Off` promises.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let options = |wal| {
+        Options::new()
+            .wal(wal)
+            .create_if_missing(true)
+            .background_tasks(false)
+    };
+    let get = async |db: &roble::Db<SimFs>| {
+        db.get(b"k", Comparison::Equal)
+            .await
+            .expect("get")
+            .map(|f| f.value)
+    };
+
+    let logged_to = {
+        let db = roble::open_with(&env, &dir, options(roble::Wal::Synced))
+            .await
+            .expect("create");
+        db.put(b"k", b"v").await.expect("put");
+        db.current_log().expect("a log")
+    };
+    env.sim().crash();
+
+    {
+        let db = roble::open_with(&env, &dir, options(roble::Wal::Off))
+            .await
+            .expect("reopen without a WAL");
+        assert_eq!(get(&db).await, Some(b"v".to_vec()), "the log is replayed");
+
+        db.delete(b"k").await.expect("delete");
+        let table = db.flush().await.expect("flush").expect("a table");
+        let out = db.compact(0, &[table]).await.expect("compact");
+        assert!(
+            out.is_empty(),
+            "the compaction should have dropped the tombstone, not written {out:?}"
+        );
+        assert_eq!(get(&db).await, None, "deleted, flushed and compacted");
+        db.close().await.expect("close");
+    }
+    env.sim().crash();
+
+    let db = roble::open_with(&env, &dir, options(roble::Wal::Off))
+        .await
+        .expect("reopen again");
+    assert_eq!(
+        get(&db).await,
+        None,
+        "a flushed delete came undone: the reopen replayed the log the flush wrote out"
+    );
+    // And why: the flush moved the bound past the log the put went to, and
+    // the log went with it, so there was nothing left to replay.
+    assert!(
+        db.versions().min_unflushed_log_num > logged_to,
+        "the log bound should be past log {logged_to}"
+    );
+    assert_eq!(
+        of_type(&listing(env.sim(), &dir).await, FileType::Log),
+        Vec::<u64>::new(),
+        "and no log should be left for an open to replay"
     );
 }

@@ -35,7 +35,8 @@
 # so what Pebble opens is a database roble spread across levels by itself.
 #
 # The sixth is Oxia's own configuration: the WAL off, so the table and the
-# MANIFEST edit are the only things that happened and the log is untouched.
+# MANIFEST edit are the only things that happened, and the log is retired
+# rather than written to.
 #
 # The eighth starts from an empty directory, so every byte Pebble reads was
 # written by roble: the MANIFEST, both markers, the log and the tables. Every
