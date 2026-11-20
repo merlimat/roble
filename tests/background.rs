@@ -251,7 +251,10 @@ async fn a_background_flush_that_fails_is_tried_again_after_the_next_write() {
 
     put(&db, written).await.expect("the next write");
     settle().await;
-    assert_eq!(in_l0(&db), 1, "and been written out after the next write");
+    // Two tables: the memtable the failed flush left frozen, and then the one
+    // that replaced it, since a flush writes out everything written before it
+    // began (`crate::flush`).
+    assert_eq!(in_l0(&db), 2, "and been written out after the next write");
     db.close().await.expect("close");
 }
 

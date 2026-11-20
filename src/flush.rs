@@ -52,7 +52,8 @@
 //! Step 1 is the one thing a failure does not undo: the store goes on
 //! writing to the fresh memtable and the fresh log whatever becomes of the
 //! rest, so a flush that fails leaves a memtable frozen and the next flush
-//! writes *that* one out rather than freezing again.
+//! writes *that* one out rather than freezing over it — and then freezes and
+//! writes out the one that replaced it, which holds every write since.
 
 use roble_format::key::{Kind, SEQ_NUM_MAX};
 use roble_format::manifest::{NewTable, VersionEdit};
@@ -97,6 +98,10 @@ impl<F: Fs> Db<F> {
     /// from and still written out, by the next flush. What it does not do is
     /// put that memtable back in front — the writes that arrived meanwhile
     /// are in the one that replaced it, and carry higher sequence numbers.
+    /// So the next flush writes two tables, that memtable's and then the
+    /// replacement's, and returns the number of the last it wrote: a flush
+    /// that returns `Ok` has written out everything written before it was
+    /// asked, whatever became of the one before it.
     ///
     /// A flush is also where the store notices it has too many tables, so a
     /// flush that wrote one hands the compaction the picker chose to the
@@ -127,7 +132,7 @@ impl<F: Fs> Db<F> {
         // waits behind, and the narrowing is what that was in the way of.
         let flushed = {
             let change = self.changes().begin().await;
-            let flushed = self.flush_inner(&change).await;
+            let flushed = self.flush_owed(&change).await;
             // Remembered so that a task waiting to be told there is a
             // memtable to write out is not told the same thing again at
             // once: the next flush would write out the same memtable to the
@@ -155,6 +160,24 @@ impl<F: Fs> Db<F> {
             }
         }
         Ok(flushed)
+    }
+
+    /// Writes out every memtable holding a write made before the flush was
+    /// asked for, and says the number of the last table written.
+    ///
+    /// That is two memtables only after a flush that failed: the one it
+    /// froze, which `flush_inner` writes out as it stands, and the one the
+    /// writes since have gone to. Stopping after the first would make a
+    /// flush that returns `Ok` one that left acknowledged writes in memory —
+    /// with the WAL off, writes that nothing but a flush makes durable, and
+    /// for a checkpoint, writes the directory it is about to describe would
+    /// not hold.
+    async fn flush_owed(&self, change: &Change<'_>) -> Result<Option<u64>> {
+        let retried = match self.frozen() {
+            Some(_) => self.flush_inner(change).await?,
+            None => None,
+        };
+        Ok(self.flush_inner(change).await?.or(retried))
     }
 
     /// The flush proper: the table, the log, the edit, the bookkeeping.

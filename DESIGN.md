@@ -649,9 +649,12 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   is writing to the fresh memtable and the fresh log from then on, whatever
   becomes of the rest. So the new log's file number is spent at the swap
   rather than at the edit, and a flush that fails leaves a memtable frozen for
-  the next flush to write out rather than freeze over. One flush writes one
-  memtable, which is why a flush does not always leave `unflushed_bytes()` at
-  zero.
+  the next flush to write out rather than freeze over. That next flush then
+  freezes and writes out the memtable that replaced it as well, so a flush
+  that returns has written out every write made before it began, failure or
+  not — with the WAL off nothing else makes those writes durable, and a
+  checkpoint, which flushes and carries no log, would otherwise leave them
+  out.
 - **A level's tables may touch but not overlap.** Two tables of one level may
   share a user key at their bounds when the first ends there *exclusively* —
   its largest key being a range deletion's end at the largest sequence number

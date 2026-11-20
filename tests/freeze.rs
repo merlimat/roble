@@ -321,8 +321,9 @@ async fn a_flush_that_failed_leaves_its_memtable_to_the_next_flush() {
     // A freeze is the one part of a flush that a failure does not undo: the
     // store is writing to the fresh memtable and the fresh log from then on,
     // whatever becomes of the rest. So the next flush writes out the one left
-    // frozen and rotates nothing — a second freeze here would move the log
-    // past the writes that arrived in between, and then retire it.
+    // frozen as it stands — freezing over it would move the log past the
+    // writes that arrived in between, and then retire it — and only then
+    // freezes the one those writes went to, and writes that out too.
     for wal in [true, false] {
         let total = ops_of_a_flush(wal).await;
         let mut retried = 0;
@@ -389,28 +390,26 @@ async fn a_flush_that_failed_leaves_its_memtable_to_the_next_flush() {
                 continue;
             }
 
-            // A flush writes out one memtable, and the retry's was the one
-            // left frozen — so the writes that arrived after the failure are
-            // still waiting, and with the log off that is the difference
-            // between readable and durable. One more flush covers them.
-            if !wal {
-                db.flush().await.expect("a third flush");
-                assert_eq!(
-                    db.unflushed_bytes(),
-                    0,
-                    "wal={wal}: failing at {n} of {total}, nothing should be left waiting"
-                );
-            }
+            // The retry wrote out the writes that arrived after the failure as
+            // well as the memtable left frozen. A flush that returned with
+            // them still waiting would have returned without making them
+            // durable, and with the log off nothing else does.
+            assert_eq!(
+                db.unflushed_bytes(),
+                0,
+                "wal={wal}: failing at {n} of {total}, the retry left writes waiting"
+            );
 
             drop(db);
+            env.sim().crash();
             let reopened = roble::open_with(&env, &dir, options(wal))
                 .await
                 .unwrap_or_else(|e| {
                     panic!("wal={wal}: failing at {n} of {total}, the reopen: {e}")
                 });
             // With the log off only a flush makes a write durable, and the
-            // flushes above covered everything, so both configurations
-            // expect the whole model back.
+            // retry covered everything, so both configurations expect the
+            // whole model back after a crash.
             assert_eq!(
                 contents(&reopened).await,
                 model,
