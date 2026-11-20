@@ -299,11 +299,10 @@ impl<F: Fs> Db<F> {
         // reads is the note the compaction makes when it replaces a version
         // something holds (`crate::obsolete::Pinned`), not one made here.
         let version = Rc::clone(&self.version_set().version);
-        // The range check both halves need, done once. They narrow it
-        // differently from here — `newest_for` consults each table's filter
-        // and `visible` must not, since a filter is built from point keys and
-        // a range tombstone is not one — but which tables *contain* the key
-        // is one question with one answer.
+        // The tables whose range holds the key, which `newest_for` narrows
+        // further: by sequence number, and by filter once it has taken a
+        // table's range tombstones, since a filter is built from point keys
+        // and a range tombstone is not one.
         //
         // Only file numbers leave the version, which is what keeps a lookup
         // from allocating per table: what this replaced carried a clone of
@@ -314,7 +313,10 @@ impl<F: Fs> Db<F> {
         let Some(found) = self.newest_for(user, buf).await? else {
             return Ok(false);
         };
-        if !self.visible(user, &found, &buf.tables).await? {
+        // A point deletion as the newest version is a key that is not there.
+        // Range tombstones have had their say: `newest_for` answers `None`
+        // for a version one covers.
+        if crate::table::is_deletion(found.kind) {
             return Ok(false);
         }
         // The key an `Equal` found is the key it was asked for.
@@ -416,8 +418,9 @@ impl<F: Fs> Db<F> {
         // The newest range tombstone seen so far that covers `user`. Every
         // version older than it is deleted, so a table holding nothing newer
         // is not searched — and, once one is known, an entry's block is not
-        // read only for `visible` to throw it away, which is what RocksDB's
-        // `max_covering_tombstone_seq` and Pebble's `getIter` save too.
+        // read only for the check at the end to throw it away, which is what
+        // RocksDB's `max_covering_tombstone_seq` and Pebble's `getIter` save
+        // too.
         let mut covered: Option<u64> = None;
 
         // The memtables first — the one writes go to, and the one a flush is
@@ -470,11 +473,11 @@ impl<F: Fs> Db<F> {
             //
             // **Nor is a table a covering tombstone makes too old.** Its every
             // entry is no newer than its largest sequence number, so at or
-            // below the tombstone's it is deleted. `<=` here rests on what
-            // `visible`'s `>` does — a point key and a tombstone never share a
-            // sequence number — and it is what lets the table holding the
-            // tombstone go unsearched when the tombstone is the newest thing
-            // in it.
+            // below the tombstone's it is deleted. `<=` here rests on the `>`
+            // of the check at the end — a point key and a tombstone never
+            // share a sequence number — and it is what lets the table holding
+            // the tombstone go unsearched when the tombstone is the newest
+            // thing in it.
             //
             // Asked twice: once before the table is opened, for a tombstone
             // already seen, and once after, for one the table holds itself.
@@ -536,29 +539,14 @@ impl<F: Fs> Db<F> {
         // whichever source each came from. A table can hold a tombstone newer
         // than a version an earlier one gave — L0's tables overlap — so this
         // is decided once every source has been asked, not as each answers.
-        if best
-            .as_ref()
-            .is_some_and(|b| covered.is_some_and(|c| c > b.trailer >> 8))
-        {
-            return Ok(None);
-        }
-        Ok(best)
-    }
-
-    /// Whether `found` is a live value for `user`.
-    async fn visible(
-        &self,
-        user: &[u8],
-        found: &Candidate,
-        containing: &[(u64, u64)],
-    ) -> Result<bool> {
-        if crate::table::is_deletion(found.kind) {
-            return Ok(false);
-        }
-        // A range tombstone newer than the entry covers it. Older ones do not,
-        // which is why this is a sequence-number comparison and not a level
-        // one: a tombstone in a lower level can still be newer than a key
-        // above it only if its sequence number says so.
+        //
+        // This is the lookup's only range-tombstone check, and it is whole:
+        // every memtable was asked, and every table that could hold a
+        // tombstone newer than the answer was opened. A table `too_old`
+        // skipped holds nothing newer than the answer, or than a tombstone
+        // already in `covered`. The comparison is by sequence number, not by
+        // level: a tombstone in a lower level is newer than a key above it
+        // only if its sequence number says so.
         //
         // `>` rather than `>=` is not pinned by any test, and cannot be:
         // every entry in a batch gets its own sequence number, so a point key
@@ -566,33 +554,12 @@ impl<F: Fs> Db<F> {
         // apart. `>` is what Pebble means — a tombstone deletes what came
         // before it — and it is written that way for that reason, not because
         // a test demanded it.
-        let seq = found.trailer >> 8;
-        // One table at a time, rather than opening all of them and then
-        // asking: any covering tombstone answers the whole question, so the
-        // tables after it need not be opened at all.
-        for &(file_num, largest_seq) in containing {
-            // Only a tombstone newer than the entry covers it, and a table
-            // holds nothing newer than its largest sequence number — so a
-            // table no newer than the entry has nothing to say, and is not
-            // opened to be asked. `<=` and `<` read alike here for the same
-            // reason as in `newest_for`, and so are not told apart by a test.
-            if largest_seq <= seq {
-                continue;
-            }
-            let table = self.open_table(file_num).await?;
-            if crate::table::covered_by_tombstone(std::slice::from_ref(&table), user, seq)? {
-                return Ok(false);
-            }
+        if best
+            .as_ref()
+            .is_some_and(|b| covered.is_some_and(|c| c > b.trailer >> 8))
+        {
+            return Ok(None);
         }
-        // And the memtables', which are kept apart from their point keys and
-        // so are in no cursor's way (§4).
-        for held in self.memtables_each() {
-            for t in held.borrow().tombstones() {
-                if t.seq_num > seq && t.start.as_slice() <= user && user < t.end.as_slice() {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
+        Ok(best)
     }
 }
