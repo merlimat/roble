@@ -11,7 +11,8 @@ and closes.
 
 A segment is a few hundred operations: puts over a 1000-key alphabet with
 values from one byte to past a 32 KiB log block, deletes, range deletions,
-flushes, full compactions, snapshots, batches, checkpoints, walks and checks.
+flushes, full compactions, snapshots, batches, checkpoints, walks, held
+iterators and checks.
 Both engines
 run with memtables and tables small enough that flushes and compactions keep
 happening, and Pebble with its own automatic compactions on, as Oxia
@@ -36,6 +37,14 @@ outside the range — and after every move requires the key the map says, so
 it turns round in the middle of tables and at their edges, where a full scan
 never does. A step from nothing is skipped, since the engines differ there:
 Pebble turns round onto the end of the range and roble stays on nothing.
+
+A walk's iterator lives inside one operation. `iter` makes one that is held,
+up to three in a turn, and `itermove` moves one a few steps at a time from
+wherever it was left, against the map as it was when the iterator was made,
+with the turn's writes, flushes and compactions landing between its moves
+until `uniter` closes it: an iterator reads the store as of its making, and
+holds what it needs to, the memtables and the tables of its version, for as
+long as it lives.
 
 `snap` takes a snapshot, and a turn holds up to three until `unsnap` lets one
 go or the turn ends. `snapcheck` and `snapwalk` read one the way `check` and
@@ -126,6 +135,12 @@ none of the keys still in roble's memtable) or records a last sequence number
 below its tables'. One whose next file number is too low is not caught, and
 cannot be: both engines take the number past every file in the directory as
 they open it.
+
+Held iterators catch, on the first seed from 9000, a scan that reads at the
+store's latest sequence number rather than the one it was made at; twelve
+seeds from 9000 generated with walks in their place pass, since a walk takes
+no writes between its moves. They also catch the sweep removing a table a
+live scan still holds, which snapshots catch too.
 
 Kills found a directory neither engine would open: roble, reopening a
 directory, carried on writing into the last log where its replay stopped, and

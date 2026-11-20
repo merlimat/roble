@@ -1969,7 +1969,7 @@ in both directions.
   scenario. `compat/differential` generates a seeded script of segments — puts
   over a small alphabet with values from a byte to past a log block, deletes,
   range deletions, flushes, full compactions, snapshots, indexed batches,
-  checkpoints, walks and checks — and hands each segment to roble or to Go Pebble in turn on one
+  checkpoints, walks, held iterators and checks — and hands each segment to roble or to Go Pebble in turn on one
   directory, so each opens what the other wrote: its tables, the layouts its
   compactions chose (Pebble's automatic ones included), its MANIFEST, and the
   log it left unflushed. Half of roble's turns flush and compact in the
@@ -1978,7 +1978,9 @@ in both directions.
   segments before its own into a `BTreeMap` and, at every check, requires both
   scans and every comparison at every key to agree with it, and at every walk,
   an iterator over a range moved forty times — seeking, stepping, turning round
-  — to be where the map says after each move. A snapshot is read both ways
+  — to be where the map says after each move. A held iterator is moved a few
+  steps at a time across the turn, against the map as it was when it was
+  made. A snapshot is read both ways
   against the map as it stood when it was taken, after the writes, flushes and
   compactions since. A read through an open batch sees the map with the batch's
   writes laid over it, and a commit applies them. A checkpoint is first opened
