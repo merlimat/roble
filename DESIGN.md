@@ -1968,8 +1968,8 @@ in both directions.
 - **Both engines, in turn, on one random history.** Every mode above is a fixed
   scenario. `compat/differential` generates a seeded script of segments — puts
   over a small alphabet with values from a byte to past a log block, deletes,
-  range deletions, flushes, full compactions, snapshots, indexed batches, walks
-  and checks — and hands each segment to roble or to Go Pebble in turn on one
+  range deletions, flushes, full compactions, snapshots, indexed batches,
+  checkpoints, walks and checks — and hands each segment to roble or to Go Pebble in turn on one
   directory, so each opens what the other wrote: its tables, the layouts its
   compactions chose (Pebble's automatic ones included), its MANIFEST, and the
   log it left unflushed. Half of roble's turns flush and compact in the
@@ -1981,7 +1981,11 @@ in both directions.
   — to be where the map says after each move. A snapshot is read both ways
   against the map as it stood when it was taken, after the writes, flushes and
   compactions since. A read through an open batch sees the map with the batch's
-  writes laid over it, and a commit applies them. One turn in three kills itself
+  writes laid over it, and a commit applies them. A checkpoint is first opened
+  by the other engine, in its next turn, as the taker wrote it; that and every
+  later open checks it against the map as it stood when it was taken, then
+  writes a few keys into it, as whoever receives a checkpoint goes on to do.
+  One turn in three kills itself
   at a random point instead of closing, and the next, the other engine's, opens
   what it left: the script is cut where the killed turn stopped, and a write it
   had under way is decided by reading a key the two outcomes disagree on, so

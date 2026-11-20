@@ -11,7 +11,8 @@ and closes.
 
 A segment is a few hundred operations: puts over a 1000-key alphabet with
 values from one byte to past a 32 KiB log block, deletes, range deletions,
-flushes, full compactions, snapshots, batches, walks and checks. Both engines
+flushes, full compactions, snapshots, batches, checkpoints, walks and checks.
+Both engines
 run with memtables and tables small enough that flushes and compactions keep
 happening, and Pebble with its own automatic compactions on, as Oxia
 configures it otherwise: the format major version of the pin, a ten-bit bloom
@@ -49,6 +50,18 @@ operations. While it is open, seven writes in ten go into it (`bput`, `bdel`,
 through it against the map with the batch's writes laid over what is
 committed, since a commit numbers them above everything before; `commit`
 applies them to the map, and `abort` drops them.
+
+`checkpoint <id>` writes a checkpoint into a directory beside the store, named
+by an id no other checkpoint of the script has. `cpcheck <id>` opens it as a
+store, checks it against the map as it was when it was taken, writes the few
+puts the line carries into it, and closes it: whoever receives a checkpoint
+opens it and goes on writing, so a checkpoint has a history of its own from
+there, and the next `cpcheck` checks those puts too. The turn after the one
+that took a checkpoint opens it first, so the other engine is the first to
+read every checkpoint as its taker wrote it, Pebble's with the logs it copies
+in and roble's with none; later `cpcheck`s, by either engine, open what the
+last one left. Pebble's runner takes its checkpoints with `WithFlushedWAL`,
+since its writes are not synced and a checkpoint without it may miss them.
 
 A disagreement names the engine that read wrongly, the segment and the
 operation, and what the other engine wrote before it is the segments before.
@@ -94,6 +107,21 @@ failure keeps the directory and the script, cut as the turns that ran had it.
 `CRASH=0` turns kills off.
 
 ## What it has found
+
+Each new kind of operation changes the mix, so a seed named below makes the
+history it made when it was written only until the next one; the planted bugs
+are the ones to put back and run again.
+
+Checkpoints found roble refusing a log Pebble wrote: `corrupt: internal key
+kind 3`, on the first seed. Kind 3 is Pebble's `LogData`, which a batch can
+carry to the log and which Pebble's checkpoint writes itself, alone in a
+batch, to sync the log first. Pebble steps over it when it applies a batch,
+and roble's batch reader now does too. Checkpoints also catch, on the first
+seed from 8000, a checkpoint that skips its flush (Pebble opens it and finds
+none of the keys still in roble's memtable) or records a last sequence number
+below its tables'. One whose next file number is too low is not caught, and
+cannot be: both engines take the number past every file in the directory as
+they open it.
 
 Kills found a directory neither engine would open: roble, reopening a
 directory, carried on writing into the last log where its replay stopped, and

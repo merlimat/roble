@@ -69,6 +69,8 @@ pebble="$out/pebble-differential"
 for ((s = first; s < first + seeds; s++)); do
   script="$out/script-$s"
   db="$out/db-$s"
+  # Its checkpoints go beside it, as $db-cp<id>.
+  rm -rf "$db" "$db"-cp*
   "$roble" gen "$s" "$segments" "$ops" > "$script"
   # The seed picks the turns killed and where, so a seed kills the same
   # turns at the same operations again; the microsecond a kill lands at, and
@@ -121,7 +123,7 @@ for ((s = first; s < first + seeds; s++)); do
     fi
   done
   echo "seed $s: $segments turns of $ops operations, $kills of them killed, roble and Pebble agreeing with the history at every check"
-  rm -rf "$db"
+  rm -rf "$db" "$db"-cp*
   all_kills=$((all_kills + kills))
 done
 
