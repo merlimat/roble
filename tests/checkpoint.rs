@@ -153,6 +153,75 @@ async fn a_checkpoint_takes_the_memtable_with_it() {
 }
 
 #[compio::test]
+async fn a_checkpoint_after_a_failed_flush_holds_every_write_made_before_it() {
+    // A flush that fails leaves its memtable frozen, and the writes after it
+    // go to the one that replaced it. A checkpoint carries no log, so it holds
+    // a write only if the flush it starts with writes it out — and after a
+    // failure that flush has two memtables to write, not one. With the log on
+    // as much as off: the log would keep the later writes, but not in the
+    // checkpoint.
+    for wal in [roble::Wal::Synced, roble::Wal::Off] {
+        let options = || {
+            Options::new()
+                .wal(wal)
+                .background_tasks(false)
+                .disable_automatic_compactions(true)
+        };
+        let sync = wal != roble::Wal::Off;
+        let total = {
+            let (env, dir) = load("db-twin-a").await;
+            let db = roble::open_with(&env, &dir, options()).await.expect("open");
+            write_keys(&db, "before", 5, sync).await;
+            let before = env.sim().ops();
+            db.flush().await.expect("flush");
+            env.sim().ops() - before
+        };
+
+        let mut checked = 0;
+        for n in 1..=total {
+            let (env, dir) = load("db-twin-a").await;
+            let db = roble::open_with(&env, &dir, options()).await.expect("open");
+            let mut model = contents(&db).await;
+            model.extend(write_keys(&db, "before", 5, sync).await);
+
+            env.sim().fail_at(n);
+            let failed = db.flush().await.is_err();
+            env.sim().stop_failing();
+            if !failed {
+                // The injection landed somewhere the flush lets go of, such
+                // as the sweep after its edit, and there is nothing frozen.
+                continue;
+            }
+            model.extend(write_keys(&db, "after", 5, sync).await);
+
+            let at = PathBuf::from("/snapshot");
+            if db.checkpoint(&at).await.is_err() {
+                // The failure was the MANIFEST append, after which the store
+                // records nothing more and says so (`crate::flush`).
+                continue;
+            }
+            let copy = roble::open_with(&env, &at, options())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("wal={wal:?}: failing at {n} of {total}, opening the checkpoint: {e}")
+                });
+            assert_eq!(
+                contents(&copy).await,
+                model,
+                "wal={wal:?}: failing at {n} of {total}, the checkpoint is missing writes made \
+                 before it"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "wal={wal:?}: no failed flush was followed by a checkpoint, so nothing above \
+             checked one"
+        );
+    }
+}
+
+#[compio::test]
 async fn a_checkpoint_holds_its_tables_a_manifest_and_two_markers() {
     // And nothing else. A log would have nothing to carry, an `OPTIONS-*` is
     // something roble neither writes nor reads and Pebble writes for itself,
