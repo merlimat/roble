@@ -358,7 +358,9 @@ impl<F: Fs> Db<F> {
     /// wants the space back, and for a test that wants to watch.
     ///
     /// A table a reader is still open for is left for a later sweep, and the
-    /// table cache's own reader is let go of first (§5).
+    /// table cache's own reader is let go of first (§5). Nothing is deleted
+    /// once a change to the MANIFEST has failed: that is refused, as every
+    /// change to the store then is (`crate::flush`).
     #[doc(hidden)]
     pub async fn remove_obsolete_files(&self) -> Result<Vec<String>> {
         self.writable()?;
@@ -373,6 +375,12 @@ impl<F: Fs> Db<F> {
     /// `Live` below and the deletions above it would have installed a table
     /// this does not know about, and this would delete it.
     pub(crate) async fn sweep(&self, _change: &Change<'_>) -> Result<Vec<String>> {
+        // Nothing is deleted once a change to the MANIFEST has failed
+        // (`crate::flush`). The version this reads carried on without the
+        // record that failed, which a reopen may still replay, so a table
+        // that record names — or the MANIFEST a failed rotation's marker
+        // names — looks obsolete from here and is not.
+        self.recording()?;
         let names: Vec<String> = self
             .fs()
             .list(&self.store.dir)

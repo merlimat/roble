@@ -225,8 +225,9 @@ pub(crate) struct Store<F: Fs> {
     /// them, which is what keeps the sweep off the tables they will open
     /// (§5, `crate::obsolete`).
     pinned: crate::obsolete::Pinned,
-    /// Whether an append to the MANIFEST has failed, after which this store
-    /// records nothing more (`crate::flush`).
+    /// Whether a change to the MANIFEST has failed — an append, or the move
+    /// to a new one — after which this store records nothing more
+    /// (`crate::flush`).
     manifest_failed: std::cell::Cell<bool>,
     /// The one change at a time this store makes to what it is made of
     /// (§5, `crate::change`).
@@ -1855,13 +1856,27 @@ impl<F: Fs> Db<F> {
         &self.store.changes
     }
 
-    /// Whether an append to the MANIFEST has failed, which is the end of
-    /// this store's writing life (`crate::flush`).
+    /// Whether a change to the MANIFEST has failed, which is the end of this
+    /// store's writing life (`crate::flush`).
     pub(crate) fn manifest_failed(&self) -> bool {
         self.store.manifest_failed.get()
     }
 
-    /// Takes account of an append to the MANIFEST that failed.
+    /// Refuses, once a change to the MANIFEST has failed, anything that would
+    /// write a table or an edit or sweep a file (`crate::flush`).
+    pub(crate) fn recording(&self) -> Result<()> {
+        if self.manifest_failed() {
+            return Err(Error::Corrupt(
+                "an earlier change to the MANIFEST failed, so this store records no more; \
+                 reopen the database"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Takes account of a change to the MANIFEST that failed: an append, or
+    /// the move to a new one (`crate::rotate`).
     pub(crate) fn saw_manifest_failure(&self) {
         self.store.manifest_failed.set(true);
     }

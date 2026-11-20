@@ -115,10 +115,24 @@ impl<F: Fs> Db<F> {
         disk.close().await?;
         self.fs().sync_dir(&self.store.dir).await?;
 
-        // The one-way door.
+        // The one-way door. A failure in the doorway ends this store's
+        // recording (`crate::flush`): the new marker may be in the directory
+        // without being durable, so the store can no longer say which
+        // MANIFEST a reopen will read. Both describe the version as it
+        // stands, so stopping here leaves either one sound — but an append
+        // to the old one could land where no reopen looks, and the sweep,
+        // which reads the current marker from the directory and the current
+        // MANIFEST from memory, would keep the new marker and delete the
+        // MANIFEST it names.
         let iter = self.manifest_marker_iter() + 1;
         let marker =
-            move_marker(self.fs(), &self.store.dir, MARKER_MANIFEST, iter, &filename).await?;
+            match move_marker(self.fs(), &self.store.dir, MARKER_MANIFEST, iter, &filename).await {
+                Ok(marker) => marker,
+                Err(e) => {
+                    self.saw_manifest_failure();
+                    return Err(e);
+                }
+            };
 
         // Past the door, and nothing here can fail.
         self.install_manifest(filename.clone(), iter, marker);
