@@ -57,10 +57,11 @@ store, checks it against the map as it was when it was taken, writes the few
 puts the line carries into it, and closes it: whoever receives a checkpoint
 opens it and goes on writing, so a checkpoint has a history of its own from
 there, and the next `cpcheck` checks those puts too. The turn after the one
-that took a checkpoint opens it first, so the other engine is the first to
-read every checkpoint as its taker wrote it, Pebble's with the logs it copies
-in and roble's with none; later `cpcheck`s, by either engine, open what the
-last one left. Pebble's runner takes its checkpoints with `WithFlushedWAL`,
+that took a checkpoint opens it first, so the other engine reads it as its
+taker wrote it, Pebble's with the logs it copies in and roble's with none;
+later `cpcheck`s, by either engine, open what the last one left. A kill can
+spoil that order, by cutting the next turn before its first `cpcheck`s, and
+the last turn's checkpoints are never read. Pebble's runner takes its checkpoints with `WithFlushedWAL`,
 since its writes are not synced and a checkpoint without it may miss them.
 
 A disagreement names the engine that read wrongly, the segment and the
@@ -83,7 +84,10 @@ may not have landed. The next turn, the other engine's, opens what the killed
 one left and decides the `maybe` by reading a key on which the two outcomes
 disagree. It prints which, `differential resolve` writes that into the script,
 and from there the history is one again. Every acknowledged write must be
-there, and nothing else.
+there, and nothing else. A `cpcheck` under way when the turn died may or may
+not have written its puts into the checkpoint, and nothing decides which, so
+its checkpoint is not read again; a `cpcheck` of a checkpoint whose turn died
+before taking it says so and does nothing.
 
 Over 20 seeds with every eligible turn killed (`CRASH=1`), 80 kills landed
 inside roble's flushes (16) and checks (20), Pebble's opens (12), puts,
@@ -108,8 +112,8 @@ failure keeps the directory and the script, cut as the turns that ran had it.
 
 ## What it has found
 
-Each new kind of operation changes the mix, so a seed named below makes the
-history it made when it was written only until the next one; the planted bugs
+Each new kind of operation changes the mix, so a seed named in this README
+makes the history it made when it was written only until the next one; the planted bugs
 are the ones to put back and run again.
 
 Checkpoints found roble refusing a log Pebble wrote: `corrupt: internal key
