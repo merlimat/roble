@@ -160,65 +160,84 @@ func walkWant(want []string, mv, at string) (string, bool) {
 // skipped: Pebble turns round onto the range's end and roble stays on
 // nothing, and which is right is not what the walk asks.
 func walk(db pebble.Reader, model map[string][]byte, args []string, at string) {
+	w := newWalker(db, model, args[0], args[1], at)
+	defer w.iter.Close()
+	w.walk(args[2:], at)
+}
+
+// walker is an iterator over a range, the model it is to agree with, and
+// the moves made with it so far: a walk's, or a held iterator's, which keeps
+// its position and its model from one op to the next while the store
+// changes under it.
+type walker struct {
+	iter         *pebble.Iterator
+	model        map[string][]byte
+	want         []string
+	lower, upper string
+	valid        bool
+	done         []string
+}
+
+func newWalker(db pebble.Reader, model map[string][]byte, lower, upper, at string) *walker {
 	var opts pebble.IterOptions
-	lower, upper := "-", "-"
-	if args[0] != "-" {
-		opts.LowerBound = scriptKey(args[0])
-		lower = args[0]
+	if lower != "-" {
+		opts.LowerBound = scriptKey(lower)
 	}
-	if args[1] != "-" {
-		opts.UpperBound = scriptKey(args[1])
-		upper = args[1]
+	if upper != "-" {
+		opts.UpperBound = scriptKey(upper)
 	}
-	var want []string
+	w := &walker{model: model, lower: lower, upper: upper}
 	for _, k := range sorted(model) {
 		if (opts.LowerBound == nil || k >= string(opts.LowerBound)) &&
 			(opts.UpperBound == nil || k < string(opts.UpperBound)) {
-			want = append(want, k)
+			w.want = append(w.want, k)
 		}
 	}
 	iter, err := db.NewIter(&opts)
 	if err != nil {
 		fail(fmt.Errorf("%s: walk: %w", at, err))
 	}
-	defer iter.Close()
-	valid := false
-	var done []string
-	for _, mv := range args[2:] {
-		if !valid && (mv == "n" || mv == "p") {
+	w.iter = iter
+	return w
+}
+
+func (w *walker) walk(moves []string, at string) {
+	iter := w.iter
+	for _, mv := range moves {
+		if !w.valid && (mv == "n" || mv == "p") {
 			continue
 		}
 		before := ""
-		if valid {
+		if w.valid {
 			before = string(iter.Key())
 		}
-		wantKey, wantOK := walkWant(want, mv, before)
+		wantKey, wantOK := walkWant(w.want, mv, before)
 		switch {
 		case mv == "f":
-			valid = iter.First()
+			w.valid = iter.First()
 		case mv == "l":
-			valid = iter.Last()
+			w.valid = iter.Last()
 		case mv == "n":
-			valid = iter.Next()
+			w.valid = iter.Next()
 		case mv == "p":
-			valid = iter.Prev()
+			w.valid = iter.Prev()
 		case strings.HasPrefix(mv, "g:"):
-			valid = iter.SeekGE(scriptKey(mv[2:]))
+			w.valid = iter.SeekGE(scriptKey(mv[2:]))
 		case strings.HasPrefix(mv, "t:"):
-			valid = iter.SeekLT(scriptKey(mv[2:]))
+			w.valid = iter.SeekLT(scriptKey(mv[2:]))
 		}
-		done = append(done, mv)
+		w.done = append(w.done, mv)
 		if err := iter.Error(); err != nil {
-			fail(fmt.Errorf("%s: walk %s: %w", at, strings.Join(done, " "), err))
+			fail(fmt.Errorf("%s: walk %s: %w", at, strings.Join(w.done, " "), err))
 		}
 		got, gotV := "", []byte(nil)
-		if valid {
+		if w.valid {
 			got, gotV = string(iter.Key()), iter.Value()
 		}
-		if valid != wantOK || got != wantKey || (valid && !bytes.Equal(gotV, model[got])) {
+		if w.valid != wantOK || got != wantKey || (w.valid && !bytes.Equal(gotV, w.model[got])) {
 			fail(fmt.Errorf("%s: walk over [%s, %s) after %s: Pebble is on %s, the history %s",
-				at, lower, upper, strings.Join(done, " "),
-				show(got, gotV, valid), show(wantKey, model[wantKey], wantOK)))
+				at, w.lower, w.upper, strings.Join(w.done, " "),
+				show(got, gotV, w.valid), show(wantKey, w.model[wantKey], wantOK)))
 		}
 	}
 }
@@ -542,6 +561,8 @@ func main() {
 		model map[string][]byte
 	}
 	var snaps []held
+	// The held iterators, each with the model as it was when it was made.
+	var iters []*walker
 	var batch *pebble.Batch
 	for i, o := range all[segment] {
 		at := fmt.Sprintf("segment %d (pebble), operation %d", segment, i)
@@ -561,6 +582,15 @@ func main() {
 			check(db, model, at)
 		case "walk":
 			walk(db, model, o.args, at)
+		case "iter":
+			iters = append(iters, newWalker(db, maps.Clone(model), o.args[0], o.args[1], at))
+		case "itermove":
+			n := atoi(o.args[0])
+			iters[n].walk(o.args[1:], fmt.Sprintf("%s, held iterator %d", at, n))
+		case "uniter":
+			n := atoi(o.args[0])
+			err = iters[n].iter.Close()
+			iters = append(iters[:n], iters[n+1:]...)
 		case "snap":
 			snaps = append(snaps, held{db.NewSnapshot(), maps.Clone(model)})
 		case "snapcheck":
@@ -613,6 +643,11 @@ func main() {
 	}
 	if batch != nil {
 		fail(fmt.Errorf("segment %d: a batch is still open at the end", segment))
+	}
+	for _, w := range iters {
+		if err := w.iter.Close(); err != nil {
+			fail(fmt.Errorf("segment %d: iterator close: %w", segment, err))
+		}
 	}
 	for _, h := range snaps {
 		if err := h.snap.Close(); err != nil {

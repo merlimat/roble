@@ -106,6 +106,14 @@ enum Op {
     /// A scan over `[lower, upper)`, either side open when `None`, and the
     /// moves to make with it, over what `At` names.
     Walk(At, Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
+    /// An iterator over `[lower, upper)` of the store, held: appended to the
+    /// live ones and moved by later operations.
+    Iter(Option<Vec<u8>>, Option<Vec<u8>>),
+    /// Moves of the held iterator at this index, from wherever the last ones
+    /// left it.
+    IterMove(usize, Vec<Move>),
+    /// The held iterator at this index, closed.
+    Uniter(usize),
     /// A snapshot, appended to the live ones.
     Snap,
     /// The live snapshot at this index, let go.
@@ -197,6 +205,15 @@ fn parse(line: &str) -> Op {
             walk_op(At::Snap(i.parse().expect("snapshot")), lower, upper, moves)
         }
         ["bwalk", lower, upper, moves @ ..] => walk_op(At::Batch, lower, upper, moves),
+        ["iter", lower, upper] => {
+            let bound = |w: &str| (w != "-").then(|| script_key(w));
+            Op::Iter(bound(lower), bound(upper))
+        }
+        ["itermove", i, moves @ ..] => Op::IterMove(
+            i.parse().expect("iterator"),
+            moves.iter().map(|w| parse_move(w)).collect(),
+        ),
+        ["uniter", i] => Op::Uniter(i.parse().expect("iterator")),
         ["batch"] => Op::Batch,
         ["commit"] => Op::Commit,
         ["abort"] => Op::Abort,
@@ -334,6 +351,7 @@ fn apply(model: &mut Model, op: &Op) {
             model.retain(|k, _| !(a.as_bytes() <= k.as_slice() && k.as_slice() < b.as_bytes()))
         }
         Op::Flush | Op::Compact | Op::Check(_) | Op::Walk(..) | Op::Snap | Op::Unsnap(_) => {}
+        Op::Iter(..) | Op::IterMove(..) | Op::Uniter(_) => {}
         Op::Checkpoint(_) | Op::CpCheck(..) => {}
         Op::Batch | Op::Batched(_) | Op::Commit | Op::Abort | Op::Maybe(_) => {
             unreachable!("a batch's lines go through History")
@@ -375,6 +393,8 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         let mut snaps = 0;
         // So does an open batch, ended before the turn is.
         let mut batch = false;
+        // And held iterators: the keys each spans, for its moves to seek in.
+        let mut iters: Vec<(u64, u64)> = Vec::new();
         for _ in 0..ops {
             step += 1;
             let line = match rng.below(100) {
@@ -404,7 +424,25 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                 // the layouts worth reading are the ones before that.
                 89 if rng.below(4) == 0 => "compact".to_string(),
                 89 => "flush".to_string(),
-                90..=93 => gen_walk(&mut rng),
+                90..=91 => gen_walk(&mut rng),
+                // Held for a while and moved now and then, so that writes,
+                // flushes and compactions land between its moves.
+                92..=93 if iters.is_empty() || (iters.len() < 3 && rng.below(4) == 0) => {
+                    let (bounds, from, to) = gen_bounds(&mut rng);
+                    iters.push((from, to));
+                    format!("iter {bounds}")
+                }
+                92..=93 => {
+                    let i = rng.below(iters.len() as u64) as usize;
+                    if rng.below(6) == 0 {
+                        iters.remove(i);
+                        format!("uniter {i}")
+                    } else {
+                        let (from, to) = iters[i];
+                        let n = 2 + rng.below(8);
+                        format!("itermove {i}{}", gen_moves(&mut rng, from, to, n))
+                    }
+                }
                 // Taken now and then and read a while later, so that writes,
                 // flushes and compactions land between.
                 94..=95 if snaps == 0 || (snaps < 3 && rng.below(3) == 0) => {
@@ -516,6 +554,14 @@ fn into_batch(rng: &mut Rng, batch: bool, write: String) -> String {
 /// moves over it. Seeks aim at keys and between keys, a few of them outside
 /// the range, where a scan clamps them to its bounds.
 fn gen_walk(rng: &mut Rng) -> String {
+    let (bounds, from, to) = gen_bounds(rng);
+    format!("walk {bounds}{}", gen_moves(rng, from, to, 40))
+}
+
+/// A range to walk, as the script spells it, and the keys it spans: mostly a
+/// few hundred keys, with either side now and then open, and now and then
+/// the whole alphabet.
+fn gen_bounds(rng: &mut Rng) -> (String, u64, u64) {
     let (mut lower, mut upper) = ("-".to_string(), "-".to_string());
     let (mut from, mut to) = (0, KEYS);
     if rng.below(4) != 0 {
@@ -528,8 +574,14 @@ fn gen_walk(rng: &mut Rng) -> String {
             upper = key(to);
         }
     }
-    let mut line = format!("walk {lower} {upper}");
-    for _ in 0..40 {
+    (format!("{lower} {upper}"), from, to)
+}
+
+/// `n` moves, each with a space before it, seeking on keys of `[from, to)`
+/// and just outside it.
+fn gen_moves(rng: &mut Rng, from: u64, to: u64, n: u64) -> String {
+    let mut line = String::new();
+    for _ in 0..n {
         let mv = match rng.below(10) {
             0..=2 => "n".to_string(),
             3..=5 => "p".to_string(),
@@ -764,53 +816,88 @@ async fn walk<F: roble::Fs>(
     moves: &[Move],
     at: &str,
 ) {
-    let start = match lower {
-        Some(k) => Bound::Included(k.as_slice()),
-        None => Bound::Unbounded,
-    };
-    let end = match upper {
-        Some(k) => Bound::Excluded(k.as_slice()),
-        None => Bound::Unbounded,
-    };
-    let mut scan = db
-        .range((start, end))
-        .unwrap_or_else(|e| fail(&format!("{at}: walk: {e}")));
-    let mut done = Vec::new();
-    for mv in moves {
-        let now = scan.is_valid().then(|| scan.key().to_vec());
-        if now.is_none() && matches!(mv, Move::Next | Move::Prev) {
-            continue;
-        }
-        let want =
-            walk_want(model, lower, upper, now.as_deref(), mv).map(|(k, v)| (k.clone(), v.clone()));
-        let (name, result) = match mv {
-            Move::First => ("f".to_string(), scan.first().await),
-            Move::Last => ("l".to_string(), scan.last().await),
-            Move::Next => ("n".to_string(), scan.next().await),
-            Move::Prev => ("p".to_string(), scan.prev().await),
-            Move::SeekGe(k) => (
-                format!("g:{}", String::from_utf8_lossy(k)),
-                scan.seek_ge(k).await,
-            ),
-            Move::SeekLt(k) => (
-                format!("t:{}", String::from_utf8_lossy(k)),
-                scan.seek_lt(k).await,
-            ),
+    let mut walker = Walker::new(db, model.clone(), lower.clone(), upper.clone(), at);
+    walker.walk(moves, at).await;
+}
+
+/// An iterator over a range, the map it is to agree with, and the moves made
+/// with it so far: a walk's, or a held iterator's, which keeps its position
+/// and its map from one operation to the next while the store changes under
+/// it.
+struct Walker<F: roble::Fs> {
+    scan: roble::Scan<F>,
+    model: Model,
+    lower: Option<Vec<u8>>,
+    upper: Option<Vec<u8>>,
+    done: Vec<String>,
+}
+
+impl<F: roble::Fs> Walker<F> {
+    fn new(
+        db: &Src<'_, F>,
+        model: Model,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        at: &str,
+    ) -> Self {
+        let start = match &lower {
+            Some(k) => Bound::Included(k.as_slice()),
+            None => Bound::Unbounded,
         };
-        done.push(name);
-        result.unwrap_or_else(|e| fail(&format!("{at}: walk {}: {e}", done.join(" "))));
-        let got = scan
-            .is_valid()
-            .then(|| (scan.key().to_vec(), scan.value().to_vec()));
-        if got != want {
-            fail(&format!(
-                "{at}: walk over [{}, {}) after {}: roble is on {}, the history {}",
-                lower.as_deref().map_or("-".into(), String::from_utf8_lossy),
-                upper.as_deref().map_or("-".into(), String::from_utf8_lossy),
-                done.join(" "),
-                show(&got),
-                show(&want)
-            ));
+        let end = match &upper {
+            Some(k) => Bound::Excluded(k.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let scan = db
+            .range((start, end))
+            .unwrap_or_else(|e| fail(&format!("{at}: walk: {e}")));
+        Walker {
+            scan,
+            model,
+            lower,
+            upper,
+            done: Vec::new(),
+        }
+    }
+
+    async fn walk(&mut self, moves: &[Move], at: &str) {
+        let (scan, model, lower, upper) = (&mut self.scan, &self.model, &self.lower, &self.upper);
+        for mv in moves {
+            let now = scan.is_valid().then(|| scan.key().to_vec());
+            if now.is_none() && matches!(mv, Move::Next | Move::Prev) {
+                continue;
+            }
+            let want = walk_want(model, lower, upper, now.as_deref(), mv)
+                .map(|(k, v)| (k.clone(), v.clone()));
+            let (name, result) = match mv {
+                Move::First => ("f".to_string(), scan.first().await),
+                Move::Last => ("l".to_string(), scan.last().await),
+                Move::Next => ("n".to_string(), scan.next().await),
+                Move::Prev => ("p".to_string(), scan.prev().await),
+                Move::SeekGe(k) => (
+                    format!("g:{}", String::from_utf8_lossy(k)),
+                    scan.seek_ge(k).await,
+                ),
+                Move::SeekLt(k) => (
+                    format!("t:{}", String::from_utf8_lossy(k)),
+                    scan.seek_lt(k).await,
+                ),
+            };
+            self.done.push(name);
+            result.unwrap_or_else(|e| fail(&format!("{at}: walk {}: {e}", self.done.join(" "))));
+            let got = scan
+                .is_valid()
+                .then(|| (scan.key().to_vec(), scan.value().to_vec()));
+            if got != want {
+                fail(&format!(
+                    "{at}: walk over [{}, {}) after {}: roble is on {}, the history {}",
+                    lower.as_deref().map_or("-".into(), String::from_utf8_lossy),
+                    upper.as_deref().map_or("-".into(), String::from_utf8_lossy),
+                    self.done.join(" "),
+                    show(&got),
+                    show(&want)
+                ));
+            }
         }
     }
 }
@@ -1019,6 +1106,8 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
 
     // The live snapshots, each with the map as it was when it was taken.
     let mut snaps: Vec<(roble::Snapshot<_>, Model)> = Vec::new();
+    // The held iterators, each with the map as it was when it was made.
+    let mut iters: Vec<Walker<_>> = Vec::new();
     let mut batch: Option<roble::IndexedBatch<_>> = None;
     for (i, op) in all[segment].iter().enumerate() {
         let at = format!("segment {segment} (roble), operation {i}");
@@ -1058,6 +1147,21 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
                     }
                     _ => check(&src, model, &at).await,
                 }
+                Ok(())
+            }
+            Op::Iter(lower, upper) => {
+                let walker = Walker::new(&Src::Db(&db), model.clone(), lower.clone(), upper.clone(), &at);
+                iters.push(walker);
+                Ok(())
+            }
+            Op::IterMove(i, moves) => {
+                iters[*i]
+                    .walk(moves, &format!("{at}, held iterator {i}"))
+                    .await;
+                Ok(())
+            }
+            Op::Uniter(i) => {
+                iters.remove(*i);
                 Ok(())
             }
             Op::Snap => db.snapshot().map(|snap| snaps.push((snap, model.clone()))),
@@ -1117,6 +1221,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     }
     drop(batch);
     drop(snaps);
+    drop(iters);
     db.close()
         .await
         .unwrap_or_else(|e| fail(&format!("segment {segment}: close: {e}")));
