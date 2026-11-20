@@ -2070,6 +2070,25 @@ in both directions.
   CI measures coverage on every pull request (`cargo llvm-cov`), posts the totals
   as a status, and lists the lines and regions no test runs, such as the error
   branch of a `?`. An uncovered failure path needs a test or a written reason.
+- **Many callers at once.** Every test above makes one call at a time, or
+  two at a place it chose, and a shard is not used that way. `tests/stress.rs`
+  runs four writers, four readers and a task that flushes, compacts and takes
+  checkpoints, all on one store on `FileFs` with its own tasks on, so each
+  suspends wherever its I/O puts it and the runtime picks what runs meanwhile.
+  The oracle does not need the order. Each writer owns a slice of the keys
+  and stamps every batch's number into the slice's counter, so a read that is
+  one point in time — a scan, a snapshot, a checkpoint opened as a store —
+  must see each slice exactly as it was after the batch its counter names,
+  and that number must lie between the last batch acknowledged and the last
+  begun when the read was made; a lone `get` must match the slice at some
+  batch in that window. Held scans are moved by seeks and steps, and
+  snapshots read by every comparison, while writes land underneath. The test
+  fails if the calls never overlapped, or no write landed under a held read,
+  since a run like that tested nothing. It runs with the log on, where a
+  write waits on it, and off, where a write does no I/O of its own. A write
+  that makes its sequence number readable before its log write rather than
+  after its apply is caught at once with the log on. CI runs two seconds a
+  pass; `ROBLE_STRESS_SECS` runs longer.
 - **Benchmarks** on Oxia's shape: small records, a store per shard, batches per
   write, floor lookups, scans both ways, short range scans, YCSB's six mixes and
   a checkpoint. `bench/` runs roble, encina and RocksDB, each engine in a process
