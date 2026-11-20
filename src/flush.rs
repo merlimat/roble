@@ -299,7 +299,7 @@ impl<F: Fs> Db<F> {
         self.measure_disk().await;
         self.store.metrics.flushes.add(1);
         self.saw_debt();
-        self.saw_table_entries(table_num, Some(entries));
+        self.saw_table_entries(table_num, entries);
         self.recount_records();
         Ok(Some(table_num))
     }
