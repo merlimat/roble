@@ -2043,7 +2043,16 @@ in both directions.
   a crash, reopening must yield the state as of the last synced write — or as of
   the last `flush()` with `Wal::Off`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or
-  a half-rotated marker must leave the database openable.
+  a half-rotated marker must leave the database openable. A caller that carries
+  on past the error — writing, flushing, checkpointing, compacting and sweeping
+  again, with the MANIFEST rotated on every flush — must still find every write
+  the store acknowledged, live and in each checkpoint that returned, and every
+  write it made durable after a reopen, with a crash first or without. That is
+  what ends a store's recording at a failed change to the MANIFEST before the
+  next table is written or file swept, and not only before the next edit: the
+  record that failed may yet be replayed, and a table written under a number
+  it gave out, or swept because the store carried on without it, is a write
+  lost.
 - **A real process, killed.** `SimFs` is not what a store runs on, so
   `tests/crash_loop.rs` runs the store on `FileFs` in a child process — with
   its own background flushes and compactions on, small memtables and tables,

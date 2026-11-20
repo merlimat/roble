@@ -571,3 +571,117 @@ async fn a_store_that_says_it_is_finished_stops_making_its_tasks_wait() {
          not one that has forgotten what it owes"
     );
 }
+
+/// Whether an error is the store refusing to record anything more, once a
+/// change to its MANIFEST has failed (`crate::flush`).
+fn refuses_to_record(e: &roble::Error) -> bool {
+    matches!(e, roble::Error::Corrupt(m) if m.contains("records no more"))
+}
+
+/// Writes a kibibyte under the `i`th key, synced.
+async fn write_at<F: Fs>(db: &roble::Db<F>, i: usize) {
+    let mut batch = Batch::new();
+    batch
+        .put(format!("k{i:05}").as_bytes(), &[b'v'; 1024])
+        .expect("put");
+    db.write_raw(&mut batch, true).await.expect("write");
+}
+
+/// Writes until the store holds enough to want a flush, and says how many
+/// keys that took.
+async fn fill_past_the_line<F: Fs>(db: &roble::Db<F>) -> usize {
+    let mut i = 0;
+    while (db.unflushed_bytes() as u64) < db.flush_line() {
+        write_at(db, i).await;
+        i += 1;
+    }
+    i
+}
+
+#[compio::test]
+async fn a_store_that_records_no_more_is_not_asked_to_flush_or_compact_again() {
+    // Once a change to the MANIFEST has failed the store records nothing
+    // more, and refuses a flush or a compaction before either touches the
+    // disk (`crate::flush`). To the tasks that asked for one, the refusal is
+    // a failure like any other and has to count as one. A store that went
+    // on saying there was work would have its task take it, be refused with
+    // nothing to wait on, and ask again at once: a spin on the one thread
+    // the store has, which nothing else would get back.
+    //
+    // Swept over a flush's operations, because which of them leaves the
+    // store refusing is the MANIFEST's business and not this test's.
+    let options = || {
+        Options::new()
+            .background_tasks(false)
+            .disable_automatic_compactions(true)
+            .memtable_size(48 << 10)
+    };
+    let total = {
+        let (env, dir) = load("db-reads").await;
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+        fill_past_the_line(&db).await;
+        let before = env.sim().ops();
+        db.flush().await.expect("flush").expect("a table");
+        env.sim().ops() - before
+    };
+
+    let mut refused = 0;
+    for n in 1..=total {
+        let (env, dir) = load("db-reads").await;
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+        let filled = fill_past_the_line(&db).await;
+        env.sim().fail_at(n);
+        let failed = db.flush().await.is_err();
+        env.sim().stop_failing();
+        if !failed {
+            continue;
+        }
+
+        // A write, which is what makes a flush that failed worth asking for
+        // again (`tests/stall.rs`), and the store still past the line.
+        write_at(&db, filled).await;
+        let before = env.sim().ops();
+        match db.flush().await {
+            Err(e) if refuses_to_record(&e) => refused += 1,
+            // Asked again and let through: the failure was not the MANIFEST's.
+            _ => continue,
+        }
+        assert_eq!(
+            env.sim().ops(),
+            before,
+            "failing at {n} of {total}: the refused flush touched the disk"
+        );
+        assert!(
+            !flush_wanted_now(&db),
+            "failing at {n} of {total}: a refused flush should count as one that failed, or a \
+             flush task would be told to run it again at once"
+        );
+
+        assert!(
+            wanted_now(&db),
+            "failing at {n} of {total}: the fixture still wants its compaction"
+        );
+        let e = db
+            .compact_once()
+            .await
+            .expect_err("the compaction should be refused");
+        assert!(
+            refuses_to_record(&e),
+            "failing at {n} of {total}: refused for the wrong reason: {e}"
+        );
+        assert_eq!(
+            env.sim().ops(),
+            before,
+            "failing at {n} of {total}: the refused compaction touched the disk"
+        );
+        assert!(
+            !wanted_now(&db),
+            "failing at {n} of {total}: a refused compaction should count as one that failed, \
+             or the merge task would be told to run it again at once"
+        );
+    }
+    assert!(
+        refused > 0,
+        "no failure in the flush left the store refusing to record, so nothing here was refused"
+    );
+}

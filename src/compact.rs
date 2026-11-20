@@ -197,6 +197,12 @@ impl<F: Fs> Db<F> {
     /// The compaction proper: the merge with no permit held, then the
     /// outputs and the edit that claims them with it.
     async fn run_inner(&self, plan: Plan<'_>) -> Result<Vec<u64>> {
+        // A store whose MANIFEST failed records no more (`crate::flush`), so
+        // a merge it could not record is not started — and refused here
+        // rather than in `compact_once`, so that `run` counts it as failed
+        // and the merge task waits for the version to move instead of
+        // asking again at once.
+        self.recording()?;
         let _timer = self.store.metrics.compaction.start();
         let Plan {
             output_level,
@@ -257,7 +263,7 @@ impl<F: Fs> Db<F> {
                     Chunk::Last(bytes, bounds, entries) => (bytes, Some((bounds, entries))),
                 };
                 if open.is_none() {
-                    let file_num = self.take_file_num(&mut writing).await;
+                    let file_num = self.take_file_num(&mut writing).await?;
                     open = Some((file_num, self.create_table(file_num).await?, 0));
                 }
                 let spent = {
@@ -414,8 +420,17 @@ impl<F: Fs> Db<F> {
     /// reached the directory; one that did, the open moves past
     /// (`crate::open`), and the sweep collects. Pebble skips numbers the same
     /// way.
-    async fn take_file_num(&self, writing: &mut crate::obsolete::Writing<'_>) -> u64 {
+    ///
+    /// Refused once a change to the MANIFEST has failed, which a flush beside
+    /// the merge can do while it runs (`crate::flush`). The flush read the
+    /// counter and left moving it to its edit, so after that edit fails the
+    /// counter offers the very number it gave its table: a merge that took
+    /// it would write over a table the failed record names, and a reopen
+    /// that replayed the record would read the merge's keys in its place.
+    /// Under the permit, so no edit can fail between the check and the take.
+    async fn take_file_num(&self, writing: &mut crate::obsolete::Writing<'_>) -> Result<u64> {
         let _change = self.changes().begin().await;
+        self.recording()?;
         let mut versions = self.versions_mut();
         let file_num = versions.next_file_num;
         versions.next_file_num = file_num + 1;
@@ -423,7 +438,7 @@ impl<F: Fs> Db<F> {
         // Under the same permit, so no sweep can run between the number
         // being spent and the sweep being told to leave it alone.
         writing.add(file_num);
-        file_num
+        Ok(file_num)
     }
 
     /// Creates the file an output table is written into.
