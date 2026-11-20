@@ -300,6 +300,16 @@ impl<'a> Iterator for Reader<'a> {
     type Item = Result<Entry<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        while self.rest.first() == Some(&LOG_DATA) {
+            match read_str(&self.rest[1..]) {
+                Ok((_, n)) => self.rest = &self.rest[1 + n..],
+                Err(e) => {
+                    self.rest = &[];
+                    self.remaining = 0;
+                    return Some(Err(e));
+                }
+            }
+        }
         if self.rest.is_empty() {
             if self.remaining != 0 {
                 let missing = self.remaining;
@@ -320,6 +330,18 @@ impl<'a> Iterator for Reader<'a> {
 }
 
 impl std::iter::FusedIterator for Reader<'_> {}
+
+/// Pebble's `InternalKeyKindLogData`: a key with no value that Pebble writes
+/// into a log and nowhere else.
+///
+/// It is not one of the kinds a batch applies ([`Kind::from_byte`] refuses
+/// it, since a table never holds one): Pebble leaves it out of the header's
+/// count, gives it no sequence number, and steps over it when it applies a
+/// batch to a memtable. A log holds one whenever a caller of Pebble's
+/// `Batch.LogData` wrote one, and Pebble writes one itself when a checkpoint
+/// asks for its log flushed first (`WithFlushedWAL`), so the reader steps over
+/// it too.
+const LOG_DATA: u8 = 3;
 
 fn read_str(src: &[u8]) -> Result<(&[u8], usize)> {
     let (len, n) = varint::uvarint(src)?;
@@ -403,6 +425,61 @@ mod tests {
                 (Kind::DeleteSized, b"/f".to_vec(), Some(vec![0xac, 0x02])),
             ]
         );
+    }
+
+    /// A `LogData` record as Pebble's `Batch.LogData` appends it: the kind,
+    /// then the data as a key, and the count left alone.
+    fn log_data(b: &mut Batch, data: &[u8]) {
+        b.repr.push(LOG_DATA);
+        put_uvarint(&mut b.repr, data.len() as u64);
+        b.repr.extend_from_slice(data);
+    }
+
+    #[test]
+    fn log_data_is_stepped_over_wherever_it_is_and_counts_for_nothing() {
+        let mut b = Batch::new();
+        log_data(&mut b, b"first");
+        b.put(b"/a", b"1").expect("put");
+        log_data(&mut b, b"");
+        log_data(&mut b, b"middle");
+        b.delete(b"/b").expect("delete");
+        log_data(&mut b, b"last");
+        assert_eq!(b.count(), 2);
+
+        let got: Vec<(Kind, Vec<u8>)> = Batch::read(b.as_bytes())
+            .expect("read")
+            .map(|e| e.map(|e| (e.kind, e.key.to_vec())))
+            .collect::<Result<_>>()
+            .expect("every entry");
+        assert_eq!(
+            got,
+            vec![(Kind::Set, b"/a".to_vec()), (Kind::Delete, b"/b".to_vec())]
+        );
+
+        // What Pebble's checkpoint writes to flush its log: a batch of one
+        // empty LogData and a count of nothing.
+        let mut only = Batch::new();
+        log_data(&mut only, b"");
+        let mut r = Batch::read(only.as_bytes()).expect("read");
+        assert!(r.next().is_none(), "no entry to apply");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn a_log_data_record_cut_short_is_corrupt_and_ends_the_batch() {
+        let mut b = Batch::new();
+        b.put(b"/a", b"1").expect("put");
+        b.repr.extend_from_slice(&[LOG_DATA, 9, b'x']);
+        let mut r = Batch::read(b.as_bytes()).expect("read");
+        assert_eq!(
+            r.next().expect("an entry").expect("the put").kind,
+            Kind::Set
+        );
+        assert!(
+            r.next().expect("an error").is_err(),
+            "nine bytes promised, one there"
+        );
+        assert!(r.next().is_none(), "and nothing after it");
     }
 
     #[test]

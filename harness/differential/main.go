@@ -247,6 +247,16 @@ type history struct {
 	// yet decided, and maybeBatch the batch that was open at it.
 	maybe      *op
 	maybeBatch []op
+	// checkpoints holds each checkpoint taken, by id, with the segment it
+	// was taken in and the model as it stood: what is committed, without an
+	// open batch's writes. segment is the segment of the ops being applied.
+	checkpoints map[string]checkpoint
+	segment     int
+}
+
+type checkpoint struct {
+	segment int
+	model   map[string][]byte
 }
 
 func (h *history) apply(o op) {
@@ -263,6 +273,15 @@ func (h *history) apply(o op) {
 	case "maybe":
 		w := op{o.args[0], o.args[1:]}
 		h.maybe, h.maybeBatch = &w, h.batch
+	case "checkpoint":
+		h.checkpoints[o.args[0]] = checkpoint{h.segment, maps.Clone(h.model)}
+	case "cpcheck":
+		if cp, ok := h.checkpoints[o.args[0]]; ok {
+			for _, p := range o.args[1:] {
+				k, step, len := cpput(p)
+				cp.model[k] = value(step, len)
+			}
+		}
 	default:
 		apply(h.model, o)
 	}
@@ -477,12 +496,14 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	hist := history{model: map[string][]byte{}}
-	for _, s := range all[:segment] {
+	hist := history{model: map[string][]byte{}, checkpoints: map[string]checkpoint{}}
+	for i, s := range all[:segment] {
+		hist.segment = i
 		for _, o := range s {
 			hist.apply(o)
 		}
 	}
+	hist.segment = segment
 	// The same map throughout: a commit applies to it in place.
 	model := hist.model
 
@@ -574,6 +595,12 @@ func main() {
 				err = batch.Close()
 			}
 			batch = nil
+		case "checkpoint":
+			// Flushed and synced first: a turn not killed writes without
+			// syncing, and a checkpoint taken without this may miss them.
+			err = db.Checkpoint(checkpointDir(dir, o.args[0]), pebble.WithFlushedWAL())
+		case "cpcheck":
+			err = cpcheck(opts, dir, o.args, hist.checkpoints, wo, at)
 		default:
 			err = fmt.Errorf("cannot read %q", o.name)
 		}
@@ -595,6 +622,50 @@ func main() {
 	if err := db.Close(); err != nil {
 		fail(fmt.Errorf("segment %d: close: %w", segment, err))
 	}
+}
+
+// checkpointDir is where the checkpoint with this id goes: beside the store.
+func checkpointDir(dir, id string) string {
+	return dir + "-cp" + id
+}
+
+// cpput reads one put of a cpcheck: key:step:len.
+func cpput(p string) (string, int, int) {
+	f := strings.Split(p, ":")
+	if len(f) != 3 {
+		fail(fmt.Errorf("cannot read the checkpoint put %q", p))
+	}
+	return f[0], atoi(f[1]), atoi(f[2])
+}
+
+// cpcheck opens the checkpoint args[0] names, checks it against the model
+// as it stood when it was taken with the puts of earlier cpchecks on top,
+// writes the puts the rest of args names, and closes it.
+func cpcheck(opts *pebble.Options, dir string, args []string, taken map[string]checkpoint, wo *pebble.WriteOptions, at string) error {
+	id := args[0]
+	cp, ok := taken[id]
+	if !ok {
+		// Not taken: the turn that was to take it was killed first.
+		fmt.Fprintf(os.Stderr, "%s: checkpoint %s was cut with the turn that was to take it\n", at, id)
+		return nil
+	}
+	// Not created if missing: an empty store would pass for a checkpoint of
+	// an empty map.
+	opts = opts.Clone()
+	opts.ErrorIfNotExists = true
+	db, err := pebble.Open(checkpointDir(dir, id), opts)
+	if err != nil {
+		return fmt.Errorf("Pebble could not open checkpoint %s, taken in segment %d: %w", id, cp.segment, err)
+	}
+	check(db, cp.model, fmt.Sprintf("%s, checkpoint %s", at, id))
+	for _, p := range args[1:] {
+		k, step, len := cpput(p)
+		if err := db.Set([]byte(k), value(step, len), wo); err != nil {
+			db.Close()
+			return fmt.Errorf("checkpoint %s: %w", id, err)
+		}
+	}
+	return db.Close()
 }
 
 func fail(err error) {

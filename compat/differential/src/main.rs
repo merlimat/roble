@@ -60,7 +60,7 @@
 //! differential resolve <script> <segment> applied|dropped
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -121,6 +121,14 @@ enum Op {
     /// A write that was under way when the turn was killed, which may or may
     /// not have landed: the next turn decides which and `resolve` says so.
     Maybe(Box<Op>),
+    /// A checkpoint of the store into the directory beside it named by this
+    /// id, which no other checkpoint of the script has.
+    Checkpoint(usize),
+    /// The checkpoint with this id, opened, checked against the map as it
+    /// stood when it was taken with the puts of earlier `CpCheck`s on top,
+    /// given these puts, and closed: a checkpoint is a store of its own once
+    /// opened, and the one who opens it writes to it.
+    CpCheck(usize, Vec<(String, u64, usize)>),
 }
 
 /// What a check or a walk reads.
@@ -192,6 +200,20 @@ fn parse(line: &str) -> Op {
         ["batch"] => Op::Batch,
         ["commit"] => Op::Commit,
         ["abort"] => Op::Abort,
+        ["checkpoint", id] => Op::Checkpoint(id.parse().expect("checkpoint")),
+        ["cpcheck", id, puts @ ..] => Op::CpCheck(
+            id.parse().expect("checkpoint"),
+            puts.iter()
+                .map(|p| match p.split(':').collect::<Vec<_>>().as_slice() {
+                    [k, step, len] => (
+                        k.to_string(),
+                        step.parse().expect("step"),
+                        len.parse().expect("len"),
+                    ),
+                    _ => fail(&format!("cannot read the checkpoint put {p:?}")),
+                })
+                .collect(),
+        ),
         ["maybe", rest @ ..] => Op::Maybe(Box::new(parse(&rest.join(" ")))),
         [w, rest @ ..] if w.starts_with('b') && ["bput", "bdel", "bdelrange"].contains(w) => {
             Op::Batched(Box::new(parse(
@@ -241,6 +263,11 @@ struct History<'s> {
     /// A `maybe` not yet decided, with the batch that was open at it, which
     /// the `abort` after it closes before the next turn decides.
     maybe: Option<(&'s Op, Option<Vec<&'s Op>>)>,
+    /// The checkpoints taken, each with the segment it was taken in and the
+    /// map as it stood: what is committed, without an open batch's writes.
+    checkpoints: HashMap<usize, (usize, Model)>,
+    /// The segment the operations being applied are in.
+    segment: usize,
 }
 
 impl<'s> History<'s> {
@@ -255,6 +282,17 @@ impl<'s> History<'s> {
             }
             Op::Abort => self.batch = None,
             Op::Maybe(write) => self.maybe = Some((write, self.batch.clone())),
+            Op::Checkpoint(id) => {
+                self.checkpoints
+                    .insert(*id, (self.segment, self.model.clone()));
+            }
+            Op::CpCheck(id, puts) => {
+                if let Some((_, model)) = self.checkpoints.get_mut(id) {
+                    for (k, step, len) in puts {
+                        model.insert(k.as_bytes().to_vec(), value(*step, *len));
+                    }
+                }
+            }
             _ => apply(&mut self.model, op),
         }
     }
@@ -265,7 +303,7 @@ impl<'s> History<'s> {
         let mut landed = History {
             model: self.model.clone(),
             batch: batch.clone(),
-            maybe: None,
+            ..History::default()
         };
         landed.apply(write);
         Some(landed.model)
@@ -296,6 +334,7 @@ fn apply(model: &mut Model, op: &Op) {
             model.retain(|k, _| !(a.as_bytes() <= k.as_slice() && k.as_slice() < b.as_bytes()))
         }
         Op::Flush | Op::Compact | Op::Check(_) | Op::Walk(..) | Op::Snap | Op::Unsnap(_) => {}
+        Op::Checkpoint(_) | Op::CpCheck(..) => {}
         Op::Batch | Op::Batched(_) | Op::Commit | Op::Abort | Op::Maybe(_) => {
             unreachable!("a batch's lines go through History")
         }
@@ -318,9 +357,20 @@ fn generate(seed: u64, segments: u64, ops: u64) {
     let mut rng = Rng(seed | 1);
     let mut step = 0;
     let mut out = String::new();
+    // Checkpoints outlive the turn that took them, unlike snapshots: the
+    // ones still read from now and then, and the ones the last turn took.
+    let mut checkpoints: Vec<usize> = Vec::new();
+    let mut taken: Vec<usize> = Vec::new();
+    let mut next_checkpoint = 0;
     for _ in 0..segments {
         // A check first, of what the other engine left, and one last.
         out.push_str("segment\ncheck\n");
+        // Then every checkpoint the last turn took, so that the other engine
+        // is the first to open each, as the engine took it.
+        for id in taken.drain(..) {
+            out.push_str(&cpcheck(&mut rng, &mut step, id));
+            out.push('\n');
+        }
         // Snapshots live in one engine's turn: it closes the store at the end.
         let mut snaps = 0;
         // So does an open batch, ended before the turn is.
@@ -394,6 +444,28 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                     5..=11 => "bcheck".to_string(),
                     _ => format!("b{}", gen_walk(&mut rng)),
                 },
+                // Read again later by either engine, after it or the other
+                // has opened them, and four at most in reach.
+                // Not one this turn took: the other engine opens that first.
+                98 if checkpoints.iter().all(|id| taken.contains(id)) || rng.below(2) == 0 => {
+                    let id = next_checkpoint;
+                    next_checkpoint += 1;
+                    if checkpoints.len() == 4 {
+                        checkpoints.remove(0);
+                    }
+                    checkpoints.push(id);
+                    taken.push(id);
+                    format!("checkpoint {id}")
+                }
+                98 => {
+                    let older: Vec<usize> = checkpoints
+                        .iter()
+                        .copied()
+                        .filter(|id| !taken.contains(id))
+                        .collect();
+                    let id = older[rng.below(older.len() as u64) as usize];
+                    cpcheck(&mut rng, &mut step, id)
+                }
                 _ => "check".to_string(),
             };
             out.push_str(&line);
@@ -414,6 +486,20 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         out.push_str("check\n");
     }
     print!("{out}");
+}
+
+/// A read of checkpoint `id`, and up to four short puts into it after.
+fn cpcheck(rng: &mut Rng, step: &mut u64, id: usize) -> String {
+    let mut line = format!("cpcheck {id}");
+    for _ in 0..rng.below(5) {
+        *step += 1;
+        line.push_str(&format!(
+            " {}:{step}:{}",
+            key(rng.below(KEYS)),
+            1 + rng.below(200)
+        ));
+    }
+    line
 }
 
 /// A write, into the open batch seven times in ten while one is open.
@@ -820,15 +906,22 @@ fn rewrite(script: &Path, before: Vec<&str>, own: Vec<String>, after: Vec<&str>)
 }
 
 /// Cuts segment `segment`, killed after `done` operations: those stay, a
-/// write under way becomes `maybe`, and any open batch is aborted.
+/// write under way becomes `maybe`, any open batch is aborted, and a
+/// checkpoint whose `cpcheck` was under way is not read again.
 fn truncate(script: &Path, segment: usize, done: usize) {
     let text = std::fs::read_to_string(script).unwrap_or_else(|e| fail(&format!("{e}")));
-    let (before, own, after) = split_segment(&text, segment);
+    let (before, own, mut after) = split_segment(&text, segment);
     let mut kept: Vec<String> = own.iter().take(done).map(|l| l.to_string()).collect();
     if let Some(next) = own.get(done) {
         let word = next.split_whitespace().next().unwrap_or("");
         if ["put", "del", "delrange", "commit"].contains(&word) {
             kept.push(format!("maybe {next}"));
+        }
+        // Its puts may or may not have landed, and nothing reads one to
+        // decide: the checkpoint is not read again.
+        if word == "cpcheck" {
+            let id = next.split_whitespace().nth(1);
+            after.retain(|l| !(l.starts_with("cpcheck ") && l.split_whitespace().nth(1) == id));
         }
     }
     kept.push("abort".to_string());
@@ -878,9 +971,13 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
         .unwrap_or_else(|e| fail(&format!("{}: {e}", script.display())));
     let all = segments(&text);
     let mut history = History::default();
-    for op in all[..segment].iter().flatten() {
-        history.apply(op);
+    for (i, ops) in all[..segment].iter().enumerate() {
+        history.segment = i;
+        for op in ops {
+            history.apply(op);
+        }
     }
+    history.segment = segment;
 
     // Small, so flushes and compactions keep happening. Every other roble
     // turn runs them inline, inside the writes that need them, and the rest
@@ -895,19 +992,20 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     // that may be killed syncs anyway, as Pebble's has to (its unsynced
     // writes wait in its own buffers), so that both paths are run.
     let background = segment / 2 % 2 == 1;
-    let options = roble::Options::new()
-        .create_if_missing(true)
-        .wal(if sync {
-            roble::Wal::Synced
-        } else {
-            roble::Wal::Buffered
-        })
-        .memtable_size(64 << 10)
-        .target_file_size(16 << 10)
-        .lbase_max_bytes(64 << 10)
-        .background_tasks(background);
+    let options = || {
+        roble::Options::new()
+            .wal(if sync {
+                roble::Wal::Synced
+            } else {
+                roble::Wal::Buffered
+            })
+            .memtable_size(64 << 10)
+            .target_file_size(16 << 10)
+            .lbase_max_bytes(64 << 10)
+            .background_tasks(background)
+    };
     Kill::arm(kill, None);
-    let db = roble::open_with(&roble::DefaultEnv, dir, options)
+    let db = roble::open_with(&roble::DefaultEnv, dir, options().create_if_missing(true))
         .await
         .unwrap_or_else(|e| {
             fail(&format!(
@@ -985,6 +1083,31 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
                 batch = None;
                 Ok(())
             }
+            Op::Checkpoint(id) => db.checkpoint(checkpoint_dir(dir, *id)).await,
+            Op::CpCheck(id, puts) => {
+                // Not taken if the turn that was to take it was killed first.
+                let Some((taken, model)) = history.checkpoints.get(id) else {
+                    eprintln!("{at}: checkpoint {id} was cut with the turn that was to take it");
+                    println!("done {i}");
+                    continue;
+                };
+                // Not created if missing: an empty store would pass for a
+                // checkpoint of an empty map.
+                let cp = roble::open_with(&roble::DefaultEnv, checkpoint_dir(dir, *id), options())
+                    .await
+                    .unwrap_or_else(|e| {
+                        fail(&format!(
+                            "{at}: roble could not open checkpoint {id}, taken in segment {taken}: {e}"
+                        ))
+                    });
+                check(&Src::Db(&cp), model, &format!("{at}, checkpoint {id}")).await;
+                for (k, step, len) in puts {
+                    cp.put(k.as_bytes(), &value(*step, *len))
+                        .await
+                        .unwrap_or_else(|e| fail(&format!("{at}, checkpoint {id}: {e}")));
+                }
+                cp.close().await
+            }
             Op::Maybe(_) => fail(&format!("{at}: a maybe in a turn's own segment")),
         }
         .unwrap_or_else(|e| fail(&format!("{at}: {e}")));
@@ -997,6 +1120,14 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     db.close()
         .await
         .unwrap_or_else(|e| fail(&format!("segment {segment}: close: {e}")));
+}
+
+/// Where the checkpoint with this id goes: beside the store, so that a run's
+/// directory holds both and is removed with them.
+fn checkpoint_dir(dir: &Path, id: usize) -> PathBuf {
+    let mut name = dir.as_os_str().to_owned();
+    name.push(format!("-cp{id}"));
+    PathBuf::from(name)
 }
 
 fn fail(message: &str) -> ! {

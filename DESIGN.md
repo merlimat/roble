@@ -696,6 +696,15 @@ between the batch and the file. A batch hands those bytes back through
 only when it is finally read (`oxiad/common/crc`), and that convention belongs
 to the replication protocol rather than to a store.
 
+A log Pebble wrote can hold one entry no batch roble builds has: `LogData`,
+kind 3, data for whoever reads the log and nothing to apply. Pebble leaves it
+out of the header's count, gives it no sequence number, and steps over it when
+it applies a batch, and Pebble writes one itself, alone in a batch, when a
+checkpoint asks for the log to be synced first (`WithFlushedWAL`). The batch
+reader steps over it the same way; a table never holds one, so the kind itself
+stays refused everywhere else. `compat/differential` found it, the first time
+roble opened a checkpoint Pebble took that way.
+
 Two details of that contract are measured rather than assumed. Oxia checksums
 the **whole** repr, header included (`db.go`: `batch.Checksum(previousChecksum)`),
 and it does so **before** `Commit`, so the eight header bytes that hold the
@@ -1959,8 +1968,8 @@ in both directions.
 - **Both engines, in turn, on one random history.** Every mode above is a fixed
   scenario. `compat/differential` generates a seeded script of segments — puts
   over a small alphabet with values from a byte to past a log block, deletes,
-  range deletions, flushes, full compactions, snapshots, indexed batches, walks
-  and checks — and hands each segment to roble or to Go Pebble in turn on one
+  range deletions, flushes, full compactions, snapshots, indexed batches,
+  checkpoints, walks and checks — and hands each segment to roble or to Go Pebble in turn on one
   directory, so each opens what the other wrote: its tables, the layouts its
   compactions chose (Pebble's automatic ones included), its MANIFEST, and the
   log it left unflushed. Half of roble's turns flush and compact in the
@@ -1972,7 +1981,11 @@ in both directions.
   — to be where the map says after each move. A snapshot is read both ways
   against the map as it stood when it was taken, after the writes, flushes and
   compactions since. A read through an open batch sees the map with the batch's
-  writes laid over it, and a commit applies them. One turn in three kills itself
+  writes laid over it, and a commit applies them. A checkpoint is first opened
+  by the other engine, in its next turn, as the taker wrote it; that and every
+  later open checks it against the map as it stood when it was taken, then
+  writes a few keys into it, as whoever receives a checkpoint goes on to do.
+  One turn in three kills itself
   at a random point instead of closing, and the next, the other engine's, opens
   what it left: the script is cut where the killed turn stopped, and a write it
   had under way is decided by reading a key the two outcomes disagree on, so
