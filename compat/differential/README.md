@@ -137,8 +137,8 @@ cannot be: both engines take the number past every file in the directory as
 they open it.
 
 Held iterators catch, on the first seed from 9000, a scan that reads at the
-store's latest sequence number rather than the one it was made at; the same
-twelve seeds pass with held iterators turned into walks, since a walk takes
+store's latest sequence number rather than the one it was made at; twelve
+seeds from 9000 generated with walks in their place pass, since a walk takes
 no writes between its moves. They also catch the sweep removing a table a
 live scan still holds, which snapshots catch too.
 

@@ -169,6 +169,15 @@ fn script_key(word: &str) -> Vec<u8> {
     }
 }
 
+/// A key as the script spells it: `script_key` backwards, so that a message
+/// names the move the script made and holds no zero byte.
+fn spell(key: &[u8]) -> String {
+    match key.strip_suffix(&[0]) {
+        Some(k) => format!("{}+", String::from_utf8_lossy(k)),
+        None => String::from_utf8_lossy(key).into_owned(),
+    }
+}
+
 fn parse_move(word: &str) -> Move {
     match word {
         "f" => Move::First,
@@ -874,14 +883,8 @@ impl<F: roble::Fs> Walker<F> {
                 Move::Last => ("l".to_string(), scan.last().await),
                 Move::Next => ("n".to_string(), scan.next().await),
                 Move::Prev => ("p".to_string(), scan.prev().await),
-                Move::SeekGe(k) => (
-                    format!("g:{}", String::from_utf8_lossy(k)),
-                    scan.seek_ge(k).await,
-                ),
-                Move::SeekLt(k) => (
-                    format!("t:{}", String::from_utf8_lossy(k)),
-                    scan.seek_lt(k).await,
-                ),
+                Move::SeekGe(k) => (format!("g:{}", spell(k)), scan.seek_ge(k).await),
+                Move::SeekLt(k) => (format!("t:{}", spell(k)), scan.seek_lt(k).await),
             };
             self.done.push(name);
             result.unwrap_or_else(|e| fail(&format!("{at}: walk {}: {e}", self.done.join(" "))));
