@@ -26,8 +26,10 @@
 //!    here a write goes to a memtable this flush is not writing out and a
 //!    log its edit does not retire, which is what makes a write arriving in
 //!    the middle of a flush safe (§5, `crate::open::Db::freeze_memtable`).
-//!    With the WAL off there is no log, so only the memtable moves and the
-//!    edit's minimum unflushed log number falls away.
+//!    With the WAL off there is no log, so only the memtable moves, and the
+//!    edit's minimum unflushed log number moves past every log there is:
+//!    any one a WAL wrote before the store was opened without one was
+//!    replayed into a memtable a flush has written out.
 //! 2. Write the table and sync it, then sync the directory. A table whose
 //!    name never reached the disk is a table the MANIFEST will point at and
 //!    nobody can open. The bytes go out in chunks as the walk of the memtable
@@ -207,7 +209,7 @@ impl<F: Fs> Db<F> {
 
                 // The log the store writes to next, created before anything
                 // points at it. With the WAL off there is none, and so
-                // nothing to create and nothing for the edit to retire.
+                // nothing to create.
                 let log_num = if self.wal_disabled() {
                     None
                 } else {
@@ -273,16 +275,24 @@ impl<F: Fs> Db<F> {
         self.fs().sync_dir(&self.store.dir).await?;
 
         // 3. The edit. Before this the table is a file nothing refers to.
-        // With the WAL off the edit says nothing about log numbers, which
-        // leaves the MANIFEST's where it was. Pebble writes a zero there,
-        // because with the WAL off every one of its memtables carries log
-        // number zero — but a database written *with* a WAL and reopened
-        // without one has a real minimum, and writing zero over it would
-        // make logs that are already in a table live again, and then
-        // replayed.
+        //
+        //    Its minimum unflushed log number is the log the writes since the
+        //    freeze have gone to, and the logs below it are retired. With the
+        //    WAL off those writes have gone to no log, and once this lands
+        //    every record in every log is in a table: a log a WAL wrote before
+        //    the store was opened without one was replayed into the memtable
+        //    this flush, or an earlier one, wrote out. So the minimum moves
+        //    past every log there is, to this table's number, which the open
+        //    put past every file it found and which no log will ever take.
+        //    Left where it was, that log would be replayed at every open,
+        //    beneath tables already holding its records, and a key deleted
+        //    since would come back once a compaction dropped its tombstone.
+        //    Pebble retires such a log in its open, by flushing what it
+        //    replayed; its flushes with the WAL off say nothing about logs
+        //    after that.
         let edit = VersionEdit {
             comparer_name: None,
-            min_unflushed_log_num: self.current_log(),
+            min_unflushed_log_num: Some(self.current_log().unwrap_or(table_num)),
             obsolete_prev_log_num: None,
             next_file_num: Some(table_num + 1),
             last_seq_num: Some(self.last_seq_num()),
@@ -307,12 +317,13 @@ impl<F: Fs> Db<F> {
             let _ = self.rotate_inner(change).await;
         }
 
-        // 6. What the edit retired: the log this flush replaced, and any
-        //    table an earlier flush wrote whose edit never landed. The
-        //    failure is swallowed on purpose — the flush is durable and a
-        //    file that would not delete is one nothing refers to, which the
-        //    next flush will find again (§6). Reporting a flush that worked
-        //    as one that did not would be the larger lie.
+        // 6. What the edit retired: the log this flush replaced, or with the
+        //    WAL off any log the open replayed, and any table an earlier
+        //    flush wrote whose edit never landed. The failure is swallowed
+        //    on purpose — the flush is durable and a file that would not
+        //    delete is one nothing refers to, which the next flush will find
+        //    again (§6). Reporting a flush that worked as one that did not
+        //    would be the larger lie.
         let _ = self.sweep(change).await;
         self.store.metrics.saw_version(&self.version_set().version);
         self.store

@@ -148,15 +148,10 @@ impl<F: Fs> Options<F> {
     /// It does not stop a log being *read*. A database written with a WAL and
     /// reopened without one still has its unflushed logs replayed, because
     /// those records were acknowledged and dropping them silently is the one
-    /// thing an open may not do (§6).
-    ///
-    /// That crossover leaves one wart, kept rather than fixed because the
-    /// fix would be machinery for a configuration nobody runs: a store with
-    /// no WAL never moves the minimum unflushed log number, so a log it
-    /// replayed is replayed again at every later open, even once a flush has
-    /// put those records in a table. Re-applying them costs time and nothing
-    /// else — every entry arrives with the sequence number it was written
-    /// with, so a newer value or tombstone still wins.
+    /// thing an open may not do (§6). The first flush then retires those
+    /// logs, as a flush with a WAL retires the one it moved past: once their
+    /// records are in a table, replaying them again would bring back a key
+    /// deleted since, as soon as a compaction had dropped its tombstone.
     pub fn wal(mut self, wal: Wal) -> Self {
         self.wal = wal;
         self
