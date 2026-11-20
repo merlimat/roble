@@ -696,6 +696,15 @@ between the batch and the file. A batch hands those bytes back through
 only when it is finally read (`oxiad/common/crc`), and that convention belongs
 to the replication protocol rather than to a store.
 
+A log Pebble wrote can hold one entry no batch roble builds has: `LogData`,
+kind 3, data for whoever reads the log and nothing to apply. Pebble leaves it
+out of the header's count, gives it no sequence number, and steps over it when
+it applies a batch, and Pebble writes one itself, alone in a batch, when a
+checkpoint asks for the log to be synced first (`WithFlushedWAL`). The batch
+reader steps over it the same way; a table never holds one, so the kind itself
+stays refused everywhere else. `compat/differential` found it, the first time
+roble opened a checkpoint Pebble took that way.
+
 Two details of that contract are measured rather than assumed. Oxia checksums
 the **whole** repr, header included (`db.go`: `batch.Checksum(previousChecksum)`),
 and it does so **before** `Commit`, so the eight header bytes that hold the
