@@ -388,11 +388,30 @@ async fn creating_does_not_touch_a_database_that_is_already_there() {
             .is_some(),
         "the fixture's keys should still be readable"
     );
+    // Everything but the MANIFEST and its marker is as it was, and those are
+    // the rotation every writable open makes: the fixture's marker moved one
+    // iteration on, not a creation's own at the first.
+    let after = listing(fs, &dir).await;
+    let rest = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| !n.starts_with("MANIFEST-") && !n.starts_with("marker.manifest."))
+            .cloned()
+            .collect()
+    };
     assert_eq!(
-        listing(fs, &dir).await,
-        before,
-        "the directory should hold exactly what it did: no MANIFEST and no \
-         markers of a creation's own"
+        rest(&after),
+        rest(&before),
+        "the directory should hold exactly what it did, but for the MANIFEST every \
+         writable open rewrites"
+    );
+    assert!(
+        after.contains(&format!(
+            "marker.manifest.000002.{}",
+            db.manifest_filename()
+        )),
+        "the open should have rotated the fixture's MANIFEST, not written a creation's \
+         own: {after:?}"
     );
 }
 
@@ -413,7 +432,9 @@ async fn pebble_numbers_the_first_key_of_a_created_database_ten() {
         std::fs::copy(entry.path(), dir.join(entry.file_name())).expect("copy");
     }
 
-    let db = roble::open(&roble::DefaultEnv, &dir)
+    // Read-only, so that the directory is still the one Pebble's reader
+    // described: a writable open rewrites the MANIFEST.
+    let db = roble::open_read_only(&roble::DefaultEnv, &dir, Options::new())
         .await
         .expect("open the database Pebble created");
     let expected = std::fs::read_to_string(

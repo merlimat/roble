@@ -440,6 +440,13 @@ async fn a_log_the_writer_cuts_while_a_reader_replays_it_is_stale() {
         match opened {
             Ok(ro) => assert_eq!(get(&ro, b"a").await.expect("get"), Some(b"1".to_vec())),
             Err(Error::Stale(_)) => stale += 1,
+            // The writer's open retired the MANIFEST the reader had open, and
+            // the simulated filesystem stops reading a deleted file: the I/O
+            // error it is (DESIGN.md §6, "Reading beside a writer"). A POSIX
+            // filesystem would have read it to the end.
+            Err(Error::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && e.to_string().contains("MANIFEST") => {}
             Err(e) => panic!("the reader paused at operation {n} of {total}: {e}"),
         }
 

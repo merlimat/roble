@@ -111,17 +111,30 @@ async fn open_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
 async fn opening_a_database_pebble_wrote_deletes_nothing() {
     // The strongest statement this code can make, and the one that matters:
     // on a directory Pebble itself wrote and considers finished, roble
-    // deletes nothing at all. Every fixture here has its tables, its logs,
-    // its OPTIONS, its MANIFEST and its markers, and all of them are still
-    // there afterwards.
+    // deletes nothing but the MANIFEST and the marker naming it, which every
+    // writable open replaces with a fresh pair describing the same version.
+    // Every fixture here has its tables, its logs, its OPTIONS and its format
+    // marker, and all of them are still there afterwards.
+    let rest = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| !n.starts_with("MANIFEST-") && !n.starts_with("marker.manifest."))
+            .cloned()
+            .collect()
+    };
     for fixture in SETTLED {
         let (env, dir) = load(fixture).await;
         let before = listing(env.sim(), &dir).await;
         let db = roble::open(&env, &dir).await.expect("open");
         let after = listing(env.sim(), &dir).await;
         assert_eq!(
-            after, before,
+            rest(&after),
+            rest(&before),
             "opening {fixture} changed what the directory holds"
+        );
+        assert!(
+            after.contains(&db.manifest_filename()),
+            "opening {fixture} left no MANIFEST to carry on in: {after:?}"
         );
         // And asking for it outright changes nothing either.
         let removed = db
@@ -155,10 +168,17 @@ async fn a_log_pebble_kept_for_recycling_is_collected() {
         db.versions().min_unflushed_log_num > 2,
         "the fixture should have flushed past 000002.log"
     );
-    let gone: Vec<&String> = before.iter().filter(|n| !after.contains(n)).collect();
+    // The recycled log, besides the MANIFEST and marker the open's rotation
+    // replaced.
+    let gone: Vec<&str> = before
+        .iter()
+        .filter(|n| !after.contains(n))
+        .map(String::as_str)
+        .filter(|n| !n.starts_with("MANIFEST-") && !n.starts_with("marker.manifest."))
+        .collect();
     assert_eq!(
         gone,
-        vec![&"000002.log".to_string()],
+        ["000002.log"],
         "opening should collect the recycled log and nothing else"
     );
 
@@ -320,8 +340,10 @@ async fn a_file_roble_does_not_own_is_left_alone() {
             "{name} is not roble's to delete; the directory holds {after:?}"
         );
     }
-    // Nor are the files a database has that roble never writes.
-    for name in ["LOCK", "OPTIONS-000003", "MANIFEST-000001"] {
+    // Nor are the files a database has that roble never writes, or the
+    // MANIFEST it carries on in.
+    let manifest = db.manifest_filename();
+    for name in ["LOCK", "OPTIONS-000003", manifest.as_str()] {
         assert!(
             after.contains(&name.to_string()),
             "{name} should still be there; the directory holds {after:?}"
