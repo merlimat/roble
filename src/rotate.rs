@@ -49,9 +49,12 @@
 //!   which carries one. roble's rotation stands on its own, and a MANIFEST
 //!   whose records never mention a sequence number replays to zero — which
 //!   would hand the next write a number the tables already hold.
-//! - roble **does not rotate at open**. Pebble does, to bound replay; rotating
-//!   on size bounds it just as well, and leaves opening a database something
-//!   that does not write to it.
+//! - roble **rotates at every writable open**, before it deletes or appends
+//!   anything (`crate::open`): the MANIFEST it read may end in edits a crash
+//!   would still take away, and the open's sweep acts on them. Pebble's open
+//!   gets there when it has replayed anything, by flushing it, the first edit
+//!   after its load starting a new MANIFEST; roble carries on in the log it
+//!   replayed, so it writes the version out itself, replayed or not.
 
 use roble_format::files::{self, MARKER_MANIFEST};
 use roble_format::manifest::{NewTable, VersionEdit};

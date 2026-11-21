@@ -632,6 +632,13 @@ async fn disk_usage_is_the_number_the_metric_reports() {
         .iter()
         .map(|e| e.size)
         .sum();
+    // The open reports it too, measured once it has rotated and swept: not
+    // the MANIFEST and marker it replaced.
+    assert_eq!(
+        collected(reader(), &tag).get("roble.disk.size").copied(),
+        Some(listed as i64),
+        "the open should report the directory as it left it"
+    );
     let usage = db.disk_usage().await.expect("disk usage");
     assert_eq!(
         usage, listed,

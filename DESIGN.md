@@ -1044,8 +1044,9 @@ that same flush **rotates** the MANIFEST: a fresh file holding one snapshot edit
 whole version, and then `marker.manifest.*` moved to name it. The marker moves
 last and is the one-way door; roble syncs the directory between creating the new
 marker and letting the old one go, so no crash can land with no marker at all.
-roble does not rotate at open as Pebble does, which keeps opening a database
-something that does not write to it.
+**Every writable open rotates too**, before it deletes or appends anything
+(the MANIFEST it read may hold edits the disk does not, below). A database the
+open has just created is the exception, since the creation synced its one edit.
 
 `snapshot()` pins a sequence number and the version with it, by holding the
 `Rc<Version>`: a table a held version names is one the sweep leaves alone
@@ -1131,9 +1132,22 @@ it can leave the file ending partway through that edit, cut short or with its
 unwritten tail read back as zeros, and the edit was never acknowledged: the
 version is the one before it, and whatever it would have flushed is still in
 the logs. Pebble opens such a MANIFEST too (`versionSet.load` stops at the
-first record that does not read). roble then moves to a fresh MANIFEST before
-anything can append, as Pebble does on every open, because an edit appended
-after the torn bytes is one the next replay would stop short of. Damage
+first record that does not read). An edit appended after the torn bytes would
+be one the next replay stopped short of, and a writable open appends to no
+MANIFEST it read: it moves to a fresh one first.
+
+**And what the replay read may not be on the disk.** An edit is written and
+then synced. A store killed between the two, or whose sync failed, leaves the
+edit in the file for the next open to read back from the page cache, while a
+crash after that open would still take it away. Acting on it is the danger. The
+sweep deletes what the edit retired, the log a flush moved past or the tables a
+compaction merged, and after a crash the MANIFEST would name them again, gone.
+That is a synced write lost, or a database that will not open. So a writable
+open writes the version it replayed into a fresh MANIFEST and syncs it before
+it sweeps or appends anything. Pebble's open gets there when it has replayed
+anything, by flushing it before its sweep, since the first edit after a load
+starts a new MANIFEST. roble carries on in the log it replayed, so it rotates
+itself, and does so whether or not there was anything to replay. Damage
 *before* the end is still refused, where Pebble would stop there as well: an
 edit that fails to read with written bytes after it was not torn by a crash,
 and stopping at it would drop the edits after it — whose tables the sweep
@@ -1166,7 +1180,9 @@ are there. Each case:
   it can still read names, so for a store with the lock such a file is damage
   and stays an error; for a reader it is a version that has moved on. A table
   is opened when a read first reaches it, so this can come from a `get` or a
-  scan long after the open. Only the open of a file is checked this way: a
+  scan long after the open. The MANIFEST goes at every writable open now,
+  which replaces it with a fresh one (§6), so a reader racing a writer's open
+  meets this often. Only the open of a file is checked this way: a
   file already open keeps its bytes on a POSIX filesystem, so `FileFs` reads
   it to the end. Where a deleted file stops reading, as in the simulated
   filesystem, such a read fails as the I/O error it is, not as stale.
@@ -2120,7 +2136,11 @@ in both directions.
   and a scan once it is positioned again. Until then a scan is on no key and
   refuses to step, because a read that fails part way through a step leaves
   its sources wherever it found them, and stepping on from there reads a
-  merge heap that is no longer one.
+  merge heap that is no longer one. A flush or a compaction interrupted at
+  each operation, by a kill or an error, is also reopened and then crashed:
+  the store after the crash must hold the version and the contents the reopen
+  found, since the reopen read an edit that was written and perhaps not synced
+  and acted on it (§6, the rotation every writable open makes).
 - **A real process, killed.** `SimFs` is not what a store runs on, so
   `tests/crash_loop.rs` runs the store on `FileFs` in a child process — with
   its own background flushes and compactions on, small memtables and tables,

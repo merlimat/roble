@@ -39,14 +39,19 @@
 //!    the next file number past every file the listing holds.
 //! 7. Replay the logs the version leaves unflushed, so every acknowledged
 //!    write is back in the memtable before anyone can read.
-//! 8. Collect what the MANIFEST no longer refers to, which is where a flush
+//! 8. Write the version out to a fresh MANIFEST and sync it, before anything
+//!    is deleted or appended: the MANIFEST just replayed may end in an edit
+//!    the disk does not hold yet, which step 9 would act on. Pebble's open
+//!    gets the same from flushing what it replayed, when there is any. A
+//!    database step 3 created skips it.
+//! 9. Collect what the version no longer refers to, which is where a flush
 //!    interrupted between its table and its edit is cleaned up.
 //!
 //! Step 4 before step 6 is the part worth keeping: a database written above
 //! the pin must be refused for being above the pin, not for whatever its
 //! MANIFEST happens to trip over first.
 //!
-//! [`open_read_only`] walks the same steps without 1, 3 and 8: it takes no
+//! [`open_read_only`] walks the same steps without 1, 3, 8 and 9: it takes no
 //! lock, creates nothing and deletes nothing, so it can read a directory
 //! another process is writing to. What that costs is that the writer may
 //! retire a file the reader still needs, which the reader reports as
@@ -290,6 +295,11 @@ pub async fn open<E: Env>(env: &E, dir: impl AsRef<Path>) -> Result<Db<E::Fs>> {
 }
 
 /// Opens the database in `dir` as `options` says.
+///
+/// The open writes, even when nothing is replayed: it moves the database to
+/// a fresh MANIFEST describing what it read, and deletes the files that no
+/// longer name anything, so the directory has to be one it can write to.
+/// [`open_read_only`] reads one it cannot.
 pub async fn open_with<E: Env>(
     env: &E,
     dir: impl AsRef<Path>,
@@ -362,9 +372,9 @@ async fn open_dir<E: Env>(
     //    and asking it here rather than acting on step 4's refusal is what
     //    keeps "there is no database" apart from the several other reasons a
     //    directory can be refused.
-    if create_if_missing
-        && files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?.is_none()
-    {
+    let created = create_if_missing
+        && files::current_marker(names.iter().map(String::as_str), MARKER_MANIFEST)?.is_none();
+    if created {
         crate::create::create(&fs, dir, &names).await?;
         names = fs
             .list(dir)
@@ -405,7 +415,7 @@ async fn open_dir<E: Env>(
     }
 
     // 6. Replay it.
-    let ManifestEdits { edits, torn } = read_version_edits(
+    let edits = read_version_edits(
         &fs,
         &dir.join(&manifest_filename),
         parsed.file_num,
@@ -506,33 +516,6 @@ async fn open_dir<E: Env>(
         }
     }
 
-    // 8. What the replayed MANIFEST no longer refers to: the logs it has
-    //    moved past, and any table a flush wrote whose edit never landed.
-    //    This is where an interrupted flush is collected — the table was
-    //    written and synced before the edit, so a crash in between leaves a
-    //    file in no version (`crate::obsolete`). It runs after the replay,
-    //    so no log it deletes is one the replay still needed, and its
-    //    failure is swallowed: a leftover file is no reason to refuse a
-    //    database that reads.
-    //    A reader skips it: what is obsolete is the writer's to delete.
-    let swept = if read_only {
-        Vec::new()
-    } else {
-        let live = crate::obsolete::Live::of(&versions, parsed.file_num, &names)?;
-        // No reader can be open yet: the store being opened has made none,
-        // and another process holding the directory is what the lock
-        // refuses.
-        crate::obsolete::remove_obsolete(
-            &fs,
-            dir,
-            &names,
-            &live,
-            &std::collections::BTreeSet::new(),
-        )
-        .await
-        .unwrap_or_default()
-    };
-
     // The next sequence number never goes backwards: a write replay brought
     // back must not be overwritten by one numbered the same (§6). And never
     // below Pebble's floor, which is the arithmetic below reaching into a
@@ -613,7 +596,7 @@ async fn open_dir<E: Env>(
 
     let mut markers: Vec<String> = names
         .iter()
-        .filter(|n| n.starts_with("marker.") && !swept.contains(n))
+        .filter(|n| n.starts_with("marker."))
         .cloned()
         .collect();
     markers.sort();
@@ -623,11 +606,6 @@ async fn open_dir<E: Env>(
     )));
     metrics.saw_version(&versions.version);
     metrics.memtable_size.set(memtable.bytes() as i64);
-    if metrics.recording()
-        && let Ok(usage) = fs.disk_usage(dir).await
-    {
-        metrics.disk_size.set(usage.used_bytes as i64);
-    }
 
     let store_id = options.caches.new_store_id();
     let readers = std::rc::Rc::new(crate::obsolete::Readers::default());
@@ -693,14 +671,42 @@ async fn open_dir<E: Env>(
         }),
         owner: true,
     };
-    // A MANIFEST that ended in a torn edit is not appended to again: the
-    // next edit would land after the torn bytes, and a replay stops there.
-    // So the store moves to a fresh one now, before anything can append,
-    // as Pebble starts a fresh MANIFEST on every open. The old one is
-    // collected with the next sweep.
-    if torn {
-        db.rotate_manifest().await?;
+    if !read_only {
+        let change = db.changes().begin().await;
+        // 8. A fresh MANIFEST, holding one edit that describes the version
+        //    just replayed, before anything is deleted or appended. What was
+        //    read is not known to be on the disk: an edit is written and then
+        //    synced, and a store killed between the two, or whose sync
+        //    failed, leaves one in the file that a process with the same page
+        //    cache reads back here and a crash still takes away. The sweep
+        //    below deletes what such an edit retired — the log a flush moved
+        //    past, the tables a compaction merged — and after a crash the
+        //    MANIFEST would name them again, gone: a database that will not
+        //    open, or a write that was synced and is not there. And an edit
+        //    appended after one that never reached the disk is lost with it,
+        //    as one appended after a torn edit is never read. Writing the
+        //    version out afresh and syncing it settles both. Pebble's open
+        //    gets there when it has replayed anything, by flushing it before
+        //    its sweep, since the first edit after a load starts a new
+        //    MANIFEST; roble carries on in the log it replayed, so it starts
+        //    the new MANIFEST itself, and does whether or not it replayed.
+        //    A database this open created has nothing else in its MANIFEST,
+        //    which the creation synced.
+        if !created {
+            db.rotate_inner(&change).await?;
+        }
+        // 9. What the version no longer refers to: the logs it has moved
+        //    past, the MANIFEST and marker just replaced, and any table a
+        //    flush or a compaction wrote whose edit never landed (the output
+        //    is written and synced before the edit, so an interruption in
+        //    between leaves a file in no version, `crate::obsolete`). After
+        //    the replay, so no log it deletes is one the replay still needed.
+        //    Its failure is swallowed: a leftover file is no reason to
+        //    refuse a database that reads. A reader skips it, as it skips
+        //    the rotation: what is obsolete is the writer's to delete.
+        let _ = db.sweep(&change).await;
     }
+    db.measure_disk().await;
     if !read_only && options.background_tasks {
         db.spawn_background(env);
     }
@@ -825,14 +831,6 @@ fn shrunk(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Error + '_ {
     }
 }
 
-/// Every version edit in a MANIFEST, and whether it ended in a torn one.
-struct ManifestEdits {
-    edits: Vec<VersionEdit>,
-    /// A last edit that was cut short, and so was never applied. Nothing may
-    /// be appended after it: the store moves to a fresh MANIFEST instead.
-    torn: bool,
-}
-
 /// Reads every version edit in a MANIFEST.
 ///
 /// **A torn last edit ends it**, as a torn last record ends the last log. A
@@ -842,7 +840,8 @@ struct ManifestEdits {
 /// Pebble opens such a MANIFEST the same way (`versionSet.load` stops at the
 /// first record that does not read). The edit is easily dozens of the log's
 /// 32 KiB blocks long when its tables' bounds are long keys, which is what
-/// `tests/large_keys.rs` tears it across.
+/// `tests/large_keys.rs` tears it across. Nothing is appended after the tear:
+/// a writable open moves to a fresh MANIFEST before it writes anything.
 ///
 /// **Damage before the end is still refused**, where Pebble would stop at it
 /// too. An edit that fails to read with records after it was not torn by a
@@ -861,7 +860,7 @@ async fn read_version_edits<F: Fs>(
     path: &Path,
     file_num: u64,
     read_only: bool,
-) -> Result<ManifestEdits> {
+) -> Result<Vec<VersionEdit>> {
     let disk = fs
         .open(path, Access::ReadOnly)
         .await
@@ -873,23 +872,10 @@ async fn read_version_edits<F: Fs>(
     // rather than waved through.
     let mut reader = RecordReader::new(&bytes, file_num as u32);
     let mut edits = Vec::new();
-    let mut torn = false;
-    // Where the last edit that read ends. Bytes after it at a clean end are a
-    // tear too: a header cut off within its first seven bytes reads as block
-    // padding and ends the stream, and the next edit appended after it would
-    // be framed against those bytes and read as garbage. At worst they are
-    // padding a writer closed with, and a fresh MANIFEST costs one snapshot.
-    let mut good = 0;
     while let Some(record) = reader.next() {
         let record = match record {
-            Ok(record) => {
-                good = reader.offset();
-                record
-            }
-            Err(_) if !read_only && torn_tail(&bytes, reader.offset()) => {
-                torn = true;
-                break;
-            }
+            Ok(record) => record,
+            Err(_) if !read_only && torn_tail(&bytes, reader.offset()) => break,
             Err(e) => {
                 let m = format!("{}: record {}: {e}", path.display(), edits.len());
                 return Err(if read_only {
@@ -907,8 +893,7 @@ async fn read_version_edits<F: Fs>(
             path.display()
         )));
     }
-    let torn = torn || (!read_only && good < bytes.len());
-    Ok(ManifestEdits { edits, torn })
+    Ok(edits)
 }
 
 /// Whether a record that failed to read, at the chunk starting at `at`, is

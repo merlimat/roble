@@ -213,12 +213,15 @@ async fn a_rotation_survives_being_reopened() {
     }
 
     env.sim().crash();
-    let db = roble::open(&env, &dir).await.expect("reopen");
+    // The marker the crash left names the rotated MANIFEST, which the reopen
+    // follows, before it moves to a fresh one of its own.
+    let marker = manifest_marker(&listing(env.sim(), &dir).await);
     assert_eq!(
-        db.manifest_filename(),
+        files::parse_marker(&marker).expect("parse").value,
         rotated,
         "the reopen should follow the marker to the rotated MANIFEST"
     );
+    let db = roble::open(&env, &dir).await.expect("reopen");
     let mut after = expected.clone();
     after.insert(b"after".to_vec(), b"the rotation".to_vec());
     assert_eq!(
@@ -417,10 +420,13 @@ async fn a_rotation_cut_at_any_point_leaves_the_database_openable() {
         // Every cut lands *before* the door, because the door is the last
         // thing a rotation does: the directory sync that makes the new
         // marker's name durable. A rotation that moved the marker earlier
-        // would show up right here, as a cut whose reopen followed a marker
-        // to a MANIFEST that was never finished.
+        // would show up right here, as a cut whose crash left a marker naming
+        // a MANIFEST that was never finished — read before the reopen, which
+        // moves to a fresh MANIFEST of its own.
         assert_eq!(
-            db.manifest_filename(),
+            files::parse_marker(&manifest_marker(&orphaned))
+                .expect("parse")
+                .value,
             was,
             "a rotation cut at operation {n} still moved the marker"
         );

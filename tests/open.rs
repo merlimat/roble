@@ -68,7 +68,9 @@ fn expected_dump(name: &str) -> String {
 #[compio::test]
 async fn roble_reads_the_database_go_pebble_wrote() {
     let (_tmp, dir) = fixture("db-simple");
-    let db = roble::open(&roble::DefaultEnv, &dir)
+    // Read-only, so that the directory is still the one Pebble's reader
+    // described: a writable open rewrites the MANIFEST.
+    let db = roble::open_read_only(&roble::DefaultEnv, &dir, roble::Options::new())
         .await
         .expect("open the database Go wrote");
 
@@ -89,7 +91,9 @@ async fn the_replay_recovers_the_counters_a_store_resumes_from() {
     assert_eq!(v.comparer_name, BYTEWISE);
     assert_eq!(db.dir(), dir, "the directory it was opened in");
     assert_eq!(db.format_version(), 16, "the fixture is written at the pin");
-    assert_eq!(db.manifest_filename(), "MANIFEST-000001");
+    // A writable open moves to a fresh MANIFEST, numbered past every file
+    // the directory held.
+    assert_eq!(db.manifest_filename(), "MANIFEST-000008");
 
     // Three flushes and a compaction happened, so the next file number has to
     // be past every file the directory holds, and the last sequence number at

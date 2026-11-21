@@ -1600,3 +1600,231 @@ async fn a_write_that_failed_is_not_there_when_the_store_is_opened_again() {
         }
     }
 }
+
+/// A store that edits its MANIFEST only when told to.
+fn edit_options(wal: Wal) -> Options<SimFs> {
+    Options::new()
+        .create_if_missing(true)
+        .disable_automatic_compactions(true)
+        .background_tasks(false)
+        .wal(wal)
+}
+
+/// A store with `a` and `b` flushed to a table each in L0, and `c` written
+/// after them.
+async fn written(env: &SimEnv, dir: &Path, wal: Wal) -> roble::Db<SimFs> {
+    let db = roble::open_with(env, dir, edit_options(wal))
+        .await
+        .expect("create");
+    for k in [b"a", b"b"] {
+        db.put(k, b"written").await.expect("put");
+        db.flush().await.expect("flush");
+    }
+    db.put(b"c", b"written").await.expect("put c");
+    db
+}
+
+/// The two edits a store appends to its MANIFEST: a flush's, which retires
+/// a log, and a compaction's, which retires tables.
+#[derive(Clone, Copy, Debug)]
+enum Edit {
+    Flush,
+    Compaction,
+}
+
+async fn edit(db: &roble::Db<SimFs>, edit: Edit) -> roble::Result<()> {
+    match edit {
+        Edit::Flush => db.flush().await.map(|_| ()),
+        Edit::Compaction => {
+            let l0: Vec<u64> = db
+                .versions()
+                .version
+                .level(0)
+                .iter()
+                .map(|t| t.file_num)
+                .collect();
+            db.compact(0, &l0).await.map(|_| ())
+        }
+    }
+}
+
+/// Every table of the version, by level.
+fn tables(db: &roble::Db<SimFs>) -> Vec<(u32, u64)> {
+    db.versions()
+        .version
+        .levels()
+        .flat_map(|(level, tables)| tables.iter().map(move |t| (level, t.file_num)))
+        .collect()
+}
+
+#[compio::test]
+async fn a_crash_after_a_reopen_keeps_everything_the_reopen_found() {
+    // An edit is written to the MANIFEST and then synced. A process killed
+    // between the two, or whose sync fails, leaves the record in the file
+    // but not on the disk — and the next open, in a process that has the
+    // same page cache, reads it back. What that open then does on the
+    // strength of it has to survive the machine going down afterwards:
+    // above all, deleting the log or the tables the record retired.
+    let dir = PathBuf::from("/db");
+    for wal in [Wal::Synced, Wal::Off] {
+        for which in [Edit::Flush, Edit::Compaction] {
+            let total = {
+                let env = SimEnv::new();
+                let db = written(&env, &dir, wal).await;
+                let before = env.sim().ops();
+                edit(&db, which).await.expect("edit");
+                env.sim().ops() - before
+            };
+            let mut unsynced = 0;
+
+            for n in 1..=total {
+                for killed in [false, true] {
+                    let env = SimEnv::new();
+                    let db = written(&env, &dir, wal).await;
+                    let before = tables(&db);
+                    let finished = if killed {
+                        // Stopped where operation `n` was about to run, and
+                        // never resumed: the process is gone.
+                        env.sim().pause_at(n);
+                        let mut running = pin!(edit(&db, which));
+                        let mut cx = Context::from_waker(Waker::noop());
+                        matches!(running.as_mut().poll(&mut cx), Poll::Ready(Ok(())))
+                    } else {
+                        env.sim().fail_at(n);
+                        let result = edit(&db, which).await;
+                        env.sim().stop_failing();
+                        result.is_ok()
+                    };
+                    drop(db);
+                    let what = format!(
+                        "{wal:?}, a {which:?} {} operation {n} of {total}",
+                        if killed {
+                            "killed before"
+                        } else {
+                            "failing at"
+                        }
+                    );
+
+                    let db = roble::open_with(&env, &dir, edit_options(wal))
+                        .await
+                        .unwrap_or_else(|e| panic!("{what}: the reopen: {e}"));
+                    let seen = tables(&db);
+                    let found = contents(&db).await;
+                    if seen != before && !finished {
+                        unsynced += 1;
+                    }
+                    drop(db);
+                    env.sim().crash();
+
+                    let db = roble::open_with(&env, &dir, edit_options(wal))
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("{what}: reopened, crashed, and the open after it: {e}")
+                        });
+                    assert_eq!(
+                        tables(&db),
+                        seen,
+                        "{what}: the version the reopen read did not survive the crash"
+                    );
+                    assert_eq!(
+                        contents(&db).await,
+                        found,
+                        "{what}: the crash took what the reopen had found"
+                    );
+                }
+            }
+
+            // The guard: some interruption left the edit in the file and
+            // not finished, and the reopen read it back — the window this
+            // is about.
+            assert!(
+                unsynced > 0,
+                "{wal:?}, a {which:?}: no interruption left a reopen reading back an \
+                 edit that had not finished, so nothing here tested it"
+            );
+        }
+    }
+}
+
+/// Interrupts `which` on a fresh store by a kill before its operation `n`,
+/// and says whether it had finished.
+async fn killed_editing(env: &SimEnv, dir: &Path, wal: Wal, which: Edit, n: u64) -> bool {
+    let db = written(env, dir, wal).await;
+    env.sim().pause_at(n);
+    let finished = {
+        let mut running = pin!(edit(&db, which));
+        let mut cx = Context::from_waker(Waker::noop());
+        matches!(running.as_mut().poll(&mut cx), Poll::Ready(Ok(())))
+    };
+    drop(db);
+    finished
+}
+
+#[compio::test]
+async fn a_crash_while_a_reopen_moves_to_a_fresh_manifest_loses_no_durable_write() {
+    // The same interrupted edit, and then the reopen itself killed before
+    // each of its operations and the machine crashed. Whatever the reopen
+    // has done by then — rotated or not, swept or not — nothing durable may
+    // be gone: a sweep that deleted what the edit retired before the new
+    // MANIFEST was synced would be exactly that.
+    let dir = PathBuf::from("/db");
+    for wal in [Wal::Synced, Wal::Off] {
+        for which in [Edit::Flush, Edit::Compaction] {
+            let edits = {
+                let env = SimEnv::new();
+                let db = written(&env, &dir, wal).await;
+                let before = env.sim().ops();
+                edit(&db, which).await.expect("edit");
+                env.sim().ops() - before
+            };
+            for n in 1..=edits {
+                let opens = {
+                    let env = SimEnv::new();
+                    killed_editing(&env, &dir, wal, which, n).await;
+                    let before = env.sim().ops();
+                    roble::open_with(&env, &dir, edit_options(wal))
+                        .await
+                        .expect("reopen");
+                    env.sim().ops() - before
+                };
+                for m in 1..=opens {
+                    let env = SimEnv::new();
+                    let finished = killed_editing(&env, &dir, wal, which, n).await;
+                    env.sim().pause_at(m);
+                    {
+                        let mut opening = pin!(roble::open_with(&env, &dir, edit_options(wal)));
+                        let mut cx = Context::from_waker(Waker::noop());
+                        if let Poll::Ready(opened) = opening.as_mut().poll(&mut cx) {
+                            panic!(
+                                "the reopen should have paused at {m} of {opens}: {:?}",
+                                opened.err()
+                            );
+                        }
+                    }
+                    env.sim().crash();
+                    let what = format!(
+                        "{wal:?}, a {which:?} killed before operation {n} of {edits}, \
+                         the reopen killed before {m} of {opens}"
+                    );
+                    let db = roble::open_with(&env, &dir, edit_options(wal))
+                        .await
+                        .unwrap_or_else(|e| panic!("{what}: the open after the crash: {e}"));
+                    let found = contents(&db).await;
+                    // `a` and `b` were flushed; with the WAL on `c` was synced
+                    // to the log, and with it off a finished flush took it.
+                    let durable: &[&[u8]] = match (wal, which, finished) {
+                        (Wal::Off, Edit::Flush, true) | (Wal::Synced, _, _) => &[b"a", b"b", b"c"],
+                        _ => &[b"a", b"b"],
+                    };
+                    for k in durable {
+                        assert!(
+                            found.contains_key(*k),
+                            "{what}: {} is gone, though it was durable",
+                            String::from_utf8_lossy(k)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
