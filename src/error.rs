@@ -60,7 +60,8 @@ pub enum Error {
     Stale(String),
     /// The caller asked for something no database could do: a
     /// [`delete_range`](crate::Db::delete_range) whose start is not below its
-    /// end, or a batch past 2³² − 1 entries.
+    /// end, a batch past 2³² − 1 entries, or a step of a scan an error left on
+    /// no key ([`Scan`](crate::Scan)).
     ///
     /// Nothing was read and nothing on disk is wrong, which is what sets it
     /// apart from [`Error::Format`] and [`Error::Corrupt`].

@@ -746,6 +746,17 @@ impl Covering {
 ///
 /// Forward and reverse, optionally bounded. The bounds are half-open as
 /// Pebble's are: `lower` is included and `upper` is not.
+///
+/// **A call that fails leaves the scan on no key.** A read can fail part way
+/// through a seek or a step, and then the key the scan was on no longer says
+/// where it is. After an error [`Scan::is_valid`] is false, and [`Scan::next`]
+/// and [`Scan::prev`] refuse with [`Error::InvalidArgument`] until
+/// [`Scan::seek_ge`], [`Scan::seek_lt`], [`Scan::first`] or [`Scan::last`]
+/// positions the scan again. A step refuses rather than doing nothing, which
+/// is what it does once the scan has run off the end of its range, so a
+/// caller that goes on stepping is not told the range is over. Pebble's
+/// iterator keeps its error until a seek in the same way, its `Next` and
+/// `Prev` doing nothing until then.
 pub struct Scan<F: Fs = crate::FileFs> {
     iters: Vec<Source<F::Disk>>,
     /// The sources arranged so that the next key is the top of a heap rather
@@ -787,6 +798,16 @@ pub struct Scan<F: Fs = crate::FileFs> {
     scratch: Vec<u8>,
     dir: Dir,
     current: Option<Current>,
+    /// Whether the last call that positioned or stepped the scan failed.
+    ///
+    /// A read that fails part way through a call leaves the sources wherever
+    /// it found them: some moved and some not, a level taken off the table it
+    /// was waiting at without being put on the next, the heap not put right.
+    /// The key the scan was on then says nothing about where its sources are,
+    /// and a step taken from there reads from a heap that is no longer one.
+    /// So the scan is left on no key, and a step refuses until a call that
+    /// positions it from scratch, which every source is sought by afresh.
+    failed: bool,
     covering: Covering,
     /// What a [`Scan::rebuild`] builds the next sources out of: the block
     /// cursors of the levels it took apart, and the key buffers of its
@@ -816,6 +837,7 @@ impl<F: Fs> Scan<F> {
             scratch: Vec::new(),
             dir: Dir::Forward,
             current: None,
+            failed: false,
             covering: Covering::default(),
             cursors: Vec::new(),
             mem_keys: Vec::new(),
@@ -1001,26 +1023,67 @@ impl<F: Fs> Scan<F> {
         self.heap.rebuild(&self.iters, Dir::Reverse)
     }
 
+    /// The same to every source's last entry, for a scan with no upper bound.
+    async fn sought_last(&mut self) -> Result<()> {
+        self.covering.skipped = false;
+        for it in &mut self.iters {
+            it.last().await?;
+        }
+        self.dir = Dir::Reverse;
+        self.heap.rebuild(&self.iters, Dir::Reverse)
+    }
+
+    /// Passes `result` on, and when it is an error leaves the scan on no key
+    /// and refusing to step ([`Scan`]).
+    fn settled(&mut self, result: Result<()>) -> Result<()> {
+        if result.is_err() {
+            self.failed = true;
+            if let Some(current) = self.current.take() {
+                self.spare.push(current);
+            }
+        }
+        result
+    }
+
+    /// What a step from no key does: nothing, as off either end of the range,
+    /// unless an error is what left the scan there.
+    fn step_from_no_key(&self) -> Result<()> {
+        if self.failed {
+            return Err(Error::InvalidArgument(
+                "a step of a scan that an error left on no key; a seek, first or last positions \
+                 it again"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Positions on the first key at or after `from`, respecting the bounds.
     pub async fn seek_ge(&mut self, from: &[u8]) -> Result<()> {
+        self.failed = false;
         let from = match self.lower.get() {
             Some(lower) if lower > from => lower,
             _ => from,
         };
         key::search_key_into(from, &mut self.target);
-        self.sought_ge().await?;
-        self.advance().await
+        let sought = self.sought_ge().await;
+        self.settled(sought)?;
+        let advanced = self.advance().await;
+        self.settled(advanced)
     }
 
     /// Positions on the last key before `bound`, respecting the bounds.
     pub async fn seek_lt(&mut self, bound: &[u8]) -> Result<()> {
+        self.failed = false;
         let bound = match self.upper.get() {
             Some(upper) if upper < bound => upper,
             _ => bound,
         };
         key::search_key_into(bound, &mut self.target);
-        self.sought_lt().await?;
-        self.retreat().await
+        let sought = self.sought_lt().await;
+        self.settled(sought)?;
+        let retreated = self.retreat().await;
+        self.settled(retreated)
     }
 
     /// Positions on the first key in range.
@@ -1032,47 +1095,54 @@ impl<F: Fs> Scan<F> {
 
     /// Positions on the last key in range.
     pub async fn last(&mut self) -> Result<()> {
-        if let Some(upper) = self.upper.get() {
-            key::search_key_into(upper, &mut self.target);
-            self.sought_lt().await?;
-            return self.retreat().await;
-        }
-        self.covering.skipped = false;
-        for it in &mut self.iters {
-            it.last().await?;
-        }
-        self.dir = Dir::Reverse;
-        self.heap.rebuild(&self.iters, Dir::Reverse)?;
-        self.retreat().await
+        self.failed = false;
+        let sought = match self.upper.get() {
+            Some(upper) => {
+                key::search_key_into(upper, &mut self.target);
+                self.sought_lt().await
+            }
+            None => self.sought_last().await,
+        };
+        self.settled(sought)?;
+        let retreated = self.retreat().await;
+        self.settled(retreated)
     }
 
     /// Steps to the next key.
+    ///
+    /// On no key it does nothing, as off either end of the range — unless an
+    /// error left the scan there, which it refuses ([`Scan`]).
     #[allow(clippy::should_implement_trait)]
     pub async fn next(&mut self) -> Result<()> {
         let Some(current) = &self.current else {
-            return Ok(());
+            return self.step_from_no_key();
         };
         if self.dir == Dir::Reverse {
             // The iterators are all before the current key; going forward
             // means seeking past it.
             successor_into(&current.user, &mut self.scratch);
             key::search_key_into(&self.scratch, &mut self.target);
-            self.sought_ge().await?;
+            let sought = self.sought_ge().await;
+            self.settled(sought)?;
         }
         // Going forward, `advance` has already left them past the current key.
-        self.advance().await
+        let advanced = self.advance().await;
+        self.settled(advanced)
     }
 
-    /// Steps to the previous key.
+    /// Steps to the previous key, doing nothing or refusing on no key as
+    /// [`Scan::next`] does.
     pub async fn prev(&mut self) -> Result<()> {
         let Some(current) = &self.current else {
-            return Ok(());
+            return self.step_from_no_key();
         };
         if self.dir == Dir::Forward {
             key::search_key_into(&current.user, &mut self.target);
-            self.sought_lt().await?;
+            let sought = self.sought_lt().await;
+            self.settled(sought)?;
         }
-        self.retreat().await
+        let retreated = self.retreat().await;
+        self.settled(retreated)
     }
 
     /// The source on top of the heap, opening the table of any level that
