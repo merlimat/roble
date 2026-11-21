@@ -23,15 +23,39 @@
 //!
 //! This file has a global allocator of its own, so it has to be its own test
 //! binary. The count is taken as the **difference** across a run of lookups,
-//! after a warm-up, so nothing start-up does is charged to it.
+//! after a warm-up, so nothing start-up does is charged to it, and on the
+//! test's own thread, so nothing another thread does is charged to it either.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use roble::{Comparison, GetBuf};
 
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// How many times this thread has asked for memory, a resize included.
+    ///
+    /// Per thread, because everything a test measures runs on the test's own
+    /// thread: compio polls a future on the thread that blocks on it, and a
+    /// store never leaves the thread it was opened on. The rest of the
+    /// process allocates on threads of its own — the other tests, the
+    /// harness starting them and printing their results, compio's workers
+    /// for blocking calls — and a count for the whole process charged the
+    /// measured loop with whatever of that a busy machine delayed into it:
+    /// 2,000 warm writes "allocated" four times, and all four were the
+    /// harness printing the result of the test before. A call that hands
+    /// work to one of those workers is still counted here, since what it
+    /// hands over is boxed on this thread.
+    ///
+    /// `const`, and nothing to drop, so reading it from inside the allocator
+    /// allocates nothing and cannot fail, on a thread that is ending as well.
+    static ALLOCS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many times the calling thread has allocated so far.
+fn allocs() -> u64 {
+    ALLOCS.with(Cell::get)
+}
 
 struct Counting;
 
@@ -41,25 +65,20 @@ struct Counting;
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
+        ALLOCS.with(|n| n.set(n.get() + 1));
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
+        ALLOCS.with(|n| n.set(n.get() + 1));
         unsafe { System.realloc(ptr, layout, new) }
     }
 }
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
-
-/// Held by each test for the whole of its run. The counter is global and the
-/// harness runs tests on threads of their own, so two at once would each
-/// count the other's allocations.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -81,11 +100,7 @@ fn fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
 /// overlap in L0 above one in L6, so a lookup searches more than one of them
 /// and a per-table allocation would show up as more than one per lookup.
 #[compio::test]
-// Held across the awaits on purpose: `SERIAL` is what keeps the other test
-// out of the count, and each test runs on a runtime of its own thread.
-#[allow(clippy::await_holding_lock)]
 async fn a_warm_point_lookup_allocates_nothing() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, dir) = fixture("db-reads");
     let db = roble::open(&roble::DefaultEnv, &dir)
         .await
@@ -112,13 +127,13 @@ async fn a_warm_point_lookup_allocates_nothing() {
     }
 
     const RUNS: u64 = 2_000;
-    let before = ALLOCS.load(Relaxed);
+    let before = allocs();
     for _ in 0..RUNS {
         db.get_into(&probe, Comparison::Equal, &mut buf)
             .await
             .expect("get_into");
     }
-    let made = ALLOCS.load(Relaxed) - before;
+    let made = allocs() - before;
 
     // Zero, not "few". The buffers are the caller's and warm, the tables are
     // open, the blocks are cached, and the block cursor is handed back with
@@ -147,11 +162,7 @@ async fn a_warm_point_lookup_allocates_nothing() {
 /// their answer through different code, and on keys either side of every
 /// stored one, so a probe lands on a key and between two.
 #[compio::test]
-// Held across the awaits on purpose: `SERIAL` is what keeps the other test
-// out of the count, and each test runs on a runtime of its own thread.
-#[allow(clippy::await_holding_lock)]
 async fn a_warm_ordered_lookup_allocates_nothing() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, dir) = fixture("db-reads");
     let db = roble::open(&roble::DefaultEnv, &dir)
         .await
@@ -182,7 +193,7 @@ async fn a_warm_ordered_lookup_allocates_nothing() {
     }
 
     const ROUNDS: u64 = 20;
-    let before = ALLOCS.load(Relaxed);
+    let before = allocs();
     for _ in 0..ROUNDS {
         for probe in &probes {
             for how in comparisons {
@@ -190,7 +201,7 @@ async fn a_warm_ordered_lookup_allocates_nothing() {
             }
         }
     }
-    let made = ALLOCS.load(Relaxed) - before;
+    let made = allocs() - before;
     let lookups = ROUNDS * probes.len() as u64 * comparisons.len() as u64;
     assert_eq!(
         made,
@@ -212,9 +223,7 @@ async fn a_warm_ordered_lookup_allocates_nothing() {
 /// into a list for counters nothing was recording. The fixture's L0 holds
 /// tables, so the first would show here.
 #[compio::test]
-#[allow(clippy::await_holding_lock)]
 async fn a_warm_write_allocates_nothing() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, dir) = fixture("db-reads");
     let db = roble::open_with(
         &roble::DefaultEnv,
@@ -249,13 +258,13 @@ async fn a_warm_write_allocates_nothing() {
         }
     }
 
-    let before = ALLOCS.load(Relaxed);
+    let before = allocs();
     for key in &keys[1_000..] {
         batch.clear();
         batch.put(key, &value).expect("put");
         db.write_raw(&mut batch, false).await.expect("write");
     }
-    let made = ALLOCS.load(Relaxed) - before;
+    let made = allocs() - before;
     assert_eq!(
         made,
         0,
