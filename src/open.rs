@@ -585,6 +585,7 @@ async fn open_dir<E: Env>(
                 disk: std::rc::Rc::new(disk),
                 log_num,
                 at,
+                stray: false,
             })
         }
         // No log at or past the MANIFEST's minimum, which is what Pebble
@@ -604,6 +605,7 @@ async fn open_dir<E: Env>(
                 disk: std::rc::Rc::new(disk),
                 log_num,
                 at: 0,
+                stray: false,
             })
         }
         None => None,
@@ -947,8 +949,16 @@ struct Manifest {
 struct Log<D: Disk> {
     disk: std::rc::Rc<D>,
     log_num: u64,
-    /// Where the next record goes.
+    /// Where the next record goes: the end of the last record a write
+    /// committed to. It moves only once a write has succeeded, so whatever a
+    /// write that failed put in the file lies past it.
     at: usize,
+    /// Whether the file may hold bytes past `at`: a record whose write or
+    /// sync failed, or that was dropped before either returned. Nothing was
+    /// applied for it, and it is cut away by the write that failed, before
+    /// that write returns; or, if that cut failed too or the write was
+    /// dropped, before the log is written to or synced again (`Db::cut_log`).
+    stray: bool,
 }
 
 /// What replaying the logs established.
@@ -1139,6 +1149,15 @@ impl<F: Fs> Db<F> {
     /// this returns or merely written — without it the batch survives the
     /// store going away but not the machine.
     ///
+    /// A write whose append or sync fails is not applied: its caller is
+    /// handed the error, and the next write takes its sequence numbers and
+    /// its place in the log. What it put in the file is cut away before the
+    /// error is handed back (`Db::cut_log`), so that neither a reopen nor
+    /// anything written or synced after it brings any of it back. A cut that
+    /// fails as well is made again before the log is next written to or
+    /// synced; a store that goes away before then leaves the record for its
+    /// next open.
+    ///
     /// With the WAL off there is no log step and `sync` is refused rather
     /// than ignored: nothing but `flush` can make a write durable, and
     /// saying otherwise would be the silent half of a data loss.
@@ -1204,8 +1223,10 @@ impl<F: Fs> Db<F> {
         // other write may share and no freeze may happen in: the sequence
         // number stamped below and the offset the record goes to are both
         // read here and both committed to after the disk has been waited on
-        // (§5, `crate::change`).
-        let _writing = self.store.writers.begin().await;
+        // (§5, `crate::change`). A write the disk fails commits to neither,
+        // and the next one takes both again, once what this one left in the
+        // log is cut away (`Db::cut_log`).
+        let writing = self.store.writers.begin().await;
 
         let base = self.store.next_seq.get();
         // Every number the batch takes has to fit a key's trailer. Only a
@@ -1221,6 +1242,12 @@ impl<F: Fs> Db<F> {
 
         if !self.store.disable_wal {
             let _timer = self.store.metrics.wal.start();
+            // This record goes where a write that went wrong began its own.
+            // That write cut its record away, unless the cut failed as well
+            // or the write was dropped while it waited, so whatever is still
+            // there goes first: written over, a shorter record would leave
+            // the rest of it behind.
+            self.cut_log(&writing).await?;
             // The log, with the borrow released before any waiting: a
             // `RefCell` held across an await is a panic waiting for the
             // first reader that arrives in the middle of a write.
@@ -1235,23 +1262,44 @@ impl<F: Fs> Db<F> {
             let end = writer.position();
 
             let written = framed.len();
-            let (result, _) = disk
-                .write(
-                    crate::buf::WriteBuf::new(framed),
-                    at as u64,
-                    Default::default(),
-                )
-                .await;
-            result?;
-            self.store.metrics.written.add(written);
-            // A flush that failed while moving the store to its next log
-            // may have left that log durable, which makes this one an earlier
-            // log: whatever goes into it has to be complete (`Db::sync_log`).
-            if sync || self.store.log_followed.get() {
-                let _timer = self.store.metrics.sync_duration.start();
-                disk.sync(Default::default()).await?;
+            // Marked before the write is waited on, not when it fails: a
+            // write that fails may have put some of its bytes in the file,
+            // and one that is dropped while waiting never gets to say.
+            self.wal_log().stray = true;
+            let appended = async {
+                let (result, _) = disk
+                    .write(
+                        crate::buf::WriteBuf::new(framed),
+                        at as u64,
+                        Default::default(),
+                    )
+                    .await;
+                result?;
+                self.store.metrics.written.add(written);
+                // A flush that failed while moving the store to its next
+                // log may have left that log durable, which makes this one
+                // an earlier log: whatever goes into it has to be complete
+                // (`Db::sync_log`).
+                if sync || self.store.log_followed.get() {
+                    let _timer = self.store.metrics.sync_duration.start();
+                    disk.sync(Default::default()).await?;
+                }
+                Ok::<(), Error>(())
             }
-            self.wal_log().at = end;
+            .await;
+            if let Err(e) = appended {
+                // Cut now rather than left to the next write or flush: a
+                // store dropped or closed before either would leave this
+                // record for the next open, which would replay it although
+                // the write failed. A cut that fails as well keeps the mark
+                // for them, and the error handed back is the write's own
+                // either way.
+                let _ = self.cut_log(&writing).await;
+                return Err(e);
+            }
+            let mut log = self.wal_log();
+            log.at = end;
+            log.stray = false;
         }
 
         let next = self.memtable().borrow_mut().apply(batch.as_bytes(), base)?;
@@ -2181,11 +2229,66 @@ impl<F: Fs> Db<F> {
     /// in between has still perhaps made the next log's name durable — on a
     /// real filesystem even its create can — so from here until a swap moves
     /// the store off this log, every write to it is synced as well.
-    pub(crate) async fn sync_log(&self, _writing: &crate::change::Writing<'_>) -> Result<()> {
+    ///
+    /// Cut first, if a write that went wrong left its record past the log's
+    /// end and could not cut it away itself (`Db::cut_log`): synced here,
+    /// that record would be durable in a log a later one follows, and
+    /// replayed although nothing was applied for it.
+    pub(crate) async fn sync_log(&self, writing: &crate::change::Writing<'_>) -> Result<()> {
+        self.cut_log(writing).await?;
         let disk = std::rc::Rc::clone(&self.wal_log().disk);
         let _timer = self.store.metrics.sync_duration.start();
         disk.sync(Default::default()).await?;
         self.store.log_followed.set(true);
+        Ok(())
+    }
+
+    /// Cuts the log back to the end of the last record a write committed to,
+    /// if a write that failed, or was dropped part-way, may have left bytes
+    /// past it.
+    ///
+    /// Those bytes are a record nothing was applied for, whose caller was
+    /// told it failed or never heard, and whose sequence numbers the next
+    /// write takes. Left in the file they are trouble whatever comes next.
+    /// The next record is written where they begin, and a shorter one leaves
+    /// the rest of them behind it: harmless while this is the newest log,
+    /// whose end both engines read leniently, but a flush leaves this log
+    /// behind a newer one before its edit retires it, and a crash in between
+    /// leaves a log, read strictly, that does not read to its end. A sync
+    /// makes them durable — the flush's of the log it moves past among them —
+    /// and a replay then brings back the write that failed, at the sequence
+    /// number the next write took too: a delete of the same key loses to it.
+    /// And with nothing after them, the next open replays them all the same,
+    /// as the last record of the last log.
+    ///
+    /// So a write that fails calls this before it hands back its error, and
+    /// the next write and the flush's sync of the log call it again before
+    /// they touch the log, for a write whose own cut failed too or that was
+    /// dropped while it waited. The open cuts the log it carries on in for
+    /// the same reason. Not synced here: [`Disk::sync`] covers a file's
+    /// length, so whichever sync of the log comes next, the next record's or
+    /// the flush's, makes the cut durable with it. A cut that fails leaves
+    /// the mark: a write that was failing anyway hands back its own error,
+    /// and the next write or the flush fails before it touches the log.
+    ///
+    /// Pebble has nothing to cut: its log writer only appends, and once a
+    /// sync fails it writes nothing more to that log, failing the writes
+    /// after it. roble carries on in the same log, and this is what that
+    /// costs.
+    ///
+    /// Takes the writer permit as proof that no write is in flight: a write
+    /// marks the log before it waits on the disk, and a cut in the middle of
+    /// one would take its record away.
+    async fn cut_log(&self, _writing: &crate::change::Writing<'_>) -> Result<()> {
+        let (disk, at) = {
+            let log = self.wal_log();
+            if !log.stray {
+                return Ok(());
+            }
+            (std::rc::Rc::clone(&log.disk), log.at)
+        };
+        disk.set_len(at as u64).await?;
+        self.wal_log().stray = false;
         Ok(())
     }
 
@@ -2211,6 +2314,7 @@ impl<F: Fs> Db<F> {
             disk: std::rc::Rc::new(disk),
             log_num,
             at: 0,
+            stray: false,
         })
     }
 

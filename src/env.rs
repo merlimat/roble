@@ -265,7 +265,9 @@ pub trait Disk: Sized + 'static {
     ///
     /// What an open uses on the log it carries on writing to: whatever lies
     /// past the last whole record is cut away before anything is appended,
-    /// so that the log ends where its records do (`crate::open`).
+    /// so that the log ends where its records do (`crate::open`). And what a
+    /// store uses on its log to cut away what a write that failed, or was
+    /// dropped part-way, put there (`crate::open::Db::cut_log`).
     fn set_len(&self, len: u64) -> impl Future<Output = Result<()>>;
 
     /// Closes the file.
