@@ -1187,16 +1187,25 @@ are there. Each case:
   is done, the reader checks that every log but the last is still the length
   it read. If it is, any write still to land there comes after everything the
   reader saw.
-- **A log that comes up short of the length the reader took** is stale too. A
-  writable open cuts the log it carries on in back to its last record, and a
-  reader reads a log by taking its length and then reading that many bytes,
-  so a cut between the two leaves it asking for bytes the file no longer has.
-  The first writable open with a WAL of a directory Pebble closed makes such a
-  cut, since Pebble ends every log it closes with an eleven-byte EOF trailer
-  that is not a record, and so does one after a crash that tore a record.
-  Unlike a deletion, a cut reaches a file that is already open, so for a log
-  it is the read that is checked and not only the open. The new open finds the
-  log as the cut left it.
+- **A log that comes up short of the length the reader took** is stale too.
+  The writer cuts a log back to its last record: a writable open cuts the log
+  it carries on in, and a write whose append or sync fails cuts away what it
+  left past it, or the write or flush after it does (`write(batch, sync)`,
+  above). A reader reads a log by taking its length and then reading that
+  many bytes, so a cut between the two leaves it asking for bytes the file no
+  longer has. The first writable open with a WAL of a directory Pebble closed
+  makes such a cut, since Pebble ends every log it closes with an eleven-byte
+  EOF trailer that is not a record, and so does one after a crash that tore a
+  record. Unlike a deletion, a cut reaches a file that is already open, so for
+  a log it is the read that is checked and not only the open. The new open
+  finds the log as the cut left it. A cut after the read is caught by the
+  length check above when the log is not the last; a write's cut reaches such
+  a log only after a flush failed between creating the next log and moving to
+  it. On the last log nothing catches it, and an open's cut needs nothing to:
+  it removes only what any replay stops before. A failed write's cut can come
+  too late, though: a reader that read the log while the write waited on its
+  sync has replayed its record, and keeps a write whose caller was told it
+  failed.
 
 Real damage looks the same as a race to a reader, and is told apart by
 persisting: it fails every open, and the error says what it met. So does a
