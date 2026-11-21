@@ -465,8 +465,9 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   record chunks. A write is logged before it is in a memtable, so nothing is
   readable that is not recoverable; a memtable rotation rotates the log, and a
   flush retires every log the version edit's minimum unflushed log number leaves
-  behind. With `Wal::Off` none of this exists and `flush()` is the only
-  durability point (§4, §6).
+  behind. With `Wal::Off` nothing is logged and `flush()` is the only
+  durability point; a log a WAL wrote before is replayed at the open and
+  retired by the first flush (§4, §6).
 - **Memtables are skiplists over an arena**, keyed by internal key (user key,
   sequence number, kind). Range deletions are kept apart from the point keys,
   as in Pebble, so a point read never walks tombstones it doesn't need. Pebble
@@ -1029,6 +1030,15 @@ is the one the freeze installed. The logs below that number are then
 obsolete, and are deleted like any other obsolete file — including one Pebble
 had kept back to recycle, which roble does not do and so has no use for.
 
+With the WAL off there is no such log, and the minimum is the flush's own table
+number instead: past every log the open found, and a number no log will ever
+take. A log a WAL wrote before the store was reopened without one is then
+retired by the first flush, whose table holds its records. Left behind the
+minimum, it would be replayed at every open beneath tables already holding
+those records, and a key deleted since would come back once a compaction
+dropped its tombstone. Pebble retires such a log in its open, which flushes
+what it replayed.
+
 Past `Options::max_manifest_bytes` — 128 MiB, Pebble's `MaxManifestFileSize` —
 that same flush **rotates** the MANIFEST: a fresh file holding one snapshot edit of the
 whole version, and then `marker.manifest.*` moved to name it. The marker moves
@@ -1112,8 +1122,9 @@ A torn record at the tail of the last log is the ordinary shape of a crash and
 ends the replay; a torn record anywhere else, or a chunk whose log number belongs
 to an older file, is corruption. **roble refuses a log it cannot replay rather
 than opening without it**: ignoring one silently discards writes that were
-already acknowledged. With `Wal::Off` there is nothing to replay and the
-database opens as of the last flush.
+already acknowledged. With `Wal::Off` nothing reaches a log, so the database
+opens as of the last flush; a log a WAL wrote before the store was opened
+without one is still replayed, until the first flush retires it (`flush()`).
 
 The MANIFEST ends the same way. A crash between appending an edit and syncing
 it can leave the file ending partway through that edit, cut short or with its
@@ -1305,7 +1316,11 @@ file, so the question an opener asks is whether a log holds a record, not
 whether one exists — Oxia's own configuration has a log file in the directory,
 holding nothing but the eleven-byte EOF trailer. A store writes into that log
 rather than starting a new one, which is why no new file number is needed and
-no MANIFEST has to be written before a write can be logged.
+no MANIFEST has to be written before a write can be logged. A store with
+`Wal::Off` writes nothing to it, and its first flush retires it with every
+other log the open replayed (`flush()`), so a directory it has flushed holds
+no log at all — and an open that writes with a WAL creates one, as it does for
+any directory with no log at or past the minimum.
 
 ## 7. The format crate
 
@@ -2070,7 +2085,16 @@ in both directions.
   a crash, reopening must yield the state as of the last synced write — or as of
   the last `flush()` with `Wal::Off`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or
-  a half-rotated marker must leave the database openable.
+  a half-rotated marker must leave the database openable. A caller that carries
+  on past the error — writing, flushing, checkpointing, compacting and sweeping
+  again, with the MANIFEST rotated on every flush — must still find every write
+  the store acknowledged, live and in each checkpoint that returned, and every
+  write it made durable after a reopen, with a crash first or without. That is
+  what ends a store's recording at a failed change to the MANIFEST before the
+  next table is written or file swept, and not only before the next edit: the
+  record that failed may yet be replayed, and a table written under a number
+  it gave out, or swept because the store carried on without it, is a write
+  lost.
 - **A real process, killed.** `SimFs` is not what a store runs on, so
   `tests/crash_loop.rs` runs the store on `FileFs` in a child process — with
   its own background flushes and compactions on, small memtables and tables,

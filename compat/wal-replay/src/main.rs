@@ -21,7 +21,8 @@
 //!
 //! `--no-wal` opens the same database in Oxia's configuration, where a write
 //! reaches the memtable and nothing else: what Pebble reads back then came
-//! through a table and a MANIFEST edit alone, with the log untouched.
+//! through a table and a MANIFEST edit alone. Nothing is written to the log,
+//! and the flush retires it, so Pebble opens a directory with no log at all.
 //!
 //! `--rotate` flushes and then replaces the MANIFEST, so the file Pebble
 //! replays is one roble wrote from nothing — every table at every level,
@@ -393,7 +394,9 @@ async fn main() {
             .into_iter()
             .filter(|n| n.ends_with(".log"))
             .collect::<Vec<_>>();
-        println!("roble wrote with the WAL off; the logs it left alone are {logs:?}");
+        println!(
+            "roble wrote with the WAL off, and its flush retired the log; the logs left are {logs:?}"
+        );
     }
 
     if rotate {

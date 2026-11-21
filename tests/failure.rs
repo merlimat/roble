@@ -42,11 +42,13 @@
 //! durability bug actually lives: not in the ordinary path, but at the one
 //! point between a write and the sync that makes it real.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Disk, Fs, Options, WriteBuf};
+use roble::{Disk, Fs, Options, Wal, WriteBuf};
 use roble_format::batch::Batch;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -472,7 +474,10 @@ async fn careless(env: &SimEnv, dir: &Path, wal: bool) -> roble::Result<usize> {
 /// sweep collects the file and the database stops opening: "L0 table 8 is in
 /// the MANIFEST but not in /db". Every step of the way the store had been
 /// handed an error it could have stopped at, so the store has to stop
-/// itself.
+/// itself — and before the compaction, not at its edit: a store that only
+/// refused edit 7 had already let the compaction write over table 8, which
+/// leaves a database that opens with the flush's keys gone. That is for the
+/// next sweep to see.
 ///
 /// What this does **not** check is §12's prefix. A caller that ignores a
 /// failed write and goes on to the next key has asked for the gap it gets;
@@ -509,6 +514,483 @@ async fn a_store_that_is_told_to_carry_on_still_leaves_a_database_that_opens() {
              here exercised the refusal that keeps the MANIFEST honest"
         );
     }
+}
+
+/// One write to one key, as the caller saw it.
+struct Write {
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+    /// Whether the batch it was in returned `Ok`.
+    acked: bool,
+}
+
+/// Every write a run made, in order, and how many of them the store
+/// promised to keep.
+#[derive(Default)]
+struct History {
+    writes: Vec<Write>,
+    /// Every acknowledged write before this index is one the store promised
+    /// to keep: synced to the log, or written out by a flush or a checkpoint
+    /// that returned.
+    durable: usize,
+}
+
+impl History {
+    /// The values `key` may read as, when every acknowledged write before
+    /// `required` must be there and no write from `upto` on can be.
+    ///
+    /// The last such write, or the fixture's value if there is none, and any
+    /// write to the key after it: one that failed, or one nothing has made
+    /// durable yet, may have reached the disk or not.
+    fn allowed(
+        &self,
+        initial: &Model,
+        key: &[u8],
+        required: usize,
+        upto: usize,
+    ) -> Vec<Option<Vec<u8>>> {
+        let mut allowed = vec![initial.get(key).cloned()];
+        for (i, write) in self.writes[..upto].iter().enumerate() {
+            if write.key != key {
+                continue;
+            }
+            if write.acked && i < required {
+                allowed.clear();
+            }
+            allowed.push(write.value.clone());
+        }
+        allowed
+    }
+
+    /// Each key whose value in `found` is not one [`History::allowed`]
+    /// allows, with what it read as and what it could have.
+    fn wrong(&self, initial: &Model, found: &Model, required: usize, upto: usize) -> Vec<String> {
+        let keys: BTreeSet<&Vec<u8>> = initial
+            .keys()
+            .chain(found.keys())
+            .chain(self.writes.iter().map(|w| &w.key))
+            .collect();
+        let text =
+            |v: &Option<Vec<u8>>| v.as_ref().map(|v| String::from_utf8_lossy(v).into_owned());
+        let mut wrong = Vec::new();
+        for key in keys {
+            let got = found.get(key).cloned();
+            let allowed = self.allowed(initial, key, required, upto);
+            if !allowed.contains(&got) {
+                wrong.push(format!(
+                    "{} = {:?}, allowed {:?}",
+                    String::from_utf8_lossy(key),
+                    text(&got),
+                    allowed.iter().map(text).collect::<Vec<_>>()
+                ));
+            }
+        }
+        wrong
+    }
+}
+
+/// What a run of [`carry_on`] did, as its caller saw it.
+#[derive(Default)]
+struct Run {
+    history: History,
+    /// Each checkpoint that returned `Ok`: where, and how far into the
+    /// history it was taken.
+    checkpoints: Vec<(PathBuf, usize)>,
+    /// Whether a call has returned an error yet.
+    failed: bool,
+    /// Whether a call was refused because the store records no more.
+    refused: bool,
+    /// How many checkpoints returned `Ok` after a call had failed.
+    checkpoints_after_a_failure: usize,
+}
+
+impl Run {
+    /// Takes account of what a call returned, and says whether it was `Ok`.
+    fn saw<T>(&mut self, result: &roble::Result<T>) -> bool {
+        if let Err(e) = result {
+            self.failed = true;
+            self.refused |= refuses_to_record(e);
+        }
+        result.is_ok()
+    }
+}
+
+/// A store that rotates its MANIFEST on every flush and compaction, so that
+/// a failure lands on a rotation as often as on an append, and merges L0 as
+/// soon as it holds a table, so that every compaction [`carry_on`] asks for
+/// has work.
+fn carry_on_options(wal: Wal) -> Options<SimFs> {
+    Options::new()
+        .wal(wal)
+        .background_tasks(false)
+        .l0_compaction_threshold(1)
+        .max_manifest_bytes(1)
+}
+
+/// Writes one batch, and records each of its writes as acknowledged or not.
+async fn write_batch(
+    db: &roble::Db<SimFs>,
+    run: &mut Run,
+    wal: Wal,
+    writes: &[(String, Option<String>)],
+) {
+    let mut batch = Batch::new();
+    for (key, value) in writes {
+        match value {
+            Some(value) => batch.put(key.as_bytes(), value.as_bytes()).expect("put"),
+            None => batch.delete(key.as_bytes()).expect("delete"),
+        }
+    }
+    let acked = run.saw(&db.write_raw(&mut batch, wal != Wal::Off).await);
+    for (key, value) in writes {
+        run.history.writes.push(Write {
+            key: key.as_bytes().to_vec(),
+            value: value.as_ref().map(|v| v.as_bytes().to_vec()),
+            acked,
+        });
+    }
+    if acked && wal != Wal::Off {
+        // Synced before it returned.
+        run.history.durable = run.history.writes.len();
+    }
+}
+
+/// Three rounds of a batch that adds, overwrites and deletes; a flush; a
+/// write the flush did not cover; a checkpoint; a compaction; and a sweep,
+/// each carried on past whatever it returned. Then one last batch nothing
+/// covers.
+///
+/// Every value is written once, so a key that reads as the wrong one says
+/// which write it came from.
+async fn carry_on(env: &SimEnv, dir: &Path, wal: Wal) -> (Option<roble::Db<SimFs>>, Run) {
+    let mut run = Run::default();
+    let opened = roble::open_with(env, dir, carry_on_options(wal)).await;
+    run.saw(&opened);
+    let Ok(db) = opened else {
+        return (None, run);
+    };
+    let mut written = 0;
+    let mut value = || {
+        written += 1;
+        Some(format!("w{written}"))
+    };
+    for round in 0..3 {
+        let mut batch = vec![
+            (format!("r{round}-a"), value()),
+            (format!("r{round}-b"), value()),
+            ("shared".to_string(), value()),
+        ];
+        if round > 0 {
+            batch.push((format!("r{}-a", round - 1), None));
+        }
+        write_batch(&db, &mut run, wal, &batch).await;
+
+        let before = run.history.writes.len();
+        if run.saw(&db.flush().await) {
+            run.history.durable = run.history.durable.max(before);
+        }
+
+        // After the flush and before the checkpoint, so that after a flush
+        // that failed the checkpoint's own has two memtables to write out.
+        let between = [
+            (format!("r{round}-c"), value()),
+            ("shared".to_string(), value()),
+        ];
+        write_batch(&db, &mut run, wal, &between).await;
+
+        let at = PathBuf::from(format!("/cp{round}"));
+        let before = run.history.writes.len();
+        let failed_before = run.failed;
+        if run.saw(&db.checkpoint(&at).await) {
+            run.history.durable = run.history.durable.max(before);
+            run.checkpoints.push((at, before));
+            run.checkpoints_after_a_failure += usize::from(failed_before);
+        }
+        run.saw(&db.compact_once().await);
+        run.saw(&db.remove_obsolete_files().await);
+    }
+    write_batch(&db, &mut run, wal, &[("tail".to_string(), value())]).await;
+    (Some(db), run)
+}
+
+/// How a run ends before its directory is opened again.
+#[derive(Clone, Copy, Debug)]
+enum End {
+    /// Closed, which leaves every byte a write put down, synced or not.
+    Close,
+    /// Crashed, which leaves only what a sync covered.
+    Crash,
+}
+
+/// Everything `db` holds, or the error that stopped the scan.
+async fn scanned<F: Fs>(db: &roble::Db<F>) -> roble::Result<Model> {
+    let mut scan = db.range(..)?;
+    scan.first().await?;
+    let mut out = Model::new();
+    while scan.is_valid() {
+        out.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next().await?;
+    }
+    Ok(out)
+}
+
+/// Opens `dir` and reads everything in it.
+async fn read_back(env: &SimEnv, dir: &Path, wal: Wal) -> roble::Result<Model> {
+    let db = roble::open_with(env, dir, carry_on_options(wal)).await?;
+    scanned(&db).await
+}
+
+/// Runs [`carry_on`] with operation `n` failing, if there is one, and ends
+/// it as `end` says. Returns what is wrong with what it left — live, in each
+/// checkpoint that returned, and reopened — and the run.
+async fn carried_on(wal: Wal, n: Option<u64>, end: End, initial: &Model) -> (Vec<String>, Run) {
+    let (env, dir) = load("db-simple").await;
+    if let Some(n) = n {
+        env.sim().fail_at(n);
+    }
+    let (db, run) = carry_on(&env, &dir, wal).await;
+    env.sim().stop_failing();
+
+    let history = &run.history;
+    let all = history.writes.len();
+    let mut wrong = Vec::new();
+    let mut check =
+        |what: &str, found: roble::Result<Model>, required: usize, upto: usize| match found {
+            Ok(found) => wrong.extend(
+                history
+                    .wrong(initial, &found, required, upto)
+                    .into_iter()
+                    .map(|w| format!("{what}: {w}")),
+            ),
+            Err(e) => wrong.push(format!("{what}: {e}")),
+        };
+    if let Some(db) = db {
+        // Every acknowledged write, whatever became of the disk.
+        check("live", scanned(&db).await, all, all);
+        match end {
+            End::Close => db.close().await.expect("close"),
+            End::Crash => drop(db),
+        }
+    }
+    if let End::Crash = end {
+        env.sim().crash();
+    }
+    for (at, upto) in &run.checkpoints {
+        let found = read_back(&env, at, wal).await;
+        check(&format!("checkpoint {}", at.display()), found, *upto, *upto);
+    }
+    let found = read_back(&env, &dir, wal).await;
+    check("reopened", found, history.durable, all);
+    (wrong, run)
+}
+
+/// A store told to carry on keeps what it acknowledged.
+///
+/// The careless caller again, held to more than a database that opens: to
+/// what the store told it along the way. Every acknowledged write is there
+/// live; every write before a checkpoint that returned is in that
+/// checkpoint; and a reopen, with a crash first or without one, finds every
+/// write that a synced log or a flush that returned made durable. A write
+/// that failed, or one nothing has made durable yet, may be there or not —
+/// so long as nothing older shows through it.
+///
+/// The scenario rotates the MANIFEST on every flush and compaction, and goes
+/// on writing, flushing, checkpointing, compacting and sweeping past each
+/// error, so that the one injected failure lands on each of those in turn
+/// and what runs after it finds out what it left. What it found:
+///
+/// - after a failed flush, the next one wrote out the memtable left frozen
+///   and not the writes since, so a checkpoint left them out, and with the
+///   log off so did a reopen after a crash;
+/// - after a failed append, the next merge wrote its output under the number
+///   the failed record gave its table, and a clean reopen, which replays
+///   that record, read the merge's keys where the flush's had been;
+/// - a sweep after a failed append deleted the table the record names, and
+///   one after a failed move to a new MANIFEST deleted the MANIFEST the new
+///   marker names, and neither database would open.
+#[compio::test]
+async fn a_store_told_to_carry_on_keeps_what_it_acknowledged() {
+    let initial = {
+        let (env, dir) = load("db-simple").await;
+        let db = roble::open(&env, &dir).await.expect("open");
+        contents(&db).await
+    };
+    for wal in [Wal::Synced, Wal::Off] {
+        let total = {
+            let (env, dir) = load("db-simple").await;
+            let before = env.sim().ops();
+            let (_db, run) = carry_on(&env, &dir, wal).await;
+            assert!(
+                !run.failed,
+                "wal={wal:?}: with nothing failing, every call should have returned Ok"
+            );
+            env.sim().ops() - before
+        };
+        let (wrong, _) = carried_on(wal, None, End::Close, &initial).await;
+        assert!(
+            wrong.is_empty(),
+            "wal={wal:?}: with nothing failing: {wrong:#?}"
+        );
+
+        let mut runs = Vec::new();
+        let mut refused = 0;
+        let mut checkpoints_after_a_failure = 0;
+        for n in 1..=total {
+            for end in [End::Close, End::Crash] {
+                let (wrong, run) = carried_on(wal, Some(n), end, &initial).await;
+                if !wrong.is_empty() {
+                    runs.push(format!(
+                        "failing at {n} of {total}, then {end:?}:\n    {}",
+                        wrong.join("\n    ")
+                    ));
+                }
+                refused += usize::from(run.refused);
+                checkpoints_after_a_failure += run.checkpoints_after_a_failure;
+            }
+        }
+        assert!(
+            runs.is_empty(),
+            "wal={wal:?}: {} runs lost or invented a write:\n{}",
+            runs.len(),
+            runs.join("\n")
+        );
+        // The guards that keep this from passing for want of reaching
+        // anything: a failure that left the store refusing to record, and a
+        // checkpoint that returned after a failure, which is the one with
+        // something to make up for.
+        assert!(
+            refused > 0,
+            "wal={wal:?}: no failure left the store refusing to record"
+        );
+        assert!(
+            checkpoints_after_a_failure > 0,
+            "wal={wal:?}: no checkpoint returned after a failure"
+        );
+    }
+}
+
+/// Three synced writes, for the flush beside a merge to write out.
+async fn beside_a_merge(db: &roble::Db<SimFs>) -> Model {
+    let mut written = Model::new();
+    for i in 0..3 {
+        let key = format!("beside-{i}").into_bytes();
+        let mut batch = Batch::new();
+        batch.put(&key, b"synced").expect("put");
+        db.write_raw(&mut batch, true).await.expect("write");
+        written.insert(key, b"synced".to_vec());
+    }
+    written
+}
+
+/// A merge running when a flush's edit fails takes no number the edit gave
+/// out.
+///
+/// A merge holds no permit, so a flush can run while it reads, and it
+/// numbers each output only as the output begins (`take_file_num`). The
+/// flush read the counter and left moving it to its edit; when the edit's
+/// sync fails the record is in the MANIFEST all the same, and the counter
+/// still offers the number it gave the flush's table. The merge was past
+/// any check at its start before anything failed, so it is the number
+/// itself that has to be refused. A merge that took it would write over the
+/// flush's table, and a clean reopen — replaying the record — would read
+/// the merge's keys in its place, and not the synced writes whose log the
+/// record retired.
+///
+/// The carry-on sweep cannot get here: nothing on the simulated filesystem
+/// suspends unless told to, so there a merge always starts after the
+/// failure or finishes before it.
+#[compio::test]
+async fn a_merge_running_when_an_edit_fails_takes_no_number_the_edit_gave_out() {
+    // `db-reads` arrives wanting a compaction, which is the merge.
+    let options = || {
+        Options::new()
+            .background_tasks(false)
+            .disable_automatic_compactions(true)
+    };
+    let initial = {
+        let (env, dir) = load("db-reads").await;
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+        contents(&db).await
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let total = {
+        let (env, dir) = load("db-reads").await;
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+        beside_a_merge(&db).await;
+        env.sim().pause_at(1);
+        let mut merging = pin!(db.compact_once());
+        assert!(
+            merging.as_mut().poll(&mut cx).is_pending(),
+            "the merge should have suspended"
+        );
+        let before = env.sim().ops();
+        db.flush().await.expect("flush").expect("a table");
+        env.sim().ops() - before
+    };
+
+    let mut refused = 0;
+    for n in 1..=total {
+        let (env, dir) = load("db-reads").await;
+        let db = roble::open_with(&env, &dir, options()).await.expect("open");
+        let mut model = initial.clone();
+        model.extend(beside_a_merge(&db).await);
+
+        let (flushed, merged) = {
+            // Driven by hand as far as its first operation: its tables
+            // claimed, no permit held, and no output numbered yet.
+            let counter = db.versions().next_file_num;
+            env.sim().pause_at(1);
+            let mut merging = pin!(db.compact_once());
+            assert!(
+                merging.as_mut().poll(&mut cx).is_pending(),
+                "failing at {n}: the merge should have suspended at its first operation"
+            );
+            assert_eq!(
+                db.versions().next_file_num,
+                counter,
+                "failing at {n}: the merge should not have numbered an output yet"
+            );
+
+            env.sim().fail_at(n);
+            let flushed = db.flush().await;
+            env.sim().stop_failing();
+
+            let mut polls = 0;
+            let merged = loop {
+                if let Poll::Ready(merged) = merging.as_mut().poll(&mut cx) {
+                    break merged;
+                }
+                polls += 1;
+                assert!(
+                    polls < 100_000,
+                    "failing at {n}: the merge is not making progress"
+                );
+            };
+            (flushed, merged)
+        };
+        // Only a failure that left the store recording no more is this
+        // test's business; after any other, the merge is free to land.
+        match (flushed, merged) {
+            (Err(_), Err(e)) if refuses_to_record(&e) => refused += 1,
+            _ => continue,
+        }
+
+        drop(db);
+        let reopened = roble::open_with(&env, &dir, options())
+            .await
+            .unwrap_or_else(|e| panic!("failing at {n} of {total}, the reopen: {e}"));
+        assert_eq!(
+            contents(&reopened).await,
+            model,
+            "failing at {n} of {total}: a clean reopen replays the edit that failed, and should \
+             read the table it names as the flush wrote it"
+        );
+    }
+    assert!(
+        refused > 0,
+        "no failure in the flush left the merge beside it refused, so nothing here reached a \
+         merge running when an edit failed"
+    );
 }
 
 /// Two flushes in a row that each fail before their edit lands, with a
