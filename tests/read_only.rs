@@ -23,7 +23,9 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimDisk, SimEnv, SimFs, SimLock};
 use roble::{Access, Comparison, DirEntry, Disk, DiskUsage, Env, Error, Fs, Options, WriteBuf};
@@ -372,6 +374,83 @@ async fn an_earlier_log_that_grows_while_a_reader_replays_is_stale() {
     *fs.grow.borrow_mut() = Some((newer, older));
     let env = ReaderEnv(fs);
     assert!(matches!(reader(&env).await, Err(Error::Stale(_))));
+}
+
+/// The writer's open, cutting the log it carries on in back to its last
+/// record while a reader is replaying that log.
+///
+/// The reader reads a log by taking its length and then reading that many
+/// bytes. Taking the length is not an operation the simulated filesystem
+/// counts, so a pause at the read falls between the two, and a cut there
+/// leaves the reader asking for bytes past the file's new end. The writer's
+/// open is put at each of the reader's operations in turn.
+#[compio::test]
+async fn a_log_the_writer_cuts_while_a_reader_replays_it_is_stale() {
+    // A log holding a record and a torn one after it, which the writer's
+    // open cuts away. The disk is the test's own handle on the log.
+    async fn a_torn_log() -> (SimEnv, SimDisk) {
+        let sim_env = SimEnv::new();
+        let db = writer(&sim_env).await;
+        put(&db, b"a", b"1").await;
+        drop(db);
+        let log = named(sim_env.sim(), FileType::Log).await.remove(0);
+        let disk = sim_env
+            .sim()
+            .open(&log, Access::ReadWrite)
+            .await
+            .expect("open");
+        let at = disk.len().await.expect("len");
+        // A chunk header that claims more bytes than follow it.
+        let torn = vec![0xde, 0xad, 0xbe, 0xef, 0xff, 0x00, 1, b'x'];
+        let (result, _) = disk.write(WriteBuf::new(torn), at, ()).await;
+        result.expect("write");
+        (sim_env, disk)
+    }
+
+    // How many operations a reader's open takes with nothing racing it.
+    let total = {
+        let (sim_env, _) = a_torn_log().await;
+        let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+        let before = sim_env.sim().ops();
+        reader(&env).await.expect("open");
+        sim_env.sim().ops() - before
+    };
+
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut stale = 0;
+    for n in 1..=total {
+        let (sim_env, log) = a_torn_log().await;
+        let uncut = log.len().await.expect("len");
+        let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+
+        sim_env.sim().pause_at(n);
+        let mut opening = pin!(reader(&env));
+        assert!(
+            opening.as_mut().poll(&mut cx).is_pending(),
+            "the reader should have paused at operation {n} of {total}"
+        );
+        let _db = reopen(&sim_env).await.expect("the writer opens");
+        assert!(
+            log.len().await.expect("len") < uncut,
+            "the writer's open should have cut the log"
+        );
+        let Poll::Ready(opened) = opening.as_mut().poll(&mut cx) else {
+            panic!("one pause, not a block: the reader should finish on its next poll");
+        };
+        match opened {
+            Ok(ro) => assert_eq!(get(&ro, b"a").await.expect("get"), Some(b"1".to_vec())),
+            Err(Error::Stale(_)) => stale += 1,
+            Err(e) => panic!("the reader paused at operation {n} of {total}: {e}"),
+        }
+
+        // Opening again reads the log as the writer left it.
+        let ro = reader(&env).await.expect("reopen");
+        assert_eq!(get(&ro, b"a").await.expect("get"), Some(b"1".to_vec()));
+    }
+    assert!(
+        stale > 0,
+        "no run put the cut between the reader's taking the log's length and its read"
+    );
 }
 
 /// A torn record in a log that is not the last is corruption to the writer

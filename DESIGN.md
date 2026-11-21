@@ -1162,6 +1162,16 @@ are there. Each case:
   is done, the reader checks that every log but the last is still the length
   it read. If it is, any write still to land there comes after everything the
   reader saw.
+- **A log that comes up short of the length the reader took** is stale too. A
+  writable open cuts the log it carries on in back to its last record, and a
+  reader reads a log by taking its length and then reading that many bytes,
+  so a cut between the two leaves it asking for bytes the file no longer has.
+  The first writable open with a WAL of a directory Pebble closed makes such a
+  cut, since Pebble ends every log it closes with an eleven-byte EOF trailer
+  that is not a record, and so does one after a crash that tore a record.
+  Unlike a deletion, a cut reaches a file that is already open, so for a log
+  it is the read that is checked and not only the open. The new open finds the
+  log as the cut left it.
 
 Real damage looks the same as a race to a reader, and is told apart by
 persisting: it fails every open, and the error says what it met. So does a
