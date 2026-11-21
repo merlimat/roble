@@ -811,7 +811,8 @@ pub(crate) fn retired(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Err
 /// with the lock shrinks a log, so for it this stays the I/O error it is. A
 /// reader holds no lock, and a log that comes up short is one the writer cut
 /// between the two: a writable open cuts the log it carries on in back to its
-/// last record (`open_dir`).
+/// last record (`open_dir`), and a write that fails cuts away what it left
+/// past it (`Db::cut_log`).
 fn shrunk(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Error + '_ {
     move |e| match e {
         Error::Io(e) if read_only && e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -990,9 +991,10 @@ struct Replayed {
 /// grew while the later ones were read — what it gained is older than what
 /// they hold, and replaying one without the other would be a hole.
 ///
-/// The writer may also open while a reader replays, and cut the log it
-/// carries on in back to its last record. A reader that took that log's
-/// length before the cut reads past its new end, which is stale too
+/// The writer may also cut a log while a reader replays it: its open cuts
+/// the log it carries on in back to its last record, and a write that fails
+/// cuts away what it left past it (`Db::cut_log`). A reader that took the
+/// log's length before the cut reads past its new end, which is stale too
 /// (`shrunk`).
 async fn replay_logs<F: Fs>(
     fs: &F,
