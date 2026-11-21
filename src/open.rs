@@ -309,9 +309,10 @@ pub async fn open_with<E: Env>(
 ///
 /// It reads the database as of the open, and does not follow the writer
 /// after it. The writer does not know it is there, so it may delete a table
-/// or a log this store still needs; the open or the read that finds it gone
-/// fails with [`Error::Stale`], and the answer is to open again (DESIGN.md
-/// §6, "Reading beside a writer").
+/// or a log this store still needs, or cut a log while this open reads it;
+/// the open or the read that finds a file gone or cut fails with
+/// [`Error::Stale`], and the answer is to open again (DESIGN.md §6, "Reading
+/// beside a writer").
 pub async fn open_read_only<E: Env>(
     env: &E,
     dir: impl AsRef<Path>,
@@ -802,6 +803,27 @@ pub(crate) fn retired(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Err
     }
 }
 
+/// Turns a log that came up short of the length it was measured at into
+/// [`Error::Stale`], for a reader.
+///
+/// A log is read whole by taking its length and then reading that many
+/// bytes, which cannot come up short on a file nothing shrinks. Only a store
+/// with the lock shrinks a log, so for it this stays the I/O error it is. A
+/// reader holds no lock, and a log that comes up short is one the writer cut
+/// between the two: a writable open cuts the log it carries on in back to its
+/// last record (`open_dir`).
+fn shrunk(read_only: bool, path: &Path) -> impl FnOnce(Error) -> Error + '_ {
+    move |e| match e {
+        Error::Io(e) if read_only && e.kind() == io::ErrorKind::UnexpectedEof => {
+            Error::Stale(format!(
+                "{} shrank as it was read: the process writing the database cut it",
+                path.display()
+            ))
+        }
+        e => e,
+    }
+}
+
 /// Every version edit in a MANIFEST, and whether it ended in a torn one.
 struct ManifestEdits {
     edits: Vec<VersionEdit>,
@@ -967,6 +989,11 @@ struct Replayed {
 /// earlier log is stale rather than corrupt, and so is an earlier log that
 /// grew while the later ones were read — what it gained is older than what
 /// they hold, and replaying one without the other would be a hole.
+///
+/// The writer may also open while a reader replays, and cut the log it
+/// carries on in back to its last record. A reader that took that log's
+/// length before the cut reads past its new end, which is stale too
+/// (`shrunk`).
 async fn replay_logs<F: Fs>(
     fs: &F,
     dir: &Path,
@@ -996,7 +1023,9 @@ async fn replay_logs<F: Fs>(
             .open(&path, Access::ReadOnly)
             .await
             .map_err(retired(read_only, &path))?;
-        let bytes = read_all(&disk, Default::default()).await?;
+        let bytes = read_all(&disk, Default::default())
+            .await
+            .map_err(shrunk(read_only, &path))?;
         let mut reader = RecordReader::new(&bytes, *log_num as u32);
 
         let mut good = 0usize;

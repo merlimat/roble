@@ -55,8 +55,8 @@ pub enum Error {
     /// ([`crate::open_read_only`]).
     ReadOnly,
     /// A store opened read-only needed a file the process writing the
-    /// database has retired or not finished writing; opening again reads the
-    /// database as it is now (DESIGN.md §6, "Reading beside a writer").
+    /// database has retired, cut or not finished writing; opening again reads
+    /// the database as it is now (DESIGN.md §6, "Reading beside a writer").
     Stale(String),
     /// The caller asked for something no database could do: a
     /// [`delete_range`](crate::Db::delete_range) whose start is not below its
