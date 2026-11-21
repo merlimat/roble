@@ -1313,3 +1313,290 @@ async fn a_flush_makes_the_log_it_moves_past_durable_before_the_next_one_is() {
         "no failure of the flush left a later log behind every write: {moved_past:?}"
     );
 }
+
+/// What the write that goes wrong puts under `k`: longer than what the write
+/// after it puts there, so that a record written over its record leaves a
+/// tail.
+const LONGER: &[u8] = b"old-and-much-longer-than-the-next-one";
+
+/// How many bytes log `log` in `dir` holds, synced or not.
+async fn log_len(env: &SimEnv, dir: &Path, log: u64) -> u64 {
+    let name = roble_format::files::log_filename(log);
+    env.sim()
+        .list(dir)
+        .await
+        .expect("list")
+        .iter()
+        .find(|e| e.name == Path::new(&name))
+        .map_or(0, |e| e.size)
+}
+
+/// How the first write of `k` goes wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wrong {
+    /// Its `n`th operation fails, and it hands back the error.
+    Fails(u64),
+    /// It is dropped while it waits to sync, its record written: a write its
+    /// caller gave up on, which never gets to cut that record away.
+    Dropped,
+}
+
+/// What comes first after the write that goes wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    /// `k` again, shorter, and then the flush: the next record goes where the
+    /// one that went wrong began.
+    Write,
+    /// The flush, and then a delete of `k`: the flush syncs the log it moves
+    /// past with nothing written after the record that went wrong.
+    Flush,
+}
+
+/// What a run of [`two_faults`] did.
+struct TwoFaults {
+    /// How many operations the flush made.
+    flush_ops: u64,
+    /// Whether the run reached the state the trap needs: the record of the
+    /// write that went wrong left in the log, and the flush leaving that log
+    /// behind a newer one without retiring it.
+    trapped: bool,
+}
+
+/// Writes `warm`; writes `k`, which goes wrong as `wrong` says; then, in the
+/// order `next` says, flushes — with operation `flush` of the flush made to
+/// fail, if one is given — and makes the write that follows the one that
+/// went wrong; and crashes.
+///
+/// `None` if the first write of `k` was to fail and did not, which leaves
+/// nothing to test.
+async fn two_faults(
+    env: &SimEnv,
+    dir: &Path,
+    next: Next,
+    wrong: Wrong,
+    flush: Option<u64>,
+) -> Option<TwoFaults> {
+    let db = roble::open_with(env, dir, flush_options())
+        .await
+        .expect("create");
+    db.put(b"warm", b"x").await.expect("put warm");
+    let log = db
+        .current_log()
+        .expect("a store with a WAL writes to a log");
+    let before = log_len(env, dir, log).await;
+
+    match wrong {
+        Wrong::Fails(write) => {
+            env.sim().fail_at(write);
+            let failed = db.put(b"k", LONGER).await.is_err();
+            env.sim().stop_failing();
+            if !failed {
+                return None;
+            }
+        }
+        Wrong::Dropped => {
+            // Its first operation appends the record and its second syncs
+            // it, which is made to wait once before it runs: polled once, the
+            // write is waiting there, and dropped there.
+            env.sim().pause_at(2);
+            let mut put = std::pin::pin!(db.put(b"k", LONGER));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                put.as_mut().poll(&mut cx).is_pending(),
+                "the write of k did not wait on its sync"
+            );
+        }
+    }
+    let left = log_len(env, dir, log).await > before;
+
+    // The write after the one that went wrong is acknowledged and synced,
+    // before the flush or after it, so no crash may take it.
+    if next == Next::Write {
+        db.put(b"k", b"new")
+            .await
+            .expect("the write after the one that went wrong");
+    }
+    if let Some(flush) = flush {
+        env.sim().fail_at(flush);
+    }
+    let ops = env.sim().ops();
+    let _ = db.flush().await;
+    let flush_ops = env.sim().ops() - ops;
+    env.sim().stop_failing();
+    let behind = db.current_log().is_some_and(|current| current > log)
+        && db.versions().min_unflushed_log_num <= log;
+    if next == Next::Flush {
+        db.delete(b"k")
+            .await
+            .expect("the write after the one that went wrong");
+    }
+    drop(db);
+    env.sim().crash();
+    Some(TwoFaults {
+        flush_ops,
+        trapped: left && behind,
+    })
+}
+
+/// A write that failed, or was dropped while it waited on the disk, leaves
+/// nothing of itself in the log for what comes after it, a write or a flush:
+/// interrupt the flush anywhere and crash, and the directory opens with every
+/// write the store acknowledged.
+///
+/// The record of a write whose sync fails is already in the file, past the
+/// end the store keeps for the log, and nothing was applied for it: the next
+/// write takes its sequence number and its place. Written over by that write,
+/// a shorter record left the failed one's tail behind it. Harmless while the
+/// log is the newest, whose end both engines read leniently; but a flush
+/// creates a newer log before its edit retires this one, and a crash in
+/// between left a log that was finished, by the rule both engines replay it
+/// by, and did not read to its end: "record chunk type 117", a letter of the
+/// value that failed. And synced by a flush before any write came — a flush
+/// syncs the log it moves past — the failed record was durable, and the
+/// replay brought it back at the sequence number the delete after the flush
+/// had taken too. A delete loses to a write at the same number, so the
+/// reopen read the value whose write had failed and lost a delete the store
+/// had acknowledged.
+///
+/// A write that fails cuts its record away before it returns. A write dropped
+/// while it waits on its sync never gets to, and leaves its record for the
+/// write or the flush after it to cut: that is the run the guard below counts
+/// on.
+///
+/// Two faults, which is why no sweep of one reached it: the write, to leave
+/// its record past the log's end, and an operation of the flush, to leave the
+/// log behind a newer one.
+#[compio::test]
+async fn a_write_that_failed_or_was_dropped_neither_tears_the_log_nor_comes_back() {
+    let writes = write_operations().await;
+
+    for next in [Next::Write, Next::Flush] {
+        let mut expected = Model::from([(b"warm".to_vec(), b"x".to_vec())]);
+        if next == Next::Write {
+            expected.insert(b"k".to_vec(), b"new".to_vec());
+        }
+        let mut trapped = 0u64;
+        for wrong in (1..=writes).map(Wrong::Fails).chain([Wrong::Dropped]) {
+            // How many operations the flush makes, with nothing of it
+            // failing, after a write that went wrong as this one does: a
+            // flush that has a record to cut makes one more.
+            let Some(dry) = two_faults(&SimEnv::new(), Path::new("/db"), next, wrong, None).await
+            else {
+                continue;
+            };
+            // One past the flush's last operation is a flush that succeeds.
+            for flush in 1..=dry.flush_ops + 1 {
+                let env = SimEnv::new();
+                let dir = PathBuf::from("/db");
+                let run = two_faults(&env, &dir, next, wrong, Some(flush))
+                    .await
+                    .expect("the write goes wrong as it did in the dry run");
+                trapped += u64::from(run.trapped);
+
+                let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                    panic!(
+                        "{next:?} next, the write {wrong:?}, the flush failing at {flush} of \
+                         {}: the reopen: {e}",
+                        dry.flush_ops
+                    )
+                });
+                let k = db
+                    .get(b"k", roble::Comparison::Equal)
+                    .await
+                    .expect("get k")
+                    .map(|found| found.value);
+                assert_eq!(
+                    k.as_ref(),
+                    expected.get(b"k".as_slice()),
+                    "{next:?} next, the write {wrong:?}, the flush failing at {flush} of {}",
+                    dry.flush_ops
+                );
+                assert_eq!(
+                    contents(&db).await,
+                    expected,
+                    "{next:?} next, the write {wrong:?}, the flush failing at {flush} of {}",
+                    dry.flush_ops
+                );
+            }
+        }
+
+        // The guard that keeps this from passing for the wrong reason: some
+        // run has to have left the record of the write that went wrong in
+        // the log, and the log behind a newer one, or nothing here met such
+        // a record in a log read strictly.
+        assert!(
+            trapped > 0,
+            "{next:?} next: no run left the record of the write that went wrong in a log a \
+             newer one follows"
+        );
+    }
+}
+
+/// How many operations the write of `k` after `warm` makes, with nothing
+/// failing.
+async fn write_operations() -> u64 {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(&env, &dir, flush_options())
+        .await
+        .expect("create");
+    db.put(b"warm", b"x").await.expect("put warm");
+    let before = env.sim().ops();
+    db.put(b"k", LONGER).await.expect("put k");
+    env.sim().ops() - before
+}
+
+/// A write that failed is not there when the store is opened again, after it
+/// was dropped or closed rather than crashed.
+///
+/// The record of a write whose sync fails is already in the file, past the
+/// end the store keeps for the log, and nothing was applied for it. Cut away
+/// only once the log was next written to or synced, it was still there for a
+/// store that went away first, and the open, which replays the last log up to
+/// the first record that does not read, applied it: the reopen read back the
+/// value whose write had failed, which the store before it never showed.
+///
+/// No crash here, which would pass without any cut: a crash keeps only what a
+/// sync made durable, and the sync is what failed.
+#[compio::test]
+async fn a_write_that_failed_is_not_there_when_the_store_is_opened_again() {
+    let writes = write_operations().await;
+    assert!(
+        writes >= 2,
+        "a write of {writes} operations does not both append its record and sync it"
+    );
+
+    let expected = Model::from([(b"warm".to_vec(), b"x".to_vec())]);
+    for close in [false, true] {
+        let how = if close { "closed" } else { "dropped" };
+        for write in 1..=writes {
+            let env = SimEnv::new();
+            let dir = PathBuf::from("/db");
+            let db = roble::open_with(&env, &dir, flush_options())
+                .await
+                .expect("create");
+            db.put(b"warm", b"x").await.expect("put warm");
+            env.sim().fail_at(write);
+            let failed = db.put(b"k", LONGER).await.is_err();
+            env.sim().stop_failing();
+            assert!(
+                failed,
+                "failing operation {write} of {writes} did not fail the write"
+            );
+            if close {
+                db.close().await.expect("close");
+            } else {
+                drop(db);
+            }
+
+            let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                panic!("{how}: the write failed at operation {write} of {writes}: the reopen: {e}")
+            });
+            assert_eq!(
+                contents(&db).await,
+                expected,
+                "{how}: the write failed at operation {write} of {writes}"
+            );
+        }
+    }
+}

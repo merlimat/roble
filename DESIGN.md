@@ -726,6 +726,31 @@ sequence number and the log offset are both chosen and both committed to (§5).
 With `Wal::Off` the log step is skipped and durability is `flush()`'s job alone
 (§4).
 
+A write whose append or sync fails is not applied and commits to neither: the
+next write takes the same sequence numbers and puts its record where the failed
+one began. The failed record may be in the file all the same, so before the
+write hands back its error it cuts the file back to the end of the last record a
+write committed to, as an open cuts the log it carries on in. Left there, the
+record was trouble whatever came next. Written over, a shorter record left its
+tail behind, and the log stopped reading to its end once a flush had left it
+behind a newer one. Synced — a flush syncs the log it moves past — the record
+was durable, and a replay brought back a write its caller was told had failed,
+at the sequence number the write after it took too: a delete of the same key
+lost to it. And with the store dropped or closed first, the next open replayed
+it as the last record of the last log. A cut that fails as well, or a write
+dropped while it waits on the disk, leaves the record for the next write or the
+flush to cut before it touches the log; a store that goes away before then still
+leaves it for its next open. The cut is not synced on its own, since the log's
+next sync makes it durable, so a machine that dies first may keep whatever of
+the record a failed sync got onto the device. The simulated disk cannot show
+that: its failed sync makes nothing durable. Pebble never writes over a record,
+because its log writer only appends, and it does not carry on after a failed
+sync: it writes nothing more to that log, and every synced write after it fails.
+roble carries on in the same log, and the cut is what that costs. The torn log
+and the lost delete each take two faults, a write and then an operation of a
+flush, which is why `tests/failure.rs` sweeps the pair, with the write failing
+and with it dropped while it waits to sync.
+
 **Durability is the store's, not each write's.** Oxia configures Pebble once
 — `UseWAL` and `SyncData` — and makes every commit with those write options,
 so a per-write flag would be one argument on every call that Oxia never
@@ -1260,7 +1285,9 @@ by this rule, and does not read to its end — which Pebble refuses too, since
 it replays every log but the newest strictly (`strictWALTail`). Pebble never
 meets this, because it never appends to a log it replayed: its open flushes
 what it replayed and starts a fresh log. `compat/differential` found it by
-killing roble in such a flush.
+killing roble in such a flush. A write whose append or sync fails leaves the
+same kind of bytes past a running store's last record, and they are cut the
+same way (`write(batch, sync)`, above).
 
 And when there is no last log to carry on in, a writable open creates one, as
 Pebble's does. Pebble's open moves the MANIFEST past every log it replayed
