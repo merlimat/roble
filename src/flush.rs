@@ -22,7 +22,10 @@
 //!    memtable and point the store at both in one step. The sync comes
 //!    first because a log a later one follows is replayed strictly, and
 //!    without a sync on every write only this makes it complete before the
-//!    later one's name is durable (`crate::open::Db::sync_log`). From
+//!    later one's name is durable (`crate::open::Db::sync_log`). What a
+//!    write that went wrong left past the log's end, and could not cut away
+//!    itself, is cut first, rather than made durable with it
+//!    (`crate::open::Db::cut_log`). From
 //!    here a write goes to a memtable this flush is not writing out and a
 //!    log its edit does not retire, which is what makes a write arriving in
 //!    the middle of a flush safe (§5, `crate::open::Db::freeze_memtable`).
