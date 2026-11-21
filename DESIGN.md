@@ -2113,7 +2113,14 @@ in both directions.
   next table is written or file swept, and not only before the next edit: the
   record that failed may yet be replayed, and a table written under a number
   it gave out, or swept because the store carried on without it, is a write
-  lost.
+  lost. Reads are swept the same way, with nothing cached so that every read
+  reaches the disk: each read a lookup, a scan or a compaction makes fails in
+  turn, and an answer must be right or an error. What met the error must be
+  right afterwards too: the store on its next lookup, through the same buffer,
+  and a scan once it is positioned again. Until then a scan is on no key and
+  refuses to step, because a read that fails part way through a step leaves
+  its sources wherever it found them, and stepping on from there reads a
+  merge heap that is no longer one.
 - **A real process, killed.** `SimFs` is not what a store runs on, so
   `tests/crash_loop.rs` runs the store on `FileFs` in a child process — with
   its own background flushes and compactions on, small memtables and tables,

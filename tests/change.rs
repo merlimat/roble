@@ -803,7 +803,14 @@ async fn a_compaction_that_failed_leaves_its_tables_free() {
         let first = db.compact_once().await;
         env.sim().stop_failing();
         if first.is_ok() {
-            // The injection landed somewhere this compaction did not mind.
+            // The injection landed after the edit, in the sweep or the
+            // measuring that follow it, which a compaction does not fail
+            // for: it happened, and the store holds what it held.
+            assert_eq!(
+                contents(&db).await,
+                model,
+                "failing at {n} of {total}, which succeeded"
+            );
             continue;
         }
 
