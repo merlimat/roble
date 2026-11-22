@@ -26,8 +26,19 @@
 //! ends there exclusively. Reading that bound as inclusive refuses databases
 //! Pebble writes; reading every touching bound as allowed accepts databases
 //! Pebble would refuse. Both mistakes are here, one per test.
+//!
+//! The same function checks the **order** first: walking a level as it is
+//! held, each table has to start after the one before it, comparing smallest
+//! bounds as internal keys. A lookup binary-searches a level as it is held, so
+//! a level out of order hides keys even though none of its tables overlap.
+//! Where one user key is a prefix of another, that order is not the order of
+//! the bytes the bounds are encoded in.
 
-use roble::VersionSet;
+use std::path::PathBuf;
+
+use roble::sim::{SimEnv, SimFs};
+use roble::{Comparison, Options, VersionSet};
+use roble_format::batch::Batch;
 use roble_format::key::{self, Kind, SEQ_NUM_MAX};
 use roble_format::manifest::{NewTable, VersionEdit};
 
@@ -156,6 +167,100 @@ async fn tables_that_truly_overlap_are_refused_either_way() {
         .expect_err("ranges that cross are an overlap whatever the bound's kind");
         assert!(format!("{err}").contains("overlap"), "got: {err}");
     }
+}
+
+/// A key, and the same key extended by a byte below its kind byte.
+///
+/// An encoded bound is the user key followed by the trailer, and the trailer's
+/// first byte is the kind (a Set's is 1). Bytewise, that 1 meets the longer
+/// key's 0, which puts `w0\0\0` first. As internal keys, `w0` comes first.
+const PREFIX: &[u8] = b"w0";
+const EXTENDED: &[u8] = b"w0\x00\x00";
+
+#[compio::test]
+async fn a_level_holds_a_key_before_its_extension_whichever_was_added_first() {
+    let prefix = || table(1, 1, PREFIX, PREFIX, 10, Kind::Set);
+    let extended = || table(1, 2, EXTENDED, b"w1\xff\x00", 20, Kind::Set);
+    for tables in [vec![prefix(), extended()], vec![extended(), prefix()]] {
+        let set = replay(tables).expect("two tables that do not overlap");
+        let order: Vec<u64> = set.version.level(1).iter().map(|t| t.file_num).collect();
+        assert_eq!(order, [1, 2], "`w0`'s table comes first");
+    }
+}
+
+/// Writes `key` into a table of its own in L1: flushed, then compacted out
+/// of L0.
+async fn alone_in_l1(db: &roble::Db<SimFs>, key: &[u8]) {
+    let mut batch = Batch::new();
+    batch.put(key, b"v").expect("put");
+    db.write_raw(&mut batch, true).await.expect("write");
+    let table = db.flush().await.expect("flush").expect("a table");
+    db.compact(0, &[table]).await.expect("compact");
+}
+
+/// Checks that a store holding [`PREFIX`] and [`EXTENDED`] finds both, under
+/// every comparison that should land on one of them and in a scan each way.
+async fn assert_reads(db: &roble::Db<SimFs>, when: &str) {
+    let between: &[u8] = b"w0\x00";
+    for (probe, how, expected) in [
+        (PREFIX, Comparison::Equal, PREFIX),
+        (PREFIX, Comparison::Higher, EXTENDED),
+        (EXTENDED, Comparison::Lower, PREFIX),
+        (between, Comparison::Floor, PREFIX),
+        (between, Comparison::Ceiling, EXTENDED),
+    ] {
+        let found = db.get(probe, how).await.expect("get").map(|f| f.key);
+        assert_eq!(
+            found.as_deref(),
+            Some(expected),
+            "{when}: {how:?} of {}",
+            probe.escape_ascii()
+        );
+    }
+
+    let mut scan = db.range(..).expect("scan");
+    let mut forward = Vec::new();
+    scan.first().await.expect("first");
+    while scan.is_valid() {
+        forward.push(scan.key().to_vec());
+        scan.next().await.expect("next");
+    }
+    let mut backward = Vec::new();
+    scan.last().await.expect("last");
+    while scan.is_valid() {
+        backward.push(scan.key().to_vec());
+        scan.prev().await.expect("prev");
+    }
+    backward.reverse();
+    assert_eq!(forward, [PREFIX, EXTENDED], "{when}: a forward scan");
+    assert_eq!(backward, [PREFIX, EXTENDED], "{when}: a reverse scan");
+}
+
+#[compio::test]
+async fn a_store_finds_a_key_whose_extension_starts_the_next_table_of_its_level() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let options = || {
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+    };
+    let db = roble::open_with(&env, &dir, options()).await.expect("open");
+    alone_in_l1(&db, PREFIX).await;
+    alone_in_l1(&db, EXTENDED).await;
+    assert_eq!(
+        db.versions().version.level(1).len(),
+        2,
+        "each key in a table of its own in L1"
+    );
+    assert_reads(&db, "as written").await;
+
+    // A reopen builds the level again, from the MANIFEST.
+    drop(db);
+    let db = roble::open_with(&env, &dir, options())
+        .await
+        .expect("reopen");
+    assert_reads(&db, "after a reopen").await;
 }
 
 #[compio::test]

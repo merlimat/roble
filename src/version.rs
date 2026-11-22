@@ -26,7 +26,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use roble_format::key::{InternalKey, Kind};
+use roble_format::key::{self, InternalKey, Kind};
 use roble_format::manifest::{NUM_LEVELS, NewTable, VersionEdit};
 
 use crate::error::{Error, Result};
@@ -535,17 +535,30 @@ fn apply_one(
         // L0 keeps file number, because its tables overlap: there is no key
         // order to put them in.
         //
-        // The bounds are compared encoded rather than decoded. An internal
-        // key is its user key followed by a trailer, so bytewise order on
-        // the whole thing is user-key order, and this way the comparison
-        // cannot fail on a key it would have to decode.
+        // The bounds are compared as internal keys: user key ascending, then
+        // trailer descending (`key::compare`, Pebble's `InternalCompare`). Not
+        // as the bytes they are encoded in, which agree with that order only
+        // until one user key is a prefix of another. Then the shorter key's
+        // trailer meets the longer key's next byte. `w0`, whose trailer
+        // starts with a Set's kind byte, 1, sorted after `w0\0\0`, and a
+        // lookup of `w0` searched the table starting at `w0\0\0` and found
+        // nothing. A bound too short to hold a trailer fails the comparison
+        // here when the level already holds a table. `VersionSet::check`
+        // decodes every bound below L0, so it refuses one either way.
+        //
+        // The level is already in this order, so the place is found by binary
+        // search, as a lookup finds a table.
         let table = Table::from_new(new);
         let pos = if new.level == 0 {
-            tables.iter().position(|t| t.file_num > table.file_num)
+            tables
+                .iter()
+                .position(|t| t.file_num > table.file_num)
+                .unwrap_or(tables.len())
         } else {
-            tables.iter().position(|t| t.smallest > table.smallest)
-        }
-        .unwrap_or(tables.len());
+            partition(tables, |t| {
+                Ok(key::compare(&t.smallest, &table.smallest)?.is_le())
+            })?
+        };
         tables.insert(pos, table);
     }
     Ok(())
@@ -580,11 +593,27 @@ impl VersionSet {
                     t.largest_is_exclusive()?,
                 ));
             }
-            bounds.sort();
+            // Walked in the order the level holds them, as Pebble's
+            // `manifest.CheckOrdering` walks a level, and not sorted first. A
+            // lookup binary-searches the level in that order (`ending_below`),
+            // so a level out of order hides keys even though no two of its
+            // tables overlap. A sorted copy, which is what this used to check,
+            // was in order whatever order the level was in.
             for pair in bounds.windows(2) {
-                let ((_, before_largest, before, exclusive), (after_smallest, _, after, _)) =
-                    (&pair[0], &pair[1]);
-                // Pebble's rule, from `manifest.CheckOrdering`:
+                let (
+                    (before_smallest, before_largest, before, exclusive),
+                    (after_smallest, _, after, _),
+                ) = (&pair[0], &pair[1]);
+                // Pebble's first rule: `prev.cmpSmallestKey(f, cmp) >= 0` is
+                // "not properly ordered". Two tables starting at one user key
+                // are left to the overlap rule below.
+                if before_smallest > after_smallest {
+                    return Err(Error::Corrupt(format!(
+                        "L{level} tables {before} and {after} are out of key order, which \
+                         Pebble never leaves below L0"
+                    )));
+                }
+                // Then the overlap rule, from the same function:
                 //
                 //     v := cmp(prev.Largest().UserKey, f.Smallest().UserKey)
                 //     if v > 0 || (v == 0 && !prev.Largest().IsExclusiveSentinel())
@@ -624,5 +653,42 @@ impl VersionSet {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A table spanning `smallest`..`largest`, both Sets at sequence number 10.
+    fn table(file_num: u64, smallest: &[u8], largest: &[u8]) -> Table {
+        Table {
+            file_num,
+            size: 100,
+            smallest: key::encode(smallest, 10, Kind::Set),
+            largest: key::encode(largest, 10, Kind::Set),
+            smallest_seq_num: 10,
+            largest_seq_num: 10,
+            marked_for_compaction: false,
+            creation_time: 0,
+        }
+    }
+
+    #[test]
+    fn a_level_out_of_key_order_is_refused_though_nothing_overlaps() {
+        // The order `apply` used to leave, `w0\0\0` before `w0`, which no
+        // edit can produce now. No two of the tables overlap, so a check of
+        // a sorted copy of the bounds let it through.
+        let mut version = Version::new();
+        version.levels[1] = vec![table(2, b"w0\x00\x00", b"w1"), table(1, b"w0", b"w0")];
+        let set = VersionSet {
+            comparer_name: BYTEWISE_COMPARER.to_string(),
+            min_unflushed_log_num: 0,
+            next_file_num: 3,
+            last_seq_num: 10,
+            version: Rc::new(version),
+        };
+        let err = set.check().expect_err("a level out of key order");
+        assert!(err.to_string().contains("out of key order"), "got: {err}");
     }
 }
