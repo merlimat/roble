@@ -39,7 +39,9 @@ pub enum Error {
     Format(FormatError),
     /// The database is valid Pebble, but uses something roble does not read:
     /// a format major version above the pin, a comparer other than bytewise,
-    /// WAL failover (DESIGN.md §3).
+    /// WAL failover (DESIGN.md §3), or logs not yet flushed whose records run
+    /// past the 4 GiB one memtable's offsets reach, which roble replays into
+    /// one memtable (DESIGN.md §6).
     ///
     /// Separate from [`Error::Format`] because the subject is the database
     /// rather than one file, and because the answer is different: a refusal
@@ -60,7 +62,8 @@ pub enum Error {
     Stale(String),
     /// The caller asked for something no database could do: a
     /// [`delete_range`](crate::Db::delete_range) whose start is not below its
-    /// end, a batch past 2³² − 1 entries, or a step of a scan an error left on
+    /// end, a batch past 2³² − 1 entries, a batch whose records could take
+    /// more of a memtable than one holds, or a step of a scan an error left on
     /// no key ([`Scan`](crate::Scan)).
     ///
     /// Nothing was read and nothing on disk is wrong, which is what sets it

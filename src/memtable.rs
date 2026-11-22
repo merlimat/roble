@@ -71,6 +71,25 @@ const BRANCHING: u64 = 4;
 /// The index that means "no node".
 const NIL: u32 = u32::MAX;
 
+/// The most bytes an arena holds. Every offset into it is a `u32`, and the
+/// largest `u32` is [`NIL`], so a record that would end past this is refused.
+/// Given offsets that wrap, it would point at another record's bytes, or sit
+/// at `NIL` and be lost.
+pub(crate) const ARENA_LIMIT: usize = u32::MAX as usize;
+
+/// The most an entry's record costs the arena beyond its user key and value:
+/// the header, links at the tallest height, and the trailer its key is kept
+/// with. Heights are drawn at random, so the tallest is the only figure that
+/// bounds a record before it is drawn. Pebble bounds an entry the same way
+/// (`memTableEntrySize`, `arenaskl.MaxNodeSize`).
+const RECORD_BOUND: usize = LINKS + 4 * MAX_HEIGHT + TRAILER_LEN;
+
+/// The most a batch of `len` bytes and `count` entries can take of an arena:
+/// its bytes, which hold every key and value, and each entry's bookkeeping.
+pub(crate) fn arena_bound(len: usize, count: u32) -> usize {
+    len.saturating_add((count as usize).saturating_mul(RECORD_BOUND))
+}
+
 /// Where each field of a node's record is, from the record's start.
 ///
 /// A record is `key_len`, `value_at` and `value_len` as little-endian `u32`s,
@@ -135,6 +154,15 @@ pub struct Memtable {
     /// index. The arena grows to what that takes in one step rather than by
     /// doubling ([`Memtable::make_room`]).
     budget: usize,
+    /// The most what it has been given can take of the arena: the
+    /// [`arena_bound`]s of the batches applied, summed. Pebble's
+    /// `memTable.prepare` reserves the same way.
+    ///
+    /// A batch is weighed against this rather than against the arena
+    /// ([`Memtable::fits`]), so the batches replayed from a log are taken as
+    /// they were when they were written, whatever heights their records draw
+    /// the second time. The arena is never longer than this.
+    reserved: usize,
     /// Where `apply` builds each entry's internal key before inserting it,
     /// kept so that a write does not allocate one: the key is copied into the
     /// arena at once and the buffer is free again for the next.
@@ -201,6 +229,7 @@ impl Memtable {
             head: [NIL; MAX_HEIGHT],
             height: 1,
             budget: 0,
+            reserved: 0,
             key: Vec::new(),
             // A zero seed would leave the generator stuck, so it is nudged.
             rng: if seed == 0 {
@@ -297,6 +326,40 @@ impl Memtable {
                 .iter()
                 .map(|t| t.start.len() + t.end.len())
                 .sum::<usize>()
+    }
+
+    /// Whether a batch [`arena_bound`] puts at `bound` can still be applied.
+    pub(crate) fn fits(&self, bound: usize) -> bool {
+        self.reserved.saturating_add(bound) <= ARENA_LIMIT
+    }
+
+    /// Counts `bound` as taken, once [`Memtable::fits`] has said it can be.
+    pub(crate) fn reserve(&mut self, bound: usize) {
+        self.reserved += bound;
+    }
+
+    /// What [`Memtable::reserve`] has counted.
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    /// Refuses `more` bytes that would take the arena past [`ARENA_LIMIT`],
+    /// before any of them is appended.
+    ///
+    /// Only a replay comes here: a write and a batch weigh their records
+    /// before they reach a memtable, and refuse them as the caller's mistake.
+    /// A replay's are the database's, which holds more than roble replays
+    /// into one memtable, so it is `Unsupported`.
+    fn check_room(&self, more: usize) -> Result<()> {
+        if self.arena.len().saturating_add(more) > ARENA_LIMIT {
+            return Err(Error::Unsupported(format!(
+                "a record of {more} bytes at offset {} of a memtable, past the {ARENA_LIMIT} \
+                 its offsets reach",
+                self.arena.len()
+            )));
+        }
+        Ok(())
     }
 
     /// The `u32` at `at` in the arena.
@@ -403,6 +466,7 @@ impl Memtable {
         // Already there? Replace its value, appending the new bytes.
         let next = self.link(prev[0], 0);
         if next != NIL && order(self.key(next), key) == Ordering::Equal {
+            self.check_room(value.len())?;
             self.make_room(value.len());
             let value_at = self.arena.len() as u32;
             self.arena.extend_from_slice(value);
@@ -413,7 +477,11 @@ impl Memtable {
         }
 
         let height = self.random_height();
-        self.make_room(LINKS + 4 * height + key.len() + value.len());
+        let len = LINKS + 4 * height + key.len() + value.len();
+        // Before the arena is grown for it: a refusal reserves and copies
+        // nothing, which at four gigabytes is not a small thing to have done.
+        self.check_room(len)?;
+        self.make_room(len);
         let me = self.arena.len() as u32;
         let value_at = me as usize + LINKS + 4 * height + key.len();
         self.arena
@@ -514,8 +582,18 @@ impl Memtable {
     /// Point keys go to the skiplist and range deletions to the list beside
     /// it — never interleaved, since a reader that walks point keys must not
     /// meet a tombstone among them (§6).
+    ///
+    /// The batch's bound is reserved, whether or not it [fits](Memtable::fits).
+    /// A write never sends one that does not: it makes room before the batch
+    /// goes to the log (`Db::make_room`). A replay can, because it applies
+    /// every log not yet flushed to one memtable. Refusing it there would
+    /// refuse a store whose records fit the arena and only their worst case
+    /// does not, so a replay is held to the arena's own limit instead
+    /// (`Memtable::insert`), and the first write after it finds no room and
+    /// writes the memtable out.
     pub fn apply(&mut self, repr: &[u8], base: u64) -> Result<u64> {
         let reader = roble_format::batch::Batch::read(repr)?;
+        self.reserve(arena_bound(repr.len(), reader.remaining()));
         let mut seq = base;
         for entry in reader {
             let entry = entry?;
@@ -825,5 +903,111 @@ mod tests {
         let k = key::encode(b"key", 1, Kind::Set);
         t.insert(&k, b"value").expect("insert");
         assert_eq!(t.bytes(), k.len() + b"value".len());
+    }
+
+    /// A memtable seeded with 1 whose arena already holds `len` bytes, in
+    /// pages nothing has written.
+    ///
+    /// `vec!` of zeros asks the allocator for zeroed memory, which it hands
+    /// out as pages the kernel has not backed yet, so four gigabytes of this
+    /// cost address space and not memory. A record written at the end
+    /// touches a page or two. Room is left past `len` so that writing one
+    /// never grows the arena, which would copy all of it.
+    fn arena_of(len: usize) -> Memtable {
+        let mut t = Memtable::new(1);
+        t.arena = vec![0u8; len + 4096];
+        t.arena.truncate(len);
+        t
+    }
+
+    /// The value at `k`, read back through a cursor.
+    fn read_back(t: &Memtable, k: &[u8]) -> Option<Vec<u8>> {
+        let mut c = t.cursor();
+        c.seek_ge(t, k).expect("seek");
+        (c.is_valid() && c.key(t) == k).then(|| c.value(t).to_vec())
+    }
+
+    #[test]
+    fn a_record_ending_at_the_last_offset_reads_back_and_one_byte_further_is_refused() {
+        let k = key::encode(b"key", 1, Kind::Set);
+        let len = LINKS + 4 * Memtable::new(1).random_height() + k.len() + b"value".len();
+
+        // The last record a `u32` can place. Given offsets that wrapped, its
+        // value read back as zeros from the start of the arena.
+        {
+            let mut t = arena_of(ARENA_LIMIT - len);
+            t.insert(&k, b"value")
+                .expect("a record ending at the limit");
+            assert_eq!(read_back(&t, &k), Some(b"value".to_vec()));
+        }
+        // One byte further, refused with nothing appended.
+        {
+            let mut t = arena_of(ARENA_LIMIT - len + 1);
+            let err = t.insert(&k, b"value").expect_err("one byte past the limit");
+            assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+            assert_eq!(t.arena.len(), ARENA_LIMIT - len + 1, "nothing was appended");
+            assert!(t.is_empty());
+        }
+        // A record starting at `NIL`, which the list read as no node and lost.
+        {
+            let mut t = arena_of(NIL as usize);
+            assert!(t.insert(&k, b"value").is_err(), "a record at NIL");
+            assert!(t.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_value_replaced_past_the_last_offset_is_refused_and_the_old_one_stays() {
+        let k = key::encode(b"key", 1, Kind::Set);
+        let mut t = arena_of(ARENA_LIMIT - 1000);
+        t.insert(&k, b"old").expect("insert");
+        let before = t.arena.len();
+
+        let err = t.insert(&k, &[b'v'; 1000]).expect_err("past the limit");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(t.arena.len(), before, "nothing was appended");
+        assert_eq!(read_back(&t, &k), Some(b"old".to_vec()));
+    }
+
+    /// A replay applies batches past the reservation, which is a worst case:
+    /// their records may well fit the arena, and the store is one main opened.
+    #[test]
+    fn a_batch_past_the_reservation_is_still_applied_and_reserved() {
+        let mut b = roble_format::batch::Batch::new();
+        b.put(b"a", b"1").expect("put");
+        b.put(b"b", b"2").expect("put");
+        let bound = arena_bound(b.len(), b.count());
+
+        let mut t = Memtable::new(1);
+        t.reserve(ARENA_LIMIT - bound + 1);
+        assert!(!t.fits(bound));
+        assert_eq!(t.apply(b.as_bytes(), 10).expect("apply"), 12);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t.reserved, ARENA_LIMIT + 1, "the batch's bound is reserved");
+    }
+
+    /// The bound is worth weighing a batch by only if it holds whatever
+    /// heights the records draw: an arena longer than its reservation would
+    /// let a batch that fits run past the last offset after all.
+    #[test]
+    fn the_arena_never_outgrows_what_its_batches_reserved() {
+        let mut t = Memtable::new(1);
+        let mut base = 1;
+        for round in 0..50u32 {
+            // Small entries, where the bookkeeping is most of the record and
+            // a batch's header least of its bound.
+            let mut b = roble_format::batch::Batch::new();
+            for i in 0..100u32 {
+                b.put(&(round * 100 + i).to_be_bytes(), b"v").expect("put");
+            }
+            base = t.apply(b.as_bytes(), base).expect("apply");
+            assert!(
+                t.arena.len() <= t.reserved,
+                "after {} batches the arena is {} bytes against {} reserved",
+                round + 1,
+                t.arena.len(),
+                t.reserved
+            );
+        }
     }
 }
