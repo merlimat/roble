@@ -60,6 +60,16 @@ through it against the map with the batch's writes laid over what is
 committed, since a commit numbers them above everything before; `commit`
 applies them to the map, and `abort` drops them.
 
+`biter` makes a held iterator through the open batch, up to two at a time
+beside the store's three, and `itermove` moves it while the batch goes on
+taking writes, against the map with the batch's writes laid over it as both
+stood when the iterator was made. An iterator reads a batch as the batch was
+at its making, as it reads the store: Pebble's does until `SetOptions`
+refreshes it, which the runner never calls, and roble's has no such call.
+Most are made a while after their batch, so that the batch holds writes from
+before the making as well as after, and `uniter` closes them before the
+batch's `commit` or `abort`.
+
 `checkpoint <id>` writes a checkpoint into a directory beside the store, named
 by an id no other checkpoint of the script has. `cpcheck <id>` opens it as a
 store, checks it against the map as it was when it was taken, writes the few
@@ -141,6 +151,15 @@ store's latest sequence number rather than the one it was made at; twelve
 seeds from 9000 generated with walks in their place pass, since a walk takes
 no writes between its moves. They also catch the sweep removing a table a
 live scan still holds, which snapshots catch too.
+
+Held iterators through the batch catch a scan over a batch that sees what
+the batch was given after the scan was made, as roble's did before #235;
+`bwalk` never did, since it walks a scan as soon as it makes it. With that
+fix taken out, all ten seeds from 1000 fail with `CRASH=0`, each in a roble
+turn at a move of an iterator `biter` made 10 to 133 batch writes before:
+onto a key past one a later `bdelrange` hid, onto a value a later `bput`
+replaced, or onto a key the batch was given later. With the fix, all ten
+pass.
 
 Kills found a directory neither engine would open: roble, reopening a
 directory, carried on writing into the last log where its replay stopped, and

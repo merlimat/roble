@@ -22,7 +22,9 @@
 // script says and require the model's answer after every move, and do both
 // through the snapshots the script takes, against the model as it was when
 // each was taken, and through the indexed batch it opens, against the model
-// with the batch's writes laid over it. A turn run.sh kills syncs its writes
+// with the batch's writes laid over it; an iterator held through the batch
+// reads it as it was when the iterator was made, while the batch takes more
+// writes. A turn run.sh kills syncs its writes
 // and sends itself SIGKILL a given number of microseconds after it begins a
 // given operation, or the open; every turn prints a line after each
 // operation, and the turn after a killed
@@ -615,6 +617,11 @@ func main() {
 			check(batch, hist.throughBatch(), at+", through the batch")
 		case "bwalk":
 			walk(batch, hist.throughBatch(), o.args, at+", through the batch")
+		case "biter":
+			// Held while the batch takes more writes, and not to see them:
+			// nothing here calls SetOptions, which would refresh its view
+			// of the batch.
+			iters = append(iters, newWalker(batch, hist.throughBatch(), o.args[0], o.args[1], at+", through the batch"))
 		case "commit":
 			if err = batch.Commit(wo); err == nil {
 				err = batch.Close()

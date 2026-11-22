@@ -38,9 +38,11 @@
 //! writes, flushes and compactions after it go on underneath. `batch` opens
 //! an indexed batch; `bput`, `bdel` and `bdelrange` write into it while the
 //! store's own writes go on beside it, `bcheck` and `bwalk` read through it
-//! against the map with the batch laid over it, and `commit` or `abort` ends
-//! it. So a disagreement names the engine that read wrongly, the segment,
-//! and what the other had written before it.
+//! against the map with the batch laid over it, `biter` holds an iterator
+//! through it that is to read the batch as it was when the iterator was
+//! made while the batch takes more writes, and `commit` or `abort` ends it.
+//! So a disagreement names the engine that read wrongly, the segment, and
+//! what the other had written before it.
 //!
 //! Some turns are killed. `run.sh` names an operation, or the open, and a
 //! delay in microseconds; the turn starts a timer as it begins that one and
@@ -106,9 +108,9 @@ enum Op {
     /// A scan over `[lower, upper)`, either side open when `None`, and the
     /// moves to make with it, over what `At` names.
     Walk(At, Option<Vec<u8>>, Option<Vec<u8>>, Vec<Move>),
-    /// An iterator over `[lower, upper)` of the store, held: appended to the
-    /// live ones and moved by later operations.
-    Iter(Option<Vec<u8>>, Option<Vec<u8>>),
+    /// An iterator over `[lower, upper)` of what `At` names, held: appended
+    /// to the live ones and moved by later operations.
+    Iter(At, Option<Vec<u8>>, Option<Vec<u8>>),
     /// Moves of the held iterator at this index, from wherever the last ones
     /// left it.
     IterMove(usize, Vec<Move>),
@@ -139,7 +141,7 @@ enum Op {
     CpCheck(usize, Vec<(String, u64, usize)>),
 }
 
-/// What a check or a walk reads.
+/// What a check, a walk or a held iterator reads.
 #[derive(Clone, Copy)]
 enum At {
     Store,
@@ -214,9 +216,10 @@ fn parse(line: &str) -> Op {
             walk_op(At::Snap(i.parse().expect("snapshot")), lower, upper, moves)
         }
         ["bwalk", lower, upper, moves @ ..] => walk_op(At::Batch, lower, upper, moves),
-        ["iter", lower, upper] => {
+        [w @ ("iter" | "biter"), lower, upper] => {
             let bound = |w: &str| (w != "-").then(|| script_key(w));
-            Op::Iter(bound(lower), bound(upper))
+            let at = if *w == "biter" { At::Batch } else { At::Store };
+            Op::Iter(at, bound(lower), bound(upper))
         }
         ["itermove", i, moves @ ..] => Op::IterMove(
             i.parse().expect("iterator"),
@@ -402,11 +405,18 @@ fn generate(seed: u64, segments: u64, ops: u64) {
         let mut snaps = 0;
         // So does an open batch, ended before the turn is.
         let mut batch = false;
-        // And held iterators: the keys each spans, for its moves to seek in.
-        let mut iters: Vec<(u64, u64)> = Vec::new();
+        // And held iterators: the keys each spans, for its moves to seek in,
+        // and whether it reads through the open batch, since those are
+        // closed before the batch ends.
+        let mut iters: Vec<(u64, u64, bool)> = Vec::new();
         for _ in 0..ops {
             step += 1;
             let line = match rng.below(100) {
+                // Through the open batch, and moved while the batch takes
+                // writes. Made a while after the batch is, so that the batch
+                // holds writes from before an iterator was made as well as
+                // after.
+                0..=2 if batch => gen_held(&mut rng, &mut iters, true),
                 0..=55 => {
                     // Mostly short, now and then past a 4 KiB block, and
                     // rarely past a 32 KiB log block.
@@ -436,22 +446,7 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                 90..=91 => gen_walk(&mut rng),
                 // Held for a while and moved now and then, so that writes,
                 // flushes and compactions land between its moves.
-                92..=93 if iters.is_empty() || (iters.len() < 3 && rng.below(4) == 0) => {
-                    let (bounds, from, to) = gen_bounds(&mut rng);
-                    iters.push((from, to));
-                    format!("iter {bounds}")
-                }
-                92..=93 => {
-                    let i = rng.below(iters.len() as u64) as usize;
-                    if rng.below(6) == 0 {
-                        iters.remove(i);
-                        format!("uniter {i}")
-                    } else {
-                        let (from, to) = iters[i];
-                        let n = 2 + rng.below(8);
-                        format!("itermove {i}{}", gen_moves(&mut rng, from, to, n))
-                    }
-                }
+                92..=93 => gen_held(&mut rng, &mut iters, false),
                 // Taken now and then and read a while later, so that writes,
                 // flushes and compactions land between.
                 94..=95 if snaps == 0 || (snaps < 3 && rng.below(3) == 0) => {
@@ -482,11 +477,11 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                 96..=97 => match rng.below(20) {
                     0..=3 => {
                         batch = false;
-                        "commit".to_string()
+                        format!("{}commit", close_batch_iters(&mut iters))
                     }
                     4 => {
                         batch = false;
-                        "abort".to_string()
+                        format!("{}abort", close_batch_iters(&mut iters))
                     }
                     5..=11 => "bcheck".to_string(),
                     _ => format!("b{}", gen_walk(&mut rng)),
@@ -519,6 +514,7 @@ fn generate(seed: u64, segments: u64, ops: u64) {
             out.push('\n');
         }
         if batch {
+            out.push_str(&close_batch_iters(&mut iters));
             out.push_str(if rng.below(4) == 0 {
                 "abort\n"
             } else {
@@ -547,6 +543,46 @@ fn cpcheck(rng: &mut Rng, step: &mut u64, id: usize) -> String {
         ));
     }
     line
+}
+
+/// An operation on a held iterator over the store, or through the open
+/// batch: a new one when none of its kind is held, or a quarter of the time
+/// when fewer than three over the store or two through the batch are, and
+/// otherwise moves of one of its kind, or a sixth of the time its close.
+fn gen_held(rng: &mut Rng, iters: &mut Vec<(u64, u64, bool)>, through: bool) -> String {
+    let held: Vec<usize> = (0..iters.len())
+        .filter(|&i| iters[i].2 == through)
+        .collect();
+    let most = if through { 2 } else { 3 };
+    if held.is_empty() || (held.len() < most && rng.below(4) == 0) {
+        let (bounds, from, to) = gen_bounds(rng);
+        iters.push((from, to, through));
+        format!("{}iter {bounds}", if through { "b" } else { "" })
+    } else {
+        let i = held[rng.below(held.len() as u64) as usize];
+        if rng.below(6) == 0 {
+            iters.remove(i);
+            format!("uniter {i}")
+        } else {
+            let (from, to, _) = iters[i];
+            let n = 2 + rng.below(8);
+            format!("itermove {i}{}", gen_moves(rng, from, to, n))
+        }
+    }
+}
+
+/// A `uniter` for each held iterator through the open batch, to close them
+/// before the batch is committed or aborted: the last first, so that each
+/// close leaves the indices the next lines name as they were.
+fn close_batch_iters(iters: &mut Vec<(u64, u64, bool)>) -> String {
+    let mut lines = String::new();
+    for i in (0..iters.len()).rev() {
+        if iters[i].2 {
+            iters.remove(i);
+            lines.push_str(&format!("uniter {i}\n"));
+        }
+    }
+    lines
 }
 
 /// A write, into the open batch seven times in ten while one is open.
@@ -1125,7 +1161,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
                 compact_all(&db, background, &at).await;
                 Ok(())
             }
-            Op::Check(on) | Op::Walk(on, ..) => {
+            Op::Check(on) | Op::Walk(on, ..) | Op::Iter(on, ..) => {
                 let through;
                 let (src, model, at) = match on {
                     At::Store => (Src::Db(&db), model, at.clone()),
@@ -1148,13 +1184,13 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
                     Op::Walk(_, lower, upper, moves) => {
                         walk(&src, model, lower, upper, moves, &at).await
                     }
+                    // With the map as it is now: whatever the store or the
+                    // batch is given later, the iterator is not to see.
+                    Op::Iter(_, lower, upper) => {
+                        iters.push(Walker::new(&src, model.clone(), lower.clone(), upper.clone(), &at))
+                    }
                     _ => check(&src, model, &at).await,
                 }
-                Ok(())
-            }
-            Op::Iter(lower, upper) => {
-                let walker = Walker::new(&Src::Db(&db), model.clone(), lower.clone(), upper.clone(), &at);
-                iters.push(walker);
                 Ok(())
             }
             Op::IterMove(i, moves) => {
