@@ -797,6 +797,13 @@ since Go recycles, and that is what the log number in the chunk header is for.
 a skiplist index over its own repr, and its iterators merge the batch with the
 store's view. This is Pebble's indexed batch, and it is not optional.
 
+A scan over a batch reads the batch as it was when the scan was made, as
+Pebble's iterator does until `SetOptions` refreshes it. The batch's entries
+carry stand-in numbers in the order they were written, and the scan holds the
+next one beside the store's sequence number, so an entry the batch is given
+later is skipped as a later write to the store is. A scan made afterwards sees
+it. roble has no `SetOptions`.
+
 `put_with(key, len, |buf| …)` reserves space in the arena and lets the caller
 write the value into it, which is what Oxia's `PutMarshalable` needs to marshal
 protobuf once instead of twice.

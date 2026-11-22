@@ -28,7 +28,8 @@
 //! were written. The merge then needs no special case for the batch at all:
 //! the ordinary "highest sequence number wins" gives the right answer, and
 //! the only rule added anywhere is that a number with that bit is visible to
-//! the scan reading through it (`crate::scan`).
+//! a scan reading through it when the batch held the entry as the scan was
+//! made (`crate::scan`).
 //!
 //! The stand-ins never leave this index. The repr carries no sequence numbers
 //! until `commit` stamps its header, so nothing with the bit set reaches a
@@ -263,10 +264,16 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
 
     /// A scan over the keys in `range`, reading the batch and the store
     /// together, as [`Db::range`] makes one over the store alone.
+    ///
+    /// It reads the batch as the batch is now. What the batch is given
+    /// afterwards is not this scan's to see, any more than a write to the
+    /// store made after the scan is, so a scan made later is what sees it.
+    /// Pebble's iterator over an indexed batch does the same until a
+    /// `SetOptions` refreshes it; a scan here has no such call.
     pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<Scan<F>> {
         let (lower, upper) = crate::scan::bounds(&range);
         self.db.scan_with(
-            vec![Rc::clone(&self.index)],
+            Some((Rc::clone(&self.index), self.next_seq())),
             lower.as_deref(),
             upper.as_deref(),
         )

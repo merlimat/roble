@@ -648,3 +648,82 @@ async fn a_batch_larger_than_a_megabyte_reads_back_and_commits() {
         .expect("committed");
     assert_eq!(found.value, value);
 }
+
+/// A scan reads its batch as the batch was when the scan was made, as Pebble's
+/// iterator over an indexed batch does until a `SetOptions` refreshes it
+/// (`testdata/indexed_batch_mutation`). What the batch is given afterwards is
+/// a later scan's to see.
+#[compio::test]
+async fn a_scan_does_not_see_what_its_batch_is_given_after_it_was_made() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut batch = db.indexed_batch();
+    batch.put(b"zz-foo", b"foo").expect("put");
+    batch.put(b"zz-moo", b"moo").expect("put");
+    let mut scan = batch.range(&b"zz-"[..]..).expect("scan");
+    scan.first().await.expect("first");
+    assert_eq!(scan.key(), b"zz-foo");
+
+    // On `zz-foo`, the batch's cursor waits at `zz-moo`. A key after that is
+    // ahead of the cursor, and one before `zz-foo` is behind the scan. Then a
+    // deletion of the key the scan is on.
+    batch.put(b"zz-zoo", b"zoo").expect("put");
+    batch.put(b"zz-bar", b"bar").expect("put");
+    batch.delete(b"zz-foo").expect("delete");
+
+    scan.next().await.expect("next");
+    assert_eq!(scan.key(), b"zz-moo");
+    scan.next().await.expect("next");
+    assert!(
+        !scan.is_valid(),
+        "the put ahead of the cursor came after the scan, so it is not there to step onto"
+    );
+    assert_eq!(
+        walk(&mut scan).await,
+        Model::from([
+            (b"zz-foo".to_vec(), b"foo".to_vec()),
+            (b"zz-moo".to_vec(), b"moo".to_vec()),
+        ]),
+        "seeking again should find the batch as it was"
+    );
+
+    let mut later = batch.range(&b"zz-"[..]..).expect("scan");
+    assert_eq!(
+        walk(&mut later).await,
+        Model::from([
+            (b"zz-bar".to_vec(), b"bar".to_vec()),
+            (b"zz-moo".to_vec(), b"moo".to_vec()),
+            (b"zz-zoo".to_vec(), b"zoo".to_vec()),
+        ]),
+        "a scan made now sees all of it"
+    );
+}
+
+/// The same for a range deletion, which a scan reads from the batch's list of
+/// them rather than from its keys.
+#[compio::test]
+async fn a_scan_does_not_see_a_range_deletion_its_batch_is_given_after_it_was_made() {
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+
+    let mut batch = db.indexed_batch();
+    batch.put(b"zz-foo", b"foo").expect("put");
+    let mut scan = batch.range(&b"zz-"[..]..).expect("scan");
+    scan.first().await.expect("first");
+    assert_eq!(scan.key(), b"zz-foo");
+
+    batch.delete_range(b"zz-a", b"zz-z").expect("delete_range");
+
+    scan.seek_ge(b"zz-foo").await.expect("seek");
+    assert!(
+        scan.is_valid() && scan.key() == b"zz-foo",
+        "the range deletion came after the scan, so the key is still there to it"
+    );
+    let mut later = batch.range(&b"zz-"[..]..).expect("scan");
+    assert_eq!(
+        walk(&mut later).await,
+        Model::new(),
+        "a scan made now sees it gone"
+    );
+}
