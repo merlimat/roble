@@ -39,9 +39,10 @@
 //!
 //! The log number is what makes a recycled file safe to read: a reused file
 //! still holds chunks from its previous life, and they are recognised by
-//! carrying a different log number rather than by any end marker. A chunk
-//! whose log number is exactly one more than the expected one is Pebble's EOF
-//! trailer and ends the stream cleanly.
+//! carrying a different log number, so that none is read as this log's. One
+//! ends the stream as a torn record does, not cleanly. Only Pebble's EOF
+//! trailer, a chunk whose log number is exactly one more than the expected
+//! one, ends a stream cleanly, and only a log its writer closed has one.
 
 use crate::error::{Error, Result};
 
@@ -236,14 +237,23 @@ impl RecordWriter {
     /// Frames one record, splitting it across blocks as needed.
     pub fn write_record(&mut self, payload: &[u8]) -> Result<()> {
         let header_len = self.format.header_len();
+        // A writer that carries on in a file can start where no writer
+        // stops: at the end of a record too close to its block's end for a
+        // header, as a reopen carries on in a log once it has cut it back to
+        // its last record, padding and all. The record goes to the next
+        // block, behind zeros, as the trailer does.
+        let used = self.position() % BLOCK_SIZE;
+        if BLOCK_SIZE - used < header_len {
+            self.out.resize(self.out.len() + (BLOCK_SIZE - used), 0);
+        }
         let mut rest = payload;
         let mut first = true;
         loop {
             // A chunk never crosses a block boundary. No check is needed here
-            // that the block has room for a header: the eager padding at the
-            // end of this loop guarantees it, so a branch for it would be
-            // unreachable — and an unreachable branch is one no test can
-            // cover.
+            // that the block has room for a header: the padding above and the
+            // eager padding at the end of this loop guarantee it, so a branch
+            // for it would be unreachable — and an unreachable branch is one
+            // no test can cover.
             let used = self.position() % BLOCK_SIZE;
             debug_assert!(
                 BLOCK_SIZE - used >= header_len,
@@ -287,10 +297,13 @@ impl RecordWriter {
 
 /// The records, up to a clean end of stream.
 ///
-/// A clean end is a zero-filled block tail or Pebble's EOF trailer, which is
-/// what a crash leaves behind. Anything else is an error: a torn record in
-/// the middle of a file is corruption, not an ending (DESIGN.md §6). Fused:
-/// after an error or the end it yields nothing more.
+/// A clean end is where a writer stops: the end of the stream after a record
+/// or a full block, a zero-filled block tail, or Pebble's EOF trailer.
+/// Anything else is an error, as it is to Pebble's reader: a torn record, a
+/// chunk of another log, or fewer bytes than a header ending a block the
+/// stream does not fill. Whether that is where a crash stopped the writer or
+/// corruption is the caller's to say (DESIGN.md §6). Fused: after an error
+/// or the end it yields nothing more.
 impl Iterator for RecordReader<'_> {
     type Item = Result<Vec<u8>>;
 
@@ -350,13 +363,23 @@ impl<'a> RecordReader<'a> {
             let block_start = (self.pos / BLOCK_SIZE) * BLOCK_SIZE;
             let block_end = (block_start + BLOCK_SIZE).min(self.buf.len());
             if self.pos + LEGACY_HEADER_LEN > block_end {
-                // Not even a legacy header fits: the rest of the block is pad.
                 if self.pos >= self.buf.len() {
                     return if want_first {
                         Ok(None)
                     } else {
                         Error::corrupt("stream ends in the middle of a record")
                     };
+                }
+                // Not even a legacy header fits. At the end of a full block
+                // that is its padding, whatever it holds, and the stream goes
+                // on in the next one. In a block the stream does not fill,
+                // its last, no writer stops there: Pebble's reader takes the
+                // bytes for a chunk that does not read (`r.end != r.n`).
+                if block_end - block_start < BLOCK_SIZE {
+                    return Error::corrupt(format!(
+                        "{} bytes at the end of the stream, too few for a chunk header",
+                        block_end - self.pos
+                    ));
                 }
                 self.pos = block_end;
                 continue;
@@ -408,17 +431,18 @@ impl<'a> RecordReader<'a> {
                 // first would report corruption at the end of every closed log.
                 let log_num = u32::from_le_bytes(h[7..11].try_into().expect("4 bytes"));
                 if log_num != self.log_num {
-                    // One more than expected is the EOF trailer; anything else
-                    // is a chunk left over from the file's previous life.
+                    // One more than expected, where a record starts, is the
+                    // EOF trailer, the `+ 1` wrapping as the writer's does.
+                    // Anything else is not this log's: a chunk of the file's
+                    // earlier life, or a damaged one. The stream ends there,
+                    // but not cleanly, as Pebble's reader ends it: "treat
+                    // this chunk as invalid in order to prevent reading of a
+                    // partial record".
                     if log_num == self.log_num.wrapping_add(1) && want_first {
                         return Ok(None);
                     }
-                    if want_first {
-                        return Ok(None);
-                    }
                     return Error::corrupt(format!(
-                        "chunk from log {log_num} inside log {}: a recycled tail \
-                         interrupting a record",
+                        "chunk from log {log_num} inside log {}",
                         self.log_num
                     ));
                 }
@@ -664,13 +688,13 @@ mod tests {
         let mut w = RecordWriter::recyclable(9);
         w.write_record(b"mine").expect("write");
         let bytes = w.finish();
-        // Reading it as log 10 must not yield "mine".
-        let mut rd = RecordReader::new(&bytes, 10);
-        match rd.next() {
-            None => {}
-            Some(Ok(r)) => panic!("read {r:?} from a different log"),
-            Some(Err(_)) => {}
-        }
+        // Reading it as log 10 must not yield "mine", nor end the log cleanly:
+        // 9 is not 10's trailer either.
+        let err = first_error(&bytes, 10);
+        assert!(
+            format!("{err}").contains("chunk from log 9 inside log 10"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -950,5 +974,49 @@ mod resume_tests {
         let bytes = w.as_bytes();
         assert!(bytes[..short].iter().all(|&b| b == 0), "padded");
         assert_eq!(bytes[short + 6], RECYCLABLE_FULL, "then the trailer");
+    }
+
+    /// The same for a record, which a reopen writes there when a log's last
+    /// record ends that close to its block's end: it carries on where the
+    /// record ends, its padding cut away with whatever follows it.
+    #[test]
+    fn a_record_resumed_with_no_room_in_its_block_starts_the_next() {
+        for (format, header_len) in [
+            (WireFormat::Legacy, LEGACY_HEADER_LEN),
+            (WireFormat::Recyclable, RECYCLABLE_HEADER_LEN),
+        ] {
+            for short in 1..header_len {
+                let at = BLOCK_SIZE - short;
+                let earlier = vec![b'p'; at - header_len];
+                let (mut first, mut next) = match format {
+                    WireFormat::Legacy => {
+                        (RecordWriter::legacy(), RecordWriter::legacy_resuming(at))
+                    }
+                    WireFormat::Recyclable => {
+                        (RecordWriter::recyclable(3), RecordWriter::resuming(3, at))
+                    }
+                };
+                first.write_record(&earlier).expect("write");
+                next.write_record(b"next").expect("write");
+                assert_eq!(
+                    next.position(),
+                    BLOCK_SIZE + header_len + 4,
+                    "{format:?}, {short} bytes left: the record starts the next block"
+                );
+                let resumed = next.as_bytes();
+                assert!(
+                    resumed[..short].iter().all(|&b| b == 0),
+                    "{format:?}, {short} bytes left: padded"
+                );
+
+                let mut file = first.finish();
+                file.truncate(at);
+                file.extend_from_slice(resumed);
+                let back: Vec<Vec<u8>> = RecordReader::new(&file, 3)
+                    .collect::<Result<_>>()
+                    .expect("reads back");
+                assert_eq!(back, [earlier, b"next".to_vec()], "{format:?}, {short}");
+            }
+        }
     }
 }

@@ -1325,7 +1325,13 @@ As built, the replay stops at the first record of the **last** log that does
 not read, and the store carries on writing from there — first cutting the file
 to that point, which drops what was half-written and was never acknowledged. A
 record that does not read in an *earlier* log is corruption and refused,
-because a later log exists only if that one was finished.
+because a later log exists only if that one was finished. Nor does a log end
+cleanly where a chunk under another log's number begins, the bytes of a
+recycled file's earlier life or a damaged number, or with fewer bytes than a
+header ending a block the file does not fill: Pebble's reader ends a log
+cleanly only at its EOF trailer, a block's zero padding, or the end of the
+file after a record or a full block, and its replay refuses an earlier log
+that ends any other way.
 
 The cut is what makes that last rule safe to apply to a log the store carried
 on in. Written over rather than cut, a torn record longer than what replaces
@@ -1339,6 +1345,13 @@ what it replayed and starts a fresh log. `compat/differential` found it by
 killing roble in such a flush. A write whose append or sync fails leaves the
 same kind of bytes past a running store's last record, and they are cut the
 same way (`write(batch, sync)`, above).
+
+The cut is made where the last record that reads ends, which is not always
+where the reader ended the log: past that record it steps over what it takes
+for a block's padding. Carried on past that, the store put its next record
+where no reader looks for one, and the writes a reopen took were gone at the
+next. A store carrying on where a record ends may find too little of the block
+left for a header, and pads it out first, as that record's own writer did.
 
 And when there is no last log to carry on in, a writable open creates one, as
 Pebble's does. Pebble's open moves the MANIFEST past every log it replayed
