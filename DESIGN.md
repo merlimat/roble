@@ -663,6 +663,15 @@ compaction ◄── picker (scores) ──► merge inputs ──► new sstabl
   `manifest.CheckOrdering`, and it is the ordinary result of a compaction
   split inside a range deletion, so reading the bound as inclusive refuses
   databases Pebble writes.
+- **A level's tables are held in key order.** They are ordered by smallest
+  bound, compared as an internal key: user key, then trailer descending. That
+  is the order a lookup binary-searches. The encoded bytes of a bound sort
+  the same way only until one user key is a prefix of another. Then the
+  shorter key's trailer meets the longer key's next byte, and `w0`, whose
+  trailer starts with a Set's kind byte, 1, sorted after `w0\0\0`. A level
+  held in that order answered "not found" for `w0`. The same Pebble function
+  checks the order before the overlap, walking the level as it is held.
+  roble's check after every replay and every edit does the same.
 - **Obsolete files are deleted only after the edit that retired them is
   durable**: at the end of a flush, and at an open, where the MANIFEST just
   replayed is as durable as it gets. A table goes when the current version
@@ -2106,7 +2115,8 @@ in both directions.
   reverse, flushes, compactions and reopens, checked against a `BTreeMap`, with
   a tiny cache and tiny memtables so flush, eviction and compaction happen
   constantly.
-- **Invariant checker** after every step: levels non-overlapping above L0,
+- **Invariant checker** after every step: levels in key order and
+  non-overlapping above L0,
   sublevels consistent, every file referenced by the current version present on
   disk, every file on disk that roble *recognises* referenced or obsolete (never
   neither — a database directory also holds files that are none of roble's
