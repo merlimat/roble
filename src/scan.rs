@@ -788,6 +788,16 @@ pub struct Scan<F: Fs = crate::FileFs> {
     /// reference counts, just a number and the fact that sequence numbers
     /// only go up.
     snapshot: u64,
+    /// The same for an uncommitted batch the scan reads through: the
+    /// stand-in number the batch's next entry was to take when the scan was
+    /// made (`crate::batch`), which no entry of a batch is below when there
+    /// is none.
+    ///
+    /// A batch can be written to while a scan over it is open, and its later
+    /// entries carry higher stand-ins, so this keeps them out of the scan as
+    /// `snapshot` keeps out a later write to the store. Pebble's iterator
+    /// holds the same pair, its `batchSeqNum` beside the sequence number.
+    batch_snapshot: u64,
     lower: Bound,
     upper: Bound,
     /// The internal key a seek targets, and the key it is derived from when
@@ -830,6 +840,7 @@ impl<F: Fs> Scan<F> {
             spare: Vec::new(),
             memtables: Vec::new(),
             snapshot: 0,
+            batch_snapshot: key::SEQ_NUM_BATCH,
             lower: Bound::default(),
             upper: Bound::default(),
             target: Vec::new(),
@@ -1413,7 +1424,9 @@ impl<F: Fs> Scan<F> {
                 continue;
             }
             // A version written after this scan began is not its business.
-            if visible_at(seq_num, self.snapshot) && chosen.is_none_or(|(seq, _)| seq_num > seq) {
+            if visible_at(seq_num, self.snapshot, self.batch_snapshot)
+                && chosen.is_none_or(|(seq, _)| seq_num > seq)
+            {
                 // Into the buffer the scan already holds, which a later
                 // version with a higher sequence number simply overwrites:
                 // `value_into` clears before it writes, so what is left at
@@ -1455,7 +1468,7 @@ impl<F: Fs> Scan<F> {
         for m in &self.memtables {
             for t in m.borrow().tombstones() {
                 if t.seq_num > seq
-                    && visible_at(t.seq_num, self.snapshot)
+                    && visible_at(t.seq_num, self.snapshot, self.batch_snapshot)
                     && t.start.as_slice() <= user
                     && user < t.end.as_slice()
                 {
@@ -1468,20 +1481,26 @@ impl<F: Fs> Scan<F> {
     }
 }
 
-/// Whether an entry numbered `seq` is one a scan at `snapshot` may see.
+/// Whether an entry numbered `seq` is one a scan at `snapshot` and
+/// `batch_snapshot` may see.
 ///
 /// Two rules, and the second is the whole of reading through an uncommitted
 /// batch. An ordinary entry is visible when it was written at or before the
 /// scan began. A batch's own entries carry [`key::SEQ_NUM_BATCH`] in place of
-/// numbers they have not been given yet, and are always visible, because they
-/// are what the scan was made to read through.
+/// numbers they have not been given yet, ascending in the order they were
+/// written, and are visible when the batch held them as the scan began: below
+/// `batch_snapshot`. Pebble's `base.Visible` keeps the same two snapshots.
 ///
-/// No second snapshot is needed for them, as Pebble's `base.Visible` has: a
-/// batch index is only ever a source of a scan made from that same batch, and
-/// nothing else in the database can carry the bit — committing replaces those
-/// stand-ins with real sequence numbers.
-fn visible_at(seq: u64, snapshot: u64) -> bool {
-    seq <= snapshot || seq & key::SEQ_NUM_BATCH != 0
+/// The batch's needs its own number. Only a scan made from a batch reads its
+/// index, but the batch can be written to while that scan is open, and an
+/// entry written then is no more the scan's to see than a write to the store
+/// made then.
+fn visible_at(seq: u64, snapshot: u64, batch_snapshot: u64) -> bool {
+    if seq & key::SEQ_NUM_BATCH != 0 {
+        seq < batch_snapshot
+    } else {
+        seq <= snapshot
+    }
 }
 
 /// The sources of a scan, arranged so that the next key costs a sift rather
@@ -1717,24 +1736,32 @@ impl<F: crate::env::Fs> crate::Db<F> {
     /// [`Scan::prev`] to read backwards.
     pub fn range<'k>(&self, range: impl RangeBounds<&'k [u8]>) -> Result<Scan<F>> {
         let (lower, upper) = bounds(&range);
-        self.scan_with(Vec::new(), lower.as_deref(), upper.as_deref())
+        self.scan_with(None, lower.as_deref(), upper.as_deref())
     }
 
-    /// The same, with `extra` memtables merged in ahead of the store's.
+    /// The same, reading through an uncommitted batch as well when there is
+    /// one: the batch's index, and the stand-in number its next entry will
+    /// take (`crate::batch`).
     ///
-    /// What an uncommitted batch reads through (`crate::batch`): its index is
-    /// a memtable like any other, and its entries win because of the numbers
-    /// they carry rather than because of where they are in this list. The
-    /// store's are both of them, so a scan made in the middle of a flush
-    /// reads the memtable being written out as well as the one in front.
+    /// The index is a memtable like any other, merged in ahead of the
+    /// store's, and its entries win because of the numbers they carry rather
+    /// than because of where they are in the list. The store's are both of
+    /// them, so a scan made in the middle of a flush reads the memtable being
+    /// written out as well as the one in front. The number is where the
+    /// scan's view of the batch ends (`visible_at`), which is why the two
+    /// come together: there is no reading an index without one.
     pub(crate) fn scan_with(
         &self,
-        extra: Vec<Rc<RefCell<Memtable>>>,
+        batch: Option<(Rc<RefCell<Memtable>>, u64)>,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Scan<F>> {
         let mut scan = Scan::empty(Some(Rc::clone(&self.store.metrics)));
-        self.rebuild_scan(&mut scan, extra.into_iter(), lower, upper)?;
+        let (index, batch_snapshot) = batch.unzip();
+        self.rebuild_scan(&mut scan, index.into_iter(), lower, upper)?;
+        if let Some(batch_snapshot) = batch_snapshot {
+            scan.batch_snapshot = batch_snapshot;
+        }
         Ok(scan)
     }
 
