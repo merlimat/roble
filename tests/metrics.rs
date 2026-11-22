@@ -527,13 +527,22 @@ async fn the_debt_is_what_the_levels_hold_above_their_allowances() {
             .expect("put");
     }
     db.write_raw(&mut batch, true).await.expect("write");
-    let table = db.flush().await.expect("flush").expect("a table");
+    db.flush().await.expect("flush").expect("a table");
 
     // Two L0 layers against an allowance of one: one layer's worth of debt.
     let debt = collected(reader(), &tag)["roble.compaction.debt"];
     assert!(debt > 0, "L0 is past its allowance, so there is debt");
 
-    db.compact(0, &[table]).await.expect("compact");
+    // Both layers: the fixture's table is older than the one above it and
+    // overlaps it, so the newer one cannot leave L0 without it.
+    let l0: Vec<u64> = db
+        .versions()
+        .version
+        .level(0)
+        .iter()
+        .map(|t| t.file_num)
+        .collect();
+    db.compact(0, &l0).await.expect("compact");
     let after = collected(reader(), &tag)["roble.compaction.debt"];
     assert_ne!(after, debt, "compacting should have moved the debt");
     assert_eq!(after as u64, db.compaction_debt());

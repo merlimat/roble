@@ -423,11 +423,10 @@ impl<D: Disk> Level<D> {
     /// level is and the edge of the span holds nothing newer than the
     /// tombstone, which the version records. That covers a memtable's
     /// tombstone, older than nothing in any table, and L0's, which holds the
-    /// table of every level below to the same test rather than to the order:
-    /// L0 is compacted whole, so everything below it is older than all of it
-    /// — except after a partial pick through the hidden `Db::compact`, which
-    /// is the one way to put newer keys under an older table, and is kept out
-    /// of the order's reach here for that reason.
+    /// table of every level below to the same test rather than to the order.
+    /// The order would hold there too: L0 is compacted whole, and the hidden
+    /// `Db::compact` refuses a pick of part of it that would leave an older
+    /// table over newer keys.
     ///
     /// The table the tombstone came from always holds it, and so is never
     /// older than it: its level steps as before. So does a level above the
