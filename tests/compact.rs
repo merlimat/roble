@@ -313,6 +313,117 @@ async fn a_deletion_with_something_below_it_stays() {
     );
 }
 
+/// A new store, with compaction left to the caller.
+async fn create_unscheduled(env: &SimEnv, dir: &Path) -> roble::Db<SimFs> {
+    roble::open_with(
+        env,
+        dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("create")
+}
+
+/// The file numbers a level holds, in its order.
+fn level<F: Fs>(db: &roble::Db<F>, level: u32) -> Vec<u64> {
+    db.versions()
+        .version
+        .level(level)
+        .iter()
+        .map(|t| t.file_num)
+        .collect()
+}
+
+#[compio::test]
+async fn part_of_l0_does_not_leave_without_an_older_table_it_overlaps() {
+    // RocksDB's `IntraL0CompactionDoesNotObsoleteDeletions`
+    // (facebook/rocksdb#2722), as a pick of part of L0. The older version is beside the deletion in L0
+    // rather than below it, so a compaction of the deletion alone into L1
+    // found nothing below, dropped it, and the older version came back.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = create_unscheduled(&env, &dir).await;
+
+    let mut old = Batch::new();
+    old.put(b"k", b"old value").expect("put");
+    let a = flush_batch(&db, &mut old).await;
+    let mut gone = Batch::new();
+    gone.delete(b"k").expect("delete");
+    let b = flush_batch(&db, &mut gone).await;
+
+    let refused = db
+        .compact(0, &[b])
+        .await
+        .expect_err("the deletion cannot leave the older version above it");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("L0 table {a} overlaps {b}")),
+        "the refusal should name the table left behind: {refused}"
+    );
+    assert_eq!(level(&db, 0), [a, b], "a refused pick moves nothing");
+    assert_eq!(db.get(b"k", Comparison::Equal).await.expect("get"), None);
+
+    // The older table may go alone: what stays in L0 is newer than it.
+    db.compact(0, &[a]).await.expect("compact the older table");
+    assert_eq!(level(&db, 0), [b]);
+    assert_eq!(db.get(b"k", Comparison::Equal).await.expect("get"), None);
+
+    // Then the deletion, which meets the older version in L1.
+    db.compact(0, &[b]).await.expect("compact the deletion");
+    assert!(level(&db, 0).is_empty());
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    assert_eq!(db.get(b"k", Comparison::Equal).await.expect("get"), None);
+}
+
+#[compio::test]
+async fn a_scan_and_get_agree_on_a_key_written_after_a_range_deletion() {
+    // The same pick with a range deletion as the older table, carried on to
+    // where a scan shows it. The key written after the deletion used to go
+    // down to L1 alone, and then on to L2. The deletion followed it into L1
+    // and sat above it. A scan that meets a key the deletion hides in a
+    // deeper level passes that level's keys to the end of the span without
+    // asking their age, so it passed the newer key too. `get` compares
+    // sequence numbers and found it.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = create_unscheduled(&env, &dir).await;
+
+    // In L2 under the span, older than the deletion: what sets a scan
+    // skipping.
+    let mut buried = Batch::new();
+    buried.put(b"b", b"buried").expect("put");
+    let deep = flush_batch(&db, &mut buried).await;
+    let in_l1 = one_output(db.compact(0, &[deep]).await.expect("compact"));
+    db.compact(1, &[in_l1]).await.expect("compact");
+
+    let mut sweep = Batch::new();
+    sweep.delete_range(b"a", b"z").expect("delete_range");
+    flush_batch(&db, &mut sweep).await;
+    let mut after = Batch::new();
+    after.put(b"k", b"written after").expect("put");
+    let newer = flush_batch(&db, &mut after).await;
+
+    // Refused now, which is the fix: it once took `k` down alone.
+    let _ = db.compact(0, &[newer]).await;
+    let l1 = level(&db, 1);
+    if !l1.is_empty() {
+        db.compact(1, &l1).await.expect("compact L1");
+    }
+    db.compact(0, &level(&db, 0)).await.expect("compact L0");
+
+    let found = db.get(b"k", Comparison::Equal).await.expect("get");
+    assert_eq!(found.map(|f| f.value), Some(b"written after".to_vec()));
+    assert_eq!(
+        contents(&db).await,
+        Model::from([(b"k".to_vec(), b"written after".to_vec())]),
+        "a scan should find what get finds, and not the buried key"
+    );
+}
+
 #[compio::test]
 async fn overlapping_range_tombstones_are_fragmented() {
     // Two inputs whose tombstones overlap at neither bound. Concatenating

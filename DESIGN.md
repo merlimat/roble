@@ -1606,6 +1606,17 @@ for L0 and twice that for each level below, as Pebble's `TargetFileSizes` —
 and a tombstone straddling a split is clipped at it, so the tables either side
 meet at one user key rather than overlapping across it.
 
+**A compaction out of L0 never leaves behind an older L0 table that overlaps
+one it takes.** Two things take a deeper level's keys to be the older ones:
+the deletion rule, which drops a tombstone with nothing below it, and a scan,
+which passes a deeper level's keys inside a range tombstone's span without
+asking their age (§6). A key compacted below something older than it is taken
+for the older of the two. A deletion is dropped while the value it deleted
+stays in L0, and a scan hides a key that `get` finds. `pick()` takes L0 whole.
+`compact` takes the tables it is named, and refuses a pick of part of L0 that
+would leave such a table behind. Pebble's base compaction keeps the same rule
+by growing over the older tables (`internal/manifest/l0_sublevels.go`).
+
 **L0 sublevels.** L0 is the one level whose tables overlap, so a read may have
 to look in several of them — but not in all of them. Partition L0 into layers
 within which no two tables overlap and a read consults at most one table per

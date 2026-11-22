@@ -114,12 +114,12 @@ impl<F: Fs> Db<F> {
     /// merge dropped everything it read, which is what a level of nothing
     /// but superseded keys compacts to.
     ///
-    /// Takes the tables of `level` it is given and no others, so a pick of
-    /// some of L0 can leave behind an older table that overlaps them and put
-    /// newer keys below it. The store's own compactions never do — they take
-    /// L0 whole — and nor does Pebble, whose reads, like a scan's skip past
-    /// a range tombstone here (`crate::scan`), take a deeper level's keys to
-    /// be older.
+    /// Takes the tables of `level` it is given and no others. A pick of part
+    /// of L0 that would leave behind an older table overlapping one of them
+    /// is refused: it would put newer keys below older ones, and the deletion
+    /// rule and a scan here, like Pebble, take a deeper level's keys to be
+    /// older. A newer table may stay. The store's own compactions take L0
+    /// whole.
     #[doc(hidden)]
     pub async fn compact(&self, level: u32, file_nums: &[u64]) -> Result<Vec<u64>> {
         self.writable()?;
@@ -367,6 +367,31 @@ impl<F: Fs> Db<F> {
             )));
         }
 
+        // A pick of part of L0 may leave a table behind only if that table is
+        // newer than every picked table it overlaps. An older one left in L0
+        // would sit above keys written after it, and two things take a deeper
+        // level's keys to be the older ones: the deletion rule below, and a
+        // scan's skip past a range tombstone (`crate::scan`). Pebble's base
+        // compaction grows to take such a table along (`l0_sublevels.go`).
+        // The tables here are the caller's choice, so the pick is refused and
+        // the caller names the older table too.
+        if level == 0 {
+            for left in versions.version.level(0) {
+                if wanted.contains(&left.file_num) {
+                    continue;
+                }
+                for (_, picked) in &inputs {
+                    if left.smallest_seq_num <= picked.largest_seq_num && left.overlaps(picked)? {
+                        return Err(Error::Unsupported(format!(
+                            "L0 table {} overlaps {} and is not newer than it, so {} \
+                             cannot leave L0 without it",
+                            left.file_num, picked.file_num, picked.file_num
+                        )));
+                    }
+                }
+            }
+        }
+
         // The range the inputs cover, which is what decides who joins them.
         let mut lowest = inputs[0].1.smallest_user_key()?.to_vec();
         let mut highest = inputs[0].1.largest_user_key()?.to_vec();
@@ -385,7 +410,8 @@ impl<F: Fs> Db<F> {
         // What is below the output, for the deletion rule. The inputs at the
         // output level are not below it — they are being rewritten — and
         // every level above holds newer data, which a tombstone down here
-        // was never hiding.
+        // was never hiding. That includes what this leaves in L0, which the
+        // check above keeps newer.
         let mut below = Vec::new();
         for (l, tables) in versions.version.levels() {
             if l <= output_level {
