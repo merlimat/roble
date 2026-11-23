@@ -2123,9 +2123,13 @@ in both directions.
   writes a few keys into it, as whoever receives a checkpoint goes on to do.
   One turn in three kills itself
   at a random point instead of closing, and the next, the other engine's, opens
-  what it left: the script is cut where the killed turn stopped, and a write it
-  had under way is decided by reading a key the two outcomes disagree on, so
-  every acknowledged write must be there and nothing else. CI runs ten seeds;
+  what it left: the script is cut where the killed turn stopped. Half the
+  turns run with the WAL off, as Oxia's data servers run Pebble. The writes
+  in doubt are the one under way and, with the WAL off, every one since the
+  last flush the turn finished. They are decided by reading the store whole
+  and finding how many of them, in order, it holds. With the WAL on every
+  acknowledged write must be there and nothing else; with it off, every write
+  a finished flush covered, then some first ones of the rest. CI runs ten seeds;
   `SEEDS`, `SEED`, `SEGMENTS` and `OPS` run more or replay one.
 - **A number Pebble will not export is pinned by a fixture instead.** The first
   sequence number a key may be given is `base.SeqNumStart`, in one of Pebble's

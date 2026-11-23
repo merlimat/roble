@@ -23,6 +23,14 @@ own tasks, as a store is opened by default, so that a flush or a merge runs
 beside the turn's reads, and a kill in such a turn may find one under way.
 Some turns are killed rather than closed.
 
+Half the turns write with the WAL off, as Oxia runs Pebble: roble's with
+`Wal::Off`, Pebble's with `DisableWAL`. Their segment starts `segment
+wal-off` and ends with a `flush`, since with the WAL off nothing else makes a
+write last, and Oxia flushes before it closes. A turn with the WAL off opens
+what one with it on left, its log included, and the reverse, so each engine
+replays logs the other wrote and has to retire them once it has flushed what
+they held.
+
 ## The oracle
 
 The script itself. A runner replays every segment before its own into a
@@ -82,6 +90,10 @@ later `cpcheck`s, by either engine, open what the last one left. A kill can
 spoil that order, by cutting the next turn before its first `cpcheck`s, and
 the last turn's checkpoints are never read. Pebble's runner takes its checkpoints with `WithFlushedWAL`,
 since its writes are not synced and a checkpoint without it may miss them.
+With the WAL off a checkpoint is taken flushed, by roble's own `checkpoint`
+and by Pebble's runner calling `Flush` first, as Oxia does before it takes
+one: Pebble's checkpoint copies only tables then. A `cpcheck` in such a turn
+flushes the checkpoint's store before it closes it, for its puts to last.
 
 A disagreement names the engine that read wrongly, the segment and the
 operation, and what the other engine wrote before it is the segments before.
@@ -94,16 +106,22 @@ ms; the turn starts a timer as it begins that one and, when it fires, ends
 itself as a kill would (Pebble's sends itself SIGKILL, roble's aborts),
 wherever it has got to. A kill turn syncs its writes, since Pebble's unsynced
 ones wait in its own buffers and a kill loses them; roble's are the OS's once
-written, and syncing runs its other path.
+written, and syncing runs its other path. With the WAL off there is nothing to
+sync, and Pebble refuses a synced write.
 
 A turn prints `done <i>` after each operation, so the script can be cut where
 it stopped (`differential truncate`): the operations done stay, an open batch
 is aborted, and a write that was under way becomes `maybe`, since it may or
-may not have landed. The next turn, the other engine's, opens what the killed
-one left and decides the `maybe` by reading a key on which the two outcomes
-disagree. It prints which, `differential resolve` writes that into the script,
-and from there the history is one again. Every acknowledged write must be
-there, and nothing else. A `cpcheck` under way when the turn died may or may
+may not have landed. With the WAL off, so does every write after the last
+`flush` or `checkpoint` the turn finished: a kill loses the memtable, and what
+lasts is the writes up to wherever the last flush to finish, the script's or
+the store's own, cut them off. The next turn, the other engine's, opens what
+the killed one left, reads it whole, and finds how many of the `maybe`s, taken
+in order, make what it holds. It prints that, `differential resolve` writes it
+into the script, and from there the history is one again. With the WAL on,
+every acknowledged write must be there, and nothing else. With it off, every
+write the last finished flush covered must be there, then some first ones of
+the rest, in order, and nothing else. A `cpcheck` under way when the turn died may or may
 not have written its puts into the checkpoint, and nothing decides which, so
 its checkpoint is not read again; a `cpcheck` of a checkpoint whose turn died
 before taking it says so and does nothing.
@@ -134,6 +152,23 @@ failure keeps the directory and the script, cut as the turns that ran had it.
 Each new kind of operation changes the mix, so a seed named in this README
 makes the history it made when it was written only until the next one; the planted bugs
 are the ones to put back and run again.
+
+Turns with the WAL off catch #226's bug put back. There a flush with the WAL
+off left the log the open had replayed unretired, so every later open
+replayed it again, and a key deleted since came back once a compaction had
+dropped its tombstone. With that fix taken out, 2 of the ten seeds from 5000
+fail with `CRASH=0` (5004 and 5009), each in a Pebble turn that finds one key
+more than the history. The differential before WAL-off turns, whose roble
+never ran without a WAL, passes all ten.
+
+A roble runner that says a flush is done without flushing, for all but its
+turn's last, checks the kill path. It passes the ten seeds from 6000 with
+`CRASH=0`, since the last flush writes everything out. It fails 5 of them
+with `CRASH=1`: a kill after such a flush leaves the store without writes the
+turn had counted sure, and the next turn finds the store holds none of the
+maps the writes in doubt could have left. The same in Pebble's runner, so
+that roble's turn is the one to decide, passes them all with `CRASH=0` and
+fails 4 with `CRASH=1`.
 
 Checkpoints found roble refusing a log Pebble wrote: `corrupt: internal key
 kind 3`, on the first seed. Kind 3 is Pebble's `LogData`, which a batch can
