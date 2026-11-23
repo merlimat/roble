@@ -25,8 +25,11 @@
 //! text.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
 use roble::{Comparison, Disk, Fs, GetBuf, Options, Scan, WriteBuf};
@@ -1199,5 +1202,374 @@ async fn a_level_moving_onto_a_table_of_only_a_range_deletion_offers_nothing_fro
             .map(|(k, v)| (k.clone(), v.clone()));
             assert_eq!(got, want, "{how:?} of {probe}");
         }
+    }
+}
+
+/// Polls `op` until it suspends, then runs `landing` to its end while `op`
+/// stays suspended, then `op` to its end; and says whether `landing` ran
+/// wholly inside `op`. As `tests/snapshot.rs` has it: a yield of the
+/// landing's is passed by polling it again, and `op` is given a poll only
+/// when the landing is still not done after a hundred, waiting on it.
+fn land_during<A: Future, B: Future>(op: A, landing: B) -> (A::Output, B::Output, bool) {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut op = pin!(op);
+    let mut landing = pin!(landing);
+    let mut done = match op.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    };
+    let mut polls = 0;
+    let landed = loop {
+        if let Poll::Ready(v) = landing.as_mut().poll(&mut cx) {
+            break v;
+        }
+        polls += 1;
+        assert!(polls < 100_000, "the landing is not making progress");
+        if polls % 100 == 0
+            && done.is_none()
+            && let Poll::Ready(v) = op.as_mut().poll(&mut cx)
+        {
+            done = Some(v);
+        }
+    };
+    let inside = done.is_none();
+    let done = match done {
+        Some(v) => v,
+        None => loop {
+            if let Poll::Ready(v) = op.as_mut().poll(&mut cx) {
+                break v;
+            }
+            polls += 1;
+            assert!(polls < 100_000, "the operation is not making progress");
+        },
+    };
+    (done, landed, inside)
+}
+
+/// RocksDB's `InnerMergeIteratorDataRace1` to `8` (`db/db_iter_test.cc`) and
+/// `IterPrevWithNewerSeq2` (`db/db_iterator_test.cc`), swept: writes land
+/// while a held scan is suspended in the middle of a step, and the scan has
+/// to read on past them as the store was when it was made.
+///
+/// A step awaits whenever it opens a table or reads a block, and across
+/// those awaits it holds its place in the memtable the writes go to, the
+/// range deletions it has read from there, and a key half decided among the
+/// sources. So what lands is aimed at each: a new key between every two the
+/// store holds, wherever the scan is; a newer version of every key, the one
+/// being decided among them; a range deletion over the whole keyspace, so
+/// over every key ahead in either direction; and new keys and newer versions
+/// over half the keyspace followed by a flush, which freezes the memtable the
+/// scan reads and writes it out under it.
+///
+/// The store is reopened before each sweep, so that its seeks and steps open
+/// the tables and read the blocks themselves. Its keys are in all of the
+/// memtable, two L0 tables, L1 and L2, with point and range deletions. A
+/// step does I/O only where it reaches a table it has not opened, since a
+/// table's first read takes in the whole of a small one. So the moves are
+/// laid across L2's table boundaries: a seek onto one and a step back from
+/// it, runs both ways into tables not yet opened, and a seek below one and a
+/// step forward. The test requires that a step forwards, a step backwards
+/// and the first step after a turn each do I/O to be suspended at. Swept
+/// over every operation the moves make, as `tests/obsolete.rs` sweeps a
+/// lookup across a compaction.
+#[compio::test]
+async fn a_scan_suspended_in_the_middle_of_a_step_reads_past_what_lands_meanwhile() {
+    #[derive(Clone, Copy, Debug)]
+    enum Landing {
+        Between,
+        Newer,
+        Deleted,
+        Flushed,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Move {
+        First,
+        Last,
+        Next,
+        Prev,
+        SeekGe(String),
+        SeekLt(String),
+    }
+
+    const KEYS: u64 = 600;
+    fn key(i: u64) -> Vec<u8> {
+        format!("k{i:04}").into_bytes()
+    }
+    fn options() -> Options<SimFs> {
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .background_tasks(false)
+            .target_file_size(1 << 10)
+    }
+
+    async fn write(db: &roble::Db<SimFs>, build: impl FnOnce(&mut Batch)) {
+        let mut batch = Batch::new();
+        build(&mut batch);
+        db.write_raw(&mut batch, true).await.expect("write");
+    }
+
+    /// The layout, written and closed, and what it holds: the model built as
+    /// the writes are made, and the store's own scan required to agree.
+    async fn layered() -> (SimEnv, Model) {
+        let env = SimEnv::new();
+        let db = roble::open_with(&env, Path::new("/db"), options())
+            .await
+            .expect("open");
+        let value = |tag: &str, i: u64| format!("{tag}-{i:04}-{}", "x".repeat(40)).into_bytes();
+        let mut model = Model::new();
+        let mut batch = Batch::new();
+        // Every key, down in L2.
+        for i in 0..KEYS {
+            batch.put(&key(i), &value("l2", i)).expect("put");
+            model.insert(key(i), value("l2", i));
+        }
+        db.write_raw(&mut batch, true).await.expect("write");
+        let mut tables = vec![db.flush().await.expect("flush").expect("a table")];
+        for from in 0..2 {
+            tables = db.compact(from, &tables).await.expect("compact");
+        }
+        // Every third key again, and a range deletion, in L1.
+        let mut batch = Batch::new();
+        for i in (0..KEYS).step_by(3) {
+            batch.put(&key(i), &value("l1", i)).expect("put");
+            model.insert(key(i), value("l1", i));
+        }
+        batch
+            .delete_range(&key(300), &key(330))
+            .expect("delete range");
+        model.retain(|k, _| !(key(300) <= *k && *k < key(330)));
+        db.write_raw(&mut batch, true).await.expect("write");
+        let table = db.flush().await.expect("flush").expect("a table");
+        db.compact(0, &[table]).await.expect("compact");
+        // Every fifth key again, then every seventh deleted, in two L0 tables.
+        let mut batch = Batch::new();
+        for i in (0..KEYS).step_by(5) {
+            batch.put(&key(i), &value("l0", i)).expect("put");
+            model.insert(key(i), value("l0", i));
+        }
+        db.write_raw(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush").expect("a table");
+        let mut batch = Batch::new();
+        for i in (0..KEYS).step_by(7) {
+            batch.delete(&key(i)).expect("delete");
+            model.remove(&key(i));
+        }
+        db.write_raw(&mut batch, true).await.expect("write");
+        db.flush().await.expect("flush").expect("a table");
+        // Every eleventh key again, and a range deletion, in the memtable,
+        // which the log brings back on the reopen.
+        let mut batch = Batch::new();
+        for i in (0..KEYS).step_by(11) {
+            batch.put(&key(i), &value("mem", i)).expect("put");
+            model.insert(key(i), value("mem", i));
+        }
+        batch
+            .delete_range(&key(450), &key(460))
+            .expect("delete range");
+        model.retain(|k, _| !(key(450) <= *k && *k < key(460)));
+        db.write_raw(&mut batch, true).await.expect("write");
+        assert_eq!(contents(&db).await, model, "the layout as written");
+        drop(db);
+        (env, model)
+    }
+
+    async fn reopened(env: &SimEnv) -> roble::Db<SimFs> {
+        roble::open_with(env, Path::new("/db"), options())
+            .await
+            .expect("reopen")
+    }
+
+    async fn land(db: &roble::Db<SimFs>, landing: Landing) {
+        write(db, |b| match landing {
+            Landing::Between => {
+                for i in 0..KEYS {
+                    b.put(&[key(i), vec![0]].concat(), b"between").expect("put");
+                }
+            }
+            Landing::Newer => {
+                for i in 0..KEYS {
+                    b.put(&key(i), b"newer").expect("put");
+                }
+            }
+            Landing::Deleted => b.delete_range(b"k", b"l").expect("delete range"),
+            Landing::Flushed => {
+                for i in (0..KEYS).step_by(2) {
+                    b.put(&[key(i), vec![0]].concat(), b"between").expect("put");
+                    b.put(&key(i + 1), b"newer").expect("put");
+                }
+            }
+        })
+        .await;
+        if let Landing::Flushed = landing {
+            db.flush().await.expect("flush").expect("a table");
+        }
+    }
+
+    /// One move, and where it leaves the scan.
+    async fn step(scan: &mut Scan<SimFs>, mv: &Move) -> roble::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        match mv {
+            Move::First => scan.first().await,
+            Move::Last => scan.last().await,
+            Move::Next => scan.next().await,
+            Move::Prev => scan.prev().await,
+            Move::SeekGe(k) => scan.seek_ge(k.as_bytes()).await,
+            Move::SeekLt(k) => scan.seek_lt(k.as_bytes()).await,
+        }?;
+        Ok(scan
+            .is_valid()
+            .then(|| (scan.key().to_vec(), scan.value().to_vec())))
+    }
+
+    async fn walked(
+        scan: &mut Scan<SimFs>,
+        moves: &[Move],
+    ) -> roble::Result<Vec<Option<(Vec<u8>, Vec<u8>)>>> {
+        let mut seen = Vec::with_capacity(moves.len());
+        for mv in moves {
+            seen.push(step(scan, mv).await?);
+        }
+        Ok(seen)
+    }
+
+    /// Where each move leaves a scan over `entries`, none of them stepping
+    /// off either end.
+    fn wanted(entries: &[(Vec<u8>, Vec<u8>)], moves: &[Move]) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut at: Option<usize> = None;
+        moves
+            .iter()
+            .map(|mv| {
+                let ge = |k: &[u8]| entries.partition_point(|(e, _)| e.as_slice() < k);
+                at = match mv {
+                    Move::First => (!entries.is_empty()).then_some(0),
+                    Move::Last => entries.len().checked_sub(1),
+                    Move::Next => at.and_then(|i| (i + 1 < entries.len()).then_some(i + 1)),
+                    Move::Prev => at.and_then(|i| i.checked_sub(1)),
+                    Move::SeekGe(k) => Some(ge(k.as_bytes())).filter(|&i| i < entries.len()),
+                    Move::SeekLt(k) => ge(k.as_bytes()).checked_sub(1),
+                };
+                assert!(at.is_some(), "the moves are not to step off an end: {mv:?}");
+                at.map(|i| entries[i].clone())
+            })
+            .collect()
+    }
+
+    let (env, model) = layered().await;
+    // Where L2's tables start. A seek onto one opens it and no other of its
+    // level, so the first step back from there has the level open the table
+    // before it, and a run across one has it open the next.
+    let starts: Vec<String> = {
+        let db = reopened(&env).await;
+        db.versions()
+            .version
+            .level(2)
+            .iter()
+            .map(|t| {
+                String::from_utf8(t.smallest_user_key().expect("smallest").to_vec())
+                    .expect("an ASCII key")
+            })
+            .collect()
+    };
+    assert!(
+        starts.len() >= 8,
+        "L2 should hold eight tables or more, holds {}",
+        starts.len()
+    );
+    let mut moves = vec![Move::SeekGe(starts[3].clone()), Move::Prev];
+    moves.extend(std::iter::repeat_n(Move::Prev, 100));
+    moves.extend(std::iter::repeat_n(Move::Next, 250));
+    moves.extend([Move::SeekLt(starts[7].clone()), Move::Next]);
+    moves.extend(std::iter::repeat_n(Move::Next, 20));
+    moves.push(Move::Last);
+    moves.extend(std::iter::repeat_n(Move::Prev, 10));
+    moves.push(Move::First);
+    moves.extend(std::iter::repeat_n(Move::Next, 10));
+
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+    let want = wanted(&entries, &moves);
+    // The cold moves once, with nothing landing: how many operations they
+    // make, and which move makes each.
+    let (total, made_by) = {
+        let db = reopened(&env).await;
+        let mut scan = db.range(..).expect("scan");
+        let start = env.sim().ops();
+        let mut made_by = Vec::new();
+        let mut seen = Vec::with_capacity(moves.len());
+        for (i, mv) in moves.iter().enumerate() {
+            let before = env.sim().ops();
+            seen.push(step(&mut scan, mv).await.expect("a move"));
+            made_by.extend(std::iter::repeat_n(i, (env.sim().ops() - before) as usize));
+        }
+        assert_eq!(seen, want, "the moves, with nothing landing");
+        (env.sim().ops() - start, made_by)
+    };
+    assert!(
+        total >= 8,
+        "{total} operations of a cold scan are too few to sweep"
+    );
+    // Every kind of step suspends somewhere, or the sweep is not testing it:
+    // a step forwards, a step backwards, and the first step after a turn,
+    // which seeks each level again the other way.
+    let forward = |mv: &Move| matches!(mv, Move::First | Move::Next | Move::SeekGe(_));
+    let turn = |i: usize| {
+        matches!(moves[i], Move::Next | Move::Prev)
+            && i > 0
+            && forward(&moves[i]) != forward(&moves[i - 1])
+    };
+    for (what, steps) in [
+        (
+            "a step forwards",
+            made_by.iter().any(|&i| matches!(moves[i], Move::Next)),
+        ),
+        (
+            "a step backwards",
+            made_by.iter().any(|&i| matches!(moves[i], Move::Prev)),
+        ),
+        (
+            "the first step after a turn",
+            made_by.iter().any(|&i| turn(i)),
+        ),
+    ] {
+        assert!(steps, "no operation of {what} to suspend at");
+    }
+
+    for landing in [
+        Landing::Between,
+        Landing::Newer,
+        Landing::Deleted,
+        Landing::Flushed,
+    ] {
+        let mut inside = 0;
+        for n in 1..=total {
+            let (env, _) = layered().await;
+            let db = reopened(&env).await;
+            let mut scan = db.range(..).expect("scan");
+            env.sim().pause_at(n);
+            let (seen, (), landed_inside) =
+                land_during(walked(&mut scan, &moves), land(&db, landing));
+            let seen = seen.unwrap_or_else(|e| {
+                panic!("{landing:?} landing at {n} of {total}: a move failed: {e}")
+            });
+            for (i, (got, expected)) in seen.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    got.as_ref()
+                        .map(|(k, v)| (String::from_utf8_lossy(k), String::from_utf8_lossy(v))),
+                    expected
+                        .as_ref()
+                        .map(|(k, v)| (String::from_utf8_lossy(k), String::from_utf8_lossy(v))),
+                    "{landing:?} landing at {n} of {total}: move {i}, {:?}",
+                    moves[i]
+                );
+            }
+            if landed_inside {
+                inside += 1;
+            }
+        }
+        assert!(
+            inside > 2,
+            "{landing:?}: the moves should have been caught part way more than twice, were \
+             {inside} times of {total}"
+        );
     }
 }

@@ -21,8 +21,11 @@
 //! does not do (§5, `tests/obsolete.rs`).
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
 use roble::{Comparison, Disk, Fs, Options, WriteBuf};
@@ -89,6 +92,54 @@ async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Polls `op` until it suspends, then runs `landing` to its end while `op`
+/// stays suspended, then `op` to its end; and says whether `landing` ran
+/// wholly inside `op`.
+///
+/// Not turn and turn about, as `tests/freeze.rs` interleaves: a write
+/// hands the thread over once while a flush or a merge is under way
+/// (`share_the_thread`), and given the turn, the operation would run to its
+/// end with the write not yet applied. A yield is passed by polling the
+/// landing again. Only a landing that is still not done after a hundred
+/// polls is waiting on the operation, and then the operation is polled
+/// once. The simulated filesystem never blocks, so every `Pending` comes
+/// from roble.
+fn land_during<A: Future, B: Future>(op: A, landing: B) -> (A::Output, B::Output, bool) {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut op = pin!(op);
+    let mut landing = pin!(landing);
+    let mut done = match op.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    };
+    let mut polls = 0;
+    let landed = loop {
+        if let Poll::Ready(v) = landing.as_mut().poll(&mut cx) {
+            break v;
+        }
+        polls += 1;
+        assert!(polls < 100_000, "the landing is not making progress");
+        if polls % 100 == 0
+            && done.is_none()
+            && let Poll::Ready(v) = op.as_mut().poll(&mut cx)
+        {
+            done = Some(v);
+        }
+    };
+    let inside = done.is_none();
+    let done = match done {
+        Some(v) => v,
+        None => loop {
+            if let Poll::Ready(v) = op.as_mut().poll(&mut cx) {
+                break v;
+            }
+            polls += 1;
+            assert!(polls < 100_000, "the operation is not making progress");
+        },
+    };
+    (done, landed, inside)
 }
 
 async fn write<F: Fs>(db: &roble::Db<F>, build: impl FnOnce(&mut Batch)) {
@@ -544,5 +595,168 @@ async fn a_snapshots_scan_is_bounded_the_way_a_stores_is() {
             expected,
             "bounds {lower:?}..{upper:?}"
         );
+    }
+}
+
+/// RocksDB's `TombstoneVisibleInSnapshot` (`db/db_flush_test.cc`, the race
+/// its 7.1.0 fixed), swept over every operation of a flush and of a merge.
+/// With the old value of a key on its way into a table, the key is deleted,
+/// a snapshot is taken, and the key is written again. The snapshot has to go
+/// on saying the key is not there: through the flush or merge that was under
+/// way, through the flush after it, which writes out only the newer value,
+/// and through compactions down to the last level, after which no table
+/// holds the deletion at all.
+///
+/// A snapshot holds the memtables and the version as they were, and its
+/// sequence number keeps the later put out. Taken while a flush is
+/// suspended, the memtables are the frozen one as well as the one the
+/// writes go to. One that held only the newer memtable would lose the frozen
+/// one's keys until their table landed; one that read the store's tables at
+/// its sequence number would find the old value again once the deletion had
+/// been flushed away.
+///
+/// Swept rather than aimed, with the log and without it, as
+/// `tests/freeze.rs` sweeps writes and reads in the middle of a flush: the
+/// operation is suspended before its `n`th operation, the three writes land
+/// there while it stays suspended (`land_during`), and it then runs to its
+/// end.
+#[compio::test]
+async fn a_snapshot_taken_while_a_flush_or_a_merge_is_suspended_keeps_the_deletion_before_it() {
+    /// A store holding forty keys and `foo` in its memtable, or, for a merge,
+    /// in the one L0 table a flush made of them.
+    async fn ready(wal: bool, merge: bool) -> (SimEnv, roble::Db<SimFs>, Model, Vec<u64>) {
+        let env = SimEnv::new();
+        let options = Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .background_tasks(false);
+        let options = if wal {
+            options
+        } else {
+            options.wal(roble::Wal::Off)
+        };
+        let db = roble::open_with(&env, Path::new("/db"), options)
+            .await
+            .expect("open");
+        let mut model = Model::new();
+        let mut batch = Batch::new();
+        for i in 0..40 {
+            let (k, v) = (
+                format!("k{i:03}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            );
+            batch.put(&k, &v).expect("put");
+            model.insert(k, v);
+        }
+        batch.put(b"foo", b"old").expect("put");
+        model.insert(b"foo".to_vec(), b"old".to_vec());
+        db.write_raw(&mut batch, wal).await.expect("write");
+        let tables = if merge {
+            vec![db.flush().await.expect("flush").expect("a table")]
+        } else {
+            Vec::new()
+        };
+        (env, db, model, tables)
+    }
+
+    /// The flush, or the merge of that table into L1.
+    async fn under_way(db: &roble::Db<SimFs>, tables: &[u64]) -> roble::Result<()> {
+        if tables.is_empty() {
+            db.flush().await.map(|_| ())
+        } else {
+            db.compact(0, tables).await.map(|_| ())
+        }
+    }
+
+    async fn write_with(db: &roble::Db<SimFs>, wal: bool, build: impl FnOnce(&mut Batch)) {
+        let mut batch = Batch::new();
+        build(&mut batch);
+        // With the WAL off a synced write is refused: there is no log to sync.
+        db.write_raw(&mut batch, wal).await.expect("write");
+    }
+
+    /// Every table, level by level, down to the last.
+    async fn to_the_last_level(db: &roble::Db<SimFs>) {
+        for level in 0..6 {
+            let tables: Vec<u64> = db
+                .versions()
+                .version
+                .level(level)
+                .iter()
+                .map(|t| t.file_num)
+                .collect();
+            if !tables.is_empty() {
+                db.compact(level, &tables).await.expect("compact");
+            }
+        }
+    }
+
+    for (what, merge) in [("flush", false), ("merge", true)] {
+        for wal in [true, false] {
+            let total = {
+                let (env, db, _, tables) = ready(wal, merge).await;
+                let before = env.sim().ops();
+                under_way(&db, &tables).await.expect("the operation");
+                env.sim().ops() - before
+            };
+            assert!(
+                total >= 4,
+                "{what}, wal={wal}: {total} operations are too few to sweep"
+            );
+
+            let mut suspended = 0;
+            for n in 1..=total {
+                let at = format!("{what}, wal={wal}, suspended at {n} of {total}");
+                let (env, db, model, tables) = ready(wal, merge).await;
+                env.sim().pause_at(n);
+
+                let landing = async {
+                    write_with(&db, wal, |b| b.delete(b"foo").expect("delete")).await;
+                    let snap = db.snapshot().expect("snapshot");
+                    write_with(&db, wal, |b| b.put(b"foo", b"new").expect("put")).await;
+                    snap
+                };
+                let (done, snap, inside) = land_during(under_way(&db, &tables), landing);
+                done.unwrap_or_else(|e| panic!("{at}: {e}"));
+                if inside {
+                    suspended += 1;
+                }
+
+                let mut seen = model.clone();
+                seen.remove(b"foo".as_slice());
+                let check = async |when: &str| {
+                    assert_eq!(
+                        snap.get(b"foo", Comparison::Equal)
+                            .await
+                            .expect("get")
+                            .map(|found| found.value),
+                        None,
+                        "{at}, {when}: the snapshot's lookup"
+                    );
+                    assert_eq!(
+                        walk(&mut snap.range(..).expect("scan")).await,
+                        seen,
+                        "{at}, {when}: the snapshot's scan"
+                    );
+                };
+                check("with the operation done").await;
+
+                // The deletion and the put are in one memtable, and its flush
+                // writes out only the put; the merges then leave the old
+                // value nowhere either.
+                db.flush().await.expect("flush").expect("a table");
+                to_the_last_level(&db).await;
+                check("with the deletion gone from every table").await;
+
+                let mut now = model.clone();
+                now.insert(b"foo".to_vec(), b"new".to_vec());
+                assert_eq!(contents(&db).await, now, "{at}: the store itself");
+            }
+            assert!(
+                suspended > 2,
+                "{what}, wal={wal}: the operation should have been caught part way more than \
+                 twice, was {suspended}"
+            );
+        }
     }
 }
