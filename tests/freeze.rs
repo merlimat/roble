@@ -41,6 +41,9 @@ use roble::sim::{SimEnv, SimFs};
 use roble::{Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 
+mod common;
+use common::land_during;
+
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// Polls two futures turn and turn about until both are done.
@@ -76,55 +79,6 @@ fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
         polls += 1;
         assert!(polls < 100_000, "one of these two is not making progress");
     }
-}
-
-/// Polls `op` until it suspends, then runs `landing` to its end while `op`
-/// stays suspended, then `op` to its end; and says whether `landing` ran
-/// wholly inside `op`.
-///
-/// What a write in the middle of a flush needs, and `interleave` does not
-/// give it. A write hands the thread over once while a flush or a merge is
-/// under way (`share_the_thread`), and polled turn and turn about, the flush
-/// takes that turn and runs to its end with the write not yet applied — so
-/// a write driven that way lands after the flush wherever the flush was
-/// paused. Here a yield of the landing's is passed by polling it again. Only
-/// a landing still not done after a hundred polls is waiting on the
-/// operation, and then the operation is polled once. The simulated
-/// filesystem never blocks, so every `Pending` comes from roble.
-fn land_during<A: Future, B: Future>(op: A, landing: B) -> (A::Output, B::Output, bool) {
-    let mut cx = Context::from_waker(Waker::noop());
-    let mut op = pin!(op);
-    let mut landing = pin!(landing);
-    let mut done = match op.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => Some(v),
-        Poll::Pending => None,
-    };
-    let mut polls = 0;
-    let landed = loop {
-        if let Poll::Ready(v) = landing.as_mut().poll(&mut cx) {
-            break v;
-        }
-        polls += 1;
-        assert!(polls < 100_000, "the landing is not making progress");
-        if polls % 100 == 0
-            && done.is_none()
-            && let Poll::Ready(v) = op.as_mut().poll(&mut cx)
-        {
-            done = Some(v);
-        }
-    };
-    let inside = done.is_none();
-    let done = match done {
-        Some(v) => v,
-        None => loop {
-            if let Poll::Ready(v) = op.as_mut().poll(&mut cx) {
-                break v;
-            }
-            polls += 1;
-            assert!(polls < 100_000, "the operation is not making progress");
-        },
-    };
-    (done, landed, inside)
 }
 
 async fn load(name: &str) -> (SimEnv, PathBuf) {

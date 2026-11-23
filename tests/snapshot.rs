@@ -21,16 +21,16 @@
 //! does not do (§5, `tests/obsolete.rs`).
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
 use roble::{Comparison, Disk, Fs, Options, WriteBuf};
 use roble_format::batch::Batch;
 use roble_format::files;
+
+mod common;
+use common::land_during;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -92,54 +92,6 @@ async fn listing(fs: &SimFs, dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// Polls `op` until it suspends, then runs `landing` to its end while `op`
-/// stays suspended, then `op` to its end; and says whether `landing` ran
-/// wholly inside `op`.
-///
-/// Not turn and turn about, as `tests/freeze.rs` interleaves: a write
-/// hands the thread over once while a flush or a merge is under way
-/// (`share_the_thread`), and given the turn, the operation would run to its
-/// end with the write not yet applied. A yield is passed by polling the
-/// landing again. Only a landing that is still not done after a hundred
-/// polls is waiting on the operation, and then the operation is polled
-/// once. The simulated filesystem never blocks, so every `Pending` comes
-/// from roble.
-fn land_during<A: Future, B: Future>(op: A, landing: B) -> (A::Output, B::Output, bool) {
-    let mut cx = Context::from_waker(Waker::noop());
-    let mut op = pin!(op);
-    let mut landing = pin!(landing);
-    let mut done = match op.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => Some(v),
-        Poll::Pending => None,
-    };
-    let mut polls = 0;
-    let landed = loop {
-        if let Poll::Ready(v) = landing.as_mut().poll(&mut cx) {
-            break v;
-        }
-        polls += 1;
-        assert!(polls < 100_000, "the landing is not making progress");
-        if polls % 100 == 0
-            && done.is_none()
-            && let Poll::Ready(v) = op.as_mut().poll(&mut cx)
-        {
-            done = Some(v);
-        }
-    };
-    let inside = done.is_none();
-    let done = match done {
-        Some(v) => v,
-        None => loop {
-            if let Poll::Ready(v) = op.as_mut().poll(&mut cx) {
-                break v;
-            }
-            polls += 1;
-            assert!(polls < 100_000, "the operation is not making progress");
-        },
-    };
-    (done, landed, inside)
 }
 
 async fn write<F: Fs>(db: &roble::Db<F>, build: impl FnOnce(&mut Batch)) {
