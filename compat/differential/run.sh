@@ -87,7 +87,8 @@ for ((s = first; s < first + seeds; s++)); do
       # A quarter of the kills aim at the open, the rest at an operation
       # picked at random; the turn kills itself that many microseconds after
       # it begins it, wherever it has got to by then. Synced, so that what
-      # a turn printed as done is what it wrote.
+      # a turn printed as done is what it wrote; with the WAL off, what a
+      # flush it finished wrote out is, and the rest is in doubt.
       if (( RANDOM % 4 == 0 )); then target=open; else target=$((RANDOM % (ops + 1))); fi
       "${cmd[@]}" kill "$target" $((RANDOM % 3000)) > "$progress" 2> "$out/stderr" &
       pid=$!
@@ -98,14 +99,14 @@ for ((s = first; s < first + seeds; s++)); do
       if (( rc == 137 || rc == 134 )); then
         done_ops=$(grep -c '^done' "$progress" || true)
         if grep -q '^opened' "$progress"; then
-          inside=$(awk -v n=$((i + 1)) -v d="$done_ops" '/^segment$/ { c++; next } c == n { if (j++ == d) print }' "$script")
+          inside=$(awk -v n=$((i + 1)) -v d="$done_ops" '$1 == "segment" { c++; next } c == n { if (j++ == d) print }' "$script")
         else
           inside="open"
         fi
-        "$roble" truncate "$script" "$i" "$done_ops"
+        doubt=$("$roble" truncate "$script" "$i" "$done_ops")
         killed=$i
         kills=$((kills + 1))
-        echo "  segment $i ($engine) killed after $done_ops operations, inside: ${inside:-the close}"
+        echo "  segment $i ($engine) killed after $done_ops operations, inside: ${inside:-the close}, $doubt writes in doubt"
       elif (( rc != 0 )); then
         cat "$out/stderr"
         fail "$failed"
@@ -114,10 +115,10 @@ for ((s = first; s < first + seeds; s++)); do
       if (( kills == 0 )); then failed="$failed; replay with SEEDS=1 SEED=$s"; fi
       "${cmd[@]}" > "$progress" || fail "$failed"
       if (( killed == i - 1 )); then
-        how=$(sed -n 's/^resolved //p' "$progress")
-        if [ -n "$how" ]; then
-          "$roble" resolve "$script" "$killed" "$how"
-          echo "  segment $i ($engine) found the write under way $how"
+        landed=$(sed -n 's/^resolved //p' "$progress")
+        if [ -n "$landed" ]; then
+          "$roble" resolve "$script" "$killed" "$landed"
+          echo "  segment $i ($engine) found the first $landed of them landed"
         fi
       fi
     fi

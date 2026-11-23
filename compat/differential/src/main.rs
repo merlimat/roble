@@ -44,25 +44,38 @@
 //! So a disagreement names the engine that read wrongly, the segment, and
 //! what the other had written before it.
 //!
+//! Half the turns write with the WAL off, as Oxia runs Pebble: roble's with
+//! [`roble::Wal::Off`], Pebble's with `DisableWAL`. Such a segment starts
+//! `segment wal-off` and always ends with a `flush`, since with the WAL off
+//! nothing else makes a write durable and Oxia flushes before it closes; a
+//! checkpoint's store is flushed before it is closed for the same reason. A
+//! turn with the WAL off opens what one with it on left, the log included,
+//! and the reverse, so each replays and retires logs the other wrote or did
+//! not.
+//!
 //! Some turns are killed. `run.sh` names an operation, or the open, and a
 //! delay in microseconds; the turn starts a timer as it begins that one and
 //! aborts the process when it fires, wherever it has got to. `run.sh` reads
 //! how far the turn got from the `done` lines it printed after each
 //! operation, and `truncate` cuts the script's segment there: the operations
 //! done stay, an open batch is aborted, and a write that was under way when
-//! the kill came becomes `maybe`, since it may or may not have landed. The
-//! next turn, the other engine's, opens what the killed one left, decides the
-//! `maybe` by reading a key the two outcomes disagree on, prints which, and
-//! `resolve` writes that into the script before anything else reads it.
+//! the kill came becomes `maybe`, since it may or may not have landed. With
+//! the WAL off, so does every write after the last flush or checkpoint the
+//! turn finished: a kill loses the memtable, and what lasts is the writes up
+//! to wherever the last flush to finish, the script's or the store's own,
+//! cut them off. The next turn, the other engine's, opens what the killed one
+//! left, reads it whole, finds how many of the `maybe`s, taken in order, make
+//! what it holds, prints that, and `resolve` writes it into the script before
+//! anything else reads it.
 //!
 //! ```text
 //! differential gen <seed> <segments> <ops-per-segment>   script on stdout
 //! differential run <dir> <script> <segment> [kill <op|open> <micros>]
 //! differential truncate <script> <segment> <done>        cut a killed segment
-//! differential resolve <script> <segment> applied|dropped
+//! differential resolve <script> <segment> <landed>       how many maybes landed
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -268,15 +281,36 @@ fn walk_op(at: At, lower: &str, upper: &str, moves: &[&str]) -> Op {
     )
 }
 
-/// The script's segments, each a list of operations.
-fn segments(script: &str) -> Vec<Vec<Op>> {
-    let mut out: Vec<Vec<Op>> = Vec::new();
+/// One turn's part of the script.
+struct Segment {
+    /// Whether the turn writes with the WAL off.
+    wal_off: bool,
+    ops: Vec<Op>,
+}
+
+/// Whether `line` starts a segment, and if it does, whether the segment's
+/// turn writes with the WAL off.
+fn segment_header(line: &str) -> Option<bool> {
+    match line {
+        "segment" => Some(false),
+        "segment wal-off" => Some(true),
+        _ => None,
+    }
+}
+
+/// The script's segments.
+fn segments(script: &str) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
     for line in script.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if line == "segment" {
-            out.push(Vec::new());
+        if let Some(wal_off) = segment_header(line) {
+            out.push(Segment {
+                wal_off,
+                ops: Vec::new(),
+            });
         } else {
             out.last_mut()
                 .unwrap_or_else(|| fail("an operation before the first segment"))
+                .ops
                 .push(parse(line));
         }
     }
@@ -289,9 +323,9 @@ fn segments(script: &str) -> Vec<Vec<Op>> {
 struct History<'s> {
     model: Model,
     batch: Option<Vec<&'s Op>>,
-    /// A `maybe` not yet decided, with the batch that was open at it, which
-    /// the `abort` after it closes before the next turn decides.
-    maybe: Option<(&'s Op, Option<Vec<&'s Op>>)>,
+    /// The `maybe`s not yet decided, in order, each with the batch that was
+    /// open at it: the next turn finds how many of them landed.
+    maybes: Vec<(&'s Op, Option<Vec<&'s Op>>)>,
     /// The checkpoints taken, each with the segment it was taken in and the
     /// map as it stood: what is committed, without an open batch's writes.
     checkpoints: HashMap<usize, (usize, Model)>,
@@ -310,7 +344,13 @@ impl<'s> History<'s> {
                 }
             }
             Op::Abort => self.batch = None,
-            Op::Maybe(write) => self.maybe = Some((write, self.batch.clone())),
+            Op::Maybe(write) => {
+                self.maybes.push((write, self.batch.clone()));
+                // A commit ends its batch, whether or not it landed.
+                if matches!(**write, Op::Commit) {
+                    self.batch = None;
+                }
+            }
             Op::Checkpoint(id) => {
                 self.checkpoints
                     .insert(*id, (self.segment, self.model.clone()));
@@ -324,18 +364,6 @@ impl<'s> History<'s> {
             }
             _ => apply(&mut self.model, op),
         }
-    }
-
-    /// The map if the undecided `maybe` landed, or `None` if there is none.
-    fn with_maybe(&self) -> Option<Model> {
-        let (write, batch) = self.maybe.as_ref()?;
-        let mut landed = History {
-            model: self.model.clone(),
-            batch: batch.clone(),
-            ..History::default()
-        };
-        landed.apply(write);
-        Some(landed.model)
     }
 
     /// The map as a read through the open batch sees it: the batch's writes
@@ -393,8 +421,15 @@ fn generate(seed: u64, segments: u64, ops: u64) {
     let mut taken: Vec<usize> = Vec::new();
     let mut next_checkpoint = 0;
     for _ in 0..segments {
+        // Half the turns write with the WAL off, as Oxia runs Pebble.
+        let wal_off = rng.below(2) == 0;
+        out.push_str(if wal_off {
+            "segment wal-off\n"
+        } else {
+            "segment\n"
+        });
         // A check first, of what the other engine left, and one last.
-        out.push_str("segment\ncheck\n");
+        out.push_str("check\n");
         // Then every checkpoint the last turn took, so that the other engine
         // is the first to open each, as the engine took it.
         for id in taken.drain(..) {
@@ -521,9 +556,11 @@ fn generate(seed: u64, segments: u64, ops: u64) {
                 "commit\n"
             });
         }
-        // Half the segments end flushed, and half leave their last writes
+        // With the WAL off a segment always ends flushed, as Oxia flushes
+        // before it closes: nothing else would keep its last writes. With it
+        // on, half the segments end flushed, and half leave their last writes
         // in the log for the other engine to replay.
-        if rng.below(2) == 0 {
+        if wal_off || rng.below(2) == 0 {
             out.push_str("flush\n");
         }
         out.push_str("check\n");
@@ -967,42 +1004,86 @@ async fn compact_all<F: roble::Fs>(db: &roble::Db<F>, background: bool, at: &str
     }
 }
 
-/// Decides a `maybe` the killed turn before this one left: finds a key the
-/// two outcomes disagree on, reads it, takes the outcome the store holds,
-/// and prints which for `run.sh` to `resolve` into the script.
+/// Decides the `maybe`s the killed turn before this one left: the write it
+/// had under way and, with the WAL off, every one it made after the last
+/// flush or checkpoint it finished. What survived the kill is some first
+/// ones of them, in order, since a flush writes a memtable out whole and
+/// the older ones first. Reads the store whole, finds how many of them make
+/// what it holds, and prints that for `run.sh` to `resolve` into the script.
+/// When several counts do, since one write can undo another, the most is
+/// taken: each leaves the same map.
 async fn decide<F: roble::Fs>(db: &roble::Db<F>, history: &mut History<'_>, segment: usize) {
-    let Some(landed) = history.with_maybe() else {
+    if history.maybes.is_empty() {
         return;
-    };
-    history.maybe = None;
-    let differ = landed
-        .keys()
-        .chain(history.model.keys())
-        .find(|k| landed.get(*k) != history.model.get(*k))
-        .cloned();
-    let Some(k) = differ else {
-        // The write changed nothing, so either answer is the same map.
-        println!("resolved dropped");
-        return;
-    };
-    let found = db
-        .get(&k, Comparison::Equal)
-        .await
-        .unwrap_or_else(|e| fail(&format!("segment {segment}: deciding the maybe: {e}")))
-        .map(|f| f.value);
-    if found.as_ref() == landed.get(&k) {
-        history.model = landed;
-        println!("resolved applied");
-    } else if found.as_ref() == history.model.get(&k) {
-        println!("resolved dropped");
-    } else {
-        fail(&format!(
-            "segment {segment}: the write the killed turn left under way neither landed nor did \
-             not: {} holds {}",
-            String::from_utf8_lossy(&k),
-            show(&found.map(|v| (k.clone(), v)))
-        ));
     }
+    let at = format!("segment {segment}: deciding what the killed turn left");
+    let held = contents(db, &at).await;
+    let maybes = std::mem::take(&mut history.maybes);
+    let mut model = history.model.clone();
+    let mut landed = None;
+    // The count whose map differs from the store's at the fewest keys, for
+    // the message if none matches.
+    let mut closest: Option<(usize, usize, Model)> = None;
+    for n in 0..=maybes.len() {
+        if n > 0 {
+            let (write, batch) = &maybes[n - 1];
+            let mut then = History {
+                model,
+                batch: batch.clone(),
+                ..History::default()
+            };
+            then.apply(write);
+            model = then.model;
+        }
+        let differ = differing(&model, &held).count();
+        if differ == 0 {
+            landed = Some(n);
+        } else if closest.as_ref().is_none_or(|c| differ < c.0) {
+            closest = Some((differ, n, model.clone()));
+        }
+    }
+    let Some(n) = landed else {
+        let (differ, n, model) = closest.expect("a count that does not match");
+        let k = differing(&model, &held)
+            .next()
+            .expect("a key they differ at");
+        fail(&format!(
+            "{at}: the store holds none of the {} maps its {} writes in doubt could have left; \
+             the closest, with the first {n} landed, differs from it at {differ} keys, first at \
+             {}: the store holds {}, the history {}",
+            maybes.len() + 1,
+            maybes.len(),
+            spell(k),
+            show(&held.get(k).map(|v| (k.clone(), v.clone()))),
+            show(&model.get(k).map(|v| (k.clone(), v.clone())))
+        ));
+    };
+    history.model = held;
+    println!("resolved {n}");
+}
+
+/// Everything the store holds, read with one forward scan.
+async fn contents<F: roble::Fs>(db: &roble::Db<F>, at: &str) -> Model {
+    let mut scan = db
+        .range(..)
+        .unwrap_or_else(|e| fail(&format!("{at}: scan: {e}")));
+    let mut held = Model::new();
+    scan.first()
+        .await
+        .unwrap_or_else(|e| fail(&format!("{at}: first: {e}")));
+    while scan.is_valid() {
+        held.insert(scan.key().to_vec(), scan.value().to_vec());
+        scan.next()
+            .await
+            .unwrap_or_else(|e| fail(&format!("{at}: next: {e}")));
+    }
+    held
+}
+
+/// The keys two maps disagree on, in order.
+fn differing<'m>(a: &'m Model, b: &'m Model) -> impl Iterator<Item = &'m Vec<u8>> {
+    let keys: BTreeSet<&Vec<u8>> = a.keys().chain(b.keys()).collect();
+    keys.into_iter().filter(move |k| a.get(*k) != b.get(*k))
 }
 
 /// The script's lines, split into the lines before segment `segment`, its
@@ -1010,7 +1091,7 @@ async fn decide<F: roble::Fs>(db: &roble::Db<F>, history: &mut History<'_>, segm
 fn split_segment(script: &str, segment: usize) -> (Vec<&str>, Vec<&str>, Vec<&str>) {
     let lines: Vec<&str> = script.lines().collect();
     let starts: Vec<usize> = (0..lines.len())
-        .filter(|&i| lines[i] == "segment")
+        .filter(|&i| segment_header(lines[i]).is_some())
         .collect();
     let start = starts[segment] + 1;
     let end = starts.get(segment + 1).copied().unwrap_or(lines.len());
@@ -1031,16 +1112,52 @@ fn rewrite(script: &Path, before: Vec<&str>, own: Vec<String>, after: Vec<&str>)
     std::fs::write(script, out).unwrap_or_else(|e| fail(&format!("{}: {e}", script.display())));
 }
 
-/// Cuts segment `segment`, killed after `done` operations: those stay, a
-/// write under way becomes `maybe`, any open batch is aborted, and a
-/// checkpoint whose `cpcheck` was under way is not read again.
+/// The first word of a script line: what it does.
+fn verb(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or("")
+}
+
+/// Whether a script line writes to the store.
+fn writes(line: &str) -> bool {
+    ["put", "del", "delrange", "commit"].contains(&verb(line))
+}
+
+/// Cuts segment `segment`, killed after `done` operations: those stay, any
+/// open batch is aborted, and a checkpoint whose `cpcheck` was under way is
+/// not read again. A write under way becomes `maybe`, since it may or may
+/// not have landed, and with the WAL off so does every write after the last
+/// flush or checkpoint the turn finished. Prints how many writes are in
+/// doubt.
 fn truncate(script: &Path, segment: usize, done: usize) {
     let text = std::fs::read_to_string(script).unwrap_or_else(|e| fail(&format!("{e}")));
     let (before, own, mut after) = split_segment(&text, segment);
-    let mut kept: Vec<String> = own.iter().take(done).map(|l| l.to_string()).collect();
+    let done = done.min(own.len());
+    let wal_off = before.last().copied().and_then(segment_header) == Some(true);
+    // With the WAL off a write is sure to have landed only once a flush
+    // has written it out: one of the script's, or a checkpoint's. Others
+    // may have, the store's own, and the next turn finds out.
+    let sure = if wal_off {
+        own[..done]
+            .iter()
+            .rposition(|l| ["flush", "checkpoint"].contains(&verb(l)))
+            .map_or(0, |i| i + 1)
+    } else {
+        done
+    };
+    let mut kept: Vec<String> = own[..done]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if i >= sure && writes(l) {
+                format!("maybe {l}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
     if let Some(next) = own.get(done) {
-        let word = next.split_whitespace().next().unwrap_or("");
-        if ["put", "del", "delrange", "commit"].contains(&word) {
+        let word = verb(next);
+        if writes(next) {
             kept.push(format!("maybe {next}"));
         }
         // Its puts may or may not have landed, and nothing reads one to
@@ -1050,19 +1167,25 @@ fn truncate(script: &Path, segment: usize, done: usize) {
             after.retain(|l| !(l.starts_with("cpcheck ") && l.split_whitespace().nth(1) == id));
         }
     }
+    let doubt = kept.iter().filter(|l| l.starts_with("maybe ")).count();
     kept.push("abort".to_string());
     rewrite(script, before, kept, after);
+    println!("{doubt}");
 }
 
-/// Writes the next turn's decision into segment `segment`: the `maybe`
-/// becomes its write, or goes.
-fn resolve(script: &Path, segment: usize, applied: bool) {
+/// Writes the next turn's decision into segment `segment`: the first
+/// `landed` of its `maybe`s become their writes, and the rest go.
+fn resolve(script: &Path, segment: usize, landed: usize) {
     let text = std::fs::read_to_string(script).unwrap_or_else(|e| fail(&format!("{e}")));
     let (before, own, after) = split_segment(&text, segment);
+    let mut seen = 0;
     let own = own
         .iter()
         .filter_map(|l| match l.strip_prefix("maybe ") {
-            Some(write) => applied.then(|| write.to_string()),
+            Some(write) => {
+                seen += 1;
+                (seen <= landed).then(|| write.to_string())
+            }
             None => Some(l.to_string()),
         })
         .collect();
@@ -1097,13 +1220,14 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
         .unwrap_or_else(|e| fail(&format!("{}: {e}", script.display())));
     let all = segments(&text);
     let mut history = History::default();
-    for (i, ops) in all[..segment].iter().enumerate() {
+    for (i, earlier) in all[..segment].iter().enumerate() {
         history.segment = i;
-        for op in ops {
+        for op in &earlier.ops {
             history.apply(op);
         }
     }
     history.segment = segment;
+    let wal_off = all[segment].wal_off;
 
     // Small, so flushes and compactions keep happening. Every other roble
     // turn runs them inline, inside the writes that need them, and the rest
@@ -1116,11 +1240,15 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     // what this one left, through the page cache, which a kill does not
     // lose either, and a machine crash is not the subject (SimFs is). A turn
     // that may be killed syncs anyway, as Pebble's has to (its unsynced
-    // writes wait in its own buffers), so that both paths are run.
+    // writes wait in its own buffers), so that both paths are run. With the
+    // WAL off there is nothing to sync: a write lasts once a flush has
+    // written it out, and a kill loses what none has.
     let background = segment / 2 % 2 == 1;
     let options = || {
         roble::Options::new()
-            .wal(if sync {
+            .wal(if wal_off {
+                roble::Wal::Off
+            } else if sync {
                 roble::Wal::Synced
             } else {
                 roble::Wal::Buffered
@@ -1148,7 +1276,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     // The held iterators, each with the map as it was when it was made.
     let mut iters: Vec<Walker<_>> = Vec::new();
     let mut batch: Option<roble::IndexedBatch<_>> = None;
-    for (i, op) in all[segment].iter().enumerate() {
+    for (i, op) in all[segment].ops.iter().enumerate() {
         let at = format!("segment {segment} (roble), operation {i}");
         Kill::arm(kill, Some(i));
         let model = &history.model;
@@ -1249,6 +1377,13 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
                         .await
                         .unwrap_or_else(|e| fail(&format!("{at}, checkpoint {id}: {e}")));
                 }
+                // With the WAL off its puts are in its memtable alone, which
+                // a close does not write out: flushed first, as Oxia closes.
+                if wal_off {
+                    cp.flush()
+                        .await
+                        .unwrap_or_else(|e| fail(&format!("{at}, checkpoint {id}: flush: {e}")));
+                }
                 cp.close().await
             }
             Op::Maybe(_) => fail(&format!("{at}: a maybe in a turn's own segment")),
@@ -1315,15 +1450,15 @@ async fn main() {
             num(segment) as usize,
             num(done) as usize,
         ),
-        ["resolve", script, segment, how @ ("applied" | "dropped")] => resolve(
+        ["resolve", script, segment, landed] => resolve(
             &PathBuf::from(script),
             num(segment) as usize,
-            *how == "applied",
+            num(landed) as usize,
         ),
         _ => fail(
             "usage: differential gen <seed> <segments> <ops> | run <dir> <script> <segment> \
              [kill <op|open> <micros>] \
-             | truncate <script> <segment> <done> | resolve <script> <segment> applied|dropped",
+             | truncate <script> <segment> <done> | resolve <script> <segment> <landed>",
         ),
     }
 }

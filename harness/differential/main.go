@@ -24,16 +24,19 @@
 // each was taken, and through the indexed batch it opens, against the model
 // with the batch's writes laid over it; an iterator held through the batch
 // reads it as it was when the iterator was made, while the batch takes more
-// writes. A turn run.sh kills syncs its writes
+// writes. A turn run.sh kills syncs its writes, unless the WAL is off,
 // and sends itself SIGKILL a given number of microseconds after it begins a
 // given operation, or the open; every turn prints a line after each
 // operation, and the turn after a killed
-// one decides the write it left under way (compat/differential says how).
+// one decides the writes it left in doubt (compat/differential says how).
 // Pebble runs as Oxia configures it — the format major
 // version of the pin, a bloom filter at ten bits a key, L0 uncompressed and
 // Snappy below — with memtables and tables small enough that flushes and
 // compactions keep happening, and its own automatic compactions on, so that
-// what roble opens next is laid out the way Pebble chose.
+// what roble opens next is laid out the way Pebble chose. A segment that
+// starts "segment wal-off" runs with DisableWAL, as Oxia runs Pebble, and
+// flushes before each checkpoint and before closing a checkpoint it wrote
+// to, as Oxia flushes before it takes one and before it closes.
 //
 //	differential <dir> <script> <segment> [kill <op|open> <micros>]
 package main
@@ -45,6 +48,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,8 +85,11 @@ type op struct {
 	args []string
 }
 
-func segments(script string) ([][]op, error) {
+// segments reads a script's segments, and whether each one's turn writes
+// with the WAL off.
+func segments(script string) ([][]op, []bool, error) {
 	var out [][]op
+	var walOff []bool
 	for _, line := range strings.Split(script, "\n") {
 		w := strings.Fields(line)
 		if len(w) == 0 {
@@ -90,14 +97,15 @@ func segments(script string) ([][]op, error) {
 		}
 		if w[0] == "segment" {
 			out = append(out, nil)
+			walOff = append(walOff, len(w) == 2 && w[1] == "wal-off")
 			continue
 		}
 		if len(out) == 0 {
-			return nil, errors.New("an operation before the first segment")
+			return nil, nil, errors.New("an operation before the first segment")
 		}
 		out[len(out)-1] = append(out[len(out)-1], op{w[0], w[1:]})
 	}
-	return out, nil
+	return out, walOff, nil
 }
 
 func atoi(s string) int {
@@ -264,10 +272,9 @@ func apply(model map[string][]byte, o op) {
 type history struct {
 	model map[string][]byte
 	batch []op
-	// maybe is a write the killed turn before this one left under way, not
-	// yet decided, and maybeBatch the batch that was open at it.
-	maybe      *op
-	maybeBatch []op
+	// maybes are the writes the killed turn before this one left in doubt,
+	// in order, not yet decided: the next turn finds how many landed.
+	maybes []maybe
 	// checkpoints holds each checkpoint taken, by id, with the segment it
 	// was taken in and the model as it stood: what is committed, without an
 	// open batch's writes. segment is the segment of the ops being applied.
@@ -278,6 +285,12 @@ type history struct {
 type checkpoint struct {
 	segment int
 	model   map[string][]byte
+}
+
+// maybe is a write in doubt, with the batch that was open at it.
+type maybe struct {
+	write op
+	batch []op
 }
 
 func (h *history) apply(o op) {
@@ -293,7 +306,11 @@ func (h *history) apply(o op) {
 		h.batch = nil
 	case "maybe":
 		w := op{o.args[0], o.args[1:]}
-		h.maybe, h.maybeBatch = &w, h.batch
+		h.maybes = append(h.maybes, maybe{w, slices.Clone(h.batch)})
+		// A commit ends its batch, whether or not it landed.
+		if w.name == "commit" {
+			h.batch = nil
+		}
 	case "checkpoint":
 		h.checkpoints[o.args[0]] = checkpoint{h.segment, maps.Clone(h.model)}
 	case "cpcheck":
@@ -318,61 +335,85 @@ func (h *history) throughBatch() map[string][]byte {
 	return out
 }
 
-// decide settles a maybe the killed turn before this one left: it finds a
-// key the two outcomes disagree on, reads it, keeps the outcome Pebble
-// holds, and prints which for run.sh to resolve into the script.
+// decide settles the maybes the killed turn before this one left: the write
+// it had under way and, with the WAL off, every one it made after the last
+// flush or checkpoint it finished. What survived the kill is some first ones
+// of them, in order, since a flush writes a memtable out whole and the older
+// ones first. It reads Pebble whole, finds how many of them make what Pebble
+// holds, and prints that for run.sh to resolve into the script. When several
+// counts do, since one write can undo another, the most is taken: each
+// leaves the same map.
 func decide(db *pebble.DB, h *history, segment int) {
-	if h.maybe == nil {
+	if len(h.maybes) == 0 {
 		return
 	}
-	write := *h.maybe
-	h.maybe = nil
-	landed := history{model: maps.Clone(h.model), batch: h.maybeBatch}
-	landed.apply(write)
-	var differ string
-	found := false
-	for _, m := range []map[string][]byte{landed.model, h.model} {
-		for _, k := range sorted(m) {
-			a, inA := landed.model[k]
-			b, inB := h.model[k]
-			if inA != inB || !bytes.Equal(a, b) {
-				differ, found = k, true
-				break
-			}
+	at := fmt.Sprintf("segment %d: deciding what the killed turn left", segment)
+	held := contents(db, at)
+	model := maps.Clone(h.model)
+	landed := -1
+	// The count whose map differs from Pebble's at the fewest keys, for the
+	// message if none matches.
+	closest, closestN := -1, 0
+	var closestModel map[string][]byte
+	for n := 0; n <= len(h.maybes); n++ {
+		if n > 0 {
+			m := h.maybes[n-1]
+			then := history{model: model, batch: m.batch}
+			then.apply(m.write)
 		}
-		if found {
-			break
+		if d := len(differing(model, held)); d == 0 {
+			landed = n
+		} else if closest < 0 || d < closest {
+			closest, closestN, closestModel = d, n, maps.Clone(model)
 		}
 	}
-	if !found {
-		fmt.Println("resolved dropped")
-		return
+	if landed < 0 {
+		k := differing(closestModel, held)[0]
+		v, in := held[k]
+		w, inW := closestModel[k]
+		fail(fmt.Errorf("%s: Pebble holds none of the %d maps its %d writes in doubt could have left; "+
+			"the closest, with the first %d landed, differs from it at %d keys, first at %s: Pebble holds %s, the history %s",
+			at, len(h.maybes)+1, len(h.maybes), closestN, closest, k, show(k, v, in), show(k, w, inW)))
 	}
-	got, closer, err := db.Get([]byte(differ))
-	held := err == nil
-	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
-		fail(fmt.Errorf("segment %d: deciding the maybe: %w", segment, err))
+	// In place, since the caller holds this map.
+	clear(h.model)
+	maps.Copy(h.model, held)
+	h.maybes = nil
+	fmt.Printf("resolved %d\n", landed)
+}
+
+// contents is everything Pebble holds, read with one forward scan.
+func contents(db *pebble.DB, at string) map[string][]byte {
+	iter, err := db.NewIter(nil)
+	if err != nil {
+		fail(fmt.Errorf("%s: iterator: %w", at, err))
 	}
-	same := func(m map[string][]byte) bool {
-		v, in := m[differ]
-		return in == held && (!in || bytes.Equal(v, got))
+	defer iter.Close()
+	out := map[string][]byte{}
+	for ok := iter.First(); ok; ok = iter.Next() {
+		out[string(iter.Key())] = slices.Clone(iter.Value())
 	}
-	switch {
-	case same(landed.model):
-		// In place, since the caller holds this map.
-		h.batch = h.maybeBatch
-		h.apply(write)
-		h.batch = nil
-		fmt.Println("resolved applied")
-	case same(h.model):
-		fmt.Println("resolved dropped")
-	default:
-		fail(fmt.Errorf("segment %d: the write the killed turn left under way neither landed nor did not: %s holds %s",
-			segment, differ, show(differ, got, held)))
+	if err := iter.Error(); err != nil {
+		fail(fmt.Errorf("%s: %w", at, err))
 	}
-	if held {
-		closer.Close()
+	return out
+}
+
+// differing is the keys two maps disagree on, sorted.
+func differing(a, b map[string][]byte) []string {
+	var out []string
+	for k, v := range a {
+		if w, in := b[k]; !in || !bytes.Equal(v, w) {
+			out = append(out, k)
+		}
 	}
+	for k := range b {
+		if _, in := a[k]; !in {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func sorted(model map[string][]byte) []string {
@@ -491,12 +532,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: differential <dir> <script> <segment> [kill <op|open> <micros>]")
 		os.Exit(2)
 	}
+	dir, segment := os.Args[1], atoi(os.Args[3])
+	text, err := os.ReadFile(os.Args[2])
+	if err != nil {
+		fail(err)
+	}
+	all, walOffs, err := segments(string(text))
+	if err != nil {
+		fail(err)
+	}
+	walOff := walOffs[segment]
 	// A turn that is to be killed syncs: Pebble's unsynced writes wait in its
 	// own buffers, which a kill loses, where roble's are already the OS's.
+	// With the WAL off there is nothing to sync, and Pebble refuses a synced
+	// write: a write lasts once a flush has written it out.
 	wo := pebble.NoSync
 	killAt, killAfter := -2, time.Duration(0)
 	if len(os.Args) == 7 {
-		wo = pebble.Sync
+		if !walOff {
+			wo = pebble.Sync
+		}
 		killAt = -1
 		if os.Args[5] != "open" {
 			killAt = atoi(os.Args[5])
@@ -507,15 +562,6 @@ func main() {
 		if at == killAt {
 			time.AfterFunc(killAfter, func() { syscall.Kill(os.Getpid(), syscall.SIGKILL) })
 		}
-	}
-	dir, segment := os.Args[1], atoi(os.Args[3])
-	text, err := os.ReadFile(os.Args[2])
-	if err != nil {
-		fail(err)
-	}
-	all, err := segments(string(text))
-	if err != nil {
-		fail(err)
 	}
 	hist := history{model: map[string][]byte{}, checkpoints: map[string]checkpoint{}}
 	for i, s := range all[:segment] {
@@ -533,6 +579,7 @@ func main() {
 		FormatMajorVersion: pebble.FormatVirtualSSTables,
 		MemTableSize:       64 << 10,
 		LBaseMaxBytes:      64 << 10,
+		DisableWAL:         walOff,
 	}
 	opts.TargetFileSizes[0] = 16 << 10
 	for i := range opts.Levels {
@@ -633,11 +680,20 @@ func main() {
 			}
 			batch = nil
 		case "checkpoint":
-			// Flushed and synced first: a turn not killed writes without
-			// syncing, and a checkpoint taken without this may miss them.
-			err = db.Checkpoint(checkpointDir(dir, o.args[0]), pebble.WithFlushedWAL())
+			// With the WAL off the memtable's writes are in nothing a
+			// checkpoint copies: flushed first, as Oxia flushes before it
+			// takes one.
+			if walOff {
+				err = db.Flush()
+			}
+			// The log flushed and synced first: a turn not killed writes
+			// without syncing, and a checkpoint taken without this may miss
+			// them.
+			if err == nil {
+				err = db.Checkpoint(checkpointDir(dir, o.args[0]), pebble.WithFlushedWAL())
+			}
 		case "cpcheck":
-			err = cpcheck(opts, dir, o.args, hist.checkpoints, wo, at)
+			err = cpcheck(opts, dir, o.args, hist.checkpoints, wo, walOff, at)
 		default:
 			err = fmt.Errorf("cannot read %q", o.name)
 		}
@@ -683,7 +739,7 @@ func cpput(p string) (string, int, int) {
 // cpcheck opens the checkpoint args[0] names, checks it against the model
 // as it stood when it was taken with the puts of earlier cpchecks on top,
 // writes the puts the rest of args names, and closes it.
-func cpcheck(opts *pebble.Options, dir string, args []string, taken map[string]checkpoint, wo *pebble.WriteOptions, at string) error {
+func cpcheck(opts *pebble.Options, dir string, args []string, taken map[string]checkpoint, wo *pebble.WriteOptions, walOff bool, at string) error {
 	id := args[0]
 	cp, ok := taken[id]
 	if !ok {
@@ -705,6 +761,14 @@ func cpcheck(opts *pebble.Options, dir string, args []string, taken map[string]c
 		if err := db.Set([]byte(k), value(step, len), wo); err != nil {
 			db.Close()
 			return fmt.Errorf("checkpoint %s: %w", id, err)
+		}
+	}
+	// With the WAL off its puts are in its memtable alone, which Close does
+	// not write out: flushed first, as Oxia closes.
+	if walOff {
+		if err := db.Flush(); err != nil {
+			db.Close()
+			return fmt.Errorf("checkpoint %s: flush: %w", id, err)
 		}
 	}
 	return db.Close()
