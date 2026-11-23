@@ -25,15 +25,15 @@
 //! text.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
 use roble::{Comparison, Disk, Fs, GetBuf, Options, Scan, WriteBuf};
 use roble_format::batch::Batch;
+
+mod common;
+use common::land_during;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -1203,47 +1203,6 @@ async fn a_level_moving_onto_a_table_of_only_a_range_deletion_offers_nothing_fro
             assert_eq!(got, want, "{how:?} of {probe}");
         }
     }
-}
-
-/// Polls `op` until it suspends, then runs `landing` to its end while `op`
-/// stays suspended, then `op` to its end; and says whether `landing` ran
-/// wholly inside `op`. As `tests/snapshot.rs` has it: a yield of the
-/// landing's is passed by polling it again, and `op` is given a poll only
-/// when the landing is still not done after a hundred, waiting on it.
-fn land_during<A: Future, B: Future>(op: A, landing: B) -> (A::Output, B::Output, bool) {
-    let mut cx = Context::from_waker(Waker::noop());
-    let mut op = pin!(op);
-    let mut landing = pin!(landing);
-    let mut done = match op.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => Some(v),
-        Poll::Pending => None,
-    };
-    let mut polls = 0;
-    let landed = loop {
-        if let Poll::Ready(v) = landing.as_mut().poll(&mut cx) {
-            break v;
-        }
-        polls += 1;
-        assert!(polls < 100_000, "the landing is not making progress");
-        if polls % 100 == 0
-            && done.is_none()
-            && let Poll::Ready(v) = op.as_mut().poll(&mut cx)
-        {
-            done = Some(v);
-        }
-    };
-    let inside = done.is_none();
-    let done = match done {
-        Some(v) => v,
-        None => loop {
-            if let Poll::Ready(v) = op.as_mut().poll(&mut cx) {
-                break v;
-            }
-            polls += 1;
-            assert!(polls < 100_000, "the operation is not making progress");
-        },
-    };
-    (done, landed, inside)
 }
 
 /// RocksDB's `InnerMergeIteratorDataRace1` to `8` (`db/db_iter_test.cc`) and
