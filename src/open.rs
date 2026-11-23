@@ -1200,23 +1200,51 @@ impl<F: Fs> Db<F> {
         // flush inside here freezes the memtable, and a freeze waits for
         // every write in flight to finish (§5, `crate::change`). A write
         // that had counted itself first would be waiting for itself.
-        self.make_room().await?;
-        self.drain_l0().await?;
+        //
+        // Room in the memtable's arena as well as in the budget: the most
+        // the batch's records can take has to fit where every offset is a
+        // `u32` (`crate::memtable::ARENA_LIMIT`).
+        let bound = crate::memtable::arena_bound(batch.len(), batch.count());
+        let writing = loop {
+            self.make_room(bound).await?;
+            self.drain_l0().await?;
 
-        // Room made and L0 shallow enough, this write gives the thread up
-        // once to whatever is flushing or merging beside it — which is how
-        // the flush this write did *not* have to do gets to happen at all
-        // (§9, [`Db::share_the_thread`]).
-        self.share_the_thread().await;
+            // Room made and L0 shallow enough, this write gives the thread up
+            // once to whatever is flushing or merging beside it — which is how
+            // the flush this write did *not* have to do gets to happen at all
+            // (§9, [`Db::share_the_thread`]).
+            self.share_the_thread().await;
 
-        // Held from here to the end of the function, which is the span no
-        // other write may share and no freeze may happen in: the sequence
-        // number stamped below and the offset the record goes to are both
-        // read here and both committed to after the disk has been waited on
-        // (§5, `crate::change`). A write the disk fails commits to neither,
-        // and the next one takes both again, once what this one left in the
-        // log is cut away (`Db::cut_log`).
-        let writing = self.store.writers.begin().await;
+            // Held from here to the end of the function, which is the span no
+            // other write may share and no freeze may happen in: the sequence
+            // number stamped below and the offset the record goes to are both
+            // read here and both committed to after the disk has been waited on
+            // (§5, `crate::change`). A write the disk fails commits to neither,
+            // and the next one takes both again, once what this one left in the
+            // log is cut away (`Db::cut_log`).
+            let writing = self.store.writers.begin().await;
+
+            // The arena again, now that no other write can take from it: one
+            // may have while this write gave the thread up. Then round again,
+            // with the permit given back so that the flush making room does
+            // not wait for this write (§5). A batch that does not fit even a
+            // memtable holding nothing never will, and is refused here,
+            // before it is numbered or logged.
+            let memtable = self.memtable();
+            let memtable = memtable.borrow();
+            if memtable.fits(bound) {
+                break writing;
+            }
+            if memtable.is_empty() && memtable.tombstones().is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "a batch of {} bytes in {} entries, whose records could take {bound} \
+                     bytes of a memtable, more than the {} one holds",
+                    batch.len(),
+                    batch.count(),
+                    crate::memtable::ARENA_LIMIT
+                )));
+            }
+        };
 
         let base = self.store.next_seq.get();
         // Every number the batch takes has to fit a key's trailer. Only a
@@ -1365,9 +1393,18 @@ impl<F: Fs> Db<F> {
     /// one behind it. Only a store whose flushes have stopped keeping up —
     /// or one with nobody to hand them to — comes down here, and then it is
     /// this loop again.
-    async fn make_room(&self) -> Result<()> {
+    ///
+    /// **And room in the memtable's arena** for the most the batch's records
+    /// can take, `bound` ([`crate::memtable::arena_bound`]). A memtable with
+    /// no room for them is written out whatever the budget says. That takes
+    /// a batch of gigabytes, or a budget of hundreds of megabytes of small
+    /// records: the budget counts keys and values, and a small record's
+    /// header and links are several times its size.
+    async fn make_room(&self, bound: usize) -> Result<()> {
         loop {
-            if (self.unflushed_bytes() as u64) < self.store.memtable_size {
+            if (self.unflushed_bytes() as u64) < self.store.memtable_size
+                && self.memtable().borrow().fits(bound)
+            {
                 return Ok(());
             }
 
@@ -2542,5 +2579,108 @@ impl<'a> Working<'a> {
 impl Drop for Working<'_> {
     fn drop(&mut self) {
         self.0.set(self.0.get() - 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use roble_format::batch::Batch;
+
+    use crate::memtable::ARENA_LIMIT;
+    use crate::sim::{SimEnv, SimFs};
+    use crate::{Comparison, Db, Error, Options};
+
+    /// A new store, with compaction left to the caller.
+    async fn create(env: &SimEnv) -> Db<SimFs> {
+        crate::open_with(
+            env,
+            "/db",
+            Options::new()
+                .create_if_missing(true)
+                .disable_automatic_compactions(true),
+        )
+        .await
+        .expect("create")
+    }
+
+    fn put(key: &[u8]) -> Batch {
+        let mut b = Batch::new();
+        b.put(key, b"v").expect("put");
+        b
+    }
+
+    #[compio::test]
+    async fn a_write_the_arena_has_no_room_for_writes_the_memtable_out_first() {
+        let env = SimEnv::new();
+        let db = create(&env).await;
+        db.write_raw(&mut put(b"a"), false).await.expect("write");
+        // No room left, though the budget is nowhere near: where a memtable
+        // of gigabytes, or a batch of them, comes to.
+        db.memtable().borrow_mut().reserve(ARENA_LIMIT);
+
+        db.write_raw(&mut put(b"b"), false).await.expect("write");
+        assert_eq!(
+            db.versions().version.level(0).len(),
+            1,
+            "the full memtable should have been written out"
+        );
+        for key in [&b"a"[..], b"b"] {
+            assert!(
+                db.get(key, Comparison::Equal).await.expect("get").is_some(),
+                "{} is lost",
+                key.escape_ascii()
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn a_batch_no_memtable_could_take_is_refused_before_it_is_numbered_or_logged() {
+        let env = SimEnv::new();
+        let db = create(&env).await;
+        // A memtable holding nothing that has no room stands in for a batch
+        // whose records could take more than a memtable holds. The write
+        // weighs both the same way.
+        db.memtable().borrow_mut().reserve(ARENA_LIMIT);
+        let (at, next) = (db.wal_log().at, db.store.next_seq.get());
+
+        let err = db
+            .write_raw(&mut put(b"a"), false)
+            .await
+            .expect_err("no room in a memtable holding nothing");
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        assert_eq!(db.wal_log().at, at, "nothing should have been logged");
+        assert_eq!(db.store.next_seq.get(), next, "nor numbered");
+        assert_eq!(db.get(b"a", Comparison::Equal).await.expect("get"), None);
+    }
+
+    #[compio::test]
+    async fn a_write_whose_room_was_taken_while_it_waited_makes_room_again() {
+        let env = SimEnv::new();
+        let db = create(&env).await;
+        db.write_raw(&mut put(b"a"), false).await.expect("write");
+
+        // Another write in flight: this one makes room, then waits for the
+        // permit.
+        let held = db.store.writers.begin().await;
+        let mut batch = put(b"b");
+        let mut write = std::pin::pin!(db.write_raw(&mut batch, false));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(write.as_mut().poll(&mut cx).is_pending());
+        // What the other write took: all the room there was.
+        db.memtable().borrow_mut().reserve(ARENA_LIMIT);
+        drop(held);
+
+        // Without the second look the batch would be logged and applied to a
+        // memtable with no room left, where records past the arena's end are
+        // refused after the log already holds them.
+        write.await.expect("write");
+        assert_eq!(
+            db.versions().version.level(0).len(),
+            1,
+            "the memtable it no longer fit should have been written out"
+        );
+        for key in [&b"a"[..], b"b"] {
+            assert!(db.get(key, Comparison::Equal).await.expect("get").is_some());
+        }
     }
 }

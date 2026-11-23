@@ -770,13 +770,27 @@ values there is nothing to refuse.
 
 A write that finds the store **at** `Options::memtable_size` writes a memtable
 out before applying its own batch, which rotates the log with it (§5). Pebble
-asks instead whether the batch *fits*, and so never exceeds the size; roble's
-arena has no capacity to run out of, so the batch that crosses the line is
-applied whole and the bound is the budget plus one batch. The looser rule needs
-no estimate of what a batch will cost the arena, and no second path for a batch
-larger than the whole budget. Every memtable counts toward the budget, one a
-failed flush left frozen included, so the write after such a flush is the one
-that retries it.
+asks instead whether the batch *fits*, and so never exceeds the size; roble
+applies the batch that crosses the line whole, so the bound is the budget plus
+one batch, and it needs no second path for a batch larger than the whole
+budget. Every memtable counts toward the budget, one a failed flush left frozen
+included, so the write after such a flush is the one that retries it.
+
+**The arena itself does have an end.** Every offset into it is a `u32`, so it
+holds 4 GiB at most, and a record placed past that would get offsets that wrap
+onto other records' bytes. So a memtable counts the most each batch applied to
+it can take: its keys and values, and each record's header and links at the
+tallest height, which is how Pebble bounds an entry (`memTableEntrySize`). A
+write weighs its batch against that before the batch is numbered or logged. It
+writes the memtable out first when the batch would not fit, and refuses a batch
+that would not fit an empty one. An indexed batch refuses the entry that would
+make it too large to commit. Replay applies every log not yet flushed to one
+memtable and is held to the arena alone, not to the worst case. One log's
+batches each fitted when written, and so fit again. Several logs whose records
+do run past the end refuse to open; Pebble writes memtables out during a replay
+instead. A store comes to any of this with batches of gigabytes, or with a
+budget of hundreds of megabytes of small records: the budget counts keys and
+values, and a small record's header and links are several times its size.
 
 Before the batch rather than after, and that is the whole of the ordering: a
 flush that fails fails a write that has not happened, so a caller handed the

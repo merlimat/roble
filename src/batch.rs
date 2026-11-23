@@ -51,7 +51,7 @@ use roble_format::batch::Batch;
 use roble_format::key::{self, InternalKey, Kind};
 
 use crate::env::Fs;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::memtable::Memtable;
 use crate::open::Db;
 use crate::read::{Comparison, Found, successor};
@@ -70,16 +70,47 @@ pub struct IndexedBatch<'a, F: Fs = crate::FileFs> {
 
 impl<'a, F: Fs> IndexedBatch<'a, F> {
     pub(crate) fn new(db: &'a Db<F>) -> Self {
+        let repr = Batch::new();
+        // Seeded from where the store has got to, so two batches on one
+        // store get skiplists of different shapes and a run still replays
+        // (§9).
+        let mut index = Memtable::new(db.last_seq_num().wrapping_add(1));
+        // The header, which the bound a commit weighs the batch by counts
+        // (`IndexedBatch::reserve`).
+        index.reserve(repr.len());
         IndexedBatch {
             db,
-            repr: Batch::new(),
-            // Seeded from where the store has got to, so two batches on one
-            // store get skiplists of different shapes and a run still
-            // replays (§9).
-            index: Rc::new(RefCell::new(Memtable::new(
-                db.last_seq_num().wrapping_add(1),
-            ))),
+            repr,
+            index: Rc::new(RefCell::new(index)),
         }
+    }
+
+    /// Refuses an entry that would make the batch too large to commit, before
+    /// the repr or the index is touched, and counts it otherwise. `value_len`
+    /// is `None` for an entry that carries no value.
+    ///
+    /// Too large is the commit's own test: more of a memtable than one holds
+    /// ([`crate::memtable::arena_bound`]). The index's reservation counts the
+    /// header and every entry's bytes in the repr exactly, so it is the bound
+    /// the commit weighs the batch by, and a batch is refused here exactly
+    /// when its commit would be. Pebble's batch refuses to grow past 4 GiB in
+    /// the same place (`ErrBatchTooLarge`).
+    fn reserve(&self, key: &[u8], value_len: Option<usize>) -> Result<()> {
+        // The entry's bytes in the repr: its kind, the key and its length,
+        // and the value and its length when it has one.
+        let len =
+            1 + uvarint_len(key.len()) + key.len() + value_len.map_or(0, |v| uvarint_len(v) + v);
+        let bound = crate::memtable::arena_bound(len, 1);
+        let mut index = self.index.borrow_mut();
+        if !index.fits(bound) {
+            return Err(Error::InvalidArgument(format!(
+                "an entry of {len} bytes would make the batch too large to commit: its \
+                 records could take more than the {} one memtable holds",
+                crate::memtable::ARENA_LIMIT
+            )));
+        }
+        index.reserve(bound);
+        Ok(())
     }
 
     /// The stand-in number the next entry takes.
@@ -93,6 +124,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
 
     /// Adds a key and value.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.reserve(key, Some(value.len()))?;
         let seq = self.next_seq();
         self.repr.put(key, value)?;
         self.index
@@ -108,6 +140,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     where
         G: FnOnce(&mut [u8]),
     {
+        self.reserve(key, Some(value_len))?;
         let seq = self.next_seq();
         self.repr.put_with(key, value_len, fill)?;
         // The index needs the bytes `fill` wrote, and the value is the last
@@ -123,6 +156,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
 
     /// Deletes a key.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.reserve(key, None)?;
         let seq = self.next_seq();
         self.repr.delete(key)?;
         self.index
@@ -132,6 +166,7 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
 
     /// Deletes every key in `start..end`.
     pub fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<()> {
+        self.reserve(start, Some(end.len()))?;
         let seq = self.next_seq();
         self.repr.delete_range(start, end)?;
         self.index.borrow_mut().add_range(start, end, seq)
@@ -291,6 +326,12 @@ impl<'a, F: Fs> IndexedBatch<'a, F> {
     }
 }
 
+/// How many bytes `n` takes as a uvarint, as the repr writes its lengths:
+/// one for every seven bits, and one for zero.
+fn uvarint_len(n: usize) -> usize {
+    (usize::BITS - (n | 1).leading_zeros()).div_ceil(7) as usize
+}
+
 /// How much it holds, not the entries: a batch can be a whole replicated
 /// write, and its repr is what [`IndexedBatch::as_bytes`] is for.
 impl<F: Fs> std::fmt::Debug for IndexedBatch<'_, F> {
@@ -311,5 +352,70 @@ impl<F: Fs> Db<F> {
     /// [`Db::delete`] or [`Db::delete_range`].
     pub fn indexed_batch(&self) -> IndexedBatch<'_, F> {
         IndexedBatch::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::memtable::{ARENA_LIMIT, arena_bound};
+    use crate::sim::SimEnv;
+    use crate::{Comparison, Error, Options};
+
+    #[compio::test]
+    async fn a_batch_reserves_exactly_the_bound_its_commit_weighs() {
+        let env = SimEnv::new();
+        let db = crate::open_with(&env, "/db", Options::new().create_if_missing(true))
+            .await
+            .expect("create");
+        let mut batch = db.indexed_batch();
+        // Lengths either side of where a uvarint takes a second byte, and
+        // every kind of entry.
+        batch.put(b"a", &[b'v'; 127]).expect("put");
+        batch.put(&[b'k'; 128], &[b'v'; 128]).expect("put");
+        batch.delete(b"b").expect("delete");
+        batch.delete_range(b"c", b"d").expect("delete_range");
+        batch
+            .put_with(b"e", 300, |v| v.fill(b'v'))
+            .expect("put_with");
+        assert_eq!(
+            batch.index.borrow().reserved(),
+            arena_bound(batch.as_bytes().len(), batch.count())
+        );
+    }
+
+    #[compio::test]
+    async fn an_entry_that_would_make_the_batch_too_large_to_commit_changes_nothing() {
+        let env = SimEnv::new();
+        let db = crate::open_with(&env, "/db", Options::new().create_if_missing(true))
+            .await
+            .expect("create");
+        let mut batch = db.indexed_batch();
+        batch.put(b"a", b"1").expect("put");
+        // Standing in for gigabytes of entries before the next one.
+        batch.index.borrow_mut().reserve(ARENA_LIMIT);
+        let (bytes, count) = (batch.as_bytes().to_vec(), batch.count());
+
+        let mut filled = false;
+        for refused in [
+            batch.put(b"b", b"2"),
+            batch.delete(b"b"),
+            batch.delete_range(b"b", b"c"),
+            batch.put_with(b"b", 1, |_| filled = true),
+        ] {
+            let err = refused.expect_err("no room");
+            assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        }
+        assert!(!filled, "put_with should not have asked for the value");
+        assert_eq!(batch.as_bytes(), bytes.as_slice(), "the repr is as it was");
+        assert_eq!(batch.count(), count);
+        assert_eq!(batch.get(b"b", Comparison::Equal).await.expect("get"), None);
+        assert_eq!(
+            batch
+                .get(b"a", Comparison::Equal)
+                .await
+                .expect("get")
+                .map(|f| f.value),
+            Some(b"1".to_vec())
+        );
     }
 }
