@@ -45,9 +45,11 @@ type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// Polls two futures turn and turn about until both are done.
 ///
-/// The worst interleaving a single-threaded executor can produce, and the one
-/// a caller with two tasks on one store will eventually find. The simulated
-/// filesystem never blocks, so every `Pending` below comes from roble.
+/// An interleaving a caller with two tasks on one store will eventually
+/// find, and enough for the read below, which has looked at the store by the
+/// time it first gives the thread up. Not for a write, which gives it up
+/// before it lands (`land_during`). The simulated filesystem never blocks,
+/// so every `Pending` below comes from roble.
 fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
     // The waker does nothing: this loop polls again whatever it is told, so
     // nothing here depends on wake-ups being delivered.
@@ -74,6 +76,55 @@ fn interleave<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
         polls += 1;
         assert!(polls < 100_000, "one of these two is not making progress");
     }
+}
+
+/// Polls `op` until it suspends, then runs `landing` to its end while `op`
+/// stays suspended, then `op` to its end; and says whether `landing` ran
+/// wholly inside `op`.
+///
+/// What a write in the middle of a flush needs, and `interleave` does not
+/// give it. A write hands the thread over once while a flush or a merge is
+/// under way (`share_the_thread`), and polled turn and turn about, the flush
+/// takes that turn and runs to its end with the write not yet applied — so
+/// a write driven that way lands after the flush wherever the flush was
+/// paused. Here a yield of the landing's is passed by polling it again. Only
+/// a landing still not done after a hundred polls is waiting on the
+/// operation, and then the operation is polled once. The simulated
+/// filesystem never blocks, so every `Pending` comes from roble.
+fn land_during<A: Future, B: Future>(op: A, landing: B) -> (A::Output, B::Output, bool) {
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut op = pin!(op);
+    let mut landing = pin!(landing);
+    let mut done = match op.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    };
+    let mut polls = 0;
+    let landed = loop {
+        if let Poll::Ready(v) = landing.as_mut().poll(&mut cx) {
+            break v;
+        }
+        polls += 1;
+        assert!(polls < 100_000, "the landing is not making progress");
+        if polls % 100 == 0
+            && done.is_none()
+            && let Poll::Ready(v) = op.as_mut().poll(&mut cx)
+        {
+            done = Some(v);
+        }
+    };
+    let inside = done.is_none();
+    let done = match done {
+        Some(v) => v,
+        None => loop {
+            if let Poll::Ready(v) = op.as_mut().poll(&mut cx) {
+                break v;
+            }
+            polls += 1;
+            assert!(polls < 100_000, "the operation is not making progress");
+        },
+    };
+    (done, landed, inside)
 }
 
 async fn load(name: &str) -> (SimEnv, PathBuf) {
@@ -203,10 +254,13 @@ async fn a_write_in_the_middle_of_a_flush_is_not_lost() {
     // from memory and gone from the next open, having been acknowledged.
     for wal in [true, false] {
         let total = ops_of_a_flush(wal).await;
+        // The points at which the late write landed before the flush's edit.
+        let mut landed = 0;
 
         for n in 1..=total {
             let (env, dir) = load("db-twin-a").await;
             let (db, mut model) = ready(&env, &dir, wal).await;
+            let tables_before = db.versions().version.table_count();
             env.sim().pause_at(n);
 
             let late = async {
@@ -230,13 +284,23 @@ async fn a_write_in_the_middle_of_a_flush_is_not_lost() {
                     found.value, b"newer",
                     "a read in the middle of a flush answered with the stale value"
                 );
-                written
+
+                // Whether all of that came before the flush's edit. Asked of
+                // the version rather than of whether the flush had finished:
+                // paused after its edit, in the sweep that follows it, a
+                // flush has not finished and has no middle left for a write
+                // to land in.
+                let before_the_edit = db.versions().version.table_count() == tables_before;
+                (written, before_the_edit)
             };
-            let (flushed, late) = interleave(db.flush(), late);
+            let (flushed, (late, before_the_edit), _) = land_during(db.flush(), late);
             flushed
                 .unwrap_or_else(|e| panic!("wal={wal}: the flush, paused at {n}: {e}"))
                 .expect("a table");
             model.extend(late);
+            if before_the_edit {
+                landed += 1;
+            }
 
             assert_eq!(
                 contents(&db).await,
@@ -271,6 +335,19 @@ async fn a_write_in_the_middle_of_a_flush_is_not_lost() {
                 );
             }
         }
+
+        // The guard that keeps the sweep from passing for the wrong reason:
+        // a write that lands only once the flush has recorded its table
+        // passes everything above without the freeze having anything to do
+        // with it. Not every point can hold one. With the log on, a flush
+        // holds writes off from the sync of the log it moves past to the
+        // freeze, and a write that waited there lands after the flush; and
+        // past the edit there is no middle left.
+        assert!(
+            landed > 2,
+            "wal={wal}: the late write landed before the flush's edit at {landed} of \
+             {total} points, so this sweep was testing a write after a flush"
+        );
     }
 }
 
