@@ -1015,13 +1015,16 @@ async fn replay_logs<F: Fs>(
             .map_err(shrunk(read_only, &path))?;
         let mut reader = RecordReader::new(&bytes, *log_num as u32);
 
+        // Where the last record that reads ends, which is where a store
+        // carrying on in this log writes next. Not where the reader ended
+        // the log: to get there it may have stepped over what lies past that
+        // record as a block's padding, zeros or bytes too few for a header,
+        // and a record written after those would sit where no reader looks
+        // for one.
         let mut good = 0usize;
         loop {
             match reader.next() {
-                None => {
-                    good = reader.offset();
-                    break;
-                }
+                None => break,
                 Some(Ok(record)) => {
                     // A batch's own header says what sequence number it was
                     // committed at; replay must use it rather than inventing

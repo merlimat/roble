@@ -1106,10 +1106,10 @@ async fn a_reopen_after_an_interrupted_flush_never_writes_over_a_log_it_replayed
     );
 }
 
-/// A store that wrote `a` and closed, with bytes of an earlier life left past
-/// the log's last record — what a log Pebble recycled holds after its
-/// records, or a record torn by a kill. Returns the log's number.
-async fn with_a_stale_tail(env: &SimEnv, dir: &Path) -> u64 {
+/// A store that wrote `a` and closed, with `stale` left past the log's last
+/// record — what a log Pebble recycled holds after its records, or a record
+/// torn by a kill. Returns the log's number.
+async fn with_a_stale_tail(env: &SimEnv, dir: &Path, stale: &[u8]) -> u64 {
     let db = roble::open_with(env, dir, flush_options())
         .await
         .expect("create");
@@ -1126,14 +1126,151 @@ async fn with_a_stale_tail(env: &SimEnv, dir: &Path) -> u64 {
         .await
         .expect("open the log");
     let end = disk.len().await.expect("len");
-    // Letters, as the middle of an old value is: no header a reader could
-    // mistake for a record, only bytes a reader has to stop at.
-    let stale: Vec<u8> = (0..300u32).map(|i| b'a' + (i * 7 % 26) as u8).collect();
-    let (result, _) = disk.write(WriteBuf::new(stale), end, ()).await;
+    let (result, _) = disk.write(WriteBuf::new(stale.to_vec()), end, ()).await;
     result.expect("write the stale tail");
     disk.sync(()).await.expect("sync");
     disk.close().await.expect("close");
     log
+}
+
+/// The stale tails a reopen may find past a log's last record:
+///
+/// - Letters, as the middle of an old value is: no header a reader could
+///   mistake for a record, only bytes it has to stop at.
+/// - Fewer bytes than any header, letters or zeros, ending the file: too
+///   few for a reader to take for a chunk at all.
+/// - Seven to eighteen zeros ending the file, which a reader takes for a
+///   block's padding.
+fn stale_tails() -> Vec<Vec<u8>> {
+    let letters = |n: u32| -> Vec<u8> { (0..n).map(|i| b'a' + (i * 7 % 26) as u8).collect() };
+    vec![
+        letters(300),
+        letters(1),
+        letters(4),
+        letters(6),
+        vec![0; 4],
+        vec![0; 7],
+        vec![0; 12],
+        vec![0; 18],
+    ]
+}
+
+/// A write made after a reopen over a stale log tail is still there at the
+/// next open.
+///
+/// The reopen carries on in the log where its records end, cut there first.
+/// A tail too short for a header, or zeros a reader steps over as padding,
+/// reads as the log's end, which once moved the place the reopen carried on
+/// from to past the tail: nothing was cut, the next record went after the
+/// tail, and no reader gets past the tail to it.
+#[compio::test]
+async fn a_write_after_a_reopen_over_a_stale_log_tail_is_there_at_the_next_open() {
+    for stale in stale_tails() {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        with_a_stale_tail(&env, &dir, &stale).await;
+        let db = roble::open_with(&env, &dir, flush_options())
+            .await
+            .expect("the reopen over the stale tail");
+        db.put(b"b", b"written").await.expect("put b");
+        drop(db);
+        env.sim().crash();
+
+        let db = roble::open(&env, &dir).await.expect("reopen");
+        let found = contents(&db).await;
+        let keys: Vec<&[u8]> = found.keys().map(Vec::as_slice).collect();
+        assert_eq!(
+            keys,
+            [b"a".as_slice(), b"b"],
+            "a stale tail of {} bytes, from {:02x?}",
+            stale.len(),
+            &stale[..stale.len().min(8)]
+        );
+    }
+}
+
+/// A log whose last record ends closer to a block's end than a header's
+/// length, which its writer pads with zeros to the block's end, is carried
+/// on in after a reopen, whether the padding is there in full, in part or
+/// not at all, and whether a block of an earlier life follows it.
+///
+/// The reopen carries on where the record ends, and a record framed from
+/// there has to go to the next block, behind the padding, since no chunk
+/// starts where its header does not fit.
+#[compio::test]
+async fn a_reopen_carries_on_in_a_log_whose_last_record_ends_near_a_block_boundary() {
+    use roble_format::record::{BLOCK_SIZE, RECYCLABLE_HEADER_LEN, RecordWriter};
+    let block = BLOCK_SIZE as u64;
+    // A put whose record ends five bytes short of the first block's end:
+    // the chunk's header, and the batch's twelve bytes of header, one of
+    // kind, one of key length, the key, and three of value length.
+    let value = vec![b'v'; BLOCK_SIZE - 5 - RECYCLABLE_HEADER_LEN - 18];
+
+    for (case, keep, stale_block) in [
+        ("without its padding", block - 5, false),
+        ("with two of its five bytes of padding", block - 3, false),
+        ("with its padding", block, false),
+        (
+            "with its padding and a block of an earlier life",
+            block,
+            true,
+        ),
+    ] {
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        let db = roble::open_with(&env, &dir, flush_options())
+            .await
+            .expect("create");
+        db.put(b"a", &value).await.expect("put a");
+        let log = db
+            .current_log()
+            .expect("a store with a WAL writes to a log");
+        db.close().await.expect("close");
+
+        let path = dir.join(roble_format::files::log_filename(log));
+        let disk = env
+            .sim()
+            .open(&path, roble::Access::ReadWrite)
+            .await
+            .expect("open the log");
+        assert_eq!(
+            disk.len().await.expect("len"),
+            block,
+            "the record and its padding fill the first block"
+        );
+        disk.set_len(keep).await.expect("cut the log");
+        if stale_block {
+            let mut earlier = RecordWriter::recyclable((log as u32).wrapping_sub(1));
+            earlier
+                .write_record(b"a record of the file's earlier life")
+                .expect("frame");
+            let (result, _) = disk.write(WriteBuf::new(earlier.finish()), keep, ()).await;
+            result.expect("write the earlier life");
+        }
+        disk.sync(()).await.expect("sync");
+        disk.close().await.expect("close");
+
+        let db = roble::open_with(&env, &dir, flush_options())
+            .await
+            .unwrap_or_else(|e| panic!("{case}: the reopen: {e}"));
+        db.put(b"b", b"written").await.expect("put b");
+        drop(db);
+        env.sim().crash();
+
+        let db = roble::open(&env, &dir)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: the open after it: {e}"));
+        let found: Vec<(Vec<u8>, usize)> = contents(&db)
+            .await
+            .into_iter()
+            .map(|(k, v)| (k, v.len()))
+            .collect();
+        assert_eq!(
+            found,
+            [(b"a".to_vec(), value.len()), (b"b".to_vec(), 7)],
+            "the record {case}"
+        );
+    }
 }
 
 /// A log the store carries on writing to after a reopen ends where its
@@ -1149,55 +1286,64 @@ async fn with_a_stale_tail(env: &SimEnv, dir: &Path) -> u64 {
 /// Pebble had recycled.
 #[compio::test]
 async fn a_flush_interrupted_after_a_reopen_over_a_stale_log_tail_leaves_a_database_that_opens() {
-    let total = {
-        let env = SimEnv::new();
-        let dir = PathBuf::from("/db");
-        with_a_stale_tail(&env, &dir).await;
-        let db = roble::open_with(&env, &dir, flush_options())
-            .await
-            .expect("reopen");
-        db.put(b"b", b"written").await.expect("put b");
-        let before = env.sim().ops();
-        db.flush().await.expect("flush");
-        env.sim().ops() - before
-    };
+    for tail in stale_tails() {
+        let total = {
+            let env = SimEnv::new();
+            let dir = PathBuf::from("/db");
+            with_a_stale_tail(&env, &dir, &tail).await;
+            let db = roble::open_with(&env, &dir, flush_options())
+                .await
+                .expect("reopen");
+            db.put(b"b", b"written").await.expect("put b");
+            let before = env.sim().ops();
+            db.flush().await.expect("flush");
+            env.sim().ops() - before
+        };
 
-    let mut behind = 0u64;
-    for n in 1..=total {
-        let env = SimEnv::new();
-        let dir = PathBuf::from("/db");
-        let stale = with_a_stale_tail(&env, &dir).await;
-        let db = roble::open_with(&env, &dir, flush_options())
-            .await
-            .expect("the reopen over the stale tail");
-        db.put(b"b", b"written").await.expect("put b");
-        env.sim().fail_at(n);
-        let _ = db.flush().await;
-        env.sim().stop_failing();
-        // The state the trap needs: the resumed log, no longer the newest.
-        if db.current_log().is_some_and(|current| current > stale)
-            && db.versions().min_unflushed_log_num <= stale
-        {
-            behind += 1;
+        let mut behind = 0u64;
+        for n in 1..=total {
+            let env = SimEnv::new();
+            let dir = PathBuf::from("/db");
+            let stale = with_a_stale_tail(&env, &dir, &tail).await;
+            let db = roble::open_with(&env, &dir, flush_options())
+                .await
+                .expect("the reopen over the stale tail");
+            db.put(b"b", b"written").await.expect("put b");
+            env.sim().fail_at(n);
+            let _ = db.flush().await;
+            env.sim().stop_failing();
+            // The state the trap needs: the resumed log, no longer the newest.
+            if db.current_log().is_some_and(|current| current > stale)
+                && db.versions().min_unflushed_log_num <= stale
+            {
+                behind += 1;
+            }
+            drop(db);
+            env.sim().crash();
+
+            let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
+                panic!(
+                    "a stale tail of {} bytes, the flush failed at operation {n} of {total}: \
+                     the reopen: {e}",
+                    tail.len()
+                )
+            });
+            let found = contents(&db).await;
+            let keys: Vec<&[u8]> = found.keys().map(Vec::as_slice).collect();
+            assert_eq!(
+                keys,
+                [b"a".as_slice(), b"b"],
+                "a stale tail of {} bytes, the flush failed at operation {n} of {total}",
+                tail.len()
+            );
         }
-        drop(db);
-        env.sim().crash();
-
-        let db = roble::open(&env, &dir).await.unwrap_or_else(|e| {
-            panic!("the flush failed at operation {n} of {total}: the reopen: {e}")
-        });
-        let found = contents(&db).await;
-        let keys: Vec<&[u8]> = found.keys().map(Vec::as_slice).collect();
-        assert_eq!(
-            keys,
-            [b"a".as_slice(), b"b"],
-            "the flush failed at operation {n} of {total}"
+        assert!(
+            behind > 0,
+            "a stale tail of {} bytes: no failure left the resumed log behind a newer one, \
+             so nothing here tested it",
+            tail.len()
         );
     }
-    assert!(
-        behind > 0,
-        "no failure left the resumed log behind a newer one, so nothing here tested it"
-    );
 }
 
 /// A store that writes without syncing, and flushes only when asked.

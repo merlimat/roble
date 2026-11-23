@@ -531,6 +531,35 @@ async fn a_torn_manifest_is_stale_to_a_reader_and_an_unfinished_edit_to_the_writ
     );
 }
 
+/// The same when fewer bytes of the edit have arrived than a chunk header
+/// takes, ending the MANIFEST's last block: no writer stops there, and
+/// Pebble's reader takes them for a chunk that does not read, so to a reader
+/// they are an edit still arriving and to the writer one a crash cut short.
+#[compio::test]
+async fn a_manifest_torn_inside_a_chunk_header_is_stale_to_a_reader() {
+    let sim_env = SimEnv::new();
+    let db = writer(&sim_env).await;
+    put(&db, b"a", b"1").await;
+    drop(db);
+    let manifest = named(sim_env.sim(), FileType::Manifest).await.remove(0);
+    let disk = sim_env
+        .sim()
+        .open(&manifest, Access::ReadWrite)
+        .await
+        .expect("open");
+    let at = disk.len().await.expect("len");
+    let torn = vec![0xde, 0xad, 0xbe, 0xef];
+    let (result, _) = disk.write(WriteBuf::new(torn), at, ()).await;
+    result.expect("write");
+
+    let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+    assert!(matches!(reader(&env).await, Err(Error::Stale(_))));
+    let db = reopen(&sim_env)
+        .await
+        .expect("the writer opens to the edits before it");
+    assert_eq!(get(&db, b"a").await.expect("get"), Some(b"1".to_vec()));
+}
+
 /// A reader does not check the version's tables against its listing, which a
 /// flush between the two would fail; a table that has really gone is stale
 /// when a read reaches it, and only then.

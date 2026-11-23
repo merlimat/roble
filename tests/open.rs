@@ -348,6 +348,149 @@ fn table(level: u32, file_num: u64, smallest: &[u8], largest: &[u8], seq: u64) -
     }
 }
 
+/// A batch putting `key`, numbered `seq`, as a log record holds it.
+fn put_record(key: &[u8], seq: u64) -> Vec<u8> {
+    let mut batch = roble_format::batch::Batch::new();
+    batch.put(key, b"written").expect("put");
+    batch.set_seq_num(seq);
+    batch.as_bytes().to_vec()
+}
+
+/// `records` framed as chunks stamped with the low 32 bits of `stamp`, as
+/// the writer of log `stamp` stamps them.
+fn framed(stamp: u64, records: &[&[u8]]) -> Vec<u8> {
+    let mut writer = RecordWriter::recyclable(stamp as u32);
+    for r in records {
+        writer.write_record(r).expect("frame a record");
+    }
+    writer.finish()
+}
+
+/// The keys a store reads back, in order.
+async fn keys(db: &roble::Db<SimFs>) -> Vec<Vec<u8>> {
+    let mut scan = db.range(..).expect("scan");
+    scan.first().await.expect("first");
+    let mut out = Vec::new();
+    while scan.is_valid() {
+        out.push(scan.key().to_vec());
+        scan.next().await.expect("next");
+    }
+    out
+}
+
+/// A log numbered past `u32::MAX`, whose chunks carry the low 32 bits of
+/// its number, as Pebble's do (`TestRecycleLogNumberOverflow`). Its record
+/// is replayed and the store carries on in it, then in the log a flush moves
+/// it to, past `u32::MAX` too.
+///
+/// Two ways the log can end. Closed: its trailer carries the low 32 bits of
+/// the number plus one, which wrap to zero since they are all ones, and
+/// stale bytes of a longer earlier life follow. Or never closed, with a
+/// record of the file's earlier life after its own, under another number:
+/// not replayed.
+#[compio::test]
+async fn a_log_numbered_past_u32_max_is_replayed_and_carried_on_in() {
+    let log = 0x1_FFFF_FFFF;
+    let mut closed = RecordWriter::recyclable(log as u32);
+    closed
+        .write_record(&put_record(b"a", 21))
+        .expect("frame a record");
+    closed.write_eof_trailer().expect("the trailer");
+    let closed = [closed.finish(), b"zzzz".to_vec()].concat();
+    assert_eq!(closed[closed.len() - 8..closed.len() - 4], [0; 4]);
+    let unclosed = [
+        framed(log, &[&put_record(b"a", 21)]),
+        framed(log - 1, &[&put_record(b"stale", 22)]),
+    ]
+    .concat();
+
+    for (case, bytes) in [("closed", closed), ("never closed", unclosed)] {
+        let (env, dir) = Synth {
+            extra: vec![(roble_format::files::log_filename(log), bytes)],
+            ..Default::default()
+        }
+        .build()
+        .await;
+
+        let db = roble::open(&env, &dir).await.expect("open");
+        assert_eq!(db.current_log(), Some(log), "{case}");
+        db.put(b"b", b"written").await.expect("put b");
+        db.close().await.expect("close");
+
+        let db = roble::open(&env, &dir).await.expect("reopen");
+        assert_eq!(keys(&db).await, [b"a".to_vec(), b"b".to_vec()], "{case}");
+        db.flush().await.expect("flush");
+        assert!(
+            db.current_log().is_some_and(|next| next > log),
+            "{case}: the flush moves the store to a newer log"
+        );
+        db.put(b"c", b"written").await.expect("put c");
+        db.close().await.expect("close");
+
+        let db = roble::open(&env, &dir)
+            .await
+            .expect("reopen after the flush");
+        assert_eq!(
+            keys(&db).await,
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "{case}"
+        );
+    }
+}
+
+/// A log with a later one after it has to end cleanly, as Pebble's replay
+/// has every log but the newest end (`strictWALTail`): a later log exists
+/// only if the writer finished this one. Two ends Pebble's reader takes for
+/// a chunk that does not read, and so refuses, and roble's took for the
+/// log's end:
+///
+/// - A chunk under another log's number that is not the trailer's, here a
+///   record whose number was damaged. Taken for the end, it hid the records
+///   after it, while the later log's were replayed.
+/// - Fewer bytes than a header, ending the log's last block, which the file
+///   does not fill.
+#[compio::test]
+async fn an_earlier_log_that_does_not_end_cleanly_is_refused() {
+    let damaged = [
+        framed(11, &[&put_record(b"a", 21)]),
+        framed(4, &[&put_record(b"b", 22)]),
+        framed(11, &[&put_record(b"c", 23)]),
+    ]
+    .concat();
+    let short = [framed(11, &[&put_record(b"a", 21)]), b"zzzz".to_vec()].concat();
+
+    for (case, earlier) in [
+        ("a damaged log number", damaged),
+        ("a four-byte tail", short),
+    ] {
+        let (env, dir) = Synth {
+            extra: vec![
+                (roble_format::files::log_filename(11), earlier),
+                (
+                    roble_format::files::log_filename(12),
+                    framed(12, &[&put_record(b"d", 24)]),
+                ),
+            ],
+            ..Default::default()
+        }
+        .build()
+        .await;
+
+        match roble::open(&env, &dir).await {
+            Ok(db) => panic!(
+                "{case}: opened, reading {:?}",
+                keys(&db)
+                    .await
+                    .iter()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect::<Vec<_>>()
+            ),
+            Err(Error::Corrupt(m)) => assert!(m.contains("000011.log"), "{case}: {m}"),
+            Err(e) => panic!("{case}: {e}"),
+        }
+    }
+}
+
 #[compio::test]
 async fn a_format_version_above_the_pin_is_refused_before_anything_is_read() {
     let (env, dir) = Synth {
