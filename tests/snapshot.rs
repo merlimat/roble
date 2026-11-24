@@ -712,3 +712,79 @@ async fn a_snapshot_taken_while_a_flush_or_a_merge_is_suspended_keeps_the_deleti
         }
     }
 }
+
+#[compio::test]
+async fn a_scan_made_from_a_snapshot_reads_on_once_the_snapshot_is_gone() {
+    // RocksDB's `ReleaseSnapshotAfterIteratorCreation`: two L1 tables, each
+    // a range deletion over keys in L2, a scan made from a snapshot, and the
+    // snapshot dropped before the scan has read anything. The scan holds the
+    // version it was made on, not the snapshot, so a compaction that retires
+    // every table of that version, and the sweep after it, leave them on disk
+    // for it, and it reads what the snapshot saw.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("create");
+    let level = |db: &roble::Db<SimFs>, level: u32| -> Vec<u64> {
+        let versions = db.versions();
+        versions
+            .version
+            .level(level)
+            .iter()
+            .map(|t| t.file_num)
+            .collect()
+    };
+
+    write(&db, |b| {
+        for i in 0..10 {
+            b.put(format!("k{i}").as_bytes(), b"old").expect("put");
+        }
+    })
+    .await;
+    let flushed = db.flush().await.expect("flush").expect("a table");
+    let in_l1 = db.compact(0, &[flushed]).await.expect("compact");
+    db.compact(1, &in_l1).await.expect("compact");
+    for (from, to) in [("k2", "k4"), ("k6", "k8")] {
+        write(&db, |b| {
+            b.delete_range(from.as_bytes(), to.as_bytes())
+                .expect("delete_range")
+        })
+        .await;
+        let flushed = db.flush().await.expect("flush").expect("a table");
+        db.compact(0, &[flushed]).await.expect("compact");
+    }
+    assert_eq!(level(&db, 1).len(), 2, "a table for each range deletion");
+    assert_eq!(level(&db, 2).len(), 1);
+    let seen = contents(&db).await;
+    assert_eq!(seen.len(), 6, "four of the ten keys deleted: {seen:?}");
+
+    let snap = db.snapshot().expect("snapshot");
+    let mut scan = snap.range(..).expect("scan");
+    drop(snap);
+
+    // Every key written again, and everything merged down into L2.
+    write(&db, |b| {
+        for i in 0..10 {
+            b.put(format!("k{i}").as_bytes(), b"new").expect("put");
+        }
+    })
+    .await;
+    let flushed = db.flush().await.expect("flush").expect("a table");
+    let in_l1 = db.compact(0, &[flushed]).await.expect("compact");
+    db.compact(1, &in_l1).await.expect("compact");
+    assert!(level(&db, 1).is_empty(), "L1 merged into L2");
+    db.remove_obsolete_files().await.expect("sweep");
+
+    assert_eq!(
+        walk(&mut scan).await,
+        seen,
+        "the scan should read what the snapshot saw, after the snapshot went"
+    );
+}
