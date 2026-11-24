@@ -104,9 +104,9 @@ impl<F: Fs> Db<F> {
         // Synced, which the obsolete sweep does not bother with. An obsolete
         // file that comes back after a crash is collected by the next sweep;
         // a *database* that comes back is a shard the node was told to forget,
-        // holding data it would then open and serve. The simulated filesystem
-        // forgets a removed name outright, so no test can tell this line from
-        // its absence — stated rather than tested (§12).
+        // holding data it would then open and serve. `tests/destroy.rs`
+        // crashes after a destroy, and the simulated filesystem brings back
+        // a name removed since its directory was last synced, as a crash does.
         self.fs().sync_dir(&self.store.dir).await?;
         Ok(removed)
     }

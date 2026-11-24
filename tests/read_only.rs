@@ -624,3 +624,81 @@ async fn a_reader_closing_leaves_every_table_the_writer_made() {
     let db = reopen(&sim_env).await.expect("reopen the writer");
     assert_eq!(get(&db, b"b").await.expect("get"), Some(b"2".to_vec()));
 }
+
+#[compio::test]
+async fn a_reader_replays_logs_numbered_below_the_manifests_last_sequence_number() {
+    // Pebble's `TestOpenWALReplayReadOnlySeqNums`, after
+    // cockroachdb/cockroach#48660: a store with more than one unflushed log,
+    // whose MANIFEST records a last sequence number above everything the logs
+    // hold, because a compaction wrote it there after their writes. A reader
+    // has to replay them all and read every key. Here a flush that fails
+    // after freezing its memtable leaves the two logs, the one it froze and
+    // the one it moved to, and the compaction is of the two tables flushed
+    // before it.
+    async fn set_up(sim_env: &SimEnv) -> roble::Db<ReaderFs> {
+        let db = writer(sim_env).await;
+        for value in [b"1", b"2"] {
+            put(&db, b"a", value).await;
+            db.flush().await.expect("flush");
+        }
+        put(&db, b"b", b"3").await;
+        db
+    }
+    let total = {
+        let sim_env = SimEnv::new();
+        let db = set_up(&sim_env).await;
+        let before = sim_env.sim().ops();
+        db.flush().await.expect("flush");
+        sim_env.sim().ops() - before
+    };
+
+    let mut replayed = 0;
+    for n in 1..=total {
+        let sim_env = SimEnv::new();
+        let db = set_up(&sim_env).await;
+        sim_env.sim().fail_at(n);
+        let failed = db.flush().await.is_err();
+        sim_env.sim().stop_failing();
+        if !failed || named(sim_env.sim(), FileType::Log).await.len() != 2 {
+            continue;
+        }
+        put(&db, b"c", b"4").await;
+        put(&db, b"e", b"5").await;
+        let l0: Vec<u64> = db
+            .versions()
+            .version
+            .level(0)
+            .iter()
+            .map(|t| t.file_num)
+            .collect();
+        // What the second flush recorded: the last of `a`'s writes.
+        let recorded = db.versions().last_seq_num;
+        if db.compact(0, &l0).await.is_err() {
+            // A failure the store stops recording after (`crate::flush`).
+            continue;
+        }
+        assert_eq!(
+            db.versions().last_seq_num,
+            recorded + 3,
+            "a flush failing at {n} of {total}: the compaction should record the number of \
+             `e`, past `b`'s in the frozen log and `c`'s beside it"
+        );
+
+        let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+        let ro = reader(&env)
+            .await
+            .unwrap_or_else(|e| panic!("a flush failing at {n} of {total}: the reader: {e}"));
+        for (key, value) in [(b"a", b"2"), (b"b", b"3"), (b"c", b"4"), (b"e", b"5")] {
+            assert_eq!(
+                get(&ro, key).await.expect("get"),
+                Some(value.to_vec()),
+                "a flush failing at {n} of {total}: the reader's {key:?}"
+            );
+        }
+        replayed += 1;
+    }
+    assert!(
+        replayed > 0,
+        "no failed flush left two logs for a reader to replay, so nothing was tested"
+    );
+}

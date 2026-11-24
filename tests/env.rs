@@ -388,6 +388,57 @@ async fn a_crash_loses_what_was_never_synced() {
     );
 }
 
+/// A removal is a change to its directory as well, so a crash undoes one no
+/// directory sync covered, as it does a new name.
+#[compio::test]
+async fn a_crash_brings_back_a_name_removed_since_its_directory_was_synced() {
+    let fs = SimFs::new();
+    let dir = PathBuf::from("/db");
+    fs.mkdir_all(&dir).await.expect("mkdir");
+    let gone = dir.join("gone.sst");
+    let back = dir.join("back.sst");
+    let renamed = dir.join("marker.new");
+    let replaced = dir.join("marker");
+    for (path, bytes) in [
+        (&gone, b"g"),
+        (&back, b"b"),
+        (&renamed, b"n"),
+        (&replaced, b"o"),
+    ] {
+        write_file(&fs, path, bytes).await;
+    }
+    fs.sync_dir(&dir).await.expect("sync dir");
+
+    // Removed, and the directory synced after: gone for good.
+    fs.remove(&gone).await.expect("remove");
+    fs.sync_dir(&dir).await.expect("sync dir");
+    // Removed, and renamed over another, with no sync after either.
+    fs.remove(&back).await.expect("remove");
+    fs.rename(&renamed, &replaced).await.expect("rename");
+
+    fs.crash();
+
+    assert!(
+        fs.durable(&gone).is_none(),
+        "a removal a directory sync covered should last"
+    );
+    assert_eq!(
+        fs.durable(&back).as_deref(),
+        Some(&b"b"[..]),
+        "a removal no sync covered should be undone"
+    );
+    assert_eq!(
+        fs.durable(&renamed).as_deref(),
+        Some(&b"n"[..]),
+        "an unsynced rename should be undone, the old name back"
+    );
+    assert_eq!(
+        fs.durable(&replaced).as_deref(),
+        Some(&b"o"[..]),
+        "and the file it replaced with it"
+    );
+}
+
 /// The failure injection §12 relies on: every operation of a scenario, failed
 /// one at a time, and never a panic.
 #[compio::test]

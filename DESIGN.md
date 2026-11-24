@@ -2180,7 +2180,9 @@ in both directions.
 - **Failure paths.** All I/O goes through `Fs` and `Disk`, so the simulated
   implementations fail or crash at any single operation, as encina's do: each
   scenario runs once to count its operations, then once per operation with an
-  error injected there, once with a crash, and once with buffers withheld. After
+  error injected there, once with a crash, and once with buffers withheld. A
+  crash loses what no sync covered: written bytes, new names and removals alike,
+  so a file removed since its directory was last synced comes back. After
   a crash, reopening must yield the state as of the last synced write — or as of
   the last `flush()` with `Wal::Off`, which is Oxia's configuration and so
   gets its own pass of every scenario. A half-written table, a torn log record or

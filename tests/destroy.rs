@@ -199,3 +199,26 @@ async fn destroy_leaves_a_subdirectory_alone() {
         "everything else should be gone, and the directory itself should stay"
     );
 }
+
+#[compio::test]
+async fn a_destroyed_database_stays_gone_after_a_crash() {
+    // A removal lasts once its directory is synced after it, and a crash
+    // before that brings the names back. An obsolete file that comes back is
+    // swept again, but a database that comes back is a shard the node was
+    // told to forget, holding data it would open and serve. So a destroy
+    // syncs the directory once its files are gone, and a crash after it finds
+    // nothing there.
+    let (env, dir) = load("db-reads").await;
+    let db = roble::open(&env, &dir).await.expect("open");
+    db.destroy().await.expect("destroy");
+    env.sim().crash();
+
+    assert!(
+        listing(env.sim(), &dir).await.is_empty(),
+        "a crash brought back files of the destroyed database: {:?}",
+        listing(env.sim(), &dir).await
+    );
+    roble::open(&env, &dir)
+        .await
+        .expect_err("a destroyed directory is not a database, after a crash either");
+}
