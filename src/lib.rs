@@ -95,6 +95,7 @@ mod batch;
 mod buf;
 mod cache;
 mod change;
+mod check;
 mod checkpoint;
 mod compact;
 mod create;

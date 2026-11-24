@@ -268,9 +268,15 @@ fn entries(model: &Model) -> Vec<(Vec<u8>, Vec<u8>)> {
     model.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
+/// The store against the model, and its levels in the order compactions and
+/// scans rely on (`Db::check_levels`), which a fault can break before any
+/// read goes wrong.
 async fn verify<F: Fs>(db: &Db<F>, model: &Model, what: &str) {
     let scan = db.range(..).expect("scan");
     assert_eq!(whole(scan).await, entries(model), "{what}");
+    db.check_levels()
+        .await
+        .unwrap_or_else(|e| panic!("the levels are out of order: {e}"));
 }
 
 fn bounds(lower: &Option<Probe>, upper: &Option<Probe>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {

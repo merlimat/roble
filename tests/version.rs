@@ -33,14 +33,24 @@
 //! a level out of order hides keys even though none of its tables overlap.
 //! Where one user key is a prefix of another, that order is not the order of
 //! the bytes the bounds are encoded in.
+//!
+//! Across levels the rule is that what lies above is newer, which
+//! `Db::check_levels` checks. It is judged against the cases of Pebble's own
+//! check, the states two of roble's bugs left, the databases Pebble wrote,
+//! and a store's own flushes and compactions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Options, VersionSet};
+use roble::{Comparison, Disk, Fs, Options, VersionSet, WriteBuf};
+use roble_format::InternalKey;
 use roble_format::batch::Batch;
+use roble_format::files::{MARKER_FORMAT_VERSION, MARKER_MANIFEST, marker_filename};
 use roble_format::key::{self, Kind, SEQ_NUM_MAX};
 use roble_format::manifest::{NewTable, VersionEdit};
+use roble_format::rangedel::{self, Tombstone};
+use roble_format::record::RecordWriter;
+use roble_format::sst::{TableWriter, WriterOptions};
 
 const BYTEWISE: &str = "leveldb.BytewiseComparator";
 
@@ -502,7 +512,8 @@ fn cases(text: &str) -> Vec<Case> {
     out
 }
 
-/// An internal key as Pebble's `ParseInternalKey` writes it: `user.KIND.seq`.
+/// An internal key as Pebble's `ParseInternalKey` writes it: `user.KIND.seq`,
+/// with `inf` for the largest sequence number.
 fn pebble_key(s: &str) -> (Vec<u8>, Kind, u64) {
     let mut parts = s.rsplitn(3, '.');
     let seq = parts.next().expect("a sequence number");
@@ -514,11 +525,12 @@ fn pebble_key(s: &str) -> (Vec<u8>, Kind, u64) {
         "RANGEDEL" => Kind::RangeDelete,
         other => panic!("a kind this test does not know: {other}"),
     };
-    (
-        user.as_bytes().to_vec(),
-        kind,
-        seq.parse().expect("a sequence number"),
-    )
+    let seq = if seq == "inf" {
+        SEQ_NUM_MAX
+    } else {
+        seq.parse().expect("a sequence number")
+    };
+    (user.as_bytes().to_vec(), kind, seq)
 }
 
 /// A table as Pebble's L0 sublevel test reads one, `000009:a.SET.10-b.SET.10`
@@ -634,4 +646,454 @@ async fn roble_counts_the_sublevels_pebble_counts() {
     }
     // Every case but the skipped ones, so a parser that lost some fails here.
     assert_eq!(judged, 37, "the cases of {}", path.display());
+}
+
+/// A file in the simulated filesystem, written and synced.
+async fn put_file(fs: &SimFs, path: &Path, bytes: Vec<u8>) {
+    let disk = fs.create(path).await.expect("create");
+    let (result, _) = disk.write(WriteBuf::new(bytes), 0, ()).await;
+    result.expect("write");
+    disk.sync(()).await.expect("sync");
+    disk.close().await.expect("close");
+}
+
+/// One entry of a store laid out by hand: a point key, `user.KIND.seq:value`,
+/// or a range deletion, `Span:start-end:{(#seq,RANGEDEL)}`.
+enum Laid {
+    Point(Vec<u8>, Kind, u64, Vec<u8>),
+    Span(Tombstone),
+}
+
+fn laid(token: &str) -> Laid {
+    if let Some(span) = token.strip_prefix("Span:") {
+        let (range, keys) = span.split_once(':').expect("start-end:keys");
+        let (start, end) = range.split_once('-').expect("start-end");
+        let seq = keys
+            .strip_prefix("{(#")
+            .and_then(|s| s.strip_suffix(",RANGEDEL)}"))
+            .unwrap_or_else(|| panic!("one range deletion, not {keys}"));
+        return Laid::Span(Tombstone {
+            start: start.as_bytes().to_vec(),
+            end: end.as_bytes().to_vec(),
+            seq_num: seq.parse().expect("a sequence number"),
+        });
+    }
+    let (k, value) = token.split_once(':').expect("key:value");
+    let (user, kind, seq) = pebble_key(k);
+    Laid::Point(user, kind, seq, value.as_bytes().to_vec())
+}
+
+/// The store `input` lays out, as Pebble's `testdata/level_checker` lays one
+/// out: `L` starts the next level, from L1, and each table is two lines, its
+/// bounds as written and then its entries in order. roble's own cases add
+/// `L<n>`, a level by number, and `mem`, entries a log holds for the open to
+/// replay, each in a batch of its own at its own sequence number.
+async fn lay_out(input: &[String]) -> (SimEnv, PathBuf) {
+    const LOG: u64 = 2;
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let fs: &SimFs = env.sim();
+    fs.mkdir_all(&dir).await.expect("mkdir");
+
+    let mut log = RecordWriter::recyclable(LOG as u32);
+    let mut tables = Vec::new();
+    let mut next = LOG + 1;
+    let mut last_seq = 0;
+    // `None` while the lines are a memtable's.
+    let mut level: Option<u32> = None;
+    let mut lines = input.iter().map(|l| l.trim());
+    while let Some(line) = lines.next() {
+        if line == "mem" {
+            level = None;
+            continue;
+        }
+        if let Some(n) = line.strip_prefix('L')
+            && (n.is_empty() || n.parse::<u32>().is_ok())
+        {
+            level = Some(n.parse().unwrap_or_else(|_| level.map_or(1, |l| l + 1)));
+            continue;
+        }
+        let Some(level) = level else {
+            for token in line.split_whitespace() {
+                let mut batch = Batch::new();
+                let seq = match laid(token) {
+                    Laid::Point(user, Kind::Set, seq, value) => {
+                        batch.put(&user, &value).expect("put");
+                        seq
+                    }
+                    Laid::Span(t) => {
+                        batch.delete_range(&t.start, &t.end).expect("delete_range");
+                        t.seq_num
+                    }
+                    Laid::Point(_, kind, ..) => panic!("{kind:?} in a memtable"),
+                };
+                batch.set_seq_num(seq);
+                log.write_record(batch.as_bytes()).expect("frame");
+                last_seq = last_seq.max(seq);
+            }
+            continue;
+        };
+
+        let mut bounds = line.split_whitespace().map(pebble_key);
+        let (lo, lo_kind, lo_seq) = bounds.next().expect("the smallest bound");
+        let (hi, hi_kind, hi_seq) = bounds.next().expect("the largest bound");
+        let mut writer = TableWriter::new(WriterOptions::default()).expect("a writer");
+        let mut spans = Vec::new();
+        let mut seqs = Vec::new();
+        for token in lines.next().expect("a table's entries").split_whitespace() {
+            match laid(token) {
+                Laid::Point(user, kind, seq, value) => {
+                    let k = InternalKey {
+                        user_key: &user,
+                        seq_num: seq,
+                        kind,
+                        obsolete: false,
+                    };
+                    writer.add(k, &value).expect("add");
+                    seqs.push(seq);
+                }
+                Laid::Span(t) => {
+                    seqs.push(t.seq_num);
+                    spans.push(t);
+                }
+            }
+        }
+        // Fragmented, as Pebble's driver writes them.
+        for t in rangedel::fragment(&spans.iter().collect::<Vec<_>>()) {
+            writer
+                .add_range_deletion(&t.start, &t.end, t.seq_num)
+                .expect("add a range deletion");
+        }
+        let bytes = writer.finish().expect("finish");
+        let largest_seq = *seqs.iter().max().expect("an entry");
+        last_seq = last_seq.max(largest_seq);
+        tables.push(NewTable {
+            level,
+            file_num: next,
+            size: bytes.len() as u64,
+            smallest: key::encode(&lo, lo_seq, lo_kind),
+            largest: key::encode(&hi, hi_seq, hi_kind),
+            smallest_seq_num: *seqs.iter().min().expect("an entry"),
+            largest_seq_num: largest_seq,
+            marked_for_compaction: false,
+            creation_time: 0,
+        });
+        put_file(fs, &dir.join(format!("{next:06}.sst")), bytes).await;
+        next += 1;
+    }
+    put_file(fs, &dir.join(format!("{LOG:06}.log")), log.finish()).await;
+
+    let edit = VersionEdit {
+        comparer_name: Some(BYTEWISE.to_string()),
+        min_unflushed_log_num: Some(LOG),
+        next_file_num: Some(next),
+        last_seq_num: Some(last_seq),
+        new_tables: tables,
+        ..Default::default()
+    };
+    let mut manifest = RecordWriter::legacy();
+    manifest
+        .write_record(&edit.encode())
+        .expect("frame the edit");
+    put_file(fs, &dir.join("MANIFEST-000001"), manifest.finish()).await;
+    for marker in [
+        marker_filename(MARKER_FORMAT_VERSION, 1, "016"),
+        marker_filename(MARKER_MANIFEST, 1, "MANIFEST-000001"),
+    ] {
+        put_file(fs, &dir.join(marker), Vec::new()).await;
+    }
+    fs.sync_dir(&dir).await.expect("sync dir");
+    (env, dir)
+}
+
+/// What `Db::check_levels` finds wrong with the store `input` lays out, if
+/// anything. Opened read-only, so that the open writes nothing over it.
+async fn level_fault(input: &[String]) -> Option<String> {
+    let (env, dir) = lay_out(input).await;
+    let db = roble::open_read_only(&env, &dir, Options::new())
+        .await
+        .expect("the layout opens");
+    db.check_levels().await.err().map(|e| e.to_string())
+}
+
+/// The level invariant, judged against the cases of Pebble's own check.
+///
+/// `tests/pebble/level_checker` is Pebble's `testdata/level_checker` at the
+/// pin, unchanged (`tests/pebble/README.md`). Each `define` lays out tables at
+/// L1, L2 and so on, and each `check` gives what Pebble's `CheckLevels` found
+/// there: nothing, or its first fault, which names the keys and range
+/// deletions at fault, each with its level. roble has to find a fault where
+/// Pebble does, and the same one: each of those, at the same level.
+///
+/// Skipped, with the `check` after each: a `define` that turns off the
+/// writer's order checks or writes range deletions unfragmented, whose faults
+/// are in a table's own order, which is the table reader's to refuse; one
+/// holding a MERGE, which roble refuses (§3); and one whose keys are ordered
+/// by Pebble's test comparer, under which `a@9` sorts before `a@6`.
+#[compio::test]
+async fn roble_finds_the_level_faults_pebble_finds() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/level_checker");
+    let text = std::fs::read_to_string(&path).expect("Pebble's level checker test data");
+
+    let mut layout: Option<Vec<String>> = None;
+    let mut judged = 0;
+    for case in cases(&text) {
+        if case.command.starts_with("define") {
+            let plain = case.command == "define"
+                && !case
+                    .input
+                    .iter()
+                    .any(|l| l.contains(".MERGE.") || l.contains('@'));
+            layout = plain.then(|| case.input.clone());
+            continue;
+        }
+        assert!(
+            case.command.starts_with("check"),
+            "line {}: {}",
+            case.line,
+            case.command
+        );
+        let Some(input) = &layout else { continue };
+        let fault = level_fault(input).await;
+        let context = format!("line {}: over\n{}", case.line, input.join("\n"));
+        if case.expected.is_empty() {
+            assert_eq!(fault, None, "{context}");
+        } else {
+            let fault = fault.unwrap_or_else(|| {
+                panic!(
+                    "{context}\nno fault, where Pebble's has {:?}",
+                    case.expected
+                )
+            });
+            // Each one Pebble names, with the level it names: `c#27,SET in L1:`.
+            let words: Vec<&str> = case.expected.split_whitespace().collect();
+            let mut named = 0;
+            for (i, word) in words.iter().enumerate() {
+                if word.contains('#') && words.get(i + 1) == Some(&"in") {
+                    let at = format!("{word} in {} table", words[i + 2].trim_end_matches(':'));
+                    assert!(
+                        fault.contains(&at),
+                        "{context}\nroble's fault {fault:?} has no {at:?}, as Pebble's {:?} has",
+                        case.expected
+                    );
+                    named += 1;
+                }
+            }
+            assert!(named > 0, "{context}\nnothing named in {:?}", case.expected);
+        }
+        judged += 1;
+    }
+    // Every check but the skipped ones, so a runner that lost some fails here.
+    assert_eq!(judged, 10, "the checks of {}", path.display());
+}
+
+/// The states two of roble's bugs left, and the rule Pebble's check leaves
+/// out, laid out the same way.
+#[compio::test]
+async fn roble_finds_the_level_faults_its_own_bugs_left() {
+    let cases: &[(&[&str], Option<&str>)] = &[
+        // merlimat/roble#226: a log the open replayed beneath tables already
+        // holding its records, which a flush with the WAL off left unflushed.
+        // Its put is above itself, in the table the first replay was flushed
+        // into,
+        (
+            &["mem", "a.SET.5:v", "L6", "a.SET.5 a.SET.5", "a.SET.5:v"],
+            Some(
+                "corrupt: a#5,SET in a memtable is above a#5,SET in L6 table 3, which is \
+                 numbered the same",
+            ),
+        ),
+        // above a newer version of its key,
+        (
+            &[
+                "mem",
+                "a.SET.5:old",
+                "L6",
+                "a.SET.10 a.SET.10",
+                "a.SET.10:new",
+            ],
+            Some("corrupt: a#5,SET in a memtable is above a#10,SET in L6 table 3, which is newer"),
+        ),
+        // above a newer range deletion over it,
+        (
+            &[
+                "mem",
+                "b.SET.5:old",
+                "L6",
+                "a.RANGEDEL.10 c.RANGEDEL.inf",
+                "Span:a-c:{(#10,RANGEDEL)}",
+            ],
+            Some(
+                "corrupt: b#5,SET in a memtable is above a-c:{(#10,RANGEDEL)} in L6 table 3, \
+                 which is newer",
+            ),
+        ),
+        // and its range deletion above a newer key it covers, which only the
+        // rule Pebble's check leaves out finds.
+        (
+            &[
+                "mem",
+                "Span:a-c:{(#5,RANGEDEL)}",
+                "L6",
+                "b.SET.10 b.SET.10",
+                "b.SET.10:new",
+            ],
+            Some(
+                "corrupt: a-c:{(#5,RANGEDEL)} in a memtable is above b#10,SET in L6 table 3, \
+                 which is newer",
+            ),
+        ),
+        // merlimat/roble#234: a compaction of part of L0 left an older table
+        // above the deletion it moved into L1.
+        (
+            &[
+                "L0",
+                "a.SET.5 a.SET.5",
+                "a.SET.5:old",
+                "L1",
+                "a.DEL.10 a.DEL.10",
+                "a.DEL.10:",
+            ],
+            Some("corrupt: a#5,SET in L0 table 3 is above a#10,DEL in L1 table 4, which is newer"),
+        ),
+        // The rule Pebble's check leaves out, where a scan relies on it: from
+        // L1 down, it passes over every deeper key in a range deletion's span.
+        (
+            &[
+                "L1",
+                "a.RANGEDEL.5 c.RANGEDEL.inf",
+                "Span:a-c:{(#5,RANGEDEL)}",
+                "L2",
+                "b.SET.10 b.SET.10",
+                "b.SET.10:new",
+            ],
+            Some(
+                "corrupt: a-c:{(#5,RANGEDEL)} in L1 table 3 is above b#10,SET in L2 table 4, \
+                 which is newer",
+            ),
+        ),
+        // L0 stacks by sequence number, not by file number: a table numbered
+        // below another can hold newer keys, as Pebble's compactions within
+        // L0 leave.
+        (
+            &[
+                "L0",
+                "a.SET.20 a.SET.20",
+                "a.SET.20:newer",
+                "L0",
+                "a.SET.10 a.SET.10",
+                "a.SET.10:older",
+            ],
+            None,
+        ),
+    ];
+    for (input, want) in cases {
+        let input: Vec<String> = input.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            level_fault(&input).await.as_deref(),
+            *want,
+            "over\n{}",
+            input.join("\n")
+        );
+    }
+}
+
+/// A store's own flushes and compactions keep the levels in order: rounds of
+/// writes flushed over older tables, L0 compacted into L1 under later ones,
+/// then everything down to L6, with snapshots keeping older versions and a
+/// round left in the memtable at each step.
+#[compio::test]
+async fn a_store_keeps_its_levels_in_order_as_it_flushes_and_compacts() {
+    let env = SimEnv::new();
+    let db = roble::open_with(
+        &env,
+        PathBuf::from("/db"),
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true),
+    )
+    .await
+    .expect("open");
+    let tables = |db: &roble::Db<SimFs>, level: u32| -> Vec<u64> {
+        let versions = db.versions();
+        versions
+            .version
+            .level(level)
+            .iter()
+            .map(|t| t.file_num)
+            .collect()
+    };
+
+    let mut snapshots = Vec::new();
+    for round in 0..6u8 {
+        for i in 0..40u8 {
+            db.put(&[b'k', i], &[round]).await.expect("put");
+        }
+        db.delete(&[b'k', round]).await.expect("delete");
+        db.delete_range(&[b'k', 10 + 4 * round], &[b'k', 13 + 4 * round])
+            .await
+            .expect("delete_range");
+        snapshots.push(db.snapshot().expect("snapshot"));
+        db.check_levels()
+            .await
+            .unwrap_or_else(|e| panic!("round {round}, in the memtable: {e}"));
+        db.flush().await.expect("flush");
+        db.check_levels()
+            .await
+            .unwrap_or_else(|e| panic!("round {round}, flushed: {e}"));
+        if round % 2 == 1 {
+            db.compact(0, &tables(&db, 0)).await.expect("compact L0");
+            db.check_levels()
+                .await
+                .unwrap_or_else(|e| panic!("round {round}, L0 compacted: {e}"));
+        }
+    }
+
+    db.put(b"k\x05", b"in the memtable").await.expect("put");
+    db.delete_range(b"k\x00", b"k\x03")
+        .await
+        .expect("delete_range");
+    for level in 0..6 {
+        let from = tables(&db, level);
+        if !from.is_empty() {
+            db.compact(level, &from).await.expect("compact");
+            db.check_levels()
+                .await
+                .unwrap_or_else(|e| panic!("L{level} compacted: {e}"));
+        }
+    }
+    assert!(!tables(&db, 6).is_empty(), "the compactions reached L6");
+    drop(snapshots);
+}
+
+/// The databases Pebble wrote keep the levels in order, as roble reads them:
+/// every golden fixture, with its unflushed log replayed.
+#[compio::test]
+async fn pebbles_databases_keep_their_levels_in_order() {
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let mut checked = 0;
+    for fixture in std::fs::read_dir(&golden).expect("the fixtures") {
+        let src = fixture.expect("a fixture").path();
+        if !src.is_dir() {
+            continue;
+        }
+        let env = SimEnv::new();
+        let dir = PathBuf::from("/db");
+        let fs: &SimFs = env.sim();
+        fs.mkdir_all(&dir).await.expect("mkdir");
+        for file in std::fs::read_dir(&src).expect("a fixture's files") {
+            let file = file.expect("a file");
+            let bytes = std::fs::read(file.path()).expect("read");
+            put_file(fs, &dir.join(file.file_name()), bytes).await;
+        }
+        fs.sync_dir(&dir).await.expect("sync dir");
+        let db = roble::open_read_only(&env, &dir, Options::new())
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+        db.check_levels()
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+        checked += 1;
+    }
+    assert!(checked >= 7, "the fixtures of {}", golden.display());
 }
