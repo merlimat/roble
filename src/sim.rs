@@ -23,9 +23,12 @@
 //!
 //! **Crashing is the interesting part.** [`SimFs::crash`] drops everything
 //! that was written but not synced, and forgets directory entries that no
-//! [`Fs::sync_dir`] made durable. A store that survives that has actually
-//! earned the claim that reopening yields the state as of the last flush
-//! (§4); one tested only against clean closes has not.
+//! [`Fs::sync_dir`] made durable. A removal is a change to a directory as
+//! well, so it lasts only once the directory is synced after it: a crash
+//! brings back every durable name removed or renamed away since. A store
+//! that survives that has actually earned the claim that reopening yields
+//! the state as of the last flush (§4); one tested only against clean closes
+//! has not.
 //!
 //! It also keeps the trait honest: a second implementation is what turns the
 //! trait from a description of `FileFs` into an interface.
@@ -96,6 +99,9 @@ struct SimFile {
 #[derive(Debug, Default)]
 struct State {
     files: BTreeMap<PathBuf, SimFile>,
+    /// Files whose durable names were removed, or renamed away, since their
+    /// directory was last synced: what a crash brings back.
+    removed: BTreeMap<PathBuf, SimFile>,
     dirs: BTreeMap<PathBuf, bool>,
     locked: BTreeMap<PathBuf, bool>,
     /// Operations counted so far, which a scenario uses to decide where to
@@ -127,6 +133,16 @@ struct State {
 }
 
 impl State {
+    /// Takes note of a name going away, which a crash undoes if the name was
+    /// durable, until its directory is synced. The first durable one is kept:
+    /// a name created again after its removal is no durable name until a
+    /// sync, and the sync forgets the removal.
+    fn removing(&mut self, path: &Path, file: SimFile) {
+        if file.name_durable {
+            self.removed.entry(path.to_path_buf()).or_insert(file);
+        }
+    }
+
     /// Counts an operation and says whether it should fail.
     /// Whether the operation just counted should keep its buffer.
     fn withholds(&self) -> bool {
@@ -253,10 +269,14 @@ impl SimFs {
     ///
     /// Writes that no [`Disk::sync`] covered are lost, and names that no
     /// [`Fs::sync_dir`] covered disappear — including, deliberately, files
-    /// whose contents were synced but whose name was not.
+    /// whose contents were synced but whose name was not. Durable names
+    /// removed or renamed away since their directory was last synced come
+    /// back, with the bytes a sync made durable.
     pub fn crash(&self) {
         let mut state = self.state.borrow_mut();
         state.files.retain(|_, f| f.name_durable);
+        let removed = std::mem::take(&mut state.removed);
+        state.files.extend(removed);
         for f in state.files.values_mut() {
             f.live = f.durable.clone();
         }
@@ -316,12 +336,13 @@ impl Fs for SimFs {
         self.pause_if_next().await;
         let mut state = self.state.borrow_mut();
         state.step(Op::Remove)?;
-        if state.files.remove(path).is_none() {
+        let Some(file) = state.files.remove(path) else {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{}", path.display()),
             )));
-        }
+        };
+        state.removing(path, file);
         Ok(())
     }
 
@@ -337,13 +358,18 @@ impl Fs for SimFs {
         };
         // A rename is atomic, and the new name is no more durable than any
         // other new name: a marker rotation still needs its directory synced.
-        state.files.insert(
+        // Until then a crash undoes it, the old name back and any file it
+        // replaced too.
+        state.removing(from, file.clone());
+        if let Some(replaced) = state.files.insert(
             to.to_path_buf(),
             SimFile {
                 name_durable: false,
                 ..file
             },
-        );
+        ) {
+            state.removing(to, replaced);
+        }
         Ok(())
     }
 
@@ -403,6 +429,9 @@ impl Fs for SimFs {
                 file.name_durable = true;
             }
         }
+        state
+            .removed
+            .retain(|path, _| SimFs::parent_of(path) != dir);
         Ok(())
     }
 

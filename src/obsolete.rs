@@ -64,7 +64,8 @@
 //! again. Reporting a flush that worked as one that did not would be the
 //! larger lie. For the same reason the directory is not synced afterwards —
 //! Pebble does not either — because an unlink that a crash undoes merely
-//! brings back a file that is still obsolete.
+//! brings back a file that is still obsolete (`tests/obsolete.rs` crashes
+//! after each kind of removal and reopens).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

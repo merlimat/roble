@@ -777,3 +777,101 @@ async fn a_table_a_get_has_chosen_is_not_collected_before_it_reads_it() {
         "the lookup should have been caught part way through more than twice, was {suspended}"
     );
 }
+
+#[compio::test]
+async fn an_obsolete_file_a_crash_brings_back_is_obsolete_still_and_swept_again() {
+    // A sweep does not sync the directory, as Pebble's does not (§5), so a
+    // crash undoes its removals. What comes back is still obsolete: a log
+    // below the minimum unflushed one, a table the version does not name, a
+    // MANIFEST the marker does not name, a marker a higher iteration
+    // replaced. A crash after each step below brings back what the step had
+    // just removed, and the reopen has to read past every one of them, answer
+    // what was written, and remove them again.
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    let options = || {
+        Options::new()
+            .create_if_missing(true)
+            .wal(roble::Wal::Synced)
+            .disable_automatic_compactions(true)
+    };
+    let mut db = roble::open_with(&env, &dir, options())
+        .await
+        .expect("create");
+    let mut model = Model::new();
+    // What came back, by the kind of name: a log, a table, a MANIFEST or a
+    // marker.
+    let kind = |name: &str| match files::parse_filename(name).map(|p| p.file_type) {
+        Some(FileType::Log) => "log",
+        Some(FileType::Table) => "table",
+        Some(FileType::Manifest) => "MANIFEST",
+        _ if name.starts_with("marker.") => "marker",
+        _ => "other",
+    };
+    let mut came_back: BTreeMap<&str, usize> = BTreeMap::new();
+    for (round, step) in ["flush", "flush", "compact", "rotate", "flush", "compact"]
+        .into_iter()
+        .enumerate()
+    {
+        let key = format!("k{round}").into_bytes();
+        let mut batch = Batch::new();
+        batch.put(&key, b"v").expect("put");
+        db.write_raw(&mut batch, true).await.expect("write");
+        model.insert(key, b"v".to_vec());
+        match step {
+            "flush" => {
+                db.flush().await.expect("flush");
+            }
+            "compact" => {
+                let l0: Vec<u64> = db
+                    .versions()
+                    .version
+                    .level(0)
+                    .iter()
+                    .map(|t| t.file_num)
+                    .collect();
+                db.compact(0, &l0).await.expect("compact");
+            }
+            _ => {
+                db.rotate_manifest().await.expect("rotate");
+            }
+        }
+        db.remove_obsolete_files().await.expect("sweep");
+        let live = listing(env.sim(), &dir).await;
+        drop(db);
+        env.sim().crash();
+
+        let back: Vec<String> = listing(env.sim(), &dir)
+            .await
+            .into_iter()
+            .filter(|n| !live.contains(n))
+            .collect();
+        for name in &back {
+            *came_back.entry(kind(name)).or_default() += 1;
+        }
+        db = roble::open_with(&env, &dir, options())
+            .await
+            .unwrap_or_else(|e| panic!("after a {step} and a crash bringing back {back:?}: {e}"));
+        assert_eq!(
+            contents(&db).await,
+            model,
+            "after a {step} and a crash bringing back {back:?}"
+        );
+        // A log that came back and was replayed would put its records in a
+        // memtable above the same records in a table.
+        db.check_levels()
+            .await
+            .unwrap_or_else(|e| panic!("after a {step} and a crash bringing back {back:?}: {e}"));
+        let swept = listing(env.sim(), &dir).await;
+        assert!(
+            back.iter().all(|n| !swept.contains(n)),
+            "after a {step}, the reopen left what the crash brought back: {back:?} in {swept:?}"
+        );
+    }
+    for kind in ["log", "table", "MANIFEST", "marker"] {
+        assert!(
+            came_back.contains_key(kind),
+            "no crash brought back a {kind}, so its claim is untested: {came_back:?}"
+        );
+    }
+}
