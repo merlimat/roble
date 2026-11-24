@@ -582,3 +582,45 @@ async fn a_missing_table_is_stale_when_a_read_reaches_it() {
     // The writer refuses the same directory at once.
     assert!(matches!(reopen(&sim_env).await, Err(Error::Corrupt(_))));
 }
+
+#[compio::test]
+async fn a_reader_closing_leaves_every_table_the_writer_made() {
+    // RocksDB's `ReadOnlyCloseDoesNotDeleteWriterFiles`: a reader opened
+    // between two of the writer's flushes, and closed after the second, once
+    // deleted the table the second flush wrote, which its own version did
+    // not name. Here the reader also holds a snapshot and a scan across that
+    // flush and lets them go first, the last of its holds on the table it
+    // knows. Its filesystem refuses any change, so a reader that deleted
+    // anything would fail the test there, and the listing is checked as well.
+    let sim_env = SimEnv::new();
+    let db = writer(&sim_env).await;
+    put(&db, b"a", b"1").await;
+    db.flush().await.expect("flush");
+
+    let env = ReaderEnv(ReaderFs::new(sim_env.sim()));
+    let ro = reader(&env).await.expect("open beside the writer");
+    let snapshot = ro.snapshot().expect("snapshot");
+    let mut scan = ro.range(..).expect("scan");
+    scan.first().await.expect("first");
+    assert_eq!(scan.key(), b"a");
+
+    put(&db, b"b", b"2").await;
+    db.flush().await.expect("flush");
+    let tables = named(sim_env.sim(), FileType::Table).await;
+    assert_eq!(tables.len(), 2, "a table from each flush: {tables:?}");
+
+    drop(scan);
+    drop(snapshot);
+    ro.close().await.expect("close the reader");
+
+    assert_eq!(
+        named(sim_env.sim(), FileType::Table).await,
+        tables,
+        "closing the reader removed a table"
+    );
+    assert_eq!(get(&db, b"a").await.expect("get"), Some(b"1".to_vec()));
+    assert_eq!(get(&db, b"b").await.expect("get"), Some(b"2".to_vec()));
+    drop(db);
+    let db = reopen(&sim_env).await.expect("reopen the writer");
+    assert_eq!(get(&db, b"b").await.expect("get"), Some(b"2".to_vec()));
+}

@@ -21,10 +21,13 @@
 //! the half roble cannot check about itself.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Disk, Fs, Options, WriteBuf};
+use roble::{Disk, Fs, Options, Wal, WriteBuf};
 use roble_format::batch::Batch;
 use roble_format::files::{self, FileType};
 
@@ -413,4 +416,133 @@ async fn a_half_written_checkpoint_never_reads_as_a_database() {
         saw_one_marker > 0,
         "no failure landed between the two markers, so the order is untested"
     );
+}
+
+/// Runs `op` until it is about to run its operation `n`, counting from one,
+/// and stops it there for good, as a kill would; says whether it finished
+/// first, which it does if it has fewer operations than that.
+///
+/// Polled until it gets there rather than once, since a flush yields between
+/// the slices of the memtable it walks, and a yield before operation `n` is
+/// not yet the kill.
+fn killed_before(env: &SimEnv, n: u64, op: impl Future<Output = roble::Result<()>>) -> bool {
+    let start = env.sim().ops();
+    env.sim().pause_at(n);
+    let mut op = pin!(op);
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..100_000 {
+        match op.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => return result.is_ok(),
+            Poll::Pending if env.sim().ops() - start + 1 >= n => return false,
+            Poll::Pending => {}
+        }
+    }
+    panic!("the operation is not making progress");
+}
+
+#[compio::test]
+async fn a_checkpoint_survives_a_crash_that_drops_what_no_sync_covered() {
+    // RocksDB's `CheckpointWithUnsyncedDataDropped`: writes no sync covered,
+    // a checkpoint, and a crash, which drops whatever no sync covered. A
+    // checkpoint that returned has to open holding every one of them: its
+    // flush wrote them out, and everything it then put in the directory was
+    // synced, names included, before it returned.
+    //
+    // Then the same checkpoint killed before each of its operations, and the
+    // machine crashed. The store comes back with the writes or without them,
+    // and the checkpoint is either no database or one holding them all, never
+    // one holding writes the store it was taken of lost.
+    for wal in [Wal::Buffered, Wal::Off] {
+        let options = || {
+            Options::new()
+                .wal(wal)
+                .background_tasks(false)
+                .disable_automatic_compactions(true)
+        };
+        let total = {
+            let (env, dir) = load("db-twin-a").await;
+            let db = roble::open_with(&env, &dir, options()).await.expect("open");
+            write_keys(&db, "c", 10, false).await;
+            let before = env.sim().ops();
+            db.checkpoint(Path::new("/snapshot"))
+                .await
+                .expect("checkpoint");
+            env.sim().ops() - before
+        };
+
+        let (mut kept, mut lost) = (0, 0);
+        // One past the last operation is no kill at all.
+        for n in 1..=total + 1 {
+            let (env, dir) = load("db-twin-a").await;
+            let db = roble::open_with(&env, &dir, options()).await.expect("open");
+            let before = contents(&db).await;
+            let mut after = before.clone();
+            after.extend(write_keys(&db, "c", 10, false).await);
+
+            let at = Path::new("/snapshot");
+            let finished = killed_before(&env, n, db.checkpoint(at));
+            let what = if finished {
+                format!("wal={wal:?}, a checkpoint that returned")
+            } else {
+                format!("wal={wal:?}, a checkpoint killed before {n} of {total}")
+            };
+            assert_eq!(finished, n > total, "{what}");
+            drop(db);
+            env.sim().crash();
+
+            let db = roble::open_with(&env, &dir, options())
+                .await
+                .unwrap_or_else(|e| panic!("{what}: reopening the store: {e}"));
+            let found = contents(&db).await;
+            assert!(
+                found == before || found == after,
+                "{what}: the store came back with part of the batch"
+            );
+            if !finished {
+                if found == after {
+                    kept += 1;
+                } else {
+                    lost += 1;
+                }
+            }
+
+            // Killed before it made the directory, there is none.
+            let names: Vec<String> = env
+                .sim()
+                .list(at)
+                .await
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|e| e.name.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let database = names.iter().any(|n| n.starts_with("marker.manifest."));
+            assert!(
+                database || !finished,
+                "{what}: the checkpoint is no database after the crash: {names:?}"
+            );
+            if database {
+                let copy = roble::open_with(&env, at, options())
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: opening the checkpoint: {e}"));
+                assert_eq!(
+                    contents(&copy).await,
+                    after,
+                    "{what}: the checkpoint is missing writes made before it"
+                );
+                assert_eq!(
+                    found, after,
+                    "{what}: the checkpoint holds writes the store it was taken of lost"
+                );
+            }
+        }
+        // Kills either side of the flush that made the writes durable, so
+        // that both of what a store may come back as were seen.
+        assert!(
+            kept > 0 && lost > 0,
+            "wal={wal:?}: of {total} kills, {kept} kept the writes and {lost} lost them"
+        );
+    }
 }
