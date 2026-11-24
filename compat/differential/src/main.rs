@@ -41,6 +41,10 @@
 //! against the map with the batch laid over it, `biter` holds an iterator
 //! through it that is to read the batch as it was when the iterator was
 //! made while the batch takes more writes, and `commit` or `abort` ends it.
+//! Beside the map, the store's own order: as it opens and closes, at every
+//! `check`, and in every checkpoint it opens, the runner requires that what
+//! lies above in the store is newer than what it overlaps below
+//! (`Db::check_levels`), which compactions and both engines' scans rely on.
 //! So a disagreement names the engine that read wrongly, the segment, and
 //! what the other had written before it.
 //!
@@ -733,7 +737,19 @@ impl<F: roble::Fs> Src<'_, F> {
     }
 }
 
+/// Fails unless what lies above in the store is newer than what it overlaps
+/// below (`Db::check_levels`): what compactions and both engines' scans rely
+/// on, whether or not a read has gone wrong yet.
+async fn levels<F: roble::Fs>(db: &roble::Db<F>, at: &str) {
+    db.check_levels()
+        .await
+        .unwrap_or_else(|e| fail(&format!("{at}: the levels are out of order: {e}")));
+}
+
 async fn check<F: roble::Fs>(db: &Src<'_, F>, model: &Model, at: &str) {
+    if let Src::Db(store) = db {
+        levels(store, at).await;
+    }
     let mut scan = db
         .range(..)
         .unwrap_or_else(|e| fail(&format!("{at}: scan: {e}")));
@@ -1269,6 +1285,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
 
     // A kill before this line was a kill inside the open.
     println!("opened");
+    levels(&db, &format!("segment {segment} (roble), as opened")).await;
     decide(&db, &mut history, segment).await;
 
     // The live snapshots, each with the map as it was when it was taken.
@@ -1396,6 +1413,7 @@ async fn run(dir: &Path, script: &Path, segment: usize, kill: Option<Kill>) {
     drop(batch);
     drop(snaps);
     drop(iters);
+    levels(&db, &format!("segment {segment} (roble), at the close")).await;
     db.close()
         .await
         .unwrap_or_else(|e| fail(&format!("segment {segment}: close: {e}")));

@@ -11,7 +11,7 @@ store nothing but valid calls and checks that it answers them correctly, and
 | Target         | Input                                   | What fails it            |
 |----------------|-----------------------------------------|--------------------------|
 | `open_corrupt` | a golden database, plus damage to its files | a panic, abort or hang   |
-| `model`        | options, and a sequence of operations   | any answer a `BTreeMap` would not give, or any error |
+| `model`        | options, and a sequence of operations   | any answer a `BTreeMap` would not give, any error, or levels out of order |
 | `crash`        | options, a sequence of operations, and what goes wrong | a store that does not open, or comes back as no prefix of what it was told |
 
 The input picks one of the databases in `tests/golden`, read-write or
@@ -33,7 +33,9 @@ batches of puts, deletes and range deletions, flushes, compactions, reopens,
 `get` under every comparison, bounded scans moved by seeks and steps both
 ways, snapshots read after the store has moved on, and checkpoints opened as
 stores of their own. Every answer is checked against a `BTreeMap`; a reopen
-against what was durable, which with the WAL off is the last flush. Nothing
+against what was durable, which with the WAL off is the last flush. Each time
+the store is read whole, its levels are checked too: what lies above has to be
+newer than what it overlaps below (`Db::check_levels`). Nothing
 is allowed to fail: the filesystem is healthy and every call is one a caller
 may make.
 

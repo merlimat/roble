@@ -36,7 +36,9 @@
 // what roble opens next is laid out the way Pebble chose. A segment that
 // starts "segment wal-off" runs with DisableWAL, as Oxia runs Pebble, and
 // flushes before each checkpoint and before closing a checkpoint it wrote
-// to, as Oxia flushes before it takes one and before it closes.
+// to, as Oxia flushes before it takes one and before it closes. Pebble's
+// own level check runs on every version it installs, its open's included,
+// so what roble left is checked as it is opened.
 //
 //	differential <dir> <script> <segment> [kill <op|open> <micros>]
 package main
@@ -580,6 +582,10 @@ func main() {
 		MemTableSize:       64 << 10,
 		LBaseMaxBytes:      64 << 10,
 		DisableWAL:         walOff,
+		// CheckLevels on every version Pebble installs: its open's, over
+		// what roble left and the logs it replays, and every flush's and
+		// compaction's after it. A fault ends the turn with it.
+		DebugCheck: pebble.DebugCheckLevels,
 	}
 	opts.TargetFileSizes[0] = 16 << 10
 	for i := range opts.Levels {

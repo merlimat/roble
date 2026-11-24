@@ -2121,6 +2121,11 @@ in both directions.
   by the other engine, in its next turn, as the taker wrote it; that and every
   later open checks it against the map as it stood when it was taken, then
   writes a few keys into it, as whoever receives a checkpoint goes on to do.
+  Beside the map, both engines check the order the store keeps, that what
+  lies above is newer than what it overlaps below: roble with
+  `Db::check_levels` as it opens, at every check, in every checkpoint and
+  before it closes, and Pebble with its own `CheckLevels` on every version it
+  installs.
   One turn in three kills itself
   at a random point instead of closing, and the next, the other engine's, opens
   what it left: the script is cut where the killed turn stopped. Half the

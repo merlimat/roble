@@ -19,3 +19,12 @@ the newest one. Skipped: defines holding a MERGE, which roble refuses; two
 whose layers hold older sequence numbers than the layers below them, which no
 store writes and Pebble's own comment calls unnatural; and the reads after a
 `compact`, which are of Pebble's compaction.
+
+`level_checker` is Pebble's `testdata/level_checker`, copied unchanged the
+same way. `tests/version.rs` writes each `define`'s tables at their levels and
+requires `Db::check_levels` to find a fault where Pebble's `CheckLevels` does,
+naming each key and range deletion Pebble's names, at the same level.
+Skipped: defines that turn off the writer's order checks or write range
+deletions unfragmented, whose faults are in a table's own order, which the
+table reader refuses; defines holding a MERGE; and one keyed for Pebble's test
+comparer, under which `a@9` sorts before `a@6`.

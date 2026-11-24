@@ -95,6 +95,18 @@ and by Pebble's runner calling `Flush` first, as Oxia does before it takes
 one: Pebble's checkpoint copies only tables then. A `cpcheck` in such a turn
 flushes the checkpoint's store before it closes it, for its puts to last.
 
+Beside the map, each engine checks the order its store keeps: what lies above
+is newer than what it overlaps below. Compactions rely on that order, and so do
+both engines' scans, which pass over the keys a range deletion covers in the
+levels below it without reading their numbers. roble's runner calls
+`Db::check_levels` as it opens the store, at every `check`, in every checkpoint
+it opens, and before it closes. Pebble's runs Pebble's own `CheckLevels` on
+every version it installs (`DebugCheck`), its open's included, so what roble
+left is checked as Pebble opens it. roble's check is Pebble's, with one rule
+more: a range deletion above a newer key it covers, which hides that key. It
+also holds one write found in two places to be a fault, where Pebble's finds
+that only when its heap gives the deeper copy first.
+
 A disagreement names the engine that read wrongly, the segment and the
 operation, and what the other engine wrote before it is the segments before.
 
@@ -159,7 +171,11 @@ replayed it again, and a key deleted since came back once a compaction had
 dropped its tombstone. With that fix taken out, 2 of the ten seeds from 5000
 fail with `CRASH=0` (5004 and 5009), each in a Pebble turn that finds one key
 more than the history. The differential before WAL-off turns, whose roble
-never ran without a WAL, passes all ten.
+never ran without a WAL, passes all ten. The level checks find the same two
+sooner, by the write that came back rather than by the key it brought back:
+5004 a turn earlier, in roble's, which opens a checkpoint whose log such a
+flush left live and finds a put in its memtable above itself in L0; and 5009
+as Pebble opens the store, where its own check finds a put in L0 and in L1.
 
 A roble runner that says a flush is done without flushing, for all but its
 turn's last, checks the kill path. It passes the ten seeds from 6000 with
