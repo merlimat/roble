@@ -2059,3 +2059,178 @@ async fn a_single_delete_that_buries_an_older_version_in_a_compaction_is_written
         }
     }
 }
+
+/// Every point entry of a table, in order: its user key, its kind, and
+/// whether the obsolete bit is set on it.
+fn marks(bytes: &[u8]) -> Vec<(String, &'static str, bool)> {
+    let table = roble_format::sst::Table::open(bytes).expect("open the table");
+    let mut out = Vec::new();
+    table
+        .for_each_entry(|key, _| {
+            out.push((
+                String::from_utf8(key.user_key.to_vec()).expect("utf-8"),
+                key.kind.name(),
+                key.obsolete,
+            ));
+            Ok(())
+        })
+        .expect("entries");
+    out
+}
+
+#[compio::test]
+async fn a_compaction_drops_every_key_pebble_marked_obsolete() {
+    // Pebble sets the obsolete bit on a key no reader without a snapshot can
+    // see, and keeps such a key only while a snapshot can: an older version
+    // below a newer one in the same table, a point deletion in a table
+    // written to L6, and a key a range deletion in the same table covers.
+    // `db-obsolete` holds all three (`buildObsolete` in `harness/db-fixture`).
+    // roble reads the bit and never writes it (DESIGN.md §3): its table
+    // writer refuses a key that carries one. So once no snapshot is left, a
+    // compaction of these tables has to drop every marked key, and one it
+    // kept would fail the compaction rather than reach a table.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/db-obsolete");
+    // Each entry with the reason Pebble marked it, if it did.
+    let spelled =
+        |entries: &[(&str, &'static str, Option<&str>)]| -> Vec<(String, &'static str, bool)> {
+            entries
+                .iter()
+                .map(|&(key, kind, why)| (key.to_string(), kind, why.is_some()))
+                .collect()
+        };
+    let older = Some("an older version");
+    let deletion_in_l6 = Some("a deletion in L6");
+    let covered = Some("covered by the range deletion");
+
+    // What Pebble wrote, so that a fixture regenerated without the marks
+    // fails here rather than passing on tables with nothing to drop. Each
+    // table starts with a live key because Pebble never marks a table's
+    // first key as a deletion in L6.
+    let in_l6 = spelled(&[
+        ("l6-alive", "set", None),
+        ("l6-deleted", "del", deletion_in_l6),
+        ("l6-deleted", "set", older),
+        ("l6-overwritten", "set", None),
+        ("l6-overwritten", "set", older),
+        ("l6-range-1", "set", covered),
+        ("l6-range-2", "set", covered),
+        // Where the range deletion ends, so not under it.
+        ("l6-range-3", "set", None),
+        ("l6-single-deleted", "singledel", deletion_in_l6),
+        ("l6-single-deleted", "set", older),
+        ("l6-size-deleted", "delsized", deletion_in_l6),
+        ("l6-size-deleted", "set", older),
+    ]);
+    // A flush writes into L0, so its deletions are not marked.
+    let in_l0 = spelled(&[
+        ("l0-alive", "set", None),
+        ("l0-deleted", "del", None),
+        ("l0-deleted", "set", older),
+        ("l0-overwritten", "set", None),
+        ("l0-overwritten", "set", older),
+        ("l0-range-1", "set", covered),
+        ("l0-range-2", "set", covered),
+        ("l0-range-3", "set", None),
+        ("l0-single-deleted", "singledel", None),
+        ("l0-single-deleted", "set", older),
+        ("l0-size-deleted", "delsized", None),
+        ("l0-size-deleted", "set", older),
+    ]);
+    for (name, want) in [("000006.sst", &in_l6), ("000007.sst", &in_l0)] {
+        let bytes = std::fs::read(fixture.join(name)).expect("read the fixture");
+        assert_eq!(&marks(&bytes), want, "{name}");
+    }
+
+    let (env, dir) = load("db-obsolete").await;
+    let db = open_unscheduled(&env, &dir).await;
+    let in_level = |n: u32| -> Vec<u64> {
+        db.versions()
+            .version
+            .level(n)
+            .iter()
+            .map(|t| t.file_num)
+            .collect()
+    };
+    // The deletions are marked only because their table is in L6.
+    assert_eq!(in_level(6), [6]);
+    assert_eq!(in_level(0), [7]);
+
+    /// Asks for every key Pebble wrote, the deleted ones included.
+    async fn answers(db: &roble::Db<SimFs>, keys: &[String]) -> Model {
+        let mut found = Model::new();
+        for key in keys {
+            if let Some(f) = db
+                .get(key.as_bytes(), Comparison::Equal)
+                .await
+                .expect("get")
+            {
+                found.insert(f.key, f.value);
+            }
+        }
+        found
+    }
+    let keys: Vec<String> = in_l0.iter().chain(&in_l6).map(|e| e.0.clone()).collect();
+    // What Pebble's own reader found when the generator reopened it.
+    let live: Model = [
+        ("l0-alive", "old-l0-alive"),
+        ("l0-overwritten", "new-l0-overwritten"),
+        ("l0-range-3", "old-l0-range-3"),
+        ("l6-alive", "old-l6-alive"),
+        ("l6-overwritten", "new-l6-overwritten"),
+        ("l6-range-3", "old-l6-range-3"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+    .collect();
+    assert_eq!(contents(&db).await, live);
+    assert_eq!(answers(&db, &keys).await, live);
+
+    // Keys either side of all of Pebble's, flushed and pushed down a level at
+    // a time, so that each merge takes every table of the level below it: the
+    // first takes Pebble's L0 table and the last its L6 one. A merge's error
+    // is this test's failure, which is where a marked key kept would show.
+    let mut around = Batch::new();
+    around.put(b"a", b"first").expect("put");
+    around.put(b"z", b"last").expect("put");
+    let mut tables = vec![flush_batch(&db, &mut around).await, 7];
+    for from in 0..6 {
+        tables = db
+            .compact(from, &tables)
+            .await
+            .unwrap_or_else(|e| panic!("compacting L{from}: {e}"));
+    }
+    let mut after = live.clone();
+    after.insert(b"a".to_vec(), b"first".to_vec());
+    after.insert(b"z".to_vec(), b"last".to_vec());
+
+    // Both of Pebble's tables were merged away, and what replaced them holds
+    // what a reader sees and nothing else: every marked key was dropped, not
+    // carried with its bit cleared.
+    let left: Vec<u64> = db
+        .versions()
+        .version
+        .levels()
+        .flat_map(|(_, tables)| tables.iter().map(|t| t.file_num))
+        .collect();
+    assert_eq!(left, tables, "only the last merge's output is left");
+    let mut written = Vec::new();
+    for n in &tables {
+        let bytes = env
+            .sim()
+            .durable(&dir.join(format!("{n:06}.sst")))
+            .expect("the table is on disk");
+        written.extend(marks(&bytes));
+    }
+    let unmarked: Vec<(String, &'static str, bool)> = after
+        .keys()
+        .map(|k| (String::from_utf8(k.clone()).expect("utf-8"), "set", false))
+        .collect();
+    assert_eq!(written, unmarked);
+
+    assert_eq!(contents(&db).await, after);
+    assert_eq!(answers(&db, &keys).await, live);
+    drop(db);
+    let db = open_unscheduled(&env, &dir).await;
+    assert_eq!(contents(&db).await, after);
+    assert_eq!(answers(&db, &keys).await, live);
+}

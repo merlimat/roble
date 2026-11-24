@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -82,6 +83,7 @@ func main() {
 		// the other's table.
 		{"db-twin-a", buildTwin("a")},
 		{"db-twin-b", buildTwin("b")},
+		{"db-obsolete", buildObsolete},
 	} {
 		dir := filepath.Join(out, f.name)
 		if err := os.RemoveAll(dir); err != nil {
@@ -295,6 +297,142 @@ func buildTwin(tag string) func(string) error {
 		}
 		return db.Close()
 	}
+}
+
+// buildObsolete leaves two tables holding keys Pebble marked with the
+// Pebblev4 obsolete bit, for each of the three reasons Pebble sets it
+// (sstable/rowblk_writer.go):
+//
+//   - an older version of a key, below a newer one in the same table;
+//   - a point deletion of any of the three kinds, in a table written to L6;
+//   - a key a range deletion in the same table covers, which the flush or
+//     compaction writing it forces (compact.Iter.ForceObsoleteDueToRangeDel).
+//
+// Only a snapshot makes Pebble keep keys like these, so each table is written
+// while one holds the older writes, and the snapshots are released just
+// before the database closes. Every marked key is then one no reader can
+// see, and a compaction that kept one would have to write the bit, which
+// roble never does (DESIGN.md §3).
+//
+// The L6 table is a compaction of two flushes rather than one, so it is a
+// merge and not a move that leaves a flushed table there as it was: only a
+// table written into L6 gets the second reason. The L0 table is one flush,
+// with the first and third. Each table also holds two keys no mark touches:
+// one written once, and one at the end of the range deletion's span, written
+// before it. The first of those sorts first, because Pebble never marks a
+// deletion that is a table's first point key: its writer decides nothing
+// about a key until the table holds one.
+func buildObsolete(dir string) error {
+	db, err := pebble.Open(dir, uncompressed(&pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+		DisableWAL:                  true,
+	}))
+	if err != nil {
+		return err
+	}
+
+	var snaps []*pebble.Snapshot
+	for _, level := range []string{"l6-", "l0-"} {
+		// Every key once, so each SINGLEDEL below meets exactly the one SET
+		// it is for.
+		b := db.NewBatch()
+		for _, k := range []string{"alive", "deleted", "overwritten", "range-1", "range-2",
+			"range-3", "single-deleted", "size-deleted"} {
+			if err := b.Set([]byte(level+k), []byte("old-"+level+k), nil); err != nil {
+				return err
+			}
+		}
+		if err := b.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		if level == "l6-" {
+			// The first of the two flushes the compaction merges.
+			if err := db.Flush(); err != nil {
+				return err
+			}
+		}
+
+		snaps = append(snaps, db.NewSnapshot())
+
+		b = db.NewBatch()
+		if err := b.Set([]byte(level+"overwritten"), []byte("new-"+level+"overwritten"), nil); err != nil {
+			return err
+		}
+		if err := b.Delete([]byte(level+"deleted"), nil); err != nil {
+			return err
+		}
+		if err := b.SingleDelete([]byte(level+"single-deleted"), nil); err != nil {
+			return err
+		}
+		size := uint32(len("old-" + level + "size-deleted"))
+		if err := b.DeleteSized([]byte(level+"size-deleted"), size, nil); err != nil {
+			return err
+		}
+		if err := b.DeleteRange([]byte(level+"range-1"), []byte(level+"range-3"), nil); err != nil {
+			return err
+		}
+		if err := b.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		if err := db.Flush(); err != nil {
+			return err
+		}
+		if level == "l6-" {
+			if err := db.Compact(context.Background(), []byte("l6-"), []byte("l6-\xff"), false); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, s := range snaps {
+		if err := s.Close(); err != nil {
+			return err
+		}
+	}
+	if err := db.Close(); err != nil {
+		return err
+	}
+
+	// What a reader sees, by Pebble's own reader: none of the marked keys.
+	return expectContents(dir, map[string]string{
+		"l0-alive":       "old-l0-alive",
+		"l0-overwritten": "new-l0-overwritten",
+		"l0-range-3":     "old-l0-range-3",
+		"l6-alive":       "old-l6-alive",
+		"l6-overwritten": "new-l6-overwritten",
+		"l6-range-3":     "old-l6-range-3",
+	})
+}
+
+// expectContents fails unless Pebble, reopening dir, reads exactly want.
+func expectContents(dir string, want map[string]string) error {
+	db, err := pebble.Open(dir, uncompressed(&pebble.Options{
+		FS:                          vfs.Default,
+		FormatMajorVersion:          pebble.FormatVirtualSSTables,
+		DisableAutomaticCompactions: true,
+		ReadOnly:                    true,
+	}))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	iter, err := db.NewIter(nil)
+	if err != nil {
+		return err
+	}
+	got := map[string]string{}
+	for iter.First(); iter.Valid(); iter.Next() {
+		got[string(iter.Key())] = string(iter.Value())
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+	if !maps.Equal(got, want) {
+		return fmt.Errorf("Pebble reads %v, not %v", got, want)
+	}
+	return nil
 }
 
 // tableNumbers lists the sstable file numbers in a directory.
