@@ -491,6 +491,39 @@ async fn an_earlier_log_that_does_not_end_cleanly_is_refused() {
     }
 }
 
+/// A chunk stamped as a log's EOF trailer ends that log cleanly whatever
+/// length it claims, so an earlier log that ends at one is replayed, and the
+/// later log after it. Pebble's reader knows the trailer by its log number
+/// alone, tested before the length; roble's tested the length first, and
+/// refused the store.
+#[compio::test]
+async fn an_earlier_log_ends_at_its_trailer_whatever_length_the_trailer_claims() {
+    // A recyclable full chunk's header, stamped 12, one past log 11, the
+    // trailer's number, and claiming more bytes than the file holds.
+    let mut stamped = vec![0u8; 11];
+    stamped[4..6].copy_from_slice(&1000u16.to_le_bytes());
+    stamped[6] = 5;
+    stamped[7..11].copy_from_slice(&12u32.to_le_bytes());
+    let (env, dir) = Synth {
+        extra: vec![
+            (
+                roble_format::files::log_filename(11),
+                [framed(11, &[&put_record(b"a", 21)]), stamped].concat(),
+            ),
+            (
+                roble_format::files::log_filename(12),
+                framed(12, &[&put_record(b"d", 24)]),
+            ),
+        ],
+        ..Default::default()
+    }
+    .build()
+    .await;
+
+    let db = roble::open(&env, &dir).await.expect("open");
+    assert_eq!(keys(&db).await, [b"a".to_vec(), b"d".to_vec()]);
+}
+
 #[compio::test]
 async fn a_format_version_above_the_pin_is_refused_before_anything_is_read() {
     let (env, dir) = Synth {

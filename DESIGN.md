@@ -431,6 +431,13 @@ version of its key that the flush or compaction drops is written as a
 and uncover the one under that; Pebble's own `singleDeleteNext` turns one
 that meets a deletion or a `SETWITHDEL` into a `DELETE` as well (`read-probes
 stays-deleted`). A `SINGLEDEL` with nothing older beside it stays one.
+A `DELSIZED` that a flush or a compaction carries is written as it was read,
+size and all, even when the key it sized is dropped beneath it. Pebble's
+compaction spends the size on the first key the tombstone drops
+(`deleteSizedNext`): it clears the size when that key's size matches it, and
+writes a `DELETE` when it does not, counting a missized deletion, or when the
+size was spent before. No read can tell these apart; only that count and
+Pebble's table statistics do.
 
 ## 4. Decisions
 
@@ -1355,7 +1362,15 @@ recycled file's earlier life or a damaged number, or with fewer bytes than a
 header ending a block the file does not fill: Pebble's reader ends a log
 cleanly only at its EOF trailer, a block's zero padding, or the end of the
 file after a record or a full block, and its replay refuses an earlier log
-that ends any other way.
+that ends any other way. Both readers know the trailer by its log number
+alone, tested before the chunk's length, so a chunk stamped as the trailer
+where a record starts ends the log whatever length it claims.
+
+One difference from Pebble's reader is kept on purpose. A valid middle or last
+chunk where a record should start, which Pebble's skips to read on from the
+next record (`nextChunk`), roble's refuses: the first part of that record is
+gone, and reading on would drop the record without a word, the kind of hole
+the rules above close.
 
 The cut is what makes that last rule safe to apply to a log the store carried
 on in. Written over rather than cut, a torn record longer than what replaces
