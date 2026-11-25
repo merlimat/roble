@@ -419,9 +419,9 @@ impl<'a> RecordReader<'a> {
 
             let (format, position) = classify(type_byte)?;
             let header_len = format.header_len();
-            if self.pos + header_len + size > block_end {
+            if self.pos + header_len > block_end {
                 return Error::corrupt(format!(
-                    "chunk of {size} bytes runs past its block, which a chunk never does"
+                    "chunk header of {header_len} bytes runs past its block"
                 ));
             }
 
@@ -429,6 +429,9 @@ impl<'a> RecordReader<'a> {
                 // The log number is tested before the checksum on purpose:
                 // Pebble's EOF trailer carries a zero checksum, so validating
                 // first would report corruption at the end of every closed log.
+                // And before the length, as Pebble's `nextChunk` tests it: the
+                // trailer is known by its number alone, so a chunk stamped as
+                // the trailer ends the log whatever its length says.
                 let log_num = u32::from_le_bytes(h[7..11].try_into().expect("4 bytes"));
                 if log_num != self.log_num {
                     // One more than expected, where a record starts, is the
@@ -446,6 +449,12 @@ impl<'a> RecordReader<'a> {
                         self.log_num
                     ));
                 }
+            }
+
+            if self.pos + header_len + size > block_end {
+                return Error::corrupt(format!(
+                    "chunk of {size} bytes runs past its block, which a chunk never does"
+                ));
             }
 
             let covered = &self.buf[self.pos + 6..self.pos + header_len + size];
@@ -681,6 +690,51 @@ mod tests {
             }
             let _ = errored;
         }
+    }
+
+    #[test]
+    fn a_chunk_stamped_as_the_trailer_ends_the_log_whatever_its_length() {
+        // Log 5's one record, never closed, and then a header stamped with
+        // 6, the trailer's number, claiming more bytes than the stream has.
+        // Pebble's reader tests the number first and ends the log cleanly
+        // there, and so does this one.
+        let mut w = RecordWriter::recyclable(5);
+        w.write_record(b"r1").expect("write");
+        let mut bytes = w.finish();
+        let mut stamped = vec![0u8; RECYCLABLE_HEADER_LEN];
+        stamped[4..6].copy_from_slice(&1000u16.to_le_bytes());
+        stamped[6] = RECYCLABLE_FULL;
+        stamped[7..11].copy_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&stamped);
+        let records: Vec<Vec<u8>> = RecordReader::new(&bytes, 5)
+            .collect::<Result<_>>()
+            .expect("the log ends at the trailer");
+        assert_eq!(records, [b"r1".to_vec()]);
+
+        // Cut short of its eleven bytes the header is not read at all: the
+        // log number is not there to be tested, and the stream ends
+        // uncleanly, as Pebble's does at a header its block cannot hold.
+        let cut = bytes.len() - 2;
+        let mut rd = RecordReader::new(&bytes[..cut], 5);
+        assert_eq!(rd.next().expect("r1").expect("r1"), b"r1");
+        let err = rd
+            .next()
+            .expect("the cut header")
+            .expect_err("a header cut short");
+        assert!(
+            format!("{err}").contains("chunk header of 11 bytes runs past its block"),
+            "got {err:?}"
+        );
+
+        // Inside a record it is no trailer, whatever its length: every chunk
+        // of a record is its own log's.
+        let mut inside = chunk(RECYCLABLE_FIRST, Some(5), b"ab");
+        inside.extend_from_slice(&stamped);
+        let err = first_error(&inside, 5);
+        assert!(
+            format!("{err}").contains("chunk from log 6 inside log 5"),
+            "got {err:?}"
+        );
     }
 
     #[test]
