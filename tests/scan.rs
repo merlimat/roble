@@ -382,8 +382,9 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
     let mut place: Option<usize> = None;
     let mut forward = true;
     // Counted because a walk that never turned round would pass every
-    // assertion below without testing the thing this is here for.
-    let mut turns = 0usize;
+    // assertion below without testing the thing this is here for. A step
+    // against the way the scan went from no key is the other turn there is.
+    let (mut turns, mut turns_from_no_key) = (0usize, 0usize);
     for step in 0..4000usize {
         let what = rng.below(10);
         let was = place;
@@ -414,20 +415,35 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
             }
             6..=7 => {
                 scan.next().await.expect("next");
-                // A scan on no key stays on none: `next` and `prev` return at
-                // once, so a walk that fell off an end needs a seek to get
-                // back on. The model has to do the same or it drifts.
-                place = place.and_then(|p| (p + 1 < entries.len()).then_some(p + 1));
+                // A scan on no key turns round as Pebble's iterator does:
+                // off the start, a step forward lands on the first key, and
+                // off the end it stays off. `forward` is which way the last
+                // move went, which is all the scan knows of where it is.
+                place = match place {
+                    Some(p) => (p + 1 < entries.len()).then_some(p + 1),
+                    None if !forward => (!entries.is_empty()).then_some(0),
+                    None => None,
+                };
                 true
             }
             _ => {
                 scan.prev().await.expect("prev");
-                place = place.and_then(|p| p.checked_sub(1));
+                // Off the end, or made and not yet moved, a step back lands
+                // on the last key; off the start it stays off.
+                place = match place {
+                    Some(p) => p.checked_sub(1),
+                    None if forward => entries.len().checked_sub(1),
+                    None => None,
+                };
                 false
             }
         };
-        if what >= 6 && was.is_some() && now_forward != forward {
-            turns += 1;
+        if what >= 6 && now_forward != forward {
+            if was.is_some() {
+                turns += 1;
+            } else {
+                turns_from_no_key += 1;
+            }
         }
         forward = now_forward;
 
@@ -440,6 +456,11 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
     assert!(
         turns > 100,
         "a walk that barely turns round is not testing a direction change, turned {turns} times"
+    );
+    assert!(
+        turns_from_no_key > 20,
+        "a walk that barely turns round from no key is not testing it, turned \
+         {turns_from_no_key} times"
     );
 
     // And a turn at every key, in both directions, which the random walk
@@ -476,6 +497,75 @@ async fn a_scan_over_many_sources_walks_where_a_btreemap_would() {
                 "a turn forward to {p}"
             );
         }
+    }
+}
+
+/// A step from no key turns round onto the end of the range the scan ran
+/// off, as Pebble's iterator does, and a step the way the scan went stays
+/// off. A scan made and not yet positioned is going forward.
+///
+/// The walk above reaches these from wherever it happens to be; this names
+/// each once, over the whole store, under bounds, and over a range holding
+/// nothing, where every turn lands on nothing too.
+#[compio::test]
+async fn a_step_from_no_key_turns_round_onto_the_end_it_ran_off() {
+    let env = SimEnv::new();
+    let db = roble::open_with(&env, "/db", Options::new().create_if_missing(true))
+        .await
+        .expect("open");
+    for key in [&b"a"[..], b"b", b"c", b"d", b"e"] {
+        db.put(key, b"v").await.expect("put");
+    }
+    let on = |scan: &Scan<SimFs>| scan.is_valid().then(|| scan.key().to_vec());
+    let key = |k: Option<&str>| k.map(|k| k.as_bytes().to_vec());
+
+    for (lower, upper, first, last) in [
+        (Unbounded, Unbounded, Some("a"), Some("e")),
+        (
+            Included(&b"b"[..]),
+            Excluded(&b"e"[..]),
+            Some("b"),
+            Some("d"),
+        ),
+        (Included(&b"c0"[..]), Excluded(&b"c1"[..]), None, None),
+    ] {
+        let range = format!("{lower:?}..{upper:?}");
+        let (first, last) = (key(first), key(last));
+
+        let mut scan = db.range((lower, upper)).expect("scan");
+        scan.next().await.expect("next");
+        assert_eq!(on(&scan), None, "{range}: a new scan's next");
+        scan.prev().await.expect("prev");
+        assert_eq!(on(&scan), last, "{range}: a prev after it");
+        let mut scan = db.range((lower, upper)).expect("scan");
+        scan.prev().await.expect("prev");
+        assert_eq!(on(&scan), last, "{range}: a new scan's prev");
+
+        // Off the end, by a step and by a seek past every key.
+        scan.last().await.expect("last");
+        scan.next().await.expect("next");
+        assert_eq!(on(&scan), None, "{range}: a next off the end");
+        scan.next().await.expect("next");
+        assert_eq!(on(&scan), None, "{range}: another next, the same way");
+        scan.prev().await.expect("prev");
+        assert_eq!(on(&scan), last, "{range}: a prev from off the end");
+        scan.seek_ge(b"f").await.expect("seek_ge");
+        assert_eq!(on(&scan), None, "{range}: a seek past every key");
+        scan.prev().await.expect("prev");
+        assert_eq!(on(&scan), last, "{range}: a prev from past every key");
+
+        // Off the start, the same.
+        scan.first().await.expect("first");
+        scan.prev().await.expect("prev");
+        assert_eq!(on(&scan), None, "{range}: a prev off the start");
+        scan.prev().await.expect("prev");
+        assert_eq!(on(&scan), None, "{range}: another prev, the same way");
+        scan.next().await.expect("next");
+        assert_eq!(on(&scan), first, "{range}: a next from off the start");
+        scan.seek_lt(b"a").await.expect("seek_lt");
+        assert_eq!(on(&scan), None, "{range}: a seek below every key");
+        scan.next().await.expect("next");
+        assert_eq!(on(&scan), first, "{range}: a next from below every key");
     }
 }
 
@@ -1577,10 +1667,8 @@ async fn a_scan_suspended_in_the_middle_of_a_step_reads_past_what_lands_meanwhil
 /// `tests/range_del.rs` reads at a sequence number), and each step has to
 /// leave the scan where Pebble's iterator was.
 ///
-/// A step from no key is not made: off either end roble's scan stays off,
-/// where Pebble's turns round (`Scan::next`). Judging pauses at one, and
-/// resumes at the next seek, `first`, `last` or `set-bounds`, which position
-/// both the same way.
+/// Every step is judged, the ones from no key included, where roble's scan
+/// turns round as Pebble's iterator does (`Scan::next`).
 ///
 /// Skipped: the defines holding a MERGE, which roble refuses (§3), and the
 /// one with a merger; the one holding a batch's own entry, which only a scan
@@ -1607,10 +1695,8 @@ async fn roble_steps_through_one_source_as_pebbles_iterator_does() {
 
     let mut source: Option<Vec<String>> = None;
     // Cases judged, cases skipped for their define and for their steps, and
-    // the steps of the judged ones made and paused, counted once for the two
-    // sources.
-    let (mut judged, mut unheld, mut unstepped) = (0, 0, 0);
-    let (mut made, mut paused_at) = (0, 0);
+    // the steps of the judged ones made, counted once for the two sources.
+    let (mut judged, mut unheld, mut unstepped, mut made) = (0, 0, 0, 0);
     for case in cases(&text) {
         if case.command.starts_with("define") {
             // A sequence number spelled `b2` is an indexed batch's own entry,
@@ -1675,18 +1761,14 @@ async fn roble_steps_through_one_source_as_pebbles_iterator_does() {
                 .expect("scan")
             };
             let mut scan = range(&lower, &upper);
-            let mut paused = false;
+            // Whether the last move went back, as a new iterator's has not.
+            let mut back = false;
             for (step, want) in case.input.iter().zip(&expected) {
                 let context = format!("line {}, the source in {place}: {step}", case.line);
                 let words: Vec<&str> = step.split_whitespace().collect();
                 let result = match words.as_slice() {
                     ["stats"] => {
                         assert!(want.starts_with("stats:"), "{context}");
-                        continue;
-                    }
-                    ["next" | "prev"] if paused || !scan.is_valid() => {
-                        paused = true;
-                        paused_at += usize::from(place == "L6");
                         continue;
                     }
                     ["next"] => scan.next().await,
@@ -1696,13 +1778,26 @@ async fn roble_steps_through_one_source_as_pebbles_iterator_does() {
                     ["seek-ge", k] => scan.seek_ge(k.as_bytes()).await,
                     ["seek-lt", k] => scan.seek_lt(k.as_bytes()).await,
                     ["set-bounds", ..] => {
+                        // A new scan stands in, roble's having no bounds to
+                        // set. Pebble's iterator is left on no key and still
+                        // facing the way it went (`Iterator.invalidate`),
+                        // which is where a step from it turns round from, so
+                        // a seek below every key turns the new scan that way.
                         scan = range(&edge(&words, "lower="), &edge(&words, "upper="));
-                        Ok(())
+                        if back {
+                            scan.seek_lt(&[]).await
+                        } else {
+                            Ok(())
+                        }
                     }
                     other => panic!("{context}: a step this runner does not know: {other:?}"),
                 };
                 result.unwrap_or_else(|e| panic!("{context}: {e}"));
-                paused = false;
+                match words[0] {
+                    "next" | "first" | "seek-ge" => back = false,
+                    "prev" | "last" | "seek-lt" => back = true,
+                    _ => {}
+                }
                 let got = if scan.is_valid() {
                     format!(
                         "{}: ({}, .)",
@@ -1719,10 +1814,10 @@ async fn roble_steps_through_one_source_as_pebbles_iterator_does() {
         judged += 1;
     }
     assert_eq!(
-        (judged, unheld, unstepped, made, paused_at),
-        (63, 38, 46, 150, 9),
+        (judged, unheld, unstepped, made),
+        (63, 38, 46, 159),
         "the cases judged and skipped for their define and their steps, and the \
-         steps made and paused, in {}",
+         steps made, in {}",
         path.display()
     );
 }

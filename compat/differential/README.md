@@ -43,8 +43,9 @@ keys with either side now and then open, and makes forty moves with it —
 `first`, `last`, `next`, `prev`, and seeks on keys, between them and just
 outside the range — and after every move requires the key the map says, so
 it turns round in the middle of tables and at their edges, where a full scan
-never does. A step from nothing is skipped, since the engines differ there:
-Pebble turns round onto the end of the range and roble stays on nothing.
+never does. A step from nothing is judged too: off the end, or before any
+move, a step back lands on the last key in the range, and off the start a step
+forward on the first, while a step the way the iterator went stays on nothing.
 
 A walk's iterator lives inside one operation. `iter` makes one that is held,
 up to three in a turn, and `itermove` moves one a few steps at a time from

@@ -128,9 +128,13 @@ func scriptKey(w string) []byte {
 }
 
 // walkWant is where a walk's iterator should be after a move, by the
-// model: want holds the model's keys in [lower, upper), sorted, and at is
-// the key the iterator is on before the move.
-func walkWant(want []string, mv, at string) (string, bool) {
+// model: want holds the model's keys in [lower, upper), sorted, at is the
+// key the iterator is on before the move if valid says it is on one, and
+// back says whether its last move went backwards. A step from nothing turns
+// round: off the end, or made and not yet moved, a prev lands on the last
+// key, and off the start a next lands on the first, while a step the way the
+// iterator was going stays on nothing.
+func walkWant(want []string, mv, at string, valid, back bool) (string, bool) {
 	// The first index at or after k, and the last before it.
 	ge := func(k string) (string, bool) {
 		i := sort.SearchStrings(want, k)
@@ -146,14 +150,27 @@ func walkWant(want []string, mv, at string) (string, bool) {
 		}
 		return "", false
 	}
-	switch {
-	case mv == "f":
-		return ge("")
-	case mv == "l":
+	last := func() (string, bool) {
 		if len(want) == 0 {
 			return "", false
 		}
 		return want[len(want)-1], true
+	}
+	switch {
+	case mv == "f":
+		return ge("")
+	case mv == "l":
+		return last()
+	case mv == "n" && !valid:
+		if back {
+			return ge("")
+		}
+		return "", false
+	case mv == "p" && !valid:
+		if !back {
+			return last()
+		}
+		return "", false
 	case mv == "n":
 		return ge(at + "\x00")
 	case mv == "p":
@@ -168,9 +185,8 @@ func walkWant(want []string, mv, at string) (string, bool) {
 }
 
 // walk moves an iterator over [lower, upper) as the script says and
-// requires the model's answer after every move. A step from nothing is
-// skipped: Pebble turns round onto the range's end and roble stays on
-// nothing, and which is right is not what the walk asks.
+// requires the model's answer after every move, a step from nothing
+// included (walkWant).
 func walk(db pebble.Reader, model map[string][]byte, args []string, at string) {
 	w := newWalker(db, model, args[0], args[1], at)
 	defer w.iter.Close()
@@ -187,7 +203,10 @@ type walker struct {
 	want         []string
 	lower, upper string
 	valid        bool
-	done         []string
+	// Whether the last move went backwards: l, p or t. A new iterator's has
+	// not, as Pebble's starts out going forward (iterPosCurForward).
+	back bool
+	done []string
 }
 
 func newWalker(db pebble.Reader, model map[string][]byte, lower, upper, at string) *walker {
@@ -216,14 +235,11 @@ func newWalker(db pebble.Reader, model map[string][]byte, lower, upper, at strin
 func (w *walker) walk(moves []string, at string) {
 	iter := w.iter
 	for _, mv := range moves {
-		if !w.valid && (mv == "n" || mv == "p") {
-			continue
-		}
 		before := ""
 		if w.valid {
 			before = string(iter.Key())
 		}
-		wantKey, wantOK := walkWant(w.want, mv, before)
+		wantKey, wantOK := walkWant(w.want, mv, before, w.valid, w.back)
 		switch {
 		case mv == "f":
 			w.valid = iter.First()
@@ -238,6 +254,7 @@ func (w *walker) walk(moves []string, at string) {
 		case strings.HasPrefix(mv, "t:"):
 			w.valid = iter.SeekLT(scriptKey(mv[2:]))
 		}
+		w.back = mv == "l" || mv == "p" || strings.HasPrefix(mv, "t:")
 		w.done = append(w.done, mv)
 		if err := iter.Error(); err != nil {
 			fail(fmt.Errorf("%s: walk %s: %w", at, strings.Join(w.done, " "), err))

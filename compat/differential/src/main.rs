@@ -858,13 +858,17 @@ async fn check<F: roble::Fs>(db: &Src<'_, F>, model: &Model, at: &str) {
 
 /// Where a walk's scan should be after a move, by the map: the move's key
 /// among the map's keys in `[lower, upper)`, or nothing. `at` is where the
-/// scan is before the move; a step off the end of the range leaves it on
-/// nothing, and a step from nothing is not made (see [`walk`]).
+/// scan is before the move, and `back` whether its last move went backwards.
+/// A step off the end of the range leaves it on nothing, and a step from
+/// nothing turns round: off the end, or made and not yet moved, a step back
+/// lands on the last key, and off the start a step forward on the first,
+/// while a step the way the scan was going stays on nothing.
 fn walk_want<'m>(
     model: &'m Model,
     lower: &Option<Vec<u8>>,
     upper: &Option<Vec<u8>>,
     at: Option<&[u8]>,
+    back: bool,
     mv: &Move,
 ) -> Option<(&'m Vec<u8>, &'m Vec<u8>)> {
     let lo = |b: Bound<Vec<u8>>| match (lower, b) {
@@ -897,15 +901,22 @@ fn walk_want<'m>(
         Move::Last => lt(Bound::Unbounded),
         Move::SeekGe(k) => ge(Bound::Included(k.clone())),
         Move::SeekLt(k) => lt(Bound::Excluded(k.clone())),
-        Move::Next => ge(Bound::Excluded(at?.to_vec())),
-        Move::Prev => lt(Bound::Excluded(at?.to_vec())),
+        Move::Next => match at {
+            Some(at) => ge(Bound::Excluded(at.to_vec())),
+            None if back => ge(Bound::Unbounded),
+            None => None,
+        },
+        Move::Prev => match at {
+            Some(at) => lt(Bound::Excluded(at.to_vec())),
+            None if !back => lt(Bound::Unbounded),
+            None => None,
+        },
     }
 }
 
 /// A scan over the walk's range, moved as the script says, and required to
-/// be where the map says after every move. A step from nothing is skipped:
-/// roble leaves the scan on nothing and Pebble turns round onto the range's
-/// end, and which is right is not what the walk is asking.
+/// be where the map says after every move, a step from nothing included
+/// ([`walk_want`]).
 async fn walk<F: roble::Fs>(
     db: &Src<'_, F>,
     model: &Model,
@@ -927,6 +938,9 @@ struct Walker<F: roble::Fs> {
     model: Model,
     lower: Option<Vec<u8>>,
     upper: Option<Vec<u8>>,
+    /// Whether the last move went backwards: `last`, `prev` or a seek below.
+    /// A new scan's has not, as it starts out going forward.
+    back: bool,
     done: Vec<String>,
 }
 
@@ -954,6 +968,7 @@ impl<F: roble::Fs> Walker<F> {
             model,
             lower,
             upper,
+            back: false,
             done: Vec::new(),
         }
     }
@@ -962,11 +977,9 @@ impl<F: roble::Fs> Walker<F> {
         let (scan, model, lower, upper) = (&mut self.scan, &self.model, &self.lower, &self.upper);
         for mv in moves {
             let now = scan.is_valid().then(|| scan.key().to_vec());
-            if now.is_none() && matches!(mv, Move::Next | Move::Prev) {
-                continue;
-            }
-            let want = walk_want(model, lower, upper, now.as_deref(), mv)
+            let want = walk_want(model, lower, upper, now.as_deref(), self.back, mv)
                 .map(|(k, v)| (k.clone(), v.clone()));
+            self.back = matches!(mv, Move::Last | Move::Prev | Move::SeekLt(_));
             let (name, result) = match mv {
                 Move::First => ("f".to_string(), scan.first().await),
                 Move::Last => ("l".to_string(), scan.last().await),

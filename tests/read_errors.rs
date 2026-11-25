@@ -403,20 +403,24 @@ impl Walk {
         .expect("range")
     }
 
-    /// Where the model says `mv` leaves a scan that was on `at`.
-    fn expect(&self, model: &Model, at: Option<&[u8]>, mv: Move) -> Option<Vec<u8>> {
+    /// Where the model says `mv` leaves a scan that was on `at`, after a
+    /// last move that went back if `back` says so.
+    fn expect(&self, model: &Model, at: Option<&[u8]>, back: bool, mv: Move) -> Option<Vec<u8>> {
         let mut keys = model.keys().filter(|k| {
             self.lower.is_none_or(|l| **k >= key(l)) && self.upper.is_none_or(|u| **k < key(u))
         });
-        match mv {
-            Move::First => keys.next(),
-            Move::Last => keys.next_back(),
-            Move::SeekGe(i) => keys.find(|k| **k >= key(i)),
-            Move::SeekLt(i) => keys.rev().find(|k| **k < key(i)),
-            // Off either end a scan stays off it: a step from nowhere is
-            // nowhere.
-            Move::Next => at.and_then(|p| keys.find(|k| k.as_slice() > p)),
-            Move::Prev => at.and_then(|p| keys.rev().find(|k| k.as_slice() < p)),
+        match (mv, at) {
+            (Move::First, _) => keys.next(),
+            (Move::Last, _) => keys.next_back(),
+            (Move::SeekGe(i), _) => keys.find(|k| **k >= key(i)),
+            (Move::SeekLt(i), _) => keys.rev().find(|k| **k < key(i)),
+            (Move::Next, Some(p)) => keys.find(|k| k.as_slice() > p),
+            (Move::Prev, Some(p)) => keys.rev().find(|k| k.as_slice() < p),
+            // From no key a step against the way the scan went turns round
+            // onto the end it ran off, and one the same way stays off.
+            (Move::Next, None) if back => keys.next(),
+            (Move::Prev, None) if !back => keys.next_back(),
+            (Move::Next | Move::Prev, None) => None,
         }
         .cloned()
     }
@@ -467,6 +471,25 @@ fn walks() -> Vec<Walk> {
                 Move::Prev,
             ],
         },
+        // Turning round from no key at both ends, which seeks every source
+        // afresh as `first` and `last` do: from past every key, from off the
+        // end, from below every key, and from off the start.
+        Walk {
+            lower: Some(20),
+            upper: Some(100),
+            moves: vec![
+                Move::SeekGe(100),
+                Move::Prev,
+                Move::Prev,
+                Move::Next,
+                Move::Next,
+                Move::Prev,
+                Move::SeekLt(20),
+                Move::Next,
+                Move::Prev,
+                Move::Next,
+            ],
+        },
     ]
 }
 
@@ -496,12 +519,13 @@ async fn walk_on(
     walk: &Walk,
     what: &str,
 ) -> Option<(usize, roble::Error)> {
-    let mut at = None;
+    let (mut at, mut back) = (None, false);
     for (i, &mv) in walk.moves.iter().enumerate() {
         if let Err(e) = make(scan, mv).await {
             return Some((i, e));
         }
-        at = walk.expect(model, at.as_deref(), mv);
+        at = walk.expect(model, at.as_deref(), back, mv);
+        back = matches!(mv, Move::Last | Move::SeekLt(_) | Move::Prev);
         on(
             scan,
             model,
@@ -540,7 +564,7 @@ async fn a_scan_that_meets_a_failed_read_fails_and_reads_right_once_positioned_a
             // Positioned nowhere, and saying so: a scan that met an error
             // cannot vouch for where it is, so it is on no key, and a step
             // from there refuses rather than ending as though the range
-            // had run out.
+            // had run out, or turning round as though it had.
             assert!(
                 !scan.is_valid(),
                 "{what}: the scan still says it is on {}",
@@ -563,8 +587,8 @@ async fn a_scan_that_meets_a_failed_read_fails_and_reads_right_once_positioned_a
             }
 
             // Positioned again, by each call that can do it in turn, it reads
-            // right to the end of its range, and off it, where a step does
-            // nothing again.
+            // right to the end of its range, and off it, where a step on the
+            // same way does nothing.
             let (start, step) = match n % 4 {
                 0 => (Move::First, Move::Next),
                 1 => (Move::Last, Move::Prev),

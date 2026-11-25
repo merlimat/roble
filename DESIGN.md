@@ -958,6 +958,16 @@ no block of the tables it makes too old (`get` above).
 Forward and reverse, bounded, over a snapshot. `seek_ge` / `seek_lt` /
 `next` / `prev`.
 
+**Off an end, a step back turns round, as Pebble's does.** A scan that runs
+off the end of its range is on no key, and `prev` from there lands on the last
+key in range; one that runs off the start lands on the first with `next`. A
+step the way the scan went stays off, and a scan made and not yet positioned
+is going forward, so its `prev` lands on the last key and its `next` on
+nothing. Pebble's `Iterator` keeps the way it went when it runs out (`pos`)
+and turns with a seek to its bound; roble's scan keeps the way its sources
+face and turns with `first` or `last`, which seek the same way. A scan an
+error left on no key refuses to step instead (§12).
+
 **The snapshot is a sequence number.** A scan takes the highest sequence
 number in use when it is made and ignores anything above it, so a write that
 happens while it is open is simply not its business. Nothing is copied and
