@@ -18,7 +18,9 @@ LSM less its entries numbered at or above it, which is the same answer read at
 the newest one. Skipped: defines holding a MERGE, which roble refuses; two
 whose layers hold older sequence numbers than the layers below them, which no
 store writes and Pebble's own comment calls unnatural; and the reads after a
-`compact`, which are of Pebble's compaction.
+`compact`, which are of Pebble's compaction; `tests/range_del.rs` writes out
+by hand each state Pebble prints after a `compact`, and makes those reads of
+it.
 
 `level_checker` is Pebble's `testdata/level_checker`, copied unchanged the
 same way. `tests/version.rs` writes each `define`'s tables at their levels and
