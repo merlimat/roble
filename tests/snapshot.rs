@@ -820,10 +820,10 @@ async fn compact_all(db: &roble::Db<SimFs>) {
 /// reads. That is also why roble passes the case of Pebble's #2705, which is
 /// about Pebble hiding points it has marked obsolete: roble marks none.
 ///
-/// A step from no key is not made, as in `tests/scan.rs`'s runner of Pebble's
-/// iterator cases: judging pauses there until the next seek, `first` or
-/// `last`. Skipped: the define holding a MERGE, which roble refuses (§3), and
-/// `db-state`, which prints Pebble's own version.
+/// Every step is judged, the ones from no key included, where roble's scan
+/// turns round as Pebble's iterator does (`Scan::next`). Skipped: the define
+/// holding a MERGE, which roble refuses (§3), and `db-state`, which prints
+/// Pebble's own version.
 #[compio::test]
 async fn snapshots_read_what_pebbles_snapshots_read() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/snapshot");
@@ -831,7 +831,7 @@ async fn snapshots_read_what_pebbles_snapshots_read() {
 
     // The store a define made, and its snapshots by name.
     let mut store = None;
-    let (mut judged, mut skipped, mut made, mut paused_at) = (0, 0, 0, 0);
+    let (mut judged, mut skipped, mut made) = (0, 0, 0);
     for case in cases(&text) {
         let context = format!("line {}: {}", case.line, case.command);
         let mut words = case.command.split_whitespace();
@@ -879,15 +879,9 @@ async fn snapshots_read_what_pebbles_snapshots_read() {
                 .expect("scan");
                 let expected: Vec<&str> = case.expected.lines().collect();
                 assert_eq!(expected.len(), case.input.len(), "{context}: a line a step");
-                let mut paused = false;
                 for (step, want) in case.input.iter().zip(&expected) {
                     let words: Vec<&str> = step.split_whitespace().collect();
                     let result = match words.as_slice() {
-                        ["next" | "prev"] if paused || !scan.is_valid() => {
-                            paused = true;
-                            paused_at += 1;
-                            continue;
-                        }
                         ["next"] => scan.next().await,
                         ["prev"] => scan.prev().await,
                         ["first"] => scan.first().await,
@@ -897,7 +891,6 @@ async fn snapshots_read_what_pebbles_snapshots_read() {
                         other => panic!("{context}: a step this runner does not know: {other:?}"),
                     };
                     result.unwrap_or_else(|e| panic!("{context}: {step}: {e}"));
-                    paused = false;
                     let got = if scan.is_valid() {
                         format!(
                             "{}:{}",
@@ -916,9 +909,9 @@ async fn snapshots_read_what_pebbles_snapshots_read() {
         }
     }
     assert_eq!(
-        (judged, skipped, made, paused_at),
-        (10, 4, 24, 9),
-        "the cases judged and skipped, and the steps made and paused, in {}",
+        (judged, skipped, made),
+        (10, 4, 33),
+        "the cases judged and skipped, and the steps made, in {}",
         path.display()
     );
 }

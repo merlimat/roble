@@ -199,9 +199,14 @@ fn bounded(model: &Model, lower: &Option<Vec<u8>>, upper: &Option<Vec<u8>>) -> M
 
 /// Moves `scan` and checks every position against what `view` says it
 /// should be on.
+///
+/// A step from no key turns round onto the end of the range the scan ran
+/// off, and one the way it went stays off (`Scan`), so the model keeps which
+/// way the last move went. A new scan is going forward.
 async fn drive<F: Fs>(scan: &mut Scan<F>, view: &Model, moves: &[Move]) {
     let pair = |(k, v): (&Vec<u8>, &Vec<u8>)| (k.clone(), v.clone());
     let mut at: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut back = false;
     for m in moves.iter().take(32) {
         at = match m {
             Move::First => {
@@ -214,15 +219,22 @@ async fn drive<F: Fs>(scan: &mut Scan<F>, view: &Model, moves: &[Move]) {
             }
             Move::Next => {
                 scan.next().await.expect("next");
-                at.and_then(|(k, _)| {
-                    view.range((Bound::Excluded(k), Bound::Unbounded))
+                match at {
+                    Some((k, _)) => view
+                        .range((Bound::Excluded(k), Bound::Unbounded))
                         .next()
-                        .map(pair)
-                })
+                        .map(pair),
+                    None if back => view.iter().next().map(pair),
+                    None => None,
+                }
             }
             Move::Prev => {
                 scan.prev().await.expect("prev");
-                at.and_then(|(k, _)| view.range(..k).next_back().map(pair))
+                match at {
+                    Some((k, _)) => view.range(..k).next_back().map(pair),
+                    None if !back => view.iter().next_back().map(pair),
+                    None => None,
+                }
             }
             Move::SeekGe(p) => {
                 let p = p.bytes();
@@ -235,6 +247,7 @@ async fn drive<F: Fs>(scan: &mut Scan<F>, view: &Model, moves: &[Move]) {
                 view.range(..p).next_back().map(pair)
             }
         };
+        back = matches!(m, Move::Last | Move::Prev | Move::SeekLt(_));
         let got = scan
             .is_valid()
             .then(|| (scan.key().to_vec(), scan.value().to_vec()));

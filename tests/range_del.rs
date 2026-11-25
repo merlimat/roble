@@ -121,7 +121,9 @@ async fn get(db: &roble::Db<SimFs>, keys: &[String]) -> String {
 /// Two steps Pebble's file does not use, for the layouts written out by hand
 /// below: RocksDB's `seek-for-prev`, to the last key at or before its key;
 /// and Pebble's `set-bounds`, which roble has as a new scan over the bounds,
-/// unpositioned as Pebble's iterator is left.
+/// unpositioned as Pebble's iterator is left. A new scan goes forward, which
+/// is the way Pebble's iterator still faces when, as in every read below, it
+/// has not moved before its bounds are set.
 async fn iter(db: &roble::Db<SimFs>, steps: &[String]) -> String {
     let mut scan = db.range(..).expect("scan");
     let mut out = Vec::new();
@@ -406,8 +408,10 @@ impl std::fmt::Display for Move<'_> {
 /// the two ends of the keyspace. Every comparison is asked of `get` at every
 /// probe. Then, under every pair of bounds the probes make, a scan seeks to
 /// every probe either way and to its first and last keys, and from each of
-/// those steps on and turns back, or turns and steps on. No step is taken
-/// from no key, as the differential takes none.
+/// those steps on and turns back, or turns and steps on. That takes steps
+/// from no key as well, off an end of the bounds or where a seek found
+/// nothing: one the way the scan went stays off, and one against it turns
+/// round onto the end of the bounds it ran off.
 async fn walk(db: &roble::Db<SimFs>, groups: &[(Place, Vec<Entry>)], context: &str) {
     let want = visible(groups);
     let mut probes = BTreeSet::from([Vec::new(), vec![0xff]]);
@@ -479,6 +483,9 @@ async fn walk(db: &roble::Db<SimFs>, groups: &[(Place, Vec<Entry>)], context: &s
             for &start in &starts {
                 for then in [[Move::Next, Move::Prev], [Move::Prev, Move::Next]] {
                     let mut at: Option<usize> = None;
+                    // Whether the last move went back, which is the end a
+                    // step from no key turns round onto.
+                    let mut back = false;
                     let mut made = Vec::new();
                     for m in std::iter::once(start).chain(then) {
                         at = match m {
@@ -500,13 +507,22 @@ async fn walk(db: &roble::Db<SimFs>, groups: &[(Place, Vec<Entry>)], context: &s
                             }
                             Move::Next => {
                                 scan.next().await.expect("next");
-                                at.map(|i| i + 1).filter(|&i| i < view.len())
+                                match at {
+                                    Some(i) => (i + 1 < view.len()).then_some(i + 1),
+                                    None if back => (!view.is_empty()).then_some(0),
+                                    None => None,
+                                }
                             }
                             Move::Prev => {
                                 scan.prev().await.expect("prev");
-                                at.and_then(|i| i.checked_sub(1))
+                                match at {
+                                    Some(i) => i.checked_sub(1),
+                                    None if !back => view.len().checked_sub(1),
+                                    None => None,
+                                }
                             }
                         };
+                        back = matches!(m, Move::SeekLt(_) | Move::Last | Move::Prev);
                         made.push(m.to_string());
                         assert_eq!(
                             shown(scan.is_valid().then(|| (scan.key(), scan.value()))),
@@ -516,9 +532,6 @@ async fn walk(db: &roble::Db<SimFs>, groups: &[(Place, Vec<Entry>)], context: &s
                             upper.map_or("-".to_string(), |u| u.escape_ascii().to_string()),
                             made.join(" ")
                         );
-                        if at.is_none() {
-                            break;
-                        }
                     }
                 }
             }
@@ -908,8 +921,6 @@ const LAYOUTS: &[Layout] = &[
         reads: &[("iter", "last\nnext", "z: (2, .)\n.")],
     },
     Layout {
-        // Pebble's case goes on to `prev` from no key, which roble's scan does
-        // not turn round from; `walk` makes every turn it does make here.
         source: "Pebble's merging_iter, line 526: the upper bound held at a range deletion's \
                  edge",
         entries: "L1 kq.RANGEDEL.100:p
@@ -918,7 +929,11 @@ const LAYOUTS: &[Layout] = &[
         bounds: "L1: kq#100,RANGEDEL-p#inf,RANGEDEL
                  L2: b#90,SET-o#65,SET
                  L3: a#41,SET-z#inf,RANGEDEL",
-        reads: &[("iter", "set-bounds upper=n\nseek-ge krgywquurww", ".\n.")],
+        reads: &[(
+            "iter",
+            "set-bounds upper=n\nseek-ge krgywquurww\nprev",
+            ".\n.\nkoujdlp: (37, .)",
+        )],
     },
     Layout {
         source: "Pebble's merging_iter, line 556: the lower bound held at a range deletion's \

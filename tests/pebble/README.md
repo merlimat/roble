@@ -51,14 +51,14 @@ keeps the deletion. Skipped: the range deletions, which roble never drops.
 `tests/scan.rs` builds each `define`'s one source as a table and as a
 memtable, each less its entries numbered at or above the `iter`'s sequence
 number, and requires each step of a scan over it to land where Pebble's
-iterator did. A step from no key, where roble's scan stays off the end and
-Pebble's turns round, is not made, and judging resumes at the next seek,
-`first`, `last` or `set-bounds`. Skipped: defines holding a MERGE or a merger,
+iterator did, a step from no key included. `set-bounds` is a new scan over the
+bounds, turned the way the old one went, as Pebble's iterator keeps the way it
+went across new bounds. Skipped: defines holding a MERGE or a merger,
 the one holding a batch's own entry, and cases using a prefix seek or a
 `-limit` step, which roble's scan does not have.
 
 `snapshot` is Pebble's `testdata/snapshot`, copied unchanged the same way.
 `tests/snapshot.rs` makes each `define`'s writes, snapshots and compactions on
 a store and requires each step of a scan of a snapshot to land where Pebble's
-did, pausing at a step from no key the same way. Skipped: the define holding
+did, a step from no key included. Skipped: the define holding
 a MERGE, and `db-state`, which prints Pebble's own version.

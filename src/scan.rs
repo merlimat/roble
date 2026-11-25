@@ -746,25 +746,33 @@ impl Covering {
 /// Forward and reverse, optionally bounded. The bounds are half-open as
 /// Pebble's are: `lower` is included and `upper` is not.
 ///
+/// **Off an end of the range, a step back turns round.** A scan that has run
+/// off the end is on no key, and [`Scan::prev`] from there lands on the last
+/// key in range; one that has run off the start lands on the first with
+/// [`Scan::next`]. A step the way the scan was going stays off. A scan made
+/// and not yet positioned counts as going forward: its `prev` lands on the
+/// last key, and its `next` on nothing. Pebble's iterator steps the same way,
+/// keeping the way it was going when it runs out.
+///
 /// **A call that fails leaves the scan on no key.** A read can fail part way
 /// through a seek or a step, and then the key the scan was on no longer says
 /// where it is. After an error [`Scan::is_valid`] is false, and [`Scan::next`]
 /// and [`Scan::prev`] refuse with [`Error::InvalidArgument`] until
 /// [`Scan::seek_ge`], [`Scan::seek_lt`], [`Scan::first`] or [`Scan::last`]
-/// positions the scan again. A step refuses rather than doing nothing, which
-/// is what it does once the scan has run off the end of its range, so a
-/// caller that goes on stepping is not told the range is over. Pebble's
-/// iterator keeps its error until a seek in the same way, its `Next` and
-/// `Prev` doing nothing until then.
+/// positions the scan again. A step refuses rather than doing what it does
+/// off an end of the range, so a caller that goes on stepping is neither told
+/// the range is over nor sent back to one of its ends. Pebble's iterator
+/// keeps its error until a seek in the same way, its `Next` and `Prev` doing
+/// nothing until then.
 pub struct Scan<F: Fs = crate::FileFs> {
     iters: Vec<Source<F::Disk>>,
     /// The sources arranged so that the next key is the top of a heap rather
     /// than the winner of a look at every one of them.
     ///
     /// Empty until the scan is positioned, and rebuilt by every call that
-    /// positions it. Nothing reads it before then: `next` and `prev` return
-    /// at once while `current` is `None`, and every other entry point seeks
-    /// first.
+    /// positions it. Nothing reads it before then: while `current` is `None`,
+    /// `next` and `prev` either return at once or turn round through `first`
+    /// or `last`, which seek, and every other entry point seeks first.
     heap: Heap,
     /// The buffers of the keys this scan has moved off, kept to be filled
     /// again.
@@ -1055,9 +1063,18 @@ impl<F: Fs> Scan<F> {
         result
     }
 
-    /// What a step from no key does: nothing, as off either end of the range,
-    /// unless an error is what left the scan there.
-    fn step_from_no_key(&self) -> Result<()> {
+    /// What a step from no key does, `forward` or back: turn round onto the
+    /// end of the range the scan ran off, or stay off when it steps the way
+    /// the scan was going ([`Scan`]) — unless an error is what left the scan
+    /// there, which it refuses.
+    ///
+    /// `dir` is the way the last call that positioned or stepped the scan
+    /// left its sources, and a scan made and not yet positioned is going
+    /// forward ([`Scan::rebuild`]). Pebble's `nextWithLimit` and
+    /// `PrevWithLimit` turn on the same thing, their iterator's `pos`, and
+    /// turn with the same seeks: to the lower bound or the first key, or
+    /// below the upper bound or to the last.
+    async fn step_from_no_key(&mut self, forward: bool) -> Result<()> {
         if self.failed {
             return Err(Error::InvalidArgument(
                 "a step of a scan that an error left on no key; a seek, first or last positions \
@@ -1065,7 +1082,11 @@ impl<F: Fs> Scan<F> {
                     .to_string(),
             ));
         }
-        Ok(())
+        match (forward, self.dir) {
+            (true, Dir::Reverse) => self.first().await,
+            (false, Dir::Forward) => self.last().await,
+            _ => Ok(()),
+        }
     }
 
     /// Positions on the first key at or after `from`, respecting the bounds.
@@ -1120,12 +1141,14 @@ impl<F: Fs> Scan<F> {
 
     /// Steps to the next key.
     ///
-    /// On no key it does nothing, as off either end of the range — unless an
-    /// error left the scan there, which it refuses ([`Scan`]).
+    /// On no key it turns round onto the first key in range when the scan ran
+    /// off the start, and does nothing when it ran off the end or was never
+    /// positioned — unless an error left the scan there, which it refuses
+    /// ([`Scan`]).
     #[allow(clippy::should_implement_trait)]
     pub async fn next(&mut self) -> Result<()> {
         let Some(current) = &self.current else {
-            return self.step_from_no_key();
+            return self.step_from_no_key(true).await;
         };
         if self.dir == Dir::Reverse {
             // The iterators are all before the current key; going forward
@@ -1140,11 +1163,15 @@ impl<F: Fs> Scan<F> {
         self.settled(advanced)
     }
 
-    /// Steps to the previous key, doing nothing or refusing on no key as
-    /// [`Scan::next`] does.
+    /// Steps to the previous key.
+    ///
+    /// On no key it turns round onto the last key in range when the scan ran
+    /// off the end or was never positioned, and does nothing when it ran off
+    /// the start — unless an error left the scan there, which it refuses
+    /// ([`Scan`]).
     pub async fn prev(&mut self) -> Result<()> {
         let Some(current) = &self.current else {
-            return self.step_from_no_key();
+            return self.step_from_no_key(false).await;
         };
         if self.dir == Dir::Forward {
             key::search_key_into(&current.user, &mut self.target);
