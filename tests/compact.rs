@@ -21,6 +21,7 @@
 //! everything would pass the first on its own.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use roble::sim::{SimEnv, SimFs};
@@ -1225,6 +1226,138 @@ async fn a_tombstone_across_a_split_leaves_tables_that_touch() {
         before,
         "and the version with touching bounds should replay"
     );
+}
+
+/// RocksDB's `RangeTombstoneEndKeyAsSstableUpperBound`: two L1 tables that
+/// meet inside a range deletion go down into L2 one at a time, the second
+/// first. RocksDB once wrote overlapping L2 tables doing this, by reading the
+/// deletion's end, where the first table stops, as a key the table holds.
+///
+/// roble pulls into a compaction every table below whose user keys meet the
+/// inputs', touching ones included (`Table::overlaps`), so the first table's
+/// turn takes the second along again; and it cuts each output's deletions to
+/// the output's span. What the sequence has to leave either way is asserted
+/// after each step ([`settled_as`]), and after a crash and a reopen.
+#[compio::test]
+async fn tables_meeting_inside_a_range_deletion_go_down_one_at_a_time_and_stay_apart() {
+    let env = SimEnv::new();
+    let dir = PathBuf::from("/db");
+    // Two of the 4 KiB values to an L1 table, whose target is twice the
+    // base, so that L1 splits where RocksDB's does, at the third key.
+    // Uncompressed, as `open_splitting` explains.
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .create_if_missing(true)
+            .disable_automatic_compactions(true)
+            .target_file_size(3 << 10)
+            .compression(roble::Codec::None),
+    )
+    .await
+    .expect("create");
+    // RocksDB's `Key(i)`.
+    let key = |i: u32| format!("key{i:06}").into_bytes();
+    let value = vec![b'v'; 4 << 10];
+
+    // A key in L2 for the deletion to hide, so that it is not elided.
+    let mut batch = Batch::new();
+    batch.put(&key(0), b"").expect("put");
+    let t = flush_batch(&db, &mut batch).await;
+    let l1 = db.compact(0, &[t]).await.expect("compact into L1");
+    db.compact(1, &l1).await.expect("compact into L2");
+
+    // The deletion and then two L0 tables of keys written after it: the
+    // first, holding the deletion, has key0 and key3, the second key1 and
+    // key2.
+    let mut batch = Batch::new();
+    batch.delete_range(&key(0), &key(4)).expect("delete_range");
+    batch.put(&key(0), &value).expect("put");
+    batch.put(&key(3), &value).expect("put");
+    let a = flush_batch(&db, &mut batch).await;
+    let mut batch = Batch::new();
+    batch.put(&key(1), &value).expect("put");
+    batch.put(&key(2), &value).expect("put");
+    let b = flush_batch(&db, &mut batch).await;
+    db.compact(0, &[a, b]).await.expect("compact into L1");
+
+    let l1 = db.versions().version.level(1).to_vec();
+    assert!(
+        l1.len() == 2
+            && l1[0].largest_user_key().expect("bound") == key(2)
+            && l1[0].largest_is_exclusive().expect("bound")
+            && l1[1].smallest_user_key().expect("bound") == key(2),
+        "L1 should be two tables meeting at key2, the first ending at the deletion's sentinel"
+    );
+    let model = contents(&db).await;
+    assert_eq!(
+        model.keys().cloned().collect::<Vec<_>>(),
+        (0..4).map(key).collect::<Vec<_>>()
+    );
+    settled_as(&db, &model, "after the split").await;
+
+    // The second table into L2 first, which meets nothing there; then the
+    // first, which meets both L2 tables: key0's, and the second's at key2.
+    db.compact(1, &[l1[1].file_num])
+        .await
+        .expect("compact the second table");
+    assert_eq!(level(&db, 1), [l1[0].file_num], "the first table stays");
+    settled_as(&db, &model, "after the second table went down").await;
+    db.compact(1, &[l1[0].file_num])
+        .await
+        .expect("compact the first table");
+    assert!(level(&db, 1).is_empty(), "both tables went down");
+    settled_as(&db, &model, "after the first table went down").await;
+
+    drop(db);
+    env.sim().crash();
+    let db = roble::open(&env, &dir).await.expect("reopen");
+    settled_as(&db, &model, "after a crash and a reopen").await;
+}
+
+/// Asserts what a compaction has to leave, whatever it chose to merge: no two
+/// tables of a level below L0 overlapping, the levels in order
+/// (`Db::check_levels`), and the store reading as `model` does, with every
+/// comparison asked about every key it holds and about the key just past
+/// each.
+async fn settled_as<F: Fs>(db: &roble::Db<F>, model: &Model, when: &str) {
+    let versions = db.versions();
+    for (level, tables) in versions.version.levels().filter(|(l, _)| *l > 0) {
+        for pair in tables.windows(2) {
+            assert!(
+                !pair[0].overlaps(&pair[1]).expect("bounds"),
+                "{when}: L{level}'s tables {} and {} overlap",
+                pair[0].file_num,
+                pair[1].file_num
+            );
+        }
+    }
+    db.check_levels()
+        .await
+        .unwrap_or_else(|e| panic!("{when}: {e}"));
+    assert_eq!(&contents(db).await, model, "{when}: what a scan reads");
+    for k in model.keys() {
+        let past = [k.as_slice(), b"\0"].concat();
+        for probe in [k.as_slice(), past.as_slice()] {
+            let from = |lo: Bound<&[u8]>| model.range::<[u8], _>((lo, Bound::Unbounded)).next();
+            let to = |hi: Bound<&[u8]>| model.range::<[u8], _>((Bound::Unbounded, hi)).next_back();
+            for (how, want) in [
+                (Comparison::Equal, model.get_key_value(probe)),
+                (Comparison::Floor, to(Bound::Included(probe))),
+                (Comparison::Ceiling, from(Bound::Included(probe))),
+                (Comparison::Lower, to(Bound::Excluded(probe))),
+                (Comparison::Higher, from(Bound::Excluded(probe))),
+            ] {
+                let got = db.get(probe, how).await.expect("get");
+                assert_eq!(
+                    got.map(|f| f.key),
+                    want.map(|(k, _)| k.clone()),
+                    "{when}: {how:?} of {}",
+                    probe.escape_ascii()
+                );
+            }
+        }
+    }
 }
 
 #[compio::test]

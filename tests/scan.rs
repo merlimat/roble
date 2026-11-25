@@ -935,6 +935,24 @@ async fn a_skip_past_a_range_deletion_passes_a_deeper_table_holding_a_later_key_
 /// this pins.
 #[compio::test]
 async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_the_rest() {
+    part_of_a_split_deletion_sent_down(|l1| &l1[l1.len() - 1..], "the last part").await;
+}
+
+/// The same with the first part sent down instead, and then a middle one:
+/// RocksDB's `OlderLevelHasNewerData`, which sends down the part after the
+/// first, turned round. Going backward the skip moves L2 back to where the
+/// part still in L1 starts, so this is the case that would break if a part
+/// reached below its table's start: the parts after the first, still in L1,
+/// would send L2 back past the later keys under it.
+#[compio::test]
+async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_an_earlier_part() {
+    part_of_a_split_deletion_sent_down(|l1| &l1[..1], "the first part").await;
+    part_of_a_split_deletion_sent_down(|l1| &l1[1..2], "a middle part").await;
+}
+
+/// The store of the two tests above, with the parts of the deletion `pick`
+/// chooses compacted down into L2, read against a model.
+async fn part_of_a_split_deletion_sent_down(pick: fn(&[u64]) -> &[u64], which: &str) {
     let env = SimEnv::new();
     let dir = PathBuf::from("/db");
     let db = roble::open_with(
@@ -983,9 +1001,9 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         "the span cut across L1, not {} tables",
         l1.len()
     );
-    db.compact(1, &l1[l1.len() - 1..])
+    db.compact(1, pick(&l1))
         .await
-        .expect("compact the last part into L2");
+        .unwrap_or_else(|e| panic!("compact {which} into L2: {e}"));
 
     let want: Vec<String> = model
         .keys()
@@ -998,7 +1016,7 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         forward.push(String::from_utf8(scan.key().to_vec()).expect("utf8"));
         scan.next().await.expect("next");
     }
-    assert_eq!(forward, want, "forward");
+    assert_eq!(forward, want, "{which} down: forward");
     let mut backward = Vec::new();
     scan.last().await.expect("last");
     while scan.is_valid() {
@@ -1006,7 +1024,7 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
         scan.prev().await.expect("prev");
     }
     backward.reverse();
-    assert_eq!(backward, want, "backward");
+    assert_eq!(backward, want, "{which} down: backward");
 
     // Every seek a floor or a ceiling makes from inside the span, against
     // the model.
@@ -1017,10 +1035,18 @@ async fn a_skip_past_part_of_a_split_range_deletion_keeps_the_later_keys_under_t
             .range(..probe.clone())
             .next_back()
             .map(|(k, _)| k.clone());
-        assert_eq!(floor.map(|f| f.key), want, "floor of k{i:04}~");
+        assert_eq!(
+            floor.map(|f| f.key),
+            want,
+            "{which} down: floor of k{i:04}~"
+        );
         let ceiling = db.get(&probe, Comparison::Ceiling).await.expect("ceiling");
         let want = model.range(probe.clone()..).next().map(|(k, _)| k.clone());
-        assert_eq!(ceiling.map(|f| f.key), want, "ceiling of k{i:04}~");
+        assert_eq!(
+            ceiling.map(|f| f.key),
+            want,
+            "{which} down: ceiling of k{i:04}~"
+        );
     }
 }
 
