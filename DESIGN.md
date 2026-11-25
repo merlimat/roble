@@ -2075,8 +2075,10 @@ in both directions.
   and levels (`tests/pebble/range_del`, its `get` and `iter`), the level
   invariant (`tests/pebble/level_checker`), decoding and applying version
   edits (`format/tests/pebble/version_edit_decode`,
-  `tests/pebble/version_edit_apply`), and the point deletions a compaction
-  may drop (`tests/pebble/tombstone_elision`). The files are copied unchanged, with Pebble's licence beside them,
+  `tests/pebble/version_edit_apply`), the point deletions a compaction may
+  drop (`tests/pebble/tombstone_elision`), and the steps of an iterator over
+  one source and over a snapshot (`tests/pebble/iterator`,
+  `tests/pebble/snapshot`). The files are copied unchanged, with Pebble's licence beside them,
   and CI fails if they stop being the files at the pin. Only what roble shares
   is compared: the sublevel count, not Pebble's compaction picking, and the
   fragments, not how the test draws them.

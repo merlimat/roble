@@ -31,6 +31,8 @@ use roble_format::files;
 
 mod common;
 use common::land_during;
+mod datadriven;
+use datadriven::cases;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -786,5 +788,137 @@ async fn a_scan_made_from_a_snapshot_reads_on_once_the_snapshot_is_gone() {
         walk(&mut scan).await,
         seen,
         "the scan should read what the snapshot saw, after the snapshot went"
+    );
+}
+
+/// Flushes the memtable and compacts every level into the one below, as far
+/// down as there are tables: what Pebble's `Compact` over the whole keyspace
+/// leaves of a small store.
+async fn compact_all(db: &roble::Db<SimFs>) {
+    db.flush().await.expect("flush");
+    for level in 0..6 {
+        let tables: Vec<u64> = db
+            .versions()
+            .version
+            .level(level)
+            .iter()
+            .map(|t| t.file_num)
+            .collect();
+        if !tables.is_empty() {
+            db.compact(level, &tables).await.expect("compact");
+        }
+    }
+}
+
+/// Snapshots read as Pebble's do, judged against Pebble's own test cases.
+///
+/// `tests/pebble/snapshot` is Pebble's `testdata/snapshot` at the pin,
+/// unchanged (`tests/pebble/README.md`). Each `define` writes keys one at a
+/// time, takes named snapshots between the writes and compacts, and each
+/// `iter snapshot=N` steps an iterator over one of them. A roble snapshot holds
+/// the version it was taken on, so a compaction after it changes nothing it
+/// reads. That is also why roble passes the case of Pebble's #2705, which is
+/// about Pebble hiding points it has marked obsolete: roble marks none.
+///
+/// A step from no key is not made, as in `tests/scan.rs`'s runner of Pebble's
+/// iterator cases: judging pauses there until the next seek, `first` or
+/// `last`. Skipped: the define holding a MERGE, which roble refuses (§3), and
+/// `db-state`, which prints Pebble's own version.
+#[compio::test]
+async fn snapshots_read_what_pebbles_snapshots_read() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/snapshot");
+    let text = std::fs::read_to_string(&path).expect("Pebble's snapshot test data");
+
+    // The store a define made, and its snapshots by name.
+    let mut store = None;
+    let (mut judged, mut skipped, mut made, mut paused_at) = (0, 0, 0, 0);
+    for case in cases(&text) {
+        let context = format!("line {}: {}", case.line, case.command);
+        let mut words = case.command.split_whitespace();
+        match words.next() {
+            Some("define") => {
+                store = None;
+                if case.input.iter().any(|l| l.starts_with("merge")) {
+                    continue;
+                }
+                let env = SimEnv::new();
+                let db = roble::open_with(
+                    &env,
+                    "/db",
+                    Options::new()
+                        .create_if_missing(true)
+                        .disable_automatic_compactions(true)
+                        .background_tasks(false),
+                )
+                .await
+                .expect("create");
+                let mut snapshots = BTreeMap::new();
+                for line in &case.input {
+                    match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        ["set", k, v] => db.put(k.as_bytes(), v.as_bytes()).await.expect("put"),
+                        ["del", k] => db.delete(k.as_bytes()).await.expect("delete"),
+                        ["snapshot", name] => {
+                            snapshots.insert(name.to_string(), db.snapshot().expect("snapshot"));
+                        }
+                        ["compact", _] => compact_all(&db).await,
+                        other => panic!("{context}: a write this runner does not know: {other:?}"),
+                    }
+                }
+                store = Some((env, db, snapshots));
+            }
+            Some("db-state") => skipped += 1,
+            Some("iter") => {
+                let Some((_, db, snapshots)) = &store else {
+                    skipped += 1;
+                    continue;
+                };
+                let mut scan = match words.next().and_then(|w| w.strip_prefix("snapshot=")) {
+                    Some(name) => snapshots[name].range(..),
+                    None => db.range(..),
+                }
+                .expect("scan");
+                let expected: Vec<&str> = case.expected.lines().collect();
+                assert_eq!(expected.len(), case.input.len(), "{context}: a line a step");
+                let mut paused = false;
+                for (step, want) in case.input.iter().zip(&expected) {
+                    let words: Vec<&str> = step.split_whitespace().collect();
+                    let result = match words.as_slice() {
+                        ["next" | "prev"] if paused || !scan.is_valid() => {
+                            paused = true;
+                            paused_at += 1;
+                            continue;
+                        }
+                        ["next"] => scan.next().await,
+                        ["prev"] => scan.prev().await,
+                        ["first"] => scan.first().await,
+                        ["last"] => scan.last().await,
+                        ["seek-ge", k] => scan.seek_ge(k.as_bytes()).await,
+                        ["seek-lt", k] => scan.seek_lt(k.as_bytes()).await,
+                        other => panic!("{context}: a step this runner does not know: {other:?}"),
+                    };
+                    result.unwrap_or_else(|e| panic!("{context}: {step}: {e}"));
+                    paused = false;
+                    let got = if scan.is_valid() {
+                        format!(
+                            "{}:{}",
+                            String::from_utf8_lossy(scan.key()),
+                            String::from_utf8_lossy(scan.value())
+                        )
+                    } else {
+                        ".".to_string()
+                    };
+                    assert_eq!(got, *want, "{context}: {step}");
+                    made += 1;
+                }
+                judged += 1;
+            }
+            other => panic!("{context}: a command this runner does not know: {other:?}"),
+        }
+    }
+    assert_eq!(
+        (judged, skipped, made, paused_at),
+        (10, 4, 24, 9),
+        "the cases judged and skipped, and the steps made and paused, in {}",
+        path.display()
     );
 }

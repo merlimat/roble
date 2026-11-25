@@ -165,6 +165,8 @@ jobs:
             "tests/pebble/level_checker:testdata/level_checker" \
             "tests/pebble/version_edit_apply:internal/manifest/testdata/version_edit_apply" \
             "tests/pebble/tombstone_elision:internal/compact/testdata/tombstone_elision" \
+            "tests/pebble/iterator:testdata/iterator" \
+            "tests/pebble/snapshot:testdata/snapshot" \
             "format/tests/pebble/fragmenter:internal/keyspan/testdata/fragmenter" \
             "format/tests/pebble/version_edit_decode:internal/manifest/testdata/version_edit_decode" \
             "tests/pebble/LICENSE:LICENSE" \

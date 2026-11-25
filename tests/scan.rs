@@ -31,9 +31,13 @@ use std::path::{Path, PathBuf};
 use roble::sim::{SimEnv, SimFs};
 use roble::{Comparison, Disk, Fs, GetBuf, Options, Scan, WriteBuf};
 use roble_format::batch::Batch;
+use roble_format::sst::WriterOptions;
 
 mod common;
 use common::land_during;
+mod datadriven;
+use datadriven::cases;
+mod lsm;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -1557,4 +1561,168 @@ async fn a_scan_suspended_in_the_middle_of_a_step_reads_past_what_lands_meanwhil
              {inside} times of {total}"
         );
     }
+}
+
+/// What Pebble's iterator answers over one source, judged against Pebble's
+/// own test cases.
+///
+/// `tests/pebble/iterator` is Pebble's `testdata/iterator` at the pin,
+/// unchanged (`tests/pebble/README.md`). Each `define` gives one source's
+/// internal keys: sets, deletions and single deletions of a few keys, several
+/// versions each. Each `iter seq=N` steps an iterator over it that sees only
+/// what is numbered below N, and Pebble prints where each step leaves it.
+/// roble's scan picks a key's newest visible version the same way from any
+/// source, so the source is built twice, as a table and as the memtable a log
+/// replays into, each without what is numbered N or above (as
+/// `tests/range_del.rs` reads at a sequence number), and each step has to
+/// leave the scan where Pebble's iterator was.
+///
+/// A step from no key is not made: off either end roble's scan stays off,
+/// where Pebble's turns round (`Scan::next`). Judging pauses at one, and
+/// resumes at the next seek, `first`, `last` or `set-bounds`, which position
+/// both the same way.
+///
+/// Skipped: the defines holding a MERGE, which roble refuses (§3), and the
+/// one with a merger; the one holding a batch's own entry, which only a scan
+/// of an indexed batch reads; and the cases using a prefix seek or a `-limit`
+/// step, which roble's scan does not have.
+#[compio::test]
+async fn roble_steps_through_one_source_as_pebbles_iterator_does() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/iterator");
+    let text = std::fs::read_to_string(&path).expect("Pebble's iterator test data");
+    let stepped = |step: &String| {
+        matches!(
+            step.split_whitespace().next(),
+            Some(
+                "seek-ge" | "seek-lt" | "first" | "last" | "next" | "prev" | "set-bounds" | "stats"
+            )
+        )
+    };
+    let edge = |words: &[&str], name: &str| {
+        words
+            .iter()
+            .find_map(|w| w.strip_prefix(name))
+            .map(|k| k.as_bytes().to_vec())
+    };
+
+    let mut source: Option<Vec<String>> = None;
+    // Cases judged, cases skipped for their define and for their steps, and
+    // the steps of the judged ones made and paused, counted once for the two
+    // sources.
+    let (mut judged, mut unheld, mut unstepped) = (0, 0, 0);
+    let (mut made, mut paused_at) = (0, 0);
+    for case in cases(&text) {
+        if case.command.starts_with("define") {
+            // A sequence number spelled `b2` is an indexed batch's own entry,
+            // which a store's tables and memtable never hold.
+            let batched = |l: &String| {
+                l.split(':')
+                    .next()
+                    .and_then(|k| k.rsplit('.').next())
+                    .is_some_and(|seq| seq.starts_with('b'))
+            };
+            let held = !case.command.contains("merger")
+                && !case
+                    .input
+                    .iter()
+                    .any(|l| l.contains(".MERGE.") || batched(l));
+            source = held.then(|| case.input.clone());
+            continue;
+        }
+        let words: Vec<&str> = case.command.split_whitespace().collect();
+        assert_eq!(words[0], "iter", "line {}: {}", case.line, case.command);
+        let Some(entries) = &source else {
+            unheld += 1;
+            continue;
+        };
+        if !case.input.iter().all(stepped) {
+            unstepped += 1;
+            continue;
+        }
+        // With no `seq`, Pebble's driver reads at 0, which sees nothing.
+        let below: u64 = edge(&words, "seq=")
+            .map(|s| String::from_utf8(s).expect("text").parse().expect("a seq"))
+            .unwrap_or(0);
+        let (lower, upper) = (edge(&words, "lower="), edge(&words, "upper="));
+        let expected: Vec<&str> = case.expected.lines().collect();
+        assert!(
+            expected.len() == case.input.len() + 1
+                && expected.last().is_some_and(|l| l.starts_with("stats:")),
+            "line {}: a line for each step and then the stats",
+            case.line
+        );
+
+        for place in ["L6", "mem"] {
+            let lines: Vec<String> = std::iter::once(place.to_string())
+                .chain(entries.iter().cloned())
+                .collect();
+            let groups = lsm::define(&lines).expect("a source without MERGE");
+            let (env, dir) = lsm::build(&groups, below, WriterOptions::default()).await;
+            let db = roble::open_with(
+                &env,
+                &dir,
+                Options::new()
+                    .disable_automatic_compactions(true)
+                    .background_tasks(false),
+            )
+            .await
+            .expect("the source opens");
+            let range = |lower: &Option<Vec<u8>>, upper: &Option<Vec<u8>>| {
+                db.range((
+                    lower.as_deref().map_or(Unbounded, Included),
+                    upper.as_deref().map_or(Unbounded, Excluded),
+                ))
+                .expect("scan")
+            };
+            let mut scan = range(&lower, &upper);
+            let mut paused = false;
+            for (step, want) in case.input.iter().zip(&expected) {
+                let context = format!("line {}, the source in {place}: {step}", case.line);
+                let words: Vec<&str> = step.split_whitespace().collect();
+                let result = match words.as_slice() {
+                    ["stats"] => {
+                        assert!(want.starts_with("stats:"), "{context}");
+                        continue;
+                    }
+                    ["next" | "prev"] if paused || !scan.is_valid() => {
+                        paused = true;
+                        paused_at += usize::from(place == "L6");
+                        continue;
+                    }
+                    ["next"] => scan.next().await,
+                    ["prev"] => scan.prev().await,
+                    ["first"] => scan.first().await,
+                    ["last"] => scan.last().await,
+                    ["seek-ge", k] => scan.seek_ge(k.as_bytes()).await,
+                    ["seek-lt", k] => scan.seek_lt(k.as_bytes()).await,
+                    ["set-bounds", ..] => {
+                        scan = range(&edge(&words, "lower="), &edge(&words, "upper="));
+                        Ok(())
+                    }
+                    other => panic!("{context}: a step this runner does not know: {other:?}"),
+                };
+                result.unwrap_or_else(|e| panic!("{context}: {e}"));
+                paused = false;
+                let got = if scan.is_valid() {
+                    format!(
+                        "{}: ({}, .)",
+                        String::from_utf8_lossy(scan.key()),
+                        String::from_utf8_lossy(scan.value())
+                    )
+                } else {
+                    ".".to_string()
+                };
+                assert_eq!(got, *want, "{context}");
+                made += usize::from(place == "L6");
+            }
+        }
+        judged += 1;
+    }
+    assert_eq!(
+        (judged, unheld, unstepped, made, paused_at),
+        (63, 38, 46, 150, 9),
+        "the cases judged and skipped for their define and their steps, and the \
+         steps made and paused, in {}",
+        path.display()
+    );
 }

@@ -46,3 +46,19 @@ output, compacts a table holding the deletion out of the start level, and
 requires roble to drop it where Pebble does. The one exception is a key at a
 table's exclusive sentinel, which roble's rule reads as inside the table and so
 keeps the deletion. Skipped: the range deletions, which roble never drops.
+
+`iterator` is Pebble's `testdata/iterator`, copied unchanged the same way.
+`tests/scan.rs` builds each `define`'s one source as a table and as a
+memtable, each less its entries numbered at or above the `iter`'s sequence
+number, and requires each step of a scan over it to land where Pebble's
+iterator did. A step from no key, where roble's scan stays off the end and
+Pebble's turns round, is not made, and judging resumes at the next seek,
+`first`, `last` or `set-bounds`. Skipped: defines holding a MERGE or a merger,
+the one holding a batch's own entry, and cases using a prefix seek or a
+`-limit` step, which roble's scan does not have.
+
+`snapshot` is Pebble's `testdata/snapshot`, copied unchanged the same way.
+`tests/snapshot.rs` makes each `define`'s writes, snapshots and compactions on
+a store and requires each step of a scan of a snapshot to land where Pebble's
+did, pausing at a step from no key the same way. Skipped: the define holding
+a MERGE, and `db-state`, which prints Pebble's own version.
