@@ -2069,10 +2069,14 @@ in both directions.
 - **Pebble's own test cases, where roble claims Pebble's rule.** Where a
   piece of roble is a pure function Pebble also tests in its own test data,
   roble runs Pebble's cases rather than writing its own: L0's sublevel count
-  (`tests/pebble/l0_sublevels`, every `define` and `add-l0-files`) and
+  (`tests/pebble/l0_sublevels`, every `define` and `add-l0-files`),
   range-deletion fragmenting (`format/tests/pebble/fragmenter`, every
-  `build`), and reads over hand-built LSMs of range deletions across
-  memtables and levels (`tests/pebble/range_del`, its `get` and `iter`). The files are copied unchanged, with Pebble's licence beside them,
+  `build`), reads over hand-built LSMs of range deletions across memtables
+  and levels (`tests/pebble/range_del`, its `get` and `iter`), the level
+  invariant (`tests/pebble/level_checker`), decoding and applying version
+  edits (`format/tests/pebble/version_edit_decode`,
+  `tests/pebble/version_edit_apply`), and the point deletions a compaction
+  may drop (`tests/pebble/tombstone_elision`). The files are copied unchanged, with Pebble's licence beside them,
   and CI fails if they stop being the files at the pin. Only what roble shares
   is compared: the sublevel count, not Pebble's compaction picking, and the
   fragments, not how the test draws them.

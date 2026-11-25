@@ -10,3 +10,9 @@ which is in `LICENSE` beside it.
 The `get` commands test Pebble's snapshot visibility over the result, which
 the format crate has no counterpart for, and are skipped. CI checks that the
 copy is still the file at the pin.
+
+`version_edit_decode` is Pebble's `internal/manifest/testdata/version_edit_decode`,
+copied unchanged the same way. `tests/version_edit.rs` decodes each `decode`'s
+bytes with `roble_format::manifest::VersionEdit::decode` and requires the
+fields Pebble prints, or a refusal of the edits of blob files, which arrive
+above the pin. The `encode` case writes blob files too, and is skipped.
