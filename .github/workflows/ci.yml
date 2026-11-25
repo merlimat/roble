@@ -163,7 +163,10 @@ jobs:
             "tests/pebble/l0_sublevels:internal/manifest/testdata/l0_sublevels" \
             "tests/pebble/range_del:testdata/range_del" \
             "tests/pebble/level_checker:testdata/level_checker" \
+            "tests/pebble/version_edit_apply:internal/manifest/testdata/version_edit_apply" \
+            "tests/pebble/tombstone_elision:internal/compact/testdata/tombstone_elision" \
             "format/tests/pebble/fragmenter:internal/keyspan/testdata/fragmenter" \
+            "format/tests/pebble/version_edit_decode:internal/manifest/testdata/version_edit_decode" \
             "tests/pebble/LICENSE:LICENSE" \
             "format/tests/pebble/LICENSE:LICENSE"; do
             ours="${pair%%:*}"

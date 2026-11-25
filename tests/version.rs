@@ -648,6 +648,250 @@ async fn roble_counts_the_sublevels_pebble_counts() {
     assert_eq!(judged, 37, "the cases of {}", path.display());
 }
 
+/// An internal key as Pebble's version tests print one, `user#seq,KIND`,
+/// with `inf` for the largest sequence number.
+fn printed_key(s: &str) -> (Vec<u8>, Kind, u64) {
+    let (user, trailer) = s.rsplit_once('#').expect("user#trailer");
+    let (seq, kind) = trailer.split_once(',').expect("seq,KIND");
+    pebble_key(&format!("{user}.{kind}.{seq}"))
+}
+
+/// An encoded internal key spelled as [`printed_key`] reads one.
+fn spell(encoded: &[u8]) -> String {
+    let k = InternalKey::decode(encoded).expect("a key");
+    let seq = match k.seq_num {
+        SEQ_NUM_MAX => "inf".to_string(),
+        n => n.to_string(),
+    };
+    format!(
+        "{}#{seq},{}",
+        k.user_key.escape_ascii(),
+        k.kind.name().to_uppercase()
+    )
+}
+
+/// A table as Pebble's version tests print one, `000002:[c#3,SET-d#4,SET]
+/// seqnums:[3-4]`, with whatever follows left aside: its sequence numbers are
+/// zero where they are not given, as there.
+fn printed_table(level: u32, line: &str) -> NewTable {
+    let (num, rest) = line.trim().split_once(":[").expect("num:[bounds]");
+    let (bounds, rest) = rest.split_once(']').expect("[bounds]");
+    let (smallest, largest) = bounds.split_once('-').expect("smallest-largest");
+    let (lo, lo_kind, lo_seq) = printed_key(smallest);
+    let (hi, hi_kind, hi_seq) = printed_key(largest);
+    let (smallest_seq_num, largest_seq_num) = rest
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("seqnums:["))
+        .and_then(|s| s.strip_suffix(']'))
+        .and_then(|s| s.split_once('-'))
+        .map(|(a, b)| (a.parse().expect("a seq"), b.parse().expect("a seq")))
+        .unwrap_or((0, 0));
+    NewTable {
+        level,
+        file_num: num.parse().expect("a file number"),
+        size: 1,
+        smallest: key::encode(&lo, lo_seq, lo_kind),
+        largest: key::encode(&hi, hi_seq, hi_kind),
+        smallest_seq_num,
+        largest_seq_num,
+        marked_for_compaction: false,
+        creation_time: 0,
+    }
+}
+
+/// What a version is as Pebble's version tests print one, in one text:
+/// L0's sublevel count and its tables by file number, which is what roble
+/// shares of L0, and each level below in its order.
+fn shape(levels: &[(u32, Vec<NewTable>)], l0_sublevels: usize) -> String {
+    let mut out = vec![format!("L0 sublevels: {l0_sublevels}")];
+    for (level, tables) in levels {
+        let mut tables = tables.clone();
+        if *level == 0 {
+            tables.sort_by_key(|t| t.file_num);
+        }
+        for t in tables {
+            out.push(format!(
+                "L{level}: {:06}:[{}-{}] seqnums:[{}-{}]",
+                t.file_num,
+                spell(&t.smallest),
+                spell(&t.largest),
+                t.smallest_seq_num,
+                t.largest_seq_num
+            ));
+        }
+    }
+    out.join("\n")
+}
+
+/// The shape of a version Pebble printed: `L0.n:` and `L<n>:` headings, each
+/// over its tables.
+fn printed_shape(lines: &[String]) -> String {
+    let mut levels: Vec<(u32, Vec<NewTable>)> = Vec::new();
+    let mut sublevels = 0;
+    for line in lines {
+        let line = line.trim();
+        if let Some(heading) = line.strip_suffix(':')
+            && let Some(level) = heading.strip_prefix('L')
+        {
+            let (level, sub) = level.split_once('.').unwrap_or((level, ""));
+            let level: u32 = level.parse().expect("a level");
+            sublevels += usize::from(!sub.is_empty());
+            if levels.last().is_none_or(|(l, _)| *l != level) {
+                levels.push((level, Vec::new()));
+            }
+            continue;
+        }
+        let (level, tables) = levels.last_mut().expect("a heading over a table");
+        tables.push(printed_table(*level, line));
+    }
+    levels.sort_by_key(|(l, _)| *l);
+    shape(&levels, sublevels)
+}
+
+/// The shape of roble's version, as [`printed_shape`] gives Pebble's.
+fn version_shape(set: &VersionSet) -> String {
+    let levels: Vec<(u32, Vec<NewTable>)> = set
+        .version
+        .levels()
+        .filter(|(_, tables)| !tables.is_empty())
+        .map(|(level, tables)| {
+            let tables = tables
+                .iter()
+                .map(|t| NewTable {
+                    level,
+                    file_num: t.file_num,
+                    size: 1,
+                    smallest: t.smallest.clone(),
+                    largest: t.largest.clone(),
+                    smallest_seq_num: t.smallest_seq_num,
+                    largest_seq_num: t.largest_seq_num,
+                    marked_for_compaction: false,
+                    creation_time: 0,
+                })
+                .collect();
+            (level, tables)
+        })
+        .collect();
+    shape(&levels, set.version.l0_sublevels().expect("the sublevels"))
+}
+
+/// Version edits applied, judged against Pebble's own test cases.
+///
+/// `tests/pebble/version_edit_apply` is Pebble's
+/// `internal/manifest/testdata/version_edit_apply` at the pin, unchanged
+/// (`tests/pebble/README.md`). Each `define` names a version and each `apply`
+/// applies edits to one, and Pebble prints the version that results or the
+/// error it refused the edits with. roble applies every edit a MANIFEST holds
+/// the same way (`VersionSet::apply`), so it has to come to the same version:
+/// each level below L0 the same tables in the same order, and L0 the same
+/// tables in as many sublevels, which is what roble shares of L0 (§9). Where
+/// Pebble refuses, roble has to refuse too: a deletion of a table the level
+/// does not hold, a table a level already holds, and tables of a level below
+/// L0 that overlap. That each is refused is compared, not how it is worded.
+///
+/// Skipped: the eleven cases of virtual tables and blob files, which arrive
+/// above roble's pin (§3).
+#[compio::test]
+async fn roble_applies_version_edits_as_pebble_does() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/version_edit_apply");
+    let text = std::fs::read_to_string(&path).expect("Pebble's version edit test data");
+    let above_the_pin = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.contains("(0") || l.contains("backing") || l.contains("blob"))
+    };
+
+    let mut defined: std::collections::HashMap<String, VersionSet> = Default::default();
+    let (mut versions, mut refusals, mut skipped) = (0, 0, 0);
+    for case in cases(&text) {
+        let mut words = case.command.split_whitespace();
+        let (command, name) = (
+            words.next().expect("a command"),
+            words.next().expect("a version's name").to_string(),
+        );
+        let context = format!("line {}: {}", case.line, case.command);
+        let expected: Vec<String> = case.expected.lines().map(String::from).collect();
+        if above_the_pin(&case.input) || above_the_pin(&expected) {
+            skipped += 1;
+            continue;
+        }
+        let result = match command {
+            "define" => {
+                let mut tables = Vec::new();
+                let mut level = 0;
+                for line in &case.input {
+                    let line = line.trim();
+                    match line.strip_suffix(':').and_then(|h| h.strip_prefix('L')) {
+                        Some(n) => level = n.parse().expect("a level"),
+                        None => tables.push(printed_table(level, line)),
+                    }
+                }
+                replay(tables)
+            }
+            "apply" => {
+                let base = defined
+                    .get(&name)
+                    .unwrap_or_else(|| panic!("{context}: no version {name} was defined"));
+                let mut edits = vec![VersionEdit::default()];
+                for line in &case.input {
+                    let line = line.trim();
+                    if line == "new version edit" {
+                        edits.push(VersionEdit::default());
+                        continue;
+                    }
+                    let edit = edits.last_mut().expect("an edit");
+                    let (what, rest) = line.split_once(':').expect("what: table");
+                    let (level, table) = rest.trim().split_once(' ').expect("level table");
+                    let level: u32 = level
+                        .strip_prefix('L')
+                        .and_then(|l| l.parse().ok())
+                        .expect("a level");
+                    match what {
+                        "del-table" => edit
+                            .deleted_tables
+                            .push((level, table.parse().expect("a file number"))),
+                        "add-table" => edit.new_tables.push(printed_table(level, table)),
+                        other => panic!("{context}: an edit this runner does not know: {other}"),
+                    }
+                }
+                let mut set = base.clone();
+                edits
+                    .iter()
+                    .try_for_each(|edit| set.apply(edit))
+                    .map(|()| set)
+            }
+            other => panic!("{context}: a command this runner does not know: {other}"),
+        };
+
+        if expected
+            .first()
+            .is_some_and(|l| l.starts_with("pebble:") || l.starts_with("error during"))
+        {
+            assert!(
+                result.is_err(),
+                "{context}: Pebble refuses this with {:?}, and roble applied it",
+                expected[0]
+            );
+            refusals += 1;
+            continue;
+        }
+        let set = result.unwrap_or_else(|e| panic!("{context}: {e}"));
+        assert_eq!(version_shape(&set), printed_shape(&expected), "{context}");
+        if command == "define" {
+            defined.insert(name, set);
+        }
+        versions += 1;
+    }
+    // Every case but the skipped ones, so a runner that lost some fails here:
+    // nine defines and ten applies, and four applies refused.
+    assert_eq!(
+        (versions, refusals, skipped),
+        (19, 4, 11),
+        "the versions, refusals and skipped cases of {}",
+        path.display()
+    );
+}
+
 /// A file in the simulated filesystem, written and synced.
 async fn put_file(fs: &SimFs, path: &Path, bytes: Vec<u8>) {
     let disk = fs.create(path).await.expect("create");
@@ -804,6 +1048,172 @@ async fn lay_out(input: &[String]) -> (SimEnv, PathBuf) {
     }
     fs.sync_dir(&dir).await.expect("sync dir");
     (env, dir)
+}
+
+/// An encoded internal key spelled as [`lay_out`] reads one, `user.KIND.seq`.
+fn laid_key(encoded: &[u8]) -> String {
+    let k = InternalKey::decode(encoded).expect("a key");
+    let seq = match k.seq_num {
+        SEQ_NUM_MAX => "inf".to_string(),
+        n => n.to_string(),
+    };
+    format!(
+        "{}.{}.{seq}",
+        String::from_utf8(k.user_key.to_vec()).expect("a key spelled in text"),
+        k.kind.name().to_uppercase()
+    )
+}
+
+/// A table with `t`'s bounds, for [`lay_out`]: its bounds as written, and
+/// entries that make them its own — a point where a bound is one, and a range
+/// deletion running to a bound that is the exclusive sentinel, from the other
+/// bound if that is a range deletion's start, or else from just past it.
+fn laid_table(t: &NewTable) -> [String; 2] {
+    let (lo, hi) = (
+        InternalKey::decode(&t.smallest).expect("a bound"),
+        InternalKey::decode(&t.largest).expect("a bound"),
+    );
+    let text = |b: &[u8]| String::from_utf8(b.to_vec()).expect("a key spelled in text");
+    let mut entries = Vec::new();
+    if lo.kind != Kind::RangeDelete {
+        entries.push(format!("{}:v", laid_key(&t.smallest)));
+    }
+    if hi.seq_num == SEQ_NUM_MAX && hi.kind == Kind::RangeDelete {
+        let (start, seq) = match lo.kind {
+            Kind::RangeDelete => (text(lo.user_key), lo.seq_num),
+            _ => (format!("{}\0", text(lo.user_key)), lo.seq_num),
+        };
+        entries.push(format!(
+            "Span:{start}-{}:{{(#{seq},RANGEDEL)}}",
+            text(hi.user_key)
+        ));
+    } else if t.largest != t.smallest {
+        entries.push(format!("{}:v", laid_key(&t.largest)));
+    }
+    [
+        format!("{} {}", laid_key(&t.smallest), laid_key(&t.largest)),
+        entries.join(" "),
+    ]
+}
+
+/// Whether a compaction out of `start` drops a deletion of `user` for having
+/// nothing below it, over `tables`.
+///
+/// The store holds only `tables`' levels below the output: those are the
+/// ones the rule asks about, a table of `start`'s would overlap the
+/// deletion's own, and one of the output's would be pulled into the
+/// compaction. Into that, a table at `start` holding
+/// the deletion alone, numbered above everything, which is compacted out:
+/// the deletion was dropped exactly when nothing is written.
+async fn drops_deletion(tables: &[NewTable], start: u32, user: &str) -> bool {
+    let mut input = Vec::new();
+    for t in tables.iter().filter(|t| t.level > start + 1) {
+        input.push(format!("L{}", t.level));
+        input.extend(laid_table(t));
+    }
+    let del = format!("{user}.DEL.1000");
+    input.extend([
+        format!("L{start}"),
+        format!("{del} {del}"),
+        format!("{del}:"),
+    ]);
+    let (env, dir) = lay_out(&input).await;
+    let db = roble::open_with(
+        &env,
+        &dir,
+        Options::new()
+            .disable_automatic_compactions(true)
+            .background_tasks(false),
+    )
+    .await
+    .expect("the layout opens");
+    let file_num = db.versions().version.level(start)[0].file_num;
+    db.compact(start, &[file_num])
+        .await
+        .expect("the compaction")
+        .is_empty()
+}
+
+/// Deletions dropped for having nothing below them, judged against Pebble's
+/// own test cases.
+///
+/// `tests/pebble/tombstone_elision` is Pebble's
+/// `internal/compact/testdata/tombstone_elision` at the pin, unchanged
+/// (`tests/pebble/README.md`). Each `define` lays out tables by their bounds,
+/// and each `elide start-level=N` asks, of a compaction out of level N into
+/// N+1, whether a deletion of each key it lists may go: there is nothing
+/// below the output that it could still be hiding. Dropping one Pebble keeps
+/// brings an older version back, so roble may never; and it drops a point
+/// deletion by the same rule, asking the same levels.
+///
+/// The one place the answers differ is a table whose largest bound is the
+/// exclusive sentinel at the key: Pebble reads that key as outside the table
+/// and drops the deletion, where roble's rule reads the bound as inclusive and
+/// keeps it (`crate::compact`'s `keep`), which costs space and is never wrong.
+///
+/// Skipped: the range deletions, all 36 of them. roble keeps every range
+/// deletion it compacts (`crate::compact`), so none of them could differ in
+/// the direction that matters.
+#[compio::test]
+async fn roble_drops_a_deletion_with_nothing_below_it_where_pebble_does() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pebble/tombstone_elision");
+    let text = std::fs::read_to_string(&path).expect("Pebble's tombstone elision test data");
+
+    let mut tables: Vec<NewTable> = Vec::new();
+    let (mut judged, mut skipped) = (0, 0);
+    let mut kept_more = Vec::new();
+    for case in cases(&text) {
+        if case.command == "define" {
+            tables.clear();
+            let mut level = 0;
+            for line in &case.input {
+                let line = line.trim();
+                match line.trim_end_matches(':').strip_prefix('L') {
+                    Some(n) => level = n.parse().expect("a level"),
+                    None => tables.push(printed_table(level, line)),
+                }
+            }
+            continue;
+        }
+        let start: u32 = case
+            .command
+            .strip_prefix("elide start-level=")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("line {}: {}", case.line, case.command));
+        for answer in case.expected.lines() {
+            if answer.starts_with("elideRangeTombstone") {
+                skipped += 1;
+                continue;
+            }
+            let (call, verdict) = answer.split_once(" = ").expect("call = verdict");
+            let user = call
+                .strip_prefix("elideTombstone(\"")
+                .and_then(|s| s.strip_suffix("\")"))
+                .expect("elideTombstone(\"key\")");
+            let pebble = verdict == "true";
+            let roble = drops_deletion(&tables, start, user).await;
+            let context = format!("line {}: start-level={start}, {user}", case.line);
+            assert!(
+                !roble || pebble,
+                "{context}: roble drops a deletion Pebble keeps"
+            );
+            if pebble && !roble {
+                kept_more.push(context);
+            }
+            judged += 1;
+        }
+    }
+    assert_eq!(
+        kept_more,
+        ["line 201: start-level=1, z"],
+        "where roble keeps a deletion Pebble drops"
+    );
+    assert_eq!(
+        (judged, skipped),
+        (58, 36),
+        "the point and range deletions of {}",
+        path.display()
+    );
 }
 
 /// What `Db::check_levels` finds wrong with the store `input` lays out, if
