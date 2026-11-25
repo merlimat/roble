@@ -48,135 +48,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use roble::sim::{SimEnv, SimFs};
-use roble::{Comparison, Disk, Fs, Options, WriteBuf};
+use roble::{Comparison, Options};
 use roble_format::InternalKey;
-use roble_format::batch::Batch;
-use roble_format::files::{MARKER_FORMAT_VERSION, MARKER_MANIFEST, marker_filename};
-use roble_format::key::{self, Kind, SEQ_NUM_MAX};
-use roble_format::manifest::{NewTable, VersionEdit};
-use roble_format::rangedel::{self, Tombstone};
-use roble_format::record::RecordWriter;
-use roble_format::sst::{TableWriter, WriterOptions};
+use roble_format::key::{Kind, SEQ_NUM_MAX};
+use roble_format::sst::WriterOptions;
 
-const BYTEWISE: &str = "leveldb.BytewiseComparator";
-/// The log the memtables are replayed from.
-const LOG: u64 = 2;
-
-/// One command of a datadriven file: the command line, its input lines, and
-/// the output written under it.
-struct Case {
-    line: usize,
-    command: String,
-    input: Vec<String>,
-    expected: String,
-}
-
-/// Splits a file in the format of cockroachdb/datadriven, the one Pebble's
-/// test data is written in. An output runs to the first blank line, or,
-/// when it opens with a second `----`, to a closing `----` pair.
-fn cases(text: &str) -> Vec<Case> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim_end();
-        if line.is_empty() || line.starts_with('#') {
-            i += 1;
-            continue;
-        }
-        let at = i + 1;
-        let command = line.to_string();
-        i += 1;
-        let mut input = Vec::new();
-        while i < lines.len() && lines[i] != "----" {
-            input.push(lines[i].to_string());
-            i += 1;
-        }
-        i += 1;
-        let mut expected = Vec::new();
-        if lines.get(i) == Some(&"----") {
-            i += 1;
-            while i + 1 < lines.len() && !(lines[i] == "----" && lines[i + 1] == "----") {
-                expected.push(lines[i]);
-                i += 1;
-            }
-            i += 2;
-        } else {
-            while i < lines.len() && !lines[i].trim().is_empty() {
-                expected.push(lines[i]);
-                i += 1;
-            }
-        }
-        out.push(Case {
-            line: at,
-            command,
-            input,
-            expected: expected.join("\n"),
-        });
-    }
-    out
-}
-
-/// An entry of a `define`, `user.KIND.seq:value`. A range deletion's value
-/// is its end key.
-#[derive(Clone)]
-struct Entry {
-    user: Vec<u8>,
-    kind: Kind,
-    seq: u64,
-    value: Vec<u8>,
-}
-
-/// Where a `define` puts a group of entries: a memtable, or one table at a
-/// level.
-#[derive(Clone)]
-enum Place {
-    Mem,
-    Level(u32),
-}
-
-/// A `define`: groups of entries, each a memtable or a table, in order. `None`
-/// for one roble cannot hold.
-fn define(input: &[String]) -> Option<Vec<(Place, Vec<Entry>)>> {
-    let mut out: Vec<(Place, Vec<Entry>)> = Vec::new();
-    for line in input {
-        let line = line.trim();
-        if line == "mem" {
-            out.push((Place::Mem, Vec::new()));
-        } else if let Some(level) = line.strip_prefix('L') {
-            out.push((Place::Level(level.parse().expect("a level")), Vec::new()));
-        } else {
-            let (k, value) = line.split_once(':').expect("key:value");
-            let mut parts = k.rsplitn(3, '.');
-            let seq = parts
-                .next()
-                .expect("seq")
-                .parse()
-                .expect("a sequence number");
-            let kind = match parts.next().expect("kind") {
-                "SET" => Kind::Set,
-                "DEL" => Kind::Delete,
-                "RANGEDEL" => Kind::RangeDelete,
-                "MERGE" => return None,
-                other => panic!("a kind this runner does not know: {other}"),
-            };
-            let user = parts.next().expect("user key").as_bytes().to_vec();
-            out.last_mut()
-                .expect("a mem or level heading")
-                .1
-                .push(Entry {
-                    user,
-                    kind,
-                    seq,
-                    value: value.as_bytes().to_vec(),
-                });
-        }
-    }
-    Some(out)
-}
+mod datadriven;
+use datadriven::cases;
+mod lsm;
+use lsm::{Entry, Place, build, define};
 
 /// Whether every layer of the LSM holds only sequence numbers above those of
 /// every layer older than it: later memtables over earlier ones, memtables
@@ -210,155 +93,6 @@ fn layered(groups: &[(Place, Vec<Entry>)]) -> bool {
         }
     }
     true
-}
-
-async fn write(fs: &SimFs, path: &Path, bytes: &[u8]) {
-    let disk = fs.create(path).await.expect("create");
-    let (result, _) = disk.write(WriteBuf::new(bytes.to_vec()), 0, ()).await;
-    result.expect("write");
-    disk.close().await.expect("close");
-}
-
-/// A table holding `entries`, and the MANIFEST's account of it.
-fn table(level: u32, file_num: u64, entries: &[Entry]) -> (Vec<u8>, NewTable) {
-    let mut points: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| e.kind != Kind::RangeDelete)
-        .collect();
-    // Internal key order: user key ascending, then newest first.
-    points.sort_by(|a, b| a.user.cmp(&b.user).then(b.seq.cmp(&a.seq)));
-    let tombstones: Vec<Tombstone> = entries
-        .iter()
-        .filter(|e| e.kind == Kind::RangeDelete)
-        .map(|e| Tombstone {
-            start: e.user.clone(),
-            end: e.value.clone(),
-            seq_num: e.seq,
-        })
-        .collect();
-    let fragments = rangedel::fragment(&tombstones.iter().collect::<Vec<_>>());
-
-    let mut writer = TableWriter::new(WriterOptions::default()).expect("a writer");
-    // Every key the table holds, encoded, so its bounds are its own.
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    for e in &points {
-        writer
-            .add(
-                InternalKey {
-                    user_key: &e.user,
-                    seq_num: e.seq,
-                    kind: e.kind,
-                    obsolete: false,
-                },
-                &e.value,
-            )
-            .expect("add");
-        keys.push(key::encode(&e.user, e.seq, e.kind));
-    }
-    for t in &fragments {
-        writer
-            .add_range_deletion(&t.start, &t.end, t.seq_num)
-            .expect("add a range deletion");
-        keys.push(key::encode(&t.start, t.seq_num, Kind::RangeDelete));
-        keys.push(key::encode(&t.end, SEQ_NUM_MAX, Kind::RangeDelete));
-    }
-    let bytes = writer.finish().expect("finish");
-    let order = |a: &Vec<u8>, b: &Vec<u8>| {
-        let (a, b) = (
-            InternalKey::decode(a).expect("a key"),
-            InternalKey::decode(b).expect("a key"),
-        );
-        a.user_key
-            .cmp(b.user_key)
-            .then((b.seq_num, b.kind.to_byte()).cmp(&(a.seq_num, a.kind.to_byte())))
-    };
-    keys.sort_by(order);
-    let seqs = entries.iter().map(|e| e.seq);
-    let meta = NewTable {
-        level,
-        file_num,
-        size: bytes.len() as u64,
-        smallest: keys.first().expect("a key").clone(),
-        largest: keys.last().expect("a key").clone(),
-        smallest_seq_num: seqs.clone().min().expect("a seq"),
-        largest_seq_num: seqs.max().expect("a seq"),
-        marked_for_compaction: false,
-        creation_time: 0,
-    };
-    (bytes, meta)
-}
-
-/// The LSM `groups` describes, less every entry numbered `below` or above,
-/// as a store directory.
-async fn build(groups: &[(Place, Vec<Entry>)], below: u64) -> (SimEnv, PathBuf) {
-    let env = SimEnv::new();
-    let dir = PathBuf::from("/db");
-    let fs: &SimFs = env.sim();
-    fs.mkdir_all(&dir).await.expect("mkdir");
-
-    let mut log = RecordWriter::recyclable(LOG as u32);
-    let mut logged: Vec<&Entry> = Vec::new();
-    let mut tables = Vec::new();
-    let mut next = LOG + 1;
-    let mut last_seq = 0;
-    for (place, entries) in groups {
-        let kept: Vec<Entry> = entries.iter().filter(|e| e.seq < below).cloned().collect();
-        last_seq = kept.iter().map(|e| e.seq).fold(last_seq, u64::max);
-        match place {
-            Place::Mem => logged.extend(entries.iter().filter(|e| e.seq < below)),
-            Place::Level(level) if !kept.is_empty() => {
-                let (bytes, meta) = table(*level, next, &kept);
-                write(fs, &dir.join(format!("{next:06}.sst")), &bytes).await;
-                tables.push(meta);
-                next += 1;
-            }
-            Place::Level(_) => {}
-        }
-    }
-    // One batch per entry at its own sequence number, in the order they were
-    // numbered, as a store would have logged them.
-    logged.sort_by_key(|e| e.seq);
-    for e in logged {
-        let mut batch = Batch::new();
-        match e.kind {
-            Kind::Set => batch.put(&e.user, &e.value),
-            Kind::Delete => batch.delete(&e.user),
-            Kind::RangeDelete => batch.delete_range(&e.user, &e.value),
-            other => panic!("{other:?} in a memtable"),
-        }
-        .expect("batch");
-        batch.set_seq_num(e.seq);
-        log.write_record(batch.as_bytes()).expect("frame");
-    }
-    write(fs, &dir.join(format!("{LOG:06}.log")), &log.finish()).await;
-
-    let edit = VersionEdit {
-        comparer_name: Some(BYTEWISE.to_string()),
-        min_unflushed_log_num: Some(LOG),
-        next_file_num: Some(next),
-        last_seq_num: Some(last_seq),
-        new_tables: tables,
-        ..Default::default()
-    };
-    let mut manifest = RecordWriter::legacy();
-    manifest
-        .write_record(&edit.encode())
-        .expect("frame the edit");
-    write(fs, &dir.join("MANIFEST-000001"), &manifest.finish()).await;
-    write(
-        fs,
-        &dir.join(marker_filename(MARKER_FORMAT_VERSION, 1, "016")),
-        b"",
-    )
-    .await;
-    write(
-        fs,
-        &dir.join(marker_filename(MARKER_MANIFEST, 1, "MANIFEST-000001")),
-        b"",
-    )
-    .await;
-    fs.sync_dir(&dir).await.expect("sync dir");
-    (env, dir)
 }
 
 fn text(b: &[u8]) -> String {
@@ -463,7 +197,7 @@ async fn roble_reads_pebbles_range_deletion_cases_as_pebble_does() {
         let Some(groups) = &lsm else { continue };
         let below = seq.expect("every read in this file is at a sequence number");
 
-        let (env, dir) = build(groups, below).await;
+        let (env, dir) = build(groups, below, WriterOptions::default()).await;
         let db = roble::open_with(
             &env,
             &dir,
@@ -552,7 +286,7 @@ async fn a_reverse_seek_keeps_the_deletion_of_the_table_it_stepped_back_out_of()
             ],
         ),
     ];
-    let (env, dir) = build(&groups, u64::MAX).await;
+    let (env, dir) = build(&groups, u64::MAX, WriterOptions::default()).await;
     let db = roble::open_with(
         &env,
         &dir,
@@ -1206,7 +940,7 @@ const LAYOUTS: &[Layout] = &[
 /// The store a layout describes, less every entry numbered `below` or above,
 /// opened as the runner above opens one.
 async fn open_layout(groups: &[(Place, Vec<Entry>)], below: u64) -> (SimEnv, roble::Db<SimFs>) {
-    let (env, dir) = build(groups, below).await;
+    let (env, dir) = build(groups, below, WriterOptions::default()).await;
     let db = roble::open_with(
         &env,
         &dir,

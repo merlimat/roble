@@ -52,6 +52,9 @@ use roble_format::rangedel::{self, Tombstone};
 use roble_format::record::RecordWriter;
 use roble_format::sst::{TableWriter, WriterOptions};
 
+mod datadriven;
+use datadriven::cases;
+
 const BYTEWISE: &str = "leveldb.BytewiseComparator";
 
 /// A table of `level` spanning `smallest`..`largest`, with `largest`'s
@@ -455,61 +458,6 @@ async fn a_table_meets_a_scans_bounds_as_the_bounds_are_written() {
             .expect("overlaps"),
         "and a scan inside the table's range reaches it"
     );
-}
-
-/// One command of a datadriven file: the command line, its input lines, and
-/// the output written under it.
-struct Case {
-    line: usize,
-    command: String,
-    input: Vec<String>,
-    expected: String,
-}
-
-/// Splits a file in the format of cockroachdb/datadriven, the one Pebble's
-/// test data is written in. An output runs to the first blank line, or,
-/// when it opens with a second `----`, to a closing `----` pair.
-fn cases(text: &str) -> Vec<Case> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim_end();
-        if line.is_empty() || line.starts_with('#') {
-            i += 1;
-            continue;
-        }
-        let at = i + 1;
-        let command = line.to_string();
-        i += 1;
-        let mut input = Vec::new();
-        while i < lines.len() && lines[i] != "----" {
-            input.push(lines[i].to_string());
-            i += 1;
-        }
-        i += 1;
-        let mut expected = Vec::new();
-        if lines.get(i) == Some(&"----") {
-            i += 1;
-            while i + 1 < lines.len() && !(lines[i] == "----" && lines[i + 1] == "----") {
-                expected.push(lines[i]);
-                i += 1;
-            }
-            i += 2;
-        } else {
-            while i < lines.len() && !lines[i].trim().is_empty() {
-                expected.push(lines[i]);
-                i += 1;
-            }
-        }
-        out.push(Case {
-            line: at,
-            command,
-            input,
-            expected: expected.join("\n"),
-        });
-    }
-    out
 }
 
 /// An internal key as Pebble's `ParseInternalKey` writes it: `user.KIND.seq`,

@@ -36,10 +36,13 @@
 //! table opens and on block reads, in seeks and in steps. A sweep whose
 //! failures all landed in one place would pass while proving much less.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use roble::sim::{SimEnv, SimFs};
 use roble::{Caches, Comparison, GetBuf, Options, Scan};
+use roble_format::sst::WriterOptions;
+
+mod lsm;
 
 type Db = roble::Db<SimFs>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -658,4 +661,106 @@ async fn a_compaction_that_meets_a_failed_read_leaves_the_store_as_it_was() {
         }
     }
     tally.require(&["compaction open", "compaction read"]);
+}
+
+/// A step back through one key's versions, a block each, fails where it
+/// cannot read the newest: it does not answer the version below it.
+///
+/// Pebble's `testdata/iter_histories/errors` at line 107, which a fix of
+/// Pebble's came with: going back from `d`, a failed read of the block
+/// holding `c#13` left its iterator answering `c#12`. Only a store holding
+/// snapshots keeps a key's older versions, so roble never writes such a
+/// table, but it reads the ones Pebble writes: `c` at 13 down to 8, then `d`
+/// and `e`, an entry to a block. The table here is written by roble's own
+/// writer, in the layout Pebble's would have.
+///
+/// roble's backward step walks every version of a key before it answers, so
+/// each read the walks make is failed in turn, and each answer before the
+/// failure has to be right; so does each lookup that answers with `c`.
+#[compio::test]
+async fn a_step_back_through_a_keys_versions_that_cannot_read_the_newest_fails() {
+    // Pebble's `c`, `d` and `e`, spelled as this file spells keys.
+    let (c, d, e) = (key(2), key(3), key(4));
+    let layout: Vec<String> = std::iter::once("L1".to_string())
+        .chain((8..=13).rev().map(|s| format!("{}.SET.{s}:c{s}", show(&c))))
+        .chain([
+            format!("{}.SET.9:d9", show(&d)),
+            format!("{}.SET.9:e9", show(&e)),
+        ])
+        .collect();
+    let groups = lsm::define(&layout).expect("a layout");
+    let (env, _) = lsm::build(&groups, u64::MAX, WriterOptions::default().block_size(1)).await;
+    let db = reopen(&env, "the layout").await;
+    let model = Model::from([
+        (c, b"c13".to_vec()),
+        (d, b"d9".to_vec()),
+        (e, b"e9".to_vec()),
+    ]);
+    holds(&db, &model, "with nothing failing").await;
+
+    // Pebble's walk first, then a turn after it, and a seek that lands on `c`
+    // from above.
+    let walks = [
+        vec![Move::Last, Move::Prev, Move::Prev],
+        vec![Move::Last, Move::Prev, Move::Prev, Move::Next],
+        vec![Move::SeekLt(3), Move::Prev],
+    ];
+    // The failed reads that stopped Pebble's step back onto `c`. It reads a
+    // block for each version above `c#8`, whose block the step onto `d` read
+    // already to see past `d`: five, and fewer would mean the versions did
+    // not each get a block.
+    let mut onto_c = BTreeSet::new();
+    for (w, moves) in walks.into_iter().enumerate() {
+        let walk = Walk {
+            lower: None,
+            upper: None,
+            moves,
+        };
+        let before = env.sim().ops();
+        let mut scan = walk.scan(&db);
+        let failed = walk_on(&mut scan, &model, &walk, &format!("walk {w}")).await;
+        assert!(failed.is_none(), "walk {w} failed with nothing failing");
+        let total = env.sim().ops() - before;
+
+        for n in 1..=total {
+            let what = format!("walk {w}, failing read {n} of {total}");
+            let mut scan = walk.scan(&db);
+            env.sim().fail_at(n);
+            let failed = walk_on(&mut scan, &model, &walk, &what).await;
+            env.sim().stop_failing();
+            let Some((i, _)) = failed else {
+                panic!("{what}: the walk went on as though nothing had failed")
+            };
+            if w == 0 && i == 2 {
+                onto_c.insert(n);
+            }
+        }
+    }
+    assert!(
+        onto_c.len() >= 5,
+        "the step back onto c failed at {} reads, {onto_c:?}, not one a version",
+        onto_c.len()
+    );
+
+    let mut buf = GetBuf::new();
+    for (probe, how) in [
+        ("k002", Comparison::Equal),
+        ("k002~", Comparison::Floor),
+        ("k003", Comparison::Lower),
+    ] {
+        let before = env.sim().ops();
+        looks_up(&db, &mut buf, &model, probe, how, "nothing failing").await;
+        let total = env.sim().ops() - before;
+        for n in 1..=total {
+            let what = format!("{how:?} {probe}, failing read {n} of {total}");
+            env.sim().fail_at(n);
+            let result = db.get_into(probe.as_bytes(), how, &mut buf).await;
+            env.sim().stop_failing();
+            assert!(
+                result.is_err(),
+                "{what}: answered as though nothing had failed"
+            );
+            looks_up(&db, &mut buf, &model, probe, how, &what).await;
+        }
+    }
 }
